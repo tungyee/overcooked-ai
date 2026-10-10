@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时产物
+*.log
+trace-*.jsonl
+frames-*.jsonl
+
+# C# 插件编译产物（plugin/build.sh 生成，引用 DLL 在游戏安装目录，不入库）
+plugin/build/
+
+# 测试样本帧：压缩版入库（离线回归依据），未压缩的大文件只留本地
+tests/fixtures/*.ndjson
+!tests/fixtures/*.ndjson.gz
+
+# macOS
+.DS_Store
+.worktrees/

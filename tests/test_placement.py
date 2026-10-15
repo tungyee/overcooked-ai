@@ -26,6 +26,9 @@ class FakeWorld(object):
     def to_grid(self, x, z):
         return (int(round(x / 1.2)), int(round(z / 1.2)))
 
+    def to_world(self, gx, gz):
+        return (gx * 1.2, gz * 1.2)
+
 
 def test_forbidden_includes_cooker_neighbors():
     """贴灶台的格不可落 —— 锅放那儿会继续加热。"""
@@ -223,3 +226,26 @@ def test_find_drop_on_real_frame(level_frame):
     if cell is not None:
         assert w.walkable(cell[0], cell[1])
         assert cell not in w.belt_cells
+
+
+def test_occupied_cells_includes_plates():
+    w = FakeWorld(plates=[{"n": "p1", "x": 1.2, "z": 0.0, "count": 2}])
+    occupied = placement.occupied_cells(w)
+    assert (1, 0) in occupied
+    assert (3, 0) not in occupied
+
+
+def test_find_drop_at_returns_station_when_free():
+    w = FakeWorld(stations=[], walkable=lambda gx, gz: gz == 0)
+    field = distance_field((0, 0), w.walkable, {})
+    st = placement.find_drop_at(w, field, (1, 0))
+    assert st is not None
+    assert st["gx"] == 1 and st["gz"] == 0
+    assert st["t"] == "counter"
+
+
+def test_find_drop_at_returns_none_when_occupied():
+    w = FakeWorld(plates=[{"n": "p1", "x": 1.2, "z": 0.0, "count": 2}],
+                  walkable=lambda gx, gz: gz == 0)
+    field = distance_field((0, 0), w.walkable, {})
+    assert placement.find_drop_at(w, field, (1, 0)) is None

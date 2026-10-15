@@ -26,6 +26,7 @@ KEY = {
     "right": 124,
     "pickup": 60,
     "chop": 44,     # P2 分屏：切菜 / 洗盘 / 喷火同键（WorkstationInteract = /）
+    "dash": 61,     # P2 分屏：冲刺（LogicalButtonID.Dash = 右 Alt / 右 Option）
 }
 
 

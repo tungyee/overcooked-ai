@@ -15,6 +15,12 @@ from ai.primitives.motion import MotionControl
 # 转向也走短按 / 观察，预算要覆盖多次 5Hz 新帧；最终仍以交互信号为准。
 FACE_MAX_TICKS = 40
 
+# 距目标还有几步就松开冲刺（刹车距离）。冲刺速度下 5 Hz 的位置反馈有
+# 200 ms 延迟，倒数第二格才松冲刺时惯性已经把人带过交互格（实机：横穿
+# 传送带去中间柜台反复冲过头）。留 3 步足够把速度降下来，又不牺牲长距离
+# 的巡航时间（3 格 ≈ 0.5 s）。
+DASH_BRAKE_CELLS = 3
+
 
 class Approach(Primitive):
     """走到能跟 target 交互的位置。
@@ -84,6 +90,19 @@ class Approach(Primitive):
             field = navigation.distance_field(
                 cur, w.walkable, w.belt_dir, blocked, soft_cost=soft)
 
+        # 目标就在脚下：散落物（投掷落地的料、掉落的灭火器）没有站点语义，
+        # 可能正落在自己站的那一格。此时已经够得着，直接到位——旧逻辑只取
+        # 四邻当 goal，于是先走开一格，距离场下一拍又把人拉回来，表现为
+        # 两格之间来回震荡（实机：灭火器掉脚下，[5,2]↔[6,2] 抖了 700 拍，
+        # 火烧到关卡结束，trace-20261014-004742 t=11000~11580）。
+        # 只对「目标格可走」成立——站点格不可走，仍走四邻。
+        if cur == cell and w.walkable(cell[0], cell[1]):
+            hands.set_move(None)
+            ctx["motion"] = {"phase": "arrived", "frame_seq": ctx.get("frame_seq"),
+                             "fresh": True, "direction": None,
+                             "target": list(cell), "goal": list(cell)}
+            return Status.SUCCESS
+
         goals = navigation.interact_cells(
             cell[0], cell[1], w.walkable, w.belt_cells)
         if self.allow_target:
@@ -125,6 +144,10 @@ class Approach(Primitive):
             hands.set_move(None)
             return Status.FAILURE
 
+        # 最后一步仍走精确档（短按 + 停稳）：满速冲过交互格会来回振荡
+        # ——实机端饭时在盘旁振荡约 8 秒、米烧糊起火，这条不能退。
+        final = (nxt == self._goal)
+
         # 自适应防震荡：默认按老跑法一路巡航（快）；只在近目标处检测到
         # 「反向折返」（越过目标又掉头，即 a—c—b 震荡）时切到短按+停稳，
         # 真正落定（motion 报 SUCCESS）后恢复巡航。不能用瞬态 arrived 复位：
@@ -132,8 +155,10 @@ class Approach(Primitive):
         # 导致永远检不出来。
         if d is not None:
             if len(path) <= 3:
-                if self._last_dir is not None and d == OPPOSITE.get(self._last_dir):
-                    self._oscillating = True
+                # 震荡检测暂时注释掉（实机：捡脚下散料时 left/right 折返，
+                # 一触发就短按停稳、卡住恼火）。后续重新设计震荡处理再启用。
+                # if self._last_dir is not None and d == OPPOSITE.get(self._last_dir):
+                #     self._oscillating = True
                 self._last_dir = d
             else:
                 self._last_dir = d
@@ -152,12 +177,21 @@ class Approach(Primitive):
                 # 逆向行走：必须长按顶住传送带推力。此时哪怕检测到震荡也
                 # 不许切短按——短按+松键会被传送带推回来，永远走不过去。
                 against_belt = True
+        # 冲刺要**提前**退出，给惯性留刹车距离：旧判据只看路径长短
+        # （len(path) > 3），于是一路冲到倒数第二格才松冲刺，惯性已经把人
+        # 带过了交互格（实机：横穿传送带去中间柜台反复冲过头、错过好几次）。
+        # 现在距目标 ≤ DASH_BRAKE_CELLS 步就停冲——方向键仍按住（继续走、
+        # 不慢），只是不再加速。顶带/逆向/震荡一律不冲（同原逻辑）。
+        remaining = len(path) - 1          # 还要走几步
+        dash = (d is not None and remaining > DASH_BRAKE_CELLS
+                and not against_belt and extra is None
+                and not self._oscillating)
         gx, gz = w.to_world(*self._goal)
         error = ((chef["x"] - gx)**2 + (chef["z"] - gz)**2)**0.5
         status = self._motion.tick(ctx, d, extra,
                                    self._oscillating and not against_belt,
                                    arrived, error, cur in w.belt_cells,
-                                   final=(nxt == self._goal))
+                                   final=final, dash=dash)
         if status == Status.SUCCESS:
             self._oscillating = False
             self._last_dir = None

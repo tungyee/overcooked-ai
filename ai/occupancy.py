@@ -117,6 +117,10 @@ def station_blocked_cells(stations, mapping):
     for st in stations or []:
         if not isinstance(st, dict):
             continue
+        # floor 站点代表可走地板（Col_Floor），不是障碍，跳过——它只用于
+        # 扩展 playable_bounds（见 world.py），不能被标成不可走。
+        if st.get("t") == "floor":
+            continue
         gx0, gz0 = st.get("gx"), st.get("gz")
         if gx0 is not None and gz0 is not None:
             blocked.add((int(gx0), int(gz0)))
@@ -180,7 +184,13 @@ def make_walkable(node_map, rows, cols, bounds, blocked, belt_cells,
       3. nodeMap 缺失（且无 bounds 可用）→ 可走。宁可走错也不要让 AI
          整体瘫掉。
       4. 传送带 → 可走。nodeMap 标 '0' 但角色能走上去。
-      5. 查 nodeMap，下标越界按不可走。
+      5. 查 nodeMap，下标越界且**在 bounds 内、且位于 nodeMap 下沿之下**时
+         当可走。nodeMap 只覆盖 gz=-4..4 的 9 行，但实际地板（Col_Floor）
+         往下延伸到 gz=-6，底部有连接左右半边的通道（实机：P1 从 (1,-6)
+         穿过中央柜台）。这几行不在 nodeMap 里，只能靠「bounds 已由 world.py
+         用 floor 的 minz 扩到地板底部 + 墙碰撞体标记障碍」来判定。
+         只放行 gz < -off_z（下沿以下），左右/上沿越界仍不可走，避免把
+         其它关卡的墙外格误当可走。没有 bounds 时仍按不可走，防 flood-fill。
     """
     def is_walkable(gx, gz):
         # type: (int, int) -> bool
@@ -197,7 +207,9 @@ def make_walkable(node_map, rows, cols, bounds, blocked, belt_cells,
         r, c = gx + off_x, gz + off_z
         if 0 <= r < rows and 0 <= c < cols:
             return node_map[r][c]
-        return False
+        # nodeMap 之外的格：只放行「下沿以下」（地板扩展出的底部通道），
+        # 左右/上沿一律不可走，防止泛化到别的关卡时把墙外格误标可走。
+        return bounds is not None and gz < -off_z
 
     return is_walkable
 

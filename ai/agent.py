@@ -202,7 +202,11 @@ class Agent:
             if chosen_task and hasattr(chosen_task, "claims"):
                 # 认领绑定到任务的 order_id（而非全局 current_order_id）
                 for res_id, action in chosen_task.claims():
-                    claims_new[(res_id, action)] = Claim("P2", chosen_task.order_id, self.tick)
+                    # 记下 item：recipe_graph 的在途烹饪抑制按熟料区分作用域，
+                    # 一单要两份熟料时第一份下锅不该压掉第二份（第 1 组 1.3）。
+                    claims_new[(res_id, action)] = Claim(
+                        "P2", chosen_task.order_id, self.tick,
+                        item=getattr(chosen_task, "item", None))
         elif new_mode == "Firefighting":
             # Firefighting 模式：只生成 RescueCooked 候选，优先灭火。
             # 实机复现 trace-20261009-130459 拍 596-727: Firefighting 触发但
@@ -271,11 +275,10 @@ class Agent:
             self.bb.commitment = None
 
         # ⑭ 日志
-        keys = []
-        if self.hands.move_dir:
-            keys.append(self.hands.move_dir)
-        if self.hands.move_extra:
-            keys.append(self.hands.move_extra)
+        # 记全按键（移动 + 冲刺 + 按住的动作键 + 本拍 tap），不只是移动方向：
+        # 旧版只记 move_dir/move_extra，于是「喷灭火器那 50 拍到底按住 chop
+        # 了没」从 trace 无法回答（trace-20261014-011202 t=2477~2526 keys 全空）。
+        keys = self.hands.active_keys()
         # commitment 在终态已清空，仍记录本拍 task 和移动/观测阶段。
         exec_state = trace.execution_record(
             status, success_task if status == "success" else chosen_task, ctx,
@@ -308,7 +311,14 @@ class Agent:
         "重新走位也反复失败"的情况——连续 ABANDON_FAIL_STREAK 次失败就
         把该 task 的资源写进 scratch.abandoned，planner 过滤时跳过它，
         让 AI 先去做别的任务（实机复现：切菜被传送带反复推走时 flap）。
+
+        task 声明 NO_ABANDON（灭火）时整条跳过：火情没有"先去做别的"
+        这个选项，拉黑只会让 P2 站在着火的灶前不动。
         """
+        if getattr(task, "NO_ABANDON", False):
+            self._fail_task_key = None
+            self._fail_streak = 0
+            return
         key = task.key
         if key == self._fail_task_key:
             self._fail_streak += 1

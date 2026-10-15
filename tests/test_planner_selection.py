@@ -81,9 +81,15 @@ def test_score_prefers_lower_estimated_steps():
 
 
 def test_score_urgency_boosts_with_lower_remaining():
-    """订单 remaining 越小，紧迫度分数越高。"""
-    order_urgent = _make_order("Urgent", ["Tomato"], remaining=1)
-    order_relaxed = _make_order("Relaxed", ["Tomato"], remaining=10)
+    """订单 remaining 越小，紧迫度分数越高。
+
+    两个 remaining 的取值要拉开到 slack 曲线的线性段里。urgency 现在读
+    slack（remaining - ETA）而非裸 remaining，且在 slack <= 0 处饱和——
+    remaining=1 和 10 两者 slack 都已为负、同为满分 5.0，分不出先后是**正确**
+    行为（都来不及了，紧迫程度没有区别）。见 ai/planner._urgency_from_slack。
+    """
+    order_urgent = _make_order("Urgent", ["Tomato"], remaining=50)
+    order_relaxed = _make_order("Relaxed", ["Tomato"], remaining=120)
 
     w_urgent = _make_world(orders=[order_urgent])
     w_relaxed = _make_world(orders=[order_relaxed])

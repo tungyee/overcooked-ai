@@ -37,17 +37,20 @@ class Hands(object):
         self.ctrl = ctrl
         self.move_dir = None     # type: Optional[str]
         self.move_extra = None   # type: Optional[str]
+        self.move_dash = False   # type: bool   # 长距离巡航时按住冲刺
         self.held_keys = set()   # type: Set[str]
         self._tick = 0
         self._last_tap = {}      # type: Dict[str, int]
         self._move_until = None  # type: Optional[float]
         self._motion_frame = None
+        self._tapped = set()     # type: Set[str]  # 本拍 tap 过的键（给 trace）
 
     # ---------- 拍推进 ----------
     def tick(self):
         # type: () -> None
         """拍号 +1。主循环每拍调一次，冷却靠它推进。"""
         self._tick += 1
+        self._tapped = set()     # tap 只属于按下的那一拍
         self.service()
 
     def service(self, now=None):
@@ -57,12 +60,12 @@ class Hands(object):
         if self._move_until is not None and now + 1e-9 >= self._move_until:
             self.set_move(None)
 
-    def pulse_move(self, d, seconds=0.05, extra=None, now=None, frame_seq=None):
-        # type: (str, float, Optional[str], Optional[float], Optional[int]) -> bool
+    def pulse_move(self, d, seconds=0.05, extra=None, now=None, frame_seq=None, dash=False):
+        # type: (str, float, Optional[str], Optional[float], Optional[int], bool) -> bool
         # 任务抢占会重建原语，但不能让同一旧帧又发起一次短按。
         if frame_seq is not None and frame_seq == self._motion_frame:
             return False
-        self.set_move(d, extra)
+        self.set_move(d, extra, dash)
         now = time.monotonic() if now is None else now
         self._move_until = now + seconds
         schedule = getattr(self.ctrl, "schedule_release", None)
@@ -72,18 +75,19 @@ class Hands(object):
         self._motion_frame = frame_seq
         return True
 
-    def move_on_frame(self, d, extra=None, frame_seq=None):
-        # type: (str, Optional[str], Optional[int]) -> bool
+    def move_on_frame(self, d, extra=None, frame_seq=None, dash=False):
+        # type: (str, Optional[str], Optional[int], bool) -> bool
         if frame_seq is not None and frame_seq == self._motion_frame:
             return False
-        self.set_move(d, extra)
+        self.set_move(d, extra, dash)
         self._motion_frame = frame_seq
         return True
 
     # ---------- 移动 ----------
-    def set_move(self, d, extra=None):
-        # type: (Optional[str], Optional[str]) -> None
+    def set_move(self, d, extra=None, dash=False):
+        # type: (Optional[str], Optional[str], bool) -> None
         """切换持续按住的移动方向；d=None 松开。extra 为顶带用的第二方向。
+        dash 为冲刺（长距离巡航按住、近处精确站位松开）。
 
         只改变实际需要改变的键，未变的方向永远不重按——按住是持续态，
         重按会让游戏侧看到一次抬起，表现为移动一顿一顿。
@@ -94,16 +98,17 @@ class Hands(object):
                 self.ctrl.release(key)
             self.move_dir = self.move_extra = None
         self._move_until = None
-        if d == self.move_dir and extra == self.move_extra:
+        if d == self.move_dir and extra == self.move_extra and dash == self.move_dash:
             return
-        cur = set(k for k in (self.move_dir, self.move_extra) if k)
-        want = set(k for k in (d, extra) if k)
+        cur = set(k for k in (self.move_dir, self.move_extra, "dash" if self.move_dash else None) if k)
+        want = set(k for k in (d, extra, "dash" if dash else None) if k)
         for k in sorted(cur - want):
             self.ctrl.release(k)
         for k in sorted(want - cur):
             self.ctrl.press(k)
         self.move_dir = d
         self.move_extra = extra
+        self.move_dash = dash
 
     def counter_dir(self, belt_dir, cell):
         # type: (Dict[Tuple[int, int], Tuple[int, int]], Tuple[int, int]) -> Optional[str]
@@ -128,12 +133,37 @@ class Hands(object):
             return False
         self.ctrl.tap(key)
         self._last_tap[key] = self._tick
+        self._tapped.add(key)
         return True
 
     def tap_active(self, key):
         # type: (str) -> bool
         active = getattr(self.ctrl, "tapping", None)
         return bool(active(key)) if callable(active) else False
+
+    # ---------- 观测（给 trace） ----------
+    def active_keys(self):
+        # type: () -> list
+        """本拍所有按键：移动方向 + 冲刺 + 按住的动作键 + 本拍 tap 过的键。
+
+        trace 过去只记 move_dir/move_extra，动作键一个都没记，于是「喷灭火
+        器那 50 拍到底按住 chop 了没」这种问题无法从 trace 回答，只能猜
+        （trace-20261014-011202 t=2477~2526：火没灭，keys 全空）。排查成本
+        远高于这几行，所以把按键观测补全。
+
+        tap 是瞬时的（按下即松），只在它发生的那一拍出现；hold 是持续态，
+        跨拍都报。两者混在一个列表里按名字去重——复盘只关心「这一拍有没有
+        这个键的输入」。
+        """
+        keys = set(self.held_keys)
+        if self.move_dir:
+            keys.add(self.move_dir)
+        if self.move_extra:
+            keys.add(self.move_extra)
+        if self.move_dash:
+            keys.add("dash")
+        keys |= self._tapped
+        return sorted(keys)
 
     def cancel_tap(self, key):
         # type: (str) -> None
@@ -174,6 +204,7 @@ class Hands(object):
         self.ctrl.release_all()
         self.move_dir = None
         self.move_extra = None
+        self.move_dash = False
         self._move_until = None
         self.held_keys.clear()
         self._last_tap.clear()

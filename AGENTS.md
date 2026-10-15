@@ -19,55 +19,19 @@
 
 ## 3. 目录结构
 
-```
-oc2/
-├── ai/                    # 纯库（无 __main__，入口在仓库根 run_agent.py）
-│   ├── agent.py           # 主循环：13 步装配（收帧→对账→推断→仲裁→规划→执行→日志）
-│   ├── arbiter.py         # 模式仲裁（Normal / Firefighting / Assigned + 卡住守卫）
-│   ├── planner.py         # 候选生成→可行性→协作过滤→打分→承诺惯性（约 1300 行，最大文件）
-│   ├── executor.py        # task 树生命周期（复用/重建/halt/超时）
-│   ├── blackboard.py      # 唯一可变状态容器：Claim/Commitment/P1Model/Intents/scratch
-│   ├── p1model.py         # 人类意图推断 + P1 周边 soft cost 地图
-│   ├── predicates.py      # 纯查询谓词（无副作用，只读入参 dict）
-│   ├── recipes.py         # RecipeBook：配方语义（需求/烹饪/切配/装盘态词汇）
-│   ├── world.py           # StateClient（socket 分帧）+ World（快照解析+派生数据）
-│   ├── navigation.py      # Dijkstra 全图距离场 + 回溯路径
-│   ├── occupancy.py       # 可走性判定 + cookers/items/extinguishers 去重
-│   ├── geometry.py        # GridMapping：网格↔世界坐标换算（自动校准原点）
-│   ├── stations.py        # 站点检索（按类型/食材/距离）
-│   ├── placement.py       # 落点约束（手里东西该放哪、空灶归位）
-│   ├── hands.py           # 按键唯一出口：移动 + Tap 去抖/冷却
-│   ├── controller.py      # CGEvent 键盘注入（macOS，仅真实运行用）
-│   ├── trace.py           # 决策日志（JSONL，落盘仓库根 trace-<时间戳>.jsonl）
-│   ├── reconcile.py       # 认领对账（每拍校验并释放失效认领）
-│   ├── bb_factory.py      # Blackboard / ResourceView 的构造
-│   ├── bt.py              # 行为树引擎（有记忆的 Sequence/Selector）
-│   ├── record.py / replay.py  # 帧录制 / 回放
-│   ├── primitives/        # 执行原语（行为树叶节点，带强制前后校验）
-│   │   ├── base.py        # Primitive 基类 + resolve/target_cell/_blocked_cells 等 target 解析
-│   │   ├── move.py        # Approach（走向目标格）、Face（转向目标）
-│   │   ├── tap.py         # Tap（按一下）、Confirm（按到目标达成）、Settle（落定）
-│   │   ├── hold.py        # HoldUntil（按住直到谓词满足）、TapWhileHolding（持物时按一下）
-│   │   ├── interact.py    # InteractWith（走近+按下+后置校验）、EnsureHandsFree（先腾手）
-│   │   ├── stuck.py       # MarkBlocked / Nudge / AbandonTarget / Timeout（卡住脱困 + 兜底超时）
-│   │   └── __init__.py    # 对外导出（__all__ 列全部 13 个原语）
-│   └── tasks/             # 15 个 task（身份/可行性/完成判定/建树）
-│       ├── base.py        # Task 基类 + TASK_TYPES 注册 + 跨组共享谓词
-│       ├── chop.py        # FetchToBoard、Chop
-│       ├── cook.py        # FetchToCooker、TakeCookedToPlate、ReturnPot、RescueCooked
-│       ├── plate.py       # PlaceCleanPlate、WashPlate、ResetPlate
-│       ├── assembly.py    # FetchToPlate、DeliverPlate + delivery_baseline_from
-│       ├── cleanup.py     # Discard、RecoverLoosePot、StashHeld、Prefetch
-│       └── __init__.py    # import * 触发 @_register，对外唯一入口
-├── plugin/                # C# BepInEx 插件（数据源）：Oc2AIPlugin.cs + build.sh
-├── tests/                 # pytest 测试（真实帧 fixture 已删，待重录）
-├── tools/                 # 开发工具（非运行时）：tree_viz / record_frames / dll_probe
-├── docs/                  # 交付总结、浸泡报告、基线核查、SDD spec 与 plan
-├── .superpowers/          # SDD（Subagent Driven Development）任务 brief/report/review
-├── run_agent.py           # 唯一入口（根级，ai/ 不放 __main__）
-├── pytest.ini             # testpaths=tests, pythonpath=.
-└── requirements-dev.txt   # 仅 pytest==7.4.4
-```
+`ai/` 是纯库（无 `__main__`），唯一入口是根级 `run_agent.py`。其余顶层目录：`plugin/`（C# BepInEx 插件 = 数据源）、`tests/`、`tools/`（开发工具，非运行时）、`docs/`、`.superpowers/`（SDD brief/report/review）。
+
+`ai/` 各模块职责：
+
+| 组 | 模块 |
+|---|---|
+| **主循环** | `agent.py` 13 步装配（收帧→对账→推断→仲裁→规划→执行→日志）· `arbiter.py` 模式仲裁 · `planner.py` 候选→可行性→协作过滤→打分→承诺惯性（最大文件，约 1800 行）· `executor.py` task 树生命周期 |
+| **状态** | `blackboard.py` 唯一可变状态容器 · `bb_factory.py` 其构造 · `world.py` StateClient 分帧 + World 只读视图 · `reconcile.py` 每拍认领对账 · `p1model.py` 人类意图推断 |
+| **查询** | `predicates.py` 纯谓词（无副作用、不依赖 World 类）· `recipes.py` RecipeBook 配方语义 · `recipe_graph.py` 配方 DAG 编译 + 候选发射 · `plate_tokens.py` 盘/锅内容 token 解析 · `stations.py` 站点检索 · `placement.py` 落点约束 |
+| **空间** | `navigation.py` Dijkstra 距离场 · `occupancy.py` 可走性 + 实体去重 · `geometry.py` 网格↔世界坐标 |
+| **收益** | `economy.py` 小费/连击 · `eta.py` 订单 ETA/slack/必死 · `cook_supply.py` 熟料供需（见 §4.1） |
+| **输出** | `hands.py` 按键唯一出口 · `key_scheduler.py` 按键定时松开 · `controller.py` CGEvent 注入（仅实机）· `trace.py` 决策日志 · `state_dump.py` 快照压成可序列化 dict |
+| **执行** | `bt.py` 行为树引擎（有记忆的 Sequence/Selector + RepeatUntil/Guard）· `primitives/` 原语（见 §6.2）· `tasks/` task（见 §6.1）· `record.py`/`replay.py` 录帧回放 |
 
 ## 4. 核心架构
 
@@ -79,77 +43,67 @@ World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
 ```
 
 - **Arbiter**（`arbiter.py`）：每拍先跑，只决定「谁拿控制权」，不执行动作。返回 `(mode, reason)`。优先级：卡住守卫 → 中断 task 连续失败降级 → Firefighting（灶着火且 P1 未在处理）→ Assigned（对话层指派，当前为空壳）→ Normal。Arbiter 只读黑板，模式写入由调用方（Agent）负责。**卡住守卫（同一格连续 N 拍）目前只记 `stuck detected` 日志、不触发脱困动作**——实际脱困靠两层：`HoldUntil` 的位置自愈（见 §6.2）+ Agent 连续失败计数写 `scratch.abandoned`（见 §6.2 `AbandonTarget` 行）。
-- **Planner**（`planner.py`）：纯函数步进器。`select_task(world, bb, order, book)` 走：生成候选（枚举所有订单，Plan 4 多订单模式）→ 可行性过滤（`claims_available` 前置 + `_is_abandoned` 拉黑检查 + 各 task 的 `feasible()`）→ 协作过滤（relay/split）→ 打分（10 项权重）→ 承诺惯性（防抖 + 穿插）。**无状态每拍重算**，执行顺序从可行性涌现，不建 DAG、不拓扑排序。
-- **Executor**（`executor.py`）：把 task 换成一棵小的 `bt` 行为树，每拍 tick 产出按键。task 身份（四元组，见 §6）不变就复用同一棵树（进度自然保留），变了就 halt 旧树重建；每棵树包一层 `Timeout`（`MAX_TASK_TICKS=300` 拍）做最后兜底。
+- **Planner**（`planner.py`）：纯函数步进器。`select_task(world, bb, order, book)` 走：
+  生成候选（枚举所有订单，Plan 4 多订单模式）→ 可行性过滤（`claims_available` 前置 +
+  `_is_abandoned` 拉黑检查 + 各 task 的 `feasible()`）→ **分层过滤（取最高层，见
+  `planner_layers.py`）** → 打分（该层白名单内的项）→ 承诺惯性（防抖 + 穿插）。
+  **无状态每拍重算**，执行顺序从可行性涌现，不建 DAG、不拓扑排序。层是派生值：
+  高层动作不可达时该候选自然从 feasible 消失、层自己掉下来。
+- **Executor**（`executor.py`）：把 task 换成一棵小的 `bt` 行为树，每拍 tick 产出按键。task 身份（四元组，见 §6）不变就复用同一棵树（进度自然保留），变了就 halt 旧树重建；每棵树包一层 `Timeout` 做最后兜底，默认 `MAX_TASK_TICKS=300` 拍，task 可用类属性 `TIMEOUT_TICKS` 声明自己的上限（灭火是两趟差事，用 `FIREFIGHT_TIMEOUT_TICKS=800`）。
 - **Blackboard**（`blackboard.py`）：唯一可变状态容器，取代旧 Agent 上散落的约 20 个跨拍字段。写权受控（spec §4.5）：Planner 写 `claims`/`commitment`，P1Model 写 `p1_model`，Executor 只写 `commitment.steps_done/retries` 与 `scratch`（**不可写 claims**）。
 - **World**（`world.py`）：一帧快照的**只读**视图，构造时只做解析 + 派生数据装配；可走性与寻路分别委托 `occupancy` 与 `navigation`。
-- **Trace**（`trace.py`）：每拍写一条 JSONL 记录（模式/候选/打分/选中 task/执行状态/按键），落盘仓库根 `trace-<时间戳>.jsonl`（已 gitignore），用于复盘「为什么选这个动作」。
+- **Trace**（`trace.py`）：每拍写一条 JSONL 记录（模式/候选/打分/选中 task/执行状态/按键），落盘仓库根 `trace-<时间戳>.jsonl`（已 gitignore），用于复盘「为什么选这个动作」。另有 `revenue` 摘要（分数/连击/剩余时间/订单 + 送达/连击归零/订单过期三类事件），省去手工 diff 全局 state。
+
+### 4.1 收益模型与产能
+
+这三个模块回答「为什么会 miss、怎么多赚分」。常数**全部来自真实 trace 回归**，不是经验值——改之前先看模块注释里的实测表：
+
+- **`economy.py`** —— 收益函数。小费 = 新鲜度档位（8/5/3，按 `remaining/lifetime` 落在 >2/3、1/3~2/3、<1/3）× 连击系数（combo < 3 恒为 1，之后 `combo-1`）；`base` 固定 60/单，与早晚无关。**超时不扣分**（`EXPIRY_POINT_PENALTY = 0`，社区攻略说的 −10 coin 实测不存在），代价只在连击归零 + 沉没工时。由此定出优先级：**不丢单 >> 按序送 >> 送得新鲜**（新鲜度最多差 5 分，相对 base 60 仅 8%）。52 次送达逐条断言。
+- **`eta.py`** —— 订单 ETA / slack / 必死判定。单位耗时取实测中位（见模块注释的表，两局「拍/格」6.2 与 5.9 吻合，已含移动损耗故不再乘裕度）。两个关键建模：① **烹饪是关键路径不是求和**（煮饭 12 秒里人自由，取 max）；② **多单共享一双手**，按最早截止排队后累计手上工时，且**判死的单不占队列容量**（否则判死会沿队列雪崩）。校准基准：一份寿司 ≈ 35~40 秒手上工时 → 130s 寿命最多托住 3 单。
+- **`cook_supply.py`** —— 熟料供需。`demand` 只数需求、`supply` 数「在煮 + 已熟未端 + 手持 + 已装盘」，**已装盘的那份只能在一侧扣减**（两边都扣会让缺口被重复减去，这个 bug 单测抓不到、只有真实帧能暴露）。
+
+**产能（为什么需要 `FillCooker`）**：`FetchToCooker` 绑订单，只能由 `recipe_graph.emit` 按单发射，`_in_flight_cook_claim` 压掉同单第二个候选，`_match_cookers_to_orders` 又是严格 1:1 —— 结构上「5 单要米」就不可能变成「3 口灶在烧」。实测 trace-20261014-120406 的 1700~3270 窗口 **59% 的拍里三口灶一个都没在煮**，而三单全在这窗口过期。灶空转的机会成本是 12 秒不可压缩的时钟，所以用新 task 换结构，而不是调权重。
+
+**combo 的真实机制**（57 次送达假设检验，两条规律各自无反例）：
+1. 送出一盘 dish D，游戏把它记给「同 dish 存活单里 `remaining` 最小」的那个（55/0）。**这不是我们能选的。**
+2. combo 递增 ⟺ 被记账的那单是「`id` 数值最小」者（57/0；对比假设「remaining 最小」只有 43/14 —— 两者分歧是因为订单过期后 id 会被复用）。
+
+**推论：AI 的杠杆是「选哪种菜」，不是「选哪一单」。** `DeliverPlate(order#X)` 里的 X 对 combo 毫无影响，所以送餐的紧迫度/新鲜度/完成度统一按 `_credited_order_id` 求值。又因为实机「料齐的盘」几乎从不同时有两张（本局 0 盘 4279 拍、1 盘 298 拍），送餐那一刻没有分叉，combo 偏好必须传导到**备菜**才有用（`COMBO_PREP_DISCOUNT`）。
 
 ## 5. 常用命令
 
-Python 侧没有构建步骤；C# 插件需单独编译（`./plugin/build.sh`）。Python 命令在仓库根执行。实机的启动与退出顺序见 §5.1、§5.2。
+Python 侧没有构建步骤；C# 插件需单独编译（`./plugin/build.sh`）。Python 命令在仓库根执行。
 
-### 5.1 启动顺序（游戏 → Agent）
+### 5.1 实机启停
 
-插件**不需要单独启动**：它是 BepInEx 插件（`[BepInPlugin]` + `BaseUnityPlugin`），游戏经 `run_game.sh` 启动时 BepInEx 自动加载 `BepInEx/plugins/` 下的所有 DLL，插件随即在 `Awake()` 里监听 `127.0.0.1:27411`。真正要手动的只有两步：**起游戏** → **起 Agent**（Agent 启动时连 27411，连不上直接退出：`run_agent.py` 抛 `OSError` → 退出码 1）。
+**只有两步要手动：起游戏 → 起 Agent。** 插件是 BepInEx 插件，随游戏自动加载并在 `Awake()` 里监听 `127.0.0.1:27411`，没有「启动插件」这回事。
 
 ```bash
 G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
 
-# 可选前置：仅当 plugin/Oc2AIPlugin.cs 有改动时，重新编译 + 部署（不改插件可跳过）
-./plugin/build.sh
-cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/Oc2AIPlugin.dll"   # 部署后必须重启游戏才生效
+# 可选前置：仅改了 plugin/Oc2AIPlugin.cs 时才需要（之后必须重启游戏才生效）
+./plugin/build.sh && cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/"
 
-# ① 启动游戏 —— 必须走 run_game.sh（顺带注入 BepInEx 并自动加载插件）
-"$G/run_game.sh"        # 游戏内进入关卡 Sushi_1_4_2P
-
-# ② 启动 Agent（在仓库根执行）
-python3 run_agent.py    # 连 127.0.0.1:27411 并注入 P2 按键
+"$G/run_game.sh"        # ① 起游戏，进关卡 Sushi_1_4_2P
+python3 run_agent.py    # ② 起 Agent（--dry-run 只看决策、不注入按键）
 ```
 
-- **插件随游戏自动加载，没有单独的「启动插件」命令**；唯一要手动做的是改插件源码后重新编译并部署 DLL（上面的可选前置），且必须重启游戏才生效。`build.sh` 末尾会打印这条 `cp` 命令。
-- ① **必须用 `run_game.sh`**（脚本内部等价于 `DOORSTOP_ENABLED=1` + `DYLD_INSERT_LIBRARIES=libdoorstop.dylib` 启动游戏二进制）。**从 Steam 直接启动不会注入 BepInEx**，插件与 socket 都不加载。插件在游戏启动时即监听 27411（早于进关卡），但 Agent 要等进关卡、收到 `level` 帧后才真正决策。
-- ② 要求运行终端已获 macOS「辅助功能」权限（CGEvent 注入）；只想看决策、不注入按键时用 `python3 run_agent.py --dry-run`。
+- **必须用 `run_game.sh`**（内部是 `DOORSTOP_ENABLED=1` + `DYLD_INSERT_LIBRARIES=libdoorstop.dylib`）。**从 Steam 直接启动不注入 BepInEx**，插件与 socket 都不加载。
+- Agent 启动即连 27411，连不上直接退出（退出码 1）；要等进关卡收到 `level` 帧才真正决策。真实注入需终端已获 macOS「辅助功能」权限。
+- **退出顺序相反：先停 Agent 再退游戏。** Agent 收 `Ctrl-C`/`SIGTERM` 会先 `release_all()` 松键，顺序反了会残留按住的方向键。
 
-### 5.2 退出顺序（Agent → 游戏）
-
-先停 Agent，再退游戏。Agent 收到 `Ctrl-C` / `SIGTERM` 会先 `hands.release_all()` 松开所有按键再退出（防卡键），所以**务必先停 Agent 再退出游戏**，避免残留按住的方向键/动作键。
+### 5.2 其他常用命令
 
 ```bash
-# ① 停 Agent：在其终端 Ctrl-C，或 kill -TERM <pid>（会先松键再退出）
-# ② 退出游戏：正常退出即可
-```
+python3 -m pytest tests/                       # 全部测试（当前 967 passed, 78 skipped）
+python3 -m pytest tests/test_eta.py -q         # 单文件 / 单用例（::test_xxx）
 
-插件是游戏进程内的 DLL，**没有独立进程/服务可停**：它随游戏启动而加载、随游戏退出而卸载。要停用/更新插件就是替换 `$G/BepInEx/plugins/Oc2AIPlugin.dll` 后重启游戏（或直接退出游戏）。
+python3 tools/tree_viz.py <帧文件>              # 离线冒烟：建全部 task 树、走分支、不按键
+                                               # （旧 fixture 已删，待 record_frames 重录）
+python3 tools/record_frames.py                 # 录制实时帧到 NDJSON
+python3 tools/dll_probe.py <dll> <TypeName>... # .NET 元数据探针
 
-### 5.3 其他常用命令
-
-```bash
-# 跑全部测试（当前 708 passed, 2 skipped）
-python3 -m pytest tests/
-
-# 跑单个测试文件 / 单个用例
-python3 -m pytest tests/test_planner_multi.py
-python3 -m pytest tests/test_planner_multi.py::test_xxx -q
-
-# 正式运行：连游戏（插件已在 127.0.0.1:27411 推帧）+ 注入按键
-# 前提：macOS，终端已获「辅助功能」权限，游戏在 Sushi_1_4_2P 关卡内
-python3 run_agent.py
-
-# 离线决策：不注入按键（NullController），只看决策
-python3 run_agent.py --dry-run
-
-# 离线冒烟：从一帧构建全部 task 树、打印 ASCII、走分支、不按键
-# （旧帧 fixture 已删，待 tools/record_frames.py 重录后指向新帧）
-python3 tools/tree_viz.py <重录后的帧文件>
-
-# 录帧 / .NET 元数据探针
-python3 tools/record_frames.py            # 录制实时帧到 NDJSON
-python3 tools/dll_probe.py <Assembly-CSharp.dll> <TypeName>...
-
-# 编译 C# 插件（产物 plugin/build/Oc2AIPlugin.dll；拷到游戏 BepInEx/plugins/ 后重启游戏生效）
-# 换机器可用环境变量覆盖：GAME_DIR（游戏安装目录）、DOTNET（dotnet 可执行文件）、CSC_DLL（Roslyn csc.dll 路径）
-./plugin/build.sh
+./plugin/build.sh   # 编译插件。换机器可用 GAME_DIR / DOTNET / CSC_DLL 覆盖路径
 ```
 
 ## 6. 代码组织与关键约定
@@ -163,45 +117,48 @@ python3 tools/dll_probe.py <Assembly-CSharp.dll> <TypeName>...
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / chop / assembly / cleanup）。`T.TASK_TYPES` 登记全部 15 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay）。`T.TASK_TYPES` 登记全部 19 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
-15 个 task 类型：
+主线 17 个 task 类型（另两个见表后）：
 
 | 模块 | task |
 |---|---|
 | `chop.py` | `FetchToBoard`、`Chop` |
 | `cook.py` | `FetchToCooker`、`TakeCookedToPlate`、`ReturnPot`、`RescueCooked` |
+| `fire.py` | `Extinguish` |
 | `plate.py` | `PlaceCleanPlate`、`WashPlate`、`ResetPlate` |
 | `assembly.py` | `FetchToPlate`、`DeliverPlate` |
 | `cleanup.py` | `Discard`、`RecoverLoosePot`、`StashHeld`、`Prefetch` |
+| `mix.py` | `Mix` |
+| `relay.py` | `PlaceToRelay` |
+
+另有第 18 号 `FillCooker`（`cook.py`，继承 `FetchToCooker`）：**订单无关**的填灶，
+`order_id` 恒为 None，谓词是纯世界谓词（空灶 + 熟料缺口 > 0）。它存在的理由是
+结构性的，见 §4「产能」一节。
 
 ### 6.2 执行原语（`ai/primitives/`）
 
 树的叶子是带强制前后校验的原语（spec §7.2）。ctx 契约（`primitives/base.py`）为 `{w, chef, hands, bb, field, book, tick}`；target 优先传「可调用」以便每拍重算（树跨拍复用，构造时抓的 dict 第二拍就过期）。halt 只松键、不碰物品（优雅退出由抢占方树首的 `EnsureHandsFree` 负责）。
 
-13 个原语的语义：
+15 个原语（`primitives.__all__` 另含 `Primitive` 基类与 `resolve` 辅助）：
 
-| 原语 | 作用 |
+| 原语 | 作用（括号内是容易踩的坑） |
 |---|---|
-| `Approach` | 锁定目标相邻交互位，近处 50 ms 短按后等新帧确认停稳；站到目标交互位并落定才成功。**只保证站位、不保证朝向**，定向交互须另配 `Face`。 |
-| `Face` | 转向 target（以 `interactions.gx/gz` 为准），短按方向键后等新帧判断朝向；`max_ticks` 仅兜底，不作为「转好了」的判据。 |
-| `Tap` | 单击一次，**边沿触发**（同一次激活期内只按一次，避免 toggle 反复拿起放下）；带 target 时按键前先校验 `interact_ready`。 |
-| `Confirm` | 后置校验：`pred(ctx)->bool` 成立才算成功，否则先 RUNNING 等状态刷新；正式运行按新快照消耗 `retries`，无新帧也有实际时间上限。离线无收帧元数据时仍按调用次数计。 |
-| `Settle` | 等 N 拍让状态刷新（只用于等状态，不等物理稳定——后者已由 `Approach` 的前置校验取代）。 |
-| `HoldUntil` | 按住 key 直到 `pred` 成立（切菜/喷灭火器/洗盘）；`timeout` 无默认值必须显式传，halt 时 release 防卡键。可选 `target`/`kind`：传了则每拍校验 `interact_ready`，人被推离目标时松键 FAILURE 让 Sequence 重置重新 Approach（Chop / WashPlate 用，防传送带推走空按卡死）。 |
-| `TapWhileHolding` | 按住反向键的同时单击（传送带顶位专用，防被推走）；同样边沿触发。 |
-| `EnsureHandsFree` | 手里有东西就放到就近合法落点（**幂等**：手空直接 SUCCESS）；Approach→Face→Tap→Confirm 四阶段，落点物料感知（空锅回灶、熟锅不上灶）。 |
-| `InteractWith` | 复合原语 = Approach + (Face) + Tap + Confirm；`expect` 后置校验必传（漏给即 TypeError），替代旧 22 处 goto→tap→confirm 模板。 |
-| `MarkBlocked` | L1 脱困（**预留，未接线**）：把格子拉黑写 `scratch.bad_cells`，Approach 重算距离场绕开。 |
-| `Nudge` | L2 脱困（**预留，未接线**）：侧向微移 N 拍，脱离贴墙/离格。 |
-| `AbandonTarget` | L3 脱困原语（**预留，未接线**）。实际 L3 由 Agent 的连续失败计数实现：同一 task 连续失败满 `ABANDON_FAIL_STREAK=3` 次 → 写 `scratch.abandoned`，Planner 的 `filter_feasible` 读它跳过该候选（TTL `ABANDON_TTL_TICKS=200` 拍）。 |
-| `Timeout` | task 级超时装饰（结构性安全网），超时 halt 子树转 FAILURE，交还 Planner。 |
+| `Approach` | 走到目标相邻交互位并落定。长距离巡航按住冲刺、距目标 ≤`DASH_BRAKE_CELLS`(3) 步松冲刺、最后一步短按停稳。（**只保证站位、不保证朝向**，定向交互须另配 `Face`；目标格就是脚下格时直接 SUCCESS） |
+| `Face` | 转向 target（以 `interactions.gx/gz` 为准）。（`max_ticks` 只是兜底，不是「转好了」的判据） |
+| `Tap` | 单击一次，**边沿触发**（同一激活期内只按一次，否则 toggle 会反复拿起放下） |
+| `Confirm` | 后置校验 `pred(ctx)->bool`，不成立先 RUNNING 等刷新。（`retries` 按**新快照**消耗，不是按调用次数） |
+| `Settle` | 等 N 拍让状态刷新。（只等状态，不等物理稳定——后者已由 `Approach` 取代） |
+| `WaitUntil` | **不按任何键**等到 `pred` 成立（端盘在锅前等饭熟）。（`timeout` 必须显式传） |
+| `HoldUntil` | 按住 key 直到 `pred` 成立（切菜/喷灭火器/洗盘）。（传 `target` 则每拍校验 `interact_ready`，被传送带推离时松键 FAILURE 让 Sequence 重走 Approach，防空按卡死） |
+| `TapWhileHolding` | 按住反向键的同时单击（传送带顶位专用，防被推走） |
+| `EnsureHandsFree` | 手里有东西就放到就近合法落点，**幂等**。落点物料感知：空锅回灶、熟锅/糊锅不上灶；`home_cooker=False` 关掉归位（灭火端下来的锅只去台面/地上，否则会被当空灶放回去继续烧） |
+| `InteractWith` | 复合 = Approach + (Face) + Tap + Confirm。（`expect` 必传，漏给即 TypeError） |
+| `ThrowTo` | `/` 键投掷手持可投掷物，只校验离手。（落点不可控，米曾落到地图边界行够不到） |
+| `Timeout` | task 级超时装饰，超时 halt 子树转 FAILURE 交还 Planner |
+| `MarkBlocked` / `Nudge` / `AbandonTarget` | 三级脱困，**全部预留未接线**。实际脱困靠两处：`HoldUntil` 的位置自愈，以及 Agent 的连续失败计数（同一 task 连败 `ABANDON_FAIL_STREAK=3` → 写 `scratch.abandoned`，`filter_feasible` 跳过该候选，TTL 200 拍）。**灭火是例外**：`Extinguish` 声明 `NO_ABANDON`、`plan_firefighting` 传 `ignore_abandon=True`——拉黑按资源 id 记，别的 task 在同一口灶上反复失败会把着火的那口灶也写进去 |
 
-移动控制另使用 `frame_seq/frame_received_at/now` 区分新观测与循环拍，短按和观察
-窗口按单调时钟计时。`InteractWith` 记忆执行阶段，`Controller.tap` 非阻塞并定时松键。
-Normal 模式的移动无进展还会通过 Agent 写 `scratch.bad_cells/abandoned`，按位置和资源
-短暂避让（独立于上表中预留的脱困节点）。详见
-`docs/movement_control_fix_20261010.md`（792 passed, 35 skipped；实机手感待下一局复核）。
+移动控制用 `frame_seq/frame_received_at/now` 区分「新观测」与「循环拍」，短按与观察窗口按单调时钟计时（详见 `docs/movement_control_fix_20261010.md`）。`motion.stall_seconds` 暴露巡航空转，见 §10.1。
 
 ### 6.3 资源 id 与认领粒度
 
@@ -218,7 +175,7 @@ Normal 模式的移动无进展还会通过 Agent 写 `scratch.bad_cells/abandon
 - **类型注解用 `# type: (...) -> ...` 注释形式**（非 PEP 526 内联注解），全项目统一。
 - 谓词一律**无副作用**：`predicates.py` 的函数只读入参 dict/List，不依赖 `World` 类（这样单测不必造真游戏帧）；`World` 是只读视图。
 - 纯函数优先、controller 依赖注入：`Hands(ctrl)` 通过构造注入 controller，测试传记录调用的假 controller，不碰 Quartz。
-- 键位沿袭 legacy 实机验证的 P2 分屏键位（`ai/controller.py` 的 `KEY` 表）。
+- 键位沿袭 legacy 实机验证的 P2 分屏键位（`ai/controller.py` 的 `KEY` 表）：方向键移动、右 Shift 拾取、`/` 切菜/投掷/喷火，**右 Option（keycode 61）冲刺**。
 
 ## 7. 测试策略
 
@@ -235,9 +192,9 @@ Normal 模式的移动无进展还会通过 Agent 写 `scratch.bad_cells/abandon
 - **关卡硬编码**：传送带（`occupancy.BELTS`）、盘堆兜底坐标（`stations.PLATE_STACKS`）目前只对 `Sushi_1_4_2P` 标注，未知关卡退化为空集/兜底，不崩但可能不准。泛化需插件输出。
 - **P1 名称硬编码**：`"Player 1"` / `"Player 2"`（`predicates.P1_NAME/P2_NAME`）。真实帧 `chefs[].slot` 全为 null，只能按 name 区分（已核实 2204 条 chef 条目）。
 - **熟料 token 不透明（仅旧帧）**：`RecipeBook.want_tokens` 对需烹饪的料同时给 rich token（`cooked:{raw}:{cookware}`）和旧帧 opaque `COOKED_PLATE_TOKEN`。新帧 `detail` 已通过 `plate_tokens` 输出 rich token，`plate_has`/`plate_lacks`/`missing` 据此能区分同一盘多份不同熟料；旧帧（无 detail）仍退化为不透明 token，多熟料关卡在旧帧下无法区分。
-- **打分权重未调优**：`planner.py` 的 `W_*` 常量为经验初值；穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）硬编码。
-- 文档（`docs/plan4_delivery_summary.md`）里提到的「16 个 task」与代码实际不符——`TASK_TYPES` 当前登记 **15** 个类型，以代码为准。
+- **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / `W_FRESHNESS` / slack 曲线）已按真实 trace 定标，其余 `W_*` 与穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）仍是经验初值。改之前读 §10.2。
 - 对话协作层（`Intents.assignments`、split mode 的显式分单）数据结构已预留但未实装语言解析。
+- 文档 `docs/plan4_delivery_summary.md` 提到的「16 个 task」已过时（现为 19），以代码的 `TASK_TYPES` 为准。
 
 ## 9. 安全注意事项
 
@@ -246,10 +203,62 @@ Normal 模式的移动无进展还会通过 Agent 写 `scratch.bad_cells/abandon
 
 ## 10. 当前状态
 
-- 分支 `main`；最近一轮是「实机修复」（trace 落盘/心跳、落点物料感知、两段式判据改按锅内容、承诺被抢吞掉成功记账、观察式盘↔单归属、完成度读错字段等），全量测试 **702 passed, 35 skipped**（部分真实帧 fixture 已删，相关回归转为 skip）。
-- 本轮把 C# 插件从 `../oc/src/Oc2AIPlugin.cs` 迁入 `plugin/`，解除「不改插件」冻结，并修掉「切关卡不刷新缓存」的 bug（新增 `RefreshLevel()`：检测 `ReadLevel()` 变化时重置 `_level`/`_staticJson`），已 `./plugin/build.sh` 编译通过。
-- 本轮还修了「P1 行动打断 P2 → 手里端着盘子卡死」：`FetchToBoard` / `FetchToPlate` / `DeliverPlate` 树首加 `EnsureHandsFree(keep=…)` 并声明 `HANDS="empty"`（spec §6.1(b)/§7.4）；`EnsureHandsFree` 新增 `keep` 谓词（手里已是目标物就跳过放下）；`find_ingredient` 绑定到 P2（P1 手里的料不再误判为 available）；`DeliverPlate` 的 pickup 判据从 `held_is_plate` 收紧为 `held_matches(plate_id)`。全量测试通过。
-- 已知未修完的一条：`find_ingredient()` 返回"板上的料"时给的是 `workstations[]` 那条，**没有 gx/gz/x/z**，于是 `FetchToPlate`（来源在板上）的 `Approach` 拿不到目标格，立即 FAILURE 并每拍重试。修法：按名字从 `world.stations` 合并坐标进去。
+分支 `feat/bt-opt`，全量测试 **1067 passed, 78 skipped**。
+
+本轮（2026-10-15）把打分从扁平加权和改成**层间词典序 + 层内加权和**
+（`ai/planner_layers.py`，设计见 `docs/superpowers/specs/2026-10-15-layered-scoring-design.md`）。
+动机：17 项加权和有 O(n²) 对交互，单组测试结构上查不出任何一对——§10.2 记的那次
+回退就是这个性质的后果。分层后跨类优先级由控制流隔离保证：有高层候选时低层候选
+压根不进打分。
+
+层序（数字小 = 层高）：L0 火情 / L1 不可逆损失（锅快糊）/ L2 救料（刚熟的锅）/
+L3 兑现 / L4 解卡（无盘）/ L5 异步产能（填灶）/ L6 备菜 / L7 清理。判据是「有
+倒计时的压过没倒计时的，倒计时短的压过长的」。
+
+**承诺惯性一行未改**——分层管「挑哪个」，抢占仍由 `COMMITMENT_MARGIN` 与
+`pressure >= 1.0 跳过惯性` 负责。
+
+最近一轮按 `trace-20261014-204822`（2 送达、tips 6、combo 0、收盘挂 5 单）定位并修掉四个 bug，提交 `cf2fc64`→`d644d25`：
+
+- **slack 一个量被当两件事用**（`cf2fc64` 之后的 `53d6a2b`，影响最大）。`eta.slack` 同时承担「优先级」和「可完成性」，而它只适合其中一个。队列累计下队尾单背着全队工时 → slack 最小 → urgency 最高，得出「排得越后越优先」：**94% 的可比候选组（3516/3745）倒挂**。同一个量还让判死退化成排位歧视——order#4 出现 19 拍后即判死，当时 remaining=129/130s（寿命剩 99%），三个鱼单一单未送。现在打分走 `solo_slack`（只看自己的关键路径）、判死走队列 slack 并加 `DOOM_FRESHNESS_FLOOR=0.75`。倒挂 94% → 0%。
+- **`time_left == 0` 被当成合法时限**（`ecbbadf`）：插件未开局/已结束都报 0，终局闸在开局就把 20 个候选全判 endgame，白站 147 拍。
+- **完成度加分是线性的**（`37a0edc`）：2/3 比 1/3 只多 0.33，正好被 urgency 的组间差 0.35 抵掉。实机 t=1353「差一样黄瓜就能送」的盘输给「往 1/3 的盘加第二样」，这类局面本局 2290 拍。改成 `ratio^2 * W * 3`。
+- **总分手写加法**（`cf2fc64`）：16 项重抄一遍，漏掉求和那处的症状是「trace 里有这一项但它不影响选择」而单测全不报警。改 `sum(terms.values())`。
+
+**本轮仍只有离线验证**（`tools/replay_urgency.py` 重放本局 400 帧），实机待下一局。
+
+**改动细节不在本文档维护** —— 问 `git log` 更准。这里只记对下一步工作有约束力的东西。
+
+### 10.1 待办
+
+- **糊锅没人倒**：`Discard.feasible` 要求灶还在烧，所以火灭后的糊锅只能被 `StashHeld` 搁台面，要清空得等同灶再起火，或单独加一个「糊锅进垃圾桶」task。
+- **`find_ingredient()` 返回板上的料时缺坐标**：给的是 `workstations[]` 那条，**没有 gx/gz/x/z**，于是 `FetchToPlate`（来源在板上）的 `Approach` 拿不到目标格，立即 FAILURE 并每拍重试。修法：按名字从 `world.stations` 合并坐标。
+- **~~移动空转 51%~~ 已不成立，真正的瓶颈是 observe（帧率）**：trace-20261014-204822 的 cruise 2379 拍里 stall ≥0.3s 只有 13 拍（1%），无 ≥30 拍长卡窗口。按 `tools/exec_cost.py` 归因，时间在 `observe` 阶段（占有 task 拍数的 25%，957 拍 / 132 段、中位 7 拍）：每个精确步都要「松键 + 等新鲜帧 + 等停稳」≈ 8 拍 = 0.4 秒，而插件 5 Hz（实测每 3.5 拍才一个新帧）决定了 observe 至少等 4 拍。**杠杆在减少精确步次数或提高插件推送频率，不是调移动参数。** `eta.py` 的 COST_* 常数经实测仍吻合（FetchToPlate 中位 134 vs 常数 125），不用重标。
+- **灭火「站位朝向都对却喷不灭」待复核**：`interactions.interactable` 报的是 `m_interactable`（手持物时报手持物），**不是朝向证据**，故未纳入 `interact_ready`。下一局用补全后的按键 trace 再看。
+- **全部改动只做过离线验证**（真实帧重放只回答「同样世界状态下会选什么」，不模拟物理执行），实机效果待下一局。
+- **判死的新鲜度闸是个下限、不是完整方案**：`DOOM_FRESHNESS_FLOOR` 只保证新单不被排位歧视，但「5 单并发而一双手只够 2~3 单」这个结构性超额仍然存在。更对的做法可能是显式限制并发投入的单数（按 ETA 容量取前 N 单），而不是靠判死被动收口。
+- **分层废掉了「提前端盘」的预取信号（已知代价）**：`_time_pressure` 在
+  ratio 0.25~0.5 给 0→1.0 的渐变，本意是让 `TakeCookedToPlate` 提前去端盘站位
+  （注释记着「等熟了才去拿盘会来不及，实机烧糊」）。分层后这整段落 L7、严格弱于
+  任何 L6 备菜候选，到 pressure 1.0 才跳 L2——渐变对层选择零影响。这是词典序的
+  固有代价：它表达不了「比备菜略高一点」。`tests/test_layered_selection.py::
+  test_prewarm_ramp_lands_in_cleanup_known_tradeoff` 显式钉住了这个行为。
+  **真实帧能重放时优先验这个窗口**；若确认烧糊，修法是改 spec §4.2 把
+  `TakeCookedToPlate` 纳入 L6，不是调权重。
+
+### 10.2 改权重前必读
+
+**跨层权重不会再互相抵消（分层后），但层内仍会。** 原先的实例：urgency 从
+`W_URGENCY/remaining`（中段恒 ~0.1）改成读 slack 后，另一组验证过的七个「灶空转
+该填灶」的拍全部回退，测试一个都没报警。那组回退现在由 L5 > L6 结构性排除
+（`tests/test_layered_selection.py::test_fill_cooker_outranks_prep_structurally`
+钉住）。动层**内**的 `W_*` 时，下面这套流程仍然适用。
+
+动 `W_*` 之后：① 跑 `tests/test_fill_cooker_priority.py` 与 `tests/test_plate_supply_guard.py`（两处量级卡口）；② 用 `tools/replay_urgency.py <trace>` 查 urgency 是否仍单调（倒挂须为 0%）；③ 重放一局真实 trace 比对选择分布。
+
+**打分口径**：urgency 必须读 `ETA.solo_slack_by_order`（独立 slack），**不要**读 `slack_by_order`（队列累计，判死口径）。两者对 remaining 的方向是反的，混用会让「排得越后越优先」，而单组测试查不出来——`tests/test_eta.py::test_queue_slack_is_the_one_that_inverts` 把这个差别钉住了。当前量级关系（从低到高）：备菜加分 < 填灶 `W_COOKER_IDLE=4.8` < 端刚熟的锅 `W_PRESSURE*1.0=5.0`；0 盘时洗盘 `W_PLATE_PRESSURE*2.0=10.0` 压过一切。
+
+**警惕"自欺的修复"**：combo 第一版按 `task.order_id == head` 加分，离线复验看着像修好了（改选了 order#3），但盘里装的菜没变、游戏照样记给同 dish 里 `remaining` 最小的单 —— 实机行为与旧版一字不差，只是 trace 上的 order_id 变好看了。验证改动时要问「实机会不会不一样」，不是「trace 看起来有没有变」。
 
 ## 11. 参考文档
 

@@ -169,3 +169,33 @@ class TapWhileHolding(Primitive):
             self._hands.release(self._holding)
             self._holding = None
         Primitive.halt(self)
+
+
+class WaitUntil(Primitive):
+    """等到世界谓词成立才 SUCCESS，期间不按任何键（timeout 拍数兜底）。
+
+    与 HoldUntil 的区别：**不按键**，纯等待。用于「端盘在锅前等饭熟」这类
+    需要等一个可观测状态、但此刻不该有任何按键输出的场景（等熟期间乱按
+    interact 会把手里的盘/锅弄丢或触发无关动作）。
+
+    timeout **无默认值，必须显式传**——等待时长是领域知识（等熟 vs 等状态
+    刷新差一个量级）。超时交还 Planner，而不是无限等一个可能永远不成立的状态。
+    """
+
+    def __init__(self, pred, timeout):
+        # type: (Callable[[Dict], bool], int) -> None
+        Primitive.__init__(self)
+        self.pred = pred
+        self.timeout = timeout
+
+    def tick(self, ctx):
+        # type: (Dict) -> str
+        self._enter(ctx)
+        if self.pred(ctx):
+            self.reset()
+            return Status.SUCCESS
+        if self._ticks > self.timeout:
+            self.reset()
+            return Status.FAILURE
+        ctx["hands"].set_move(None)
+        return Status.RUNNING

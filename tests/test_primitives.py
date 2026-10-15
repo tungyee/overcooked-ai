@@ -203,6 +203,40 @@ def test_approach_derives_cell_from_world_coords():
     assert ctx["hands"].move_dir == "right"
 
 
+def test_approach_target_underfoot_is_success():
+    """目标就在脚下那一格 → 立刻 SUCCESS，不许走开再走回来。
+
+    实机复现（trace-20261014-004742 t=11000~11580，火烧到关卡结束）：
+    灭火器掉在 P2 自己站的格 (6,2)，`interactions.pickup_gx/gz` 已经
+    指向 (6,2)。旧逻辑只取目标**四邻**当 goal（allow_target=False），
+    于是要走到 (5,2) 去——一走开，距离场又把它拉回 (6,2)，表现为
+    [5,2]↔[6,2] 来回震荡 700 拍，灭火器始终拿不到。
+
+    散落物（投掷落地的料、掉落的灭火器）没有站点语义，**它可能就在
+    脚下**，这是与固定站点的本质差别。
+    """
+    ctx, ctrl = make_ctx(start=(3, 0))
+    ext = {"n": "utensil_fire_extinguisher_01", "x": 3 * 1.2, "z": 0.0}
+    node = PR.Approach(ext, "pickup")
+    assert node.tick(ctx) == Status.SUCCESS
+    assert ctx["hands"].move_dir is None, "脚下的东西不该先走开"
+    assert ("press", "left") not in ctrl.calls
+    assert ("press", "right") not in ctrl.calls
+
+
+def test_approach_station_underfoot_still_uses_neighbor():
+    """固定站点（灶/板/池）仍走四邻：人站不到站点格上去。
+
+    `allow_target` 这条短路只对「目标格可走」成立——站点格不可走，
+    所以这里 goal 仍是相邻格，与旧行为一致。
+    """
+    w = FakeWorld(walkable=lambda gx, gz: gz == 0 and -2 <= gx <= 8 and gx != 5)
+    ctx, _ = make_ctx(w=w, start=(0, 0))
+    node = PR.Approach({"n": "cooker", "gx": 5, "gz": 0}, "placement")
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "right"
+
+
 def test_approach_presses_belt_counter_key():
     """站在传送带上横穿时同时顶住反向键，否则被推走（spec §7.2）。"""
     w = FakeWorld(walkable=lambda gx, gz: -2 <= gx <= 8 and -1 <= gz <= 4,
@@ -785,6 +819,53 @@ def test_ensure_hands_free_pick_hook_overrides_target():
     assert ("tap", "pickup") not in ctrl.calls
 
 
+def test_ensure_hands_free_home_cooker_false_never_targets_cooker():
+    """home_cooker=False：手里的锅只去台面/地板，绝不回灶台。
+
+    灭火端下来的锅正是这个场景——刚被清空的那口灶就是一张"空灶"，
+    放回去＝接着烧（ai/tasks/fire.py）。
+    """
+    sts = [{"t": "cooking", "n": "cooker", "gx": 1, "gz": 0, "x": 1.2, "z": 0.0},
+           {"t": "counter", "n": "free", "gx": -1, "gz": 0, "x": -1.2, "z": 0.0}]
+    cookers = [{"n": "cooker", "cooked": None}]          # 空灶（灶上没锅）
+    items = [{"n": "utensil_pot_01", "x": 0.0, "z": 0.0,
+              "has_contents": True, "cooked": "Raw"}]    # 手里那口生料锅
+    w = FakeWorld(stations=sts, cookers=cookers, items=items,
+                  walkable=lambda gx, gz: gz == 0 and -2 <= gx <= 2)
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "utensil_pot_01",
+            "interactions": _inter()}
+    ctx, _ = make_ctx(w=w, chef=chef)
+
+    default = PR.EnsureHandsFree()
+    default.tick(ctx)
+    assert default._tgt["n"] == "cooker", "默认行为是空灶归位"
+
+    node = PR.EnsureHandsFree(home_cooker=False)
+    node.tick(ctx)
+    assert node._tgt["n"] == "free", "关掉归位后只能去台面"
+
+
+def test_ensure_hands_free_burnt_pot_goes_to_counter_not_cooker():
+    """糊锅不进"空锅归位"：它既不是空的也不是生料锅，回灶＝接着烧。
+
+    这是灭火/灭火后最容易复燃的一条：刚清空的那口灶正是"空灶"。
+    """
+    sts = [{"t": "cooking", "n": "cooker", "gx": 1, "gz": 0, "x": 1.2, "z": 0.0},
+           {"t": "counter", "n": "free", "gx": -1, "gz": 0, "x": -1.2, "z": 0.0}]
+    cookers = [{"n": "cooker", "cooked": None}]             # 空灶在招手
+    items = [{"n": "utensil_pot_01", "x": 0.0, "z": 0.0,
+              "has_contents": True, "cooked": "Burnt"}]
+    w = FakeWorld(stations=sts, cookers=cookers, items=items,
+                  walkable=lambda gx, gz: gz == 0 and -2 <= gx <= 2)
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "utensil_pot_01",
+            "interactions": _inter()}
+    ctx, _ = make_ctx(w=w, chef=chef)
+
+    node = PR.EnsureHandsFree()
+    node.tick(ctx)
+    assert node._tgt["n"] == "free", "糊锅只能去台面/地板"
+
+
 def test_ensure_hands_free_falls_back_to_floor():
     """没有合法空台面 → 退到地板格（spec §6.1 落点约束）。"""
     w = FakeWorld(walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 3)
@@ -1211,3 +1292,57 @@ def test_ensure_hands_free_unknown_pot_state_is_not_treated_as_empty():
     node = PR.EnsureHandsFree()
     node.tick(ctx)
     assert node._tgt["n"] == "counter"
+
+
+# ---------- WaitUntil（不按键等谓词）----------
+
+def test_wait_until_succeeds_when_pred_true():
+    w = FakeWorld()
+    ctx, _ = make_ctx(w)
+    node = PR.WaitUntil(lambda c: True, timeout=10)
+    assert node.tick(ctx) == Status.SUCCESS
+
+
+def test_wait_until_running_until_pred_then_success():
+    w = FakeWorld()
+    ctx, _ = make_ctx(w)
+    flag = {"ready": False}
+    node = PR.WaitUntil(lambda c: flag["ready"], timeout=10)
+    assert node.tick(ctx) == Status.RUNNING
+    assert node.tick(ctx) == Status.RUNNING
+    flag["ready"] = True
+    assert node.tick(ctx) == Status.SUCCESS
+
+
+def test_wait_until_fails_on_timeout():
+    w = FakeWorld()
+    ctx, _ = make_ctx(w)
+    node = PR.WaitUntil(lambda c: False, timeout=3)
+    s = Status.RUNNING
+    for _ in range(4):
+        s = node.tick(ctx)
+    assert s == Status.FAILURE
+
+
+def test_throw_to_succeeds_when_hands_free():
+    ctx, _ = make_ctx()
+    node = PR.ThrowTo(lambda c: {"x": 5.0, "z": 0.0})
+    assert node.tick(ctx) == Status.SUCCESS
+
+
+def test_throw_to_runs_when_holding():
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Cucumber",
+            "interactions": _inter()}
+    ctx, _ = make_ctx(chef=chef)
+    node = PR.ThrowTo(lambda c: {"x": 5.0, "z": 0.0})
+    assert node.tick(ctx) in (Status.RUNNING, Status.SUCCESS)
+
+
+def test_ensure_hands_free_strict_no_fallback_to_floor():
+    """strict=True：指定落点（pick）找不到时不退地板，直接 FAILURE 交还 Planner。"""
+    w = FakeWorld(walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 3)
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Cucumber",
+            "interactions": _inter()}
+    ctx, _ = make_ctx(w=w, chef=chef)
+    # 无 counter 站点：默认 pick 找不到空台面。非 strict 会退地板，strict 必须 FAILURE。
+    assert PR.EnsureHandsFree(strict=True).tick(ctx) == Status.FAILURE

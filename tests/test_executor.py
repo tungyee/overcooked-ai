@@ -188,6 +188,23 @@ def test_executor_returns_failure_on_timeout():
     assert status == Status.FAILURE
 
 
+def test_executor_honours_task_declared_timeout():
+    """task 自报 TIMEOUT_TICKS 时用它的上限（没声明才用默认 300）。
+
+    灭火要先端锅、再取灭火器（两趟差事），默认 300 拍会中途砍树。
+    """
+    executor = Executor()
+
+    node = CountingNode([Status.RUNNING] * 400)
+    task = MockTask(("FireTask", None, ("cooker1",), None), lambda ctx: node)
+    task.TIMEOUT_TICKS = 5
+
+    for i in range(5):
+        assert executor.tick(task, _make_ctx(tick=i)) == Status.RUNNING
+    assert executor.tick(task, _make_ctx(tick=5)) == Status.FAILURE
+    assert node.halt_count >= 1, "超时要 halt 子树（松开按住的键）"
+
+
 def test_executor_timeout_decorator_halts_on_timeout():
     """Timeout 装饰器超时时 halt 子树。"""
     from ai.primitives.stuck import Timeout

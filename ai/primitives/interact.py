@@ -75,14 +75,18 @@ class EnsureHandsFree(Primitive):
     重算的红利。
 
     物料感知的落点规则（空锅回灶台、熟锅不上灶台……）由 `pick` 插口注入；
-    不注入时是"就近合法空台面"。
+    不注入时是"就近合法空台面"。`home_cooker=False` 整体关掉"空锅归位"
+    这一路——灭火端下来的锅绝不能回灶台（刚被清空的那口灶可能还在烧），
+    见 ai/tasks/fire.py。
     """
 
-    def __init__(self, pick=None, keep=None):
-        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]]) -> None
+    def __init__(self, pick=None, keep=None, home_cooker=True, strict=False):
+        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]], bool, bool) -> None
         Primitive.__init__(self)
         self._pick = pick
         self._keep = keep
+        self._home_cooker = home_cooker
+        self._strict = strict
         self._tgt = None          # 锁定的落点：台面站点 dict 或合成的格子 dict
         self._on_station = False
         self._phase = _P_APPROACH
@@ -184,10 +188,13 @@ class EnsureHandsFree(Primitive):
         执行层对 claims 没有写权（spec §4.5），所以原语没法"变成 ReturnPot"。
         真正把锅归位成一趟差事、带认领和打分，交给 ReturnPot 那个 task 去做
         （见 spec §6.1"手持状态必须纳入可行性"）。
+
+        `home_cooker=False` 时上表第一行的"① 空灶台"整条去掉（灭火端下来的
+        锅只能去台面/地板）。
         """
         w = ctx["w"]
         state = P.held_cookware_state(ctx["chef"], w.items, w.recipes)
-        if state in (P.COOKWARE_EMPTY, P.COOKWARE_RAW):
+        if self._home_cooker and state in (P.COOKWARE_EMPTY, P.COOKWARE_RAW):
             st = placement.find_empty_cooker(w, ctx["field"])
             if st is not None:
                 self._tgt, self._on_station = st, True
@@ -198,6 +205,10 @@ class EnsureHandsFree(Primitive):
         st = pick(ctx)
         if st is not None:
             self._tgt, self._on_station = st, True
+            return
+        # strict：指定落点（中转台等）满/不可达就 FAILURE 交还 Planner，
+        # 不 fallback 到地板乱放（PlaceToRelay 用）。
+        if self._strict:
             return
         cell = placement.find_drop_cell(w, ctx["field"])
         if cell is not None:

@@ -266,6 +266,24 @@ def test_match_plates_ignores_drying_rack_and_held_plates():
     assert got == {"plate_01": "order1"}, got
 
 
+def test_match_plates_includes_p2_held_plate():
+    """P2 手里正端着的盘仍参与盘↔订单匹配（端盘盛饭/送餐中盘离台面，绑定不能丢）。
+
+    实机：端盘盛饭第一步把盘从台面端起，若下一拍匹配不再算它，订单被重绑到
+    另一块空盘 → task 身份变化 → 树重建 → 手里这块被放下（端起又放下）。
+    """
+    w = _loose_cooked_world()
+    # 盘离开 counter 格（counter 在 1,1），名字 = P2 手持盘名
+    w.plates[0]["name"] = "equipment_plate_01"
+    w.plates[0]["x"] = 4.0
+    w.plates[0]["z"] = 4.0
+    w.chefs[0]["held"] = "equipment_plate_01"
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    got = planner._match_plates_to_orders(w, bb, book)
+    assert got == {"plate_01": "order1"}, got
+
+
 def test_order_needs_cooked_false_with_loose_cooked_pot():
     """散熟锅已匹配给该单 → 不再生成下锅候选（从煮的范围排出）。"""
     w = _loose_cooked_world()

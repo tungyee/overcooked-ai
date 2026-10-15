@@ -4,7 +4,7 @@
 - 米饭熟了也不去拿 → `_time_pressure` 曾是空实现（恒 0），熟料 task 结构性垫底。
 - 反复换灶 → `_gen_cook` 漏了 spec §6.1 第 3 号的"该单需熟料"子句。
 """
-from ai.blackboard import Blackboard
+from ai.blackboard import Blackboard, StuckScratch
 from ai import planner, recipe_graph, tasks as T
 from ai.recipes import RecipeBook
 from ai.world import World
@@ -25,6 +25,29 @@ def _cooker(name="cooker_01", cooked=None, is_cooking=None, burning=None,
             x=1.0, z=1.0):
     return {"n": name, "x": x, "z": z, "cooked": cooked,
             "isCooking": is_cooking, "burning": burning, "onFire": burning}
+
+
+# ---------- 火情不受 L3 拉黑（spec §7.2 的例外）----------
+
+def test_plan_firefighting_ignores_abandon_blacklist():
+    """着火的那口灶被别的 task 拉黑了，也照样要去灭。
+
+    拉黑是按资源 id 记的：Normal 里 ReturnPot / RescueCooked 在同一口灶上
+    反复失败，会把**着火的那口灶**写进 scratch.abandoned。火不能因此没人
+    管——plan_firefighting 忽略这条否决。
+    """
+    stations = [{"t": "cooking", "n": "cooker_01", "gx": 1, "gz": 1}]
+    w = _world(cookers=[_cooker(burning=True)], stations=stations)
+    bb = Blackboard()
+    bb.scratch = StuckScratch()
+    bb.scratch.abandoned["cooker_01"] = bb.tick + 200
+    book = RecipeBook([], stations)
+
+    chosen, record = planner.plan_firefighting(w, bb, book)
+
+    assert chosen is not None, "火不能被拉黑挡住"
+    assert chosen.TYPE == "Extinguish"
+    assert chosen.resources == ()
 
 
 # ---------- _time_pressure（spec §6.4）----------
@@ -71,6 +94,22 @@ def test_time_pressure_ramps_up_toward_burning():
 
     w.cookers[0]["cooking_progress"] = 5.0
     assert planner._time_pressure(task, w) == 0.0        # 还没熟 ratio 0.25
+
+
+def test_time_pressure_ramps_up_before_cooked():
+    """煮到后半程压力就开始爬：提前端盘去等熟（ratio 0.25→0.5 对应 0→1.0）。"""
+    w = _world(cookers=[{"n": "cooker_01", "x": 1.0, "z": 1.0,
+                         "cooking_progress": 6.0, "cooking_time": 12.0}])
+    task = T.TakeCookedToPlate("order1", ("cooker_01", "plate_01"),
+                               "BoiledSushiRice")
+
+    assert planner._time_pressure(task, w) == 0.0        # ratio 6/24=0.25 刚过半
+
+    w.cookers[0]["cooking_progress"] = 9.0               # ratio 0.375 → 0.5
+    assert planner._time_pressure(task, w) == 0.5
+
+    w.cookers[0]["cooking_progress"] = 12.0              # ratio 0.5 刚熟 → 1.0
+    assert planner._time_pressure(task, w) == 1.0
 
 
 def test_cooked_rice_outranks_fetch_when_scored():
@@ -175,6 +214,18 @@ def test_gen_take_cooked_generates_when_plate_lacks_it():
         "盘缺料时应能生成 TakeCookedToPlate"
 
 
+def test_gen_take_cooked_generates_while_cooking():
+    """煮中也生成 TakeCookedToPlate：提前端盘去等熟（不能等熟了才拿盘）。"""
+    w = _take_world([])
+    w.cookers = [{"n": "cooker_01", "x": 1.0, "z": 1.0,
+                  "cooked": False, "isCooking": True,
+                  "cooking_progress": 8.0, "cooking_time": 12.0,
+                  "pot_contents": ["ing:SushiRice"]}]
+    tasks = _take_tasks(w, {"plate_01": "order1"}, {"cooker_01": "order1"})
+    assert any(t.TYPE == "TakeCookedToPlate" for t in tasks), \
+        "煮中也应能生成 TakeCookedToPlate（提前准备）"
+
+
 def test_gen_take_cooked_suppressed_when_order_plate_has_it():
     """该单的盘已经有这份熟料 → 不再为它生成取熟料（实机重复倒盘回归）。"""
     w = _take_world(["CookedCompositeAssembledNode"])
@@ -215,24 +266,24 @@ def _ctx_with_pot(w, has_contents, cooked):
     return ctx
 
 
-def test_take_cooked_feasible_while_holding_cooked_pot_even_if_cooker_empty():
-    """端锅离灶后该灶 cooked=None，但**带熟料的锅**在手上 → 仍可行。
+def test_take_cooked_not_feasible_while_holding_cooked_pot_with_empty_cooker():
+    """端盘盛饭：手持熟锅不算"执行中"，灶空时没源可盛 → 不可行。
 
-    这是"取下来又放回灶台"死循环的回归：可行性不能在它自己动手那一刻翻脸。
+    旧实现端锅离灶后靠"手持熟锅"续命；现在全程端盘、不端锅，所以手持锅
+    反而是"手不对"（需先放下、换盘），不该判可行。
     """
     w = _take_world([])
     w.cookers = [{"n": "cooker_01", "x": 1.0, "z": 1.0, "cooked": None}]
     task = _take_task()
-    assert task.feasible(_ctx_with_pot(w, True, "Cooked")) is True
+    assert task.feasible(_ctx_with_pot(w, True, "Cooked")) is False
     assert task.feasible(_ctx(w, None)) is False      # 空手 + 灶空 → 不可行
 
 
 def test_take_cooked_infeasible_while_holding_empty_pot():
-    """"锅在手上"不能只看"手里是锅具"——空锅也满足，于是死循环。
+    """手持空锅/生料锅（非目标盘）且灶空 → 不可行。
 
-    实机：倒完一次之后本 task 一直可行，树首 pickup 被同一个谓词短路
-    （见 InteractWith"expect 成立就 SUCCESS"），AI 从此不回灶台取料，
-    端着空锅反复走到盘子跟前倒空气。
+    端盘盛饭只看"手持目标盘"为执行中；手持锅不是目标盘、又没源可盛，
+    交给 Planner 换别的 task（放下锅 / 去端盘）。
     """
     w = _take_world([])
     w.cookers = [{"n": "cooker_01", "x": 1.0, "z": 1.0, "cooked": None}]
@@ -241,13 +292,14 @@ def test_take_cooked_infeasible_while_holding_empty_pot():
     assert task.feasible(_ctx_with_pot(w, True, None)) is False     # 生料锅
 
 
-def test_take_cooked_pickup_expect_needs_cooked_contents():
-    """树里 pickup 步的 expect 与 feasible 同口径：锅里有熟料才算"到手"。"""
+def test_take_cooked_pickup_expect_holds_target_plate():
+    """树里 pickup 步的 expect 与 feasible 同口径：手持目标盘才算"拿起盘"。"""
     w = _take_world([])
+    w.plates[0]["name"] = "equipment_plate_01"   # holding_plate 按盘名匹配手
     tree = _take_task().build()                 # Timeout(Sequence([...]))
     pickup = tree.child.children[1]             # 0=EnsureHandsFree, 1=pickup
-    assert pickup.expect(_ctx_with_pot(w, True, "Cooked")) is True
-    assert pickup.expect(_ctx_with_pot(w, False, "Raw")) is False
+    assert pickup.expect(_ctx(w, "equipment_plate_01")) is True
+    assert pickup.expect(_ctx(w, "utensil_pot_01")) is False
     assert pickup.expect(_ctx(w, None)) is False
 
 
@@ -370,7 +422,7 @@ def test_rescue_cooked_pickup_expect_needs_cooked_contents():
 # ---------- B1：取熟料的树首先清手 ----------
 
 def test_take_cooked_tree_head_is_ensure_hands_free():
-    """端新锅前先清手（spec §6.1(b)/§7.4）——手里有锅时不再被短路骗过。"""
+    """端盘盛饭前先清手（spec §6.1(b)/§7.4）——手里有东西时不再被短路骗过。"""
     from ai.primitives.interact import EnsureHandsFree
     seq = _take_task().build().child          # Timeout -> Sequence
     assert isinstance(seq.children[0], EnsureHandsFree)

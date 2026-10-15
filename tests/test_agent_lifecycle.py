@@ -210,6 +210,27 @@ def test_run_releases_keys_on_unexpected_read_error():
     assert agent.hands.move_dir is None
 
 
+def test_firefighting_task_is_never_abandoned():
+    """灭火任务连续失败也不写 scratch.abandoned —— 火不能不管。
+
+    Agent 的 L3 兜底（连续 3 次失败即拉黑认领资源）对声明 NO_ABANDON 的
+    task 整条跳过；普通 task 照旧拉黑（第二段是同一装置里的对照）。
+    """
+    from ai import tasks as T
+
+    agent = _agent(RecordingCtrl())
+
+    fire = T.Extinguish()
+    for _ in range(5):
+        agent._note_failure(fire)
+    assert agent.bb.scratch is None, "灭火失败不该建 StuckScratch"
+
+    normal = T.ReturnPot(resources=("cooker_01",))
+    for _ in range(3):
+        agent._note_failure(normal)
+    assert agent.bb.scratch.abandoned["cooker_01"] > agent.tick
+
+
 def test_motion_obstruction_is_shared_across_order_ids():
     from ai import tasks as T
     from ai.planner import _is_abandoned

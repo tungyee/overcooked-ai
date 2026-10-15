@@ -156,3 +156,96 @@ def test_parallel_is_gone():
     留着一个没人用、没测试覆盖的并行节点，日后会有人以为它能用。
     """
     assert not hasattr(bt, "Parallel")
+
+
+def test_repeat_until_pred_true_short_circuits():
+    """pred 一开始成立 → 直接 SUCCESS，不 tick child。"""
+    child = Rec([Status.SUCCESS])
+    node = bt.RepeatUntil(lambda ctx: True, child)
+    assert node.tick({}) == Status.SUCCESS
+    assert child.ticks == 0
+
+
+def test_repeat_until_loops_until_pred():
+    """child 每轮 SUCCESS，pred 第三拍才成立 → 前两拍 RUNNING，第三拍 SUCCESS。"""
+    state = {"n": 0}
+    child = Rec([Status.SUCCESS])
+    node = bt.RepeatUntil(lambda ctx: state["n"] >= 2, child)
+    assert node.tick({}) == Status.RUNNING   # 第一轮 child SUCCESS，pred 未满足
+    state["n"] = 1
+    assert node.tick({}) == Status.RUNNING   # 第二轮
+    state["n"] = 2
+    assert node.tick({}) == Status.SUCCESS   # pred 成立，退出
+    assert child.ticks == 2                  # child 只 tick 了两轮
+
+
+def test_repeat_until_failure_propagates():
+    child = Rec([Status.FAILURE])
+    node = bt.RepeatUntil(lambda ctx: False, child)
+    assert node.tick({}) == Status.FAILURE
+
+
+def test_repeat_until_running_propagates():
+    child = Rec([Status.RUNNING])
+    node = bt.RepeatUntil(lambda ctx: False, child)
+    assert node.tick({}) == Status.RUNNING
+    assert child.ticks == 1
+
+
+def test_repeat_until_halt_propagates():
+    child = Rec([Status.RUNNING])
+    node = bt.RepeatUntil(lambda ctx: False, child)
+    node.tick({})
+    node.halt()
+    assert child.halts == 1
+
+
+def test_repeat_until_pred_exit_halts_running_child():
+    """pred 在 child RUNNING 期间成立 → 提前退出时必须 halt child（松键）。
+
+    否则循环里按住键的叶子（喷灭火器）会在 pred 突然成立时被跳过 halt，
+    键一直按着到进程退出。
+    """
+    state = {"done": False}
+    child = Rec([Status.RUNNING])
+    node = bt.RepeatUntil(lambda ctx: state["done"], child)
+    assert node.tick({}) == Status.RUNNING     # child RUNNING
+    state["done"] = True                       # pred 成立
+    assert node.tick({}) == Status.SUCCESS
+    assert child.halts == 1, "pred 提前退出要 halt 正在 RUNNING 的 child"
+
+
+def test_guard_delegates_when_pred_true():
+    """pred 成立 → 代理 child 的返回值。"""
+    assert bt.Guard(lambda ctx: True, Rec([Status.SUCCESS])).tick({}) == Status.SUCCESS
+    assert bt.Guard(lambda ctx: True, Rec([Status.FAILURE])).tick({}) == Status.FAILURE
+    running = Rec([Status.RUNNING])
+    assert bt.Guard(lambda ctx: True, running).tick({}) == Status.RUNNING
+    assert running.ticks == 1
+
+
+def test_guard_aborts_when_pred_turns_false():
+    """pred 在 child RUNNING 期间变假 → halt child + FAILURE（observer abort）。"""
+    state = {"ok": True}
+    child = Rec([Status.RUNNING])
+    node = bt.Guard(lambda ctx: state["ok"], child)
+    assert node.tick({}) == Status.RUNNING     # 先跑起来
+    state["ok"] = False                        # 条件翻转
+    assert node.tick({}) == Status.FAILURE
+    assert child.halts == 1, "中断必须 halt child（松键）"
+
+
+def test_guard_false_pred_does_not_tick_child():
+    """pred 一开始就是假 → 不 tick child，直接 halt + FAILURE。"""
+    child = Rec([Status.SUCCESS])
+    node = bt.Guard(lambda ctx: False, child)
+    assert node.tick({}) == Status.FAILURE
+    assert child.ticks == 0
+
+
+def test_guard_halt_propagates():
+    child = Rec([Status.RUNNING])
+    node = bt.Guard(lambda ctx: True, child)
+    node.tick({})
+    node.halt()
+    assert child.halts == 1

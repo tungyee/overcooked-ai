@@ -142,3 +142,99 @@ class Condition(Node):
     def tick(self, ctx):
         # type: (dict) -> str
         return Status.SUCCESS if self.fn(ctx) else Status.FAILURE
+
+
+class RepeatUntil(Node):
+    """循环装饰节点：重复 tick child，直到 pred(ctx) 成立 或 达到 max_iterations。
+
+    行为树标准的「循环节点」（Repeat / Loop / Until）——用于「连续取+投
+    N 份」这类多轮重复动作，替代静态展开 N 组子树。pred 是 ctx -> bool，
+    每拍重算；max_iterations 是固定次数兜底（传了则最多循环这么多次就
+    SUCCESS，不依赖 pred）。
+
+    语义：
+      - pred 成立 或 已循环 max_iterations 次 → 直接 SUCCESS。
+      - 否则 tick child：RUNNING → RUNNING；FAILURE → FAILURE（整体失败）。
+      - child 本轮 SUCCESS 但还没到退出条件 → 返回 RUNNING，下一拍重新
+        检查并开始下一轮（child 若是 Sequence，其有记忆语义会在 SUCCESS
+        后自动回到起点，天然支持逐轮重来）。
+    """
+
+    def __init__(self, pred, child, max_iterations=None):
+        # type: (callable, Node, Optional[Any]) -> None
+        self.pred = pred
+        self.child = child
+        self.max_iterations = max_iterations
+        self._iterations = 0
+        self._running = None
+
+    def _limit(self, ctx):
+        # type: (dict) -> Optional[int]
+        if self.max_iterations is None:
+            return None
+        if callable(self.max_iterations):
+            return self.max_iterations(ctx)
+        return self.max_iterations
+
+    def tick(self, ctx):
+        # type: (dict) -> str
+        limit = self._limit(ctx)
+        if self.pred(ctx) or (limit is not None and self._iterations >= limit):
+            # 提前退出时必须 halt 正在 RUNNING 的 child：否则 child 按住的键
+            # 会残留（比如循环里喷灭火器，pred 突然成立直接 SUCCESS，没 halt
+            # 的话 "chop" 一直按着）。halt 沿 _running 一路传到叶子松键。
+            if self._running is not None:
+                self._running.halt()
+                self._running = None
+            self._iterations = 0
+            return Status.SUCCESS
+        s = self.child.tick(ctx)
+        if s == Status.RUNNING:
+            self._running = self.child
+            return Status.RUNNING
+        if s == Status.FAILURE:
+            self._running = None
+            return Status.FAILURE
+        # SUCCESS：本轮完成，还没到退出条件，继续下一轮
+        self._iterations += 1
+        self._running = None
+        return Status.RUNNING
+
+    def halt(self):
+        if self._running is not None:
+            self._running.halt()
+            self._running = None
+        self._iterations = 0
+
+
+class Guard(Node):
+    """装饰器（Observer Abort）：每拍先查 pred，pred 变假就 halt 子树并 FAILURE。
+
+    与 Condition 的关键区别在**评估时机**：Condition 只有父节点轮询到它时
+    才查一次；Guard 在 child RUNNING 期间**每拍都重查** pred，一旦不满足就
+    打断正在运行的子树。这是通用 BT 里「紧急中断」的标准节点（UE 的
+    Decorator+ObserverAborts / Unity 的 Observer abort）。
+
+    语义：
+      - pred(ctx) 为真 → 代理 child 的返回值（SUCCESS/FAILURE/RUNNING）；
+      - pred(ctx) 为假 → halt child（释放按键等资源）→ 返回 FAILURE，
+        让父节点重新评估、切到更高优先级的分支。
+
+    典型用法：喷灭火器时包一层 Guard(没有新的带锅着火灶, HoldUntil(喷))，
+    喷到一半有别的锅着了 → pred 变假 → 松键中断 → 父节点转去端锅。
+    """
+
+    def __init__(self, pred, child):
+        # type: (callable, Node) -> None
+        self.pred = pred
+        self.child = child
+
+    def tick(self, ctx):
+        # type: (dict) -> str
+        if not self.pred(ctx):
+            self.child.halt()
+            return Status.FAILURE
+        return self.child.tick(ctx)
+
+    def halt(self):
+        self.child.halt()

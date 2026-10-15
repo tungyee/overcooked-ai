@@ -237,6 +237,27 @@ def station_at_cell(ctx, cell, kinds=None):
             "x": x, "z": z}
 
 
+def cooker_state(ctx, cooker_name):
+    # type: (Dict, Any) -> Optional[Dict]
+    """按站点实例名取灶的状态条目（资源 id 规则：站点实例名 n）。
+
+    灶的**状态**在 `cookers[]` 里、**位置**在 `stations[]` 里，两个 dict
+    各取所需。cook / fire 两组都要用，故放在 base。
+    """
+    return P.cooker_for(ctx["w"].cookers, str(cooker_name))
+
+
+def cooker_station(ctx, cooker_name):
+    # type: (Dict, Any) -> Optional[Dict]
+    """按实例名取灶的站点 dict（原语要 gx/gz 定位）。"""
+    for st in ctx["w"].stations:
+        if st.get("t") != "cooking":
+            continue
+        if P.station_name_matches(str(st.get("n") or ""), str(cooker_name)):
+            return st
+    return None
+
+
 def ingredient_available(ctx, raw):
     # type: (Dict, Optional[str]) -> bool
     """生料能否取到（手上 / 板上 / 散落 / 箱子，不含已装盘的）。
@@ -337,3 +358,30 @@ def _cooker_cells(world):
         if gx is not None and gz is not None:
             cells.add((gx, gz))
     return cells
+
+
+# 批量取+投的 buffer：散落料够「订单数 + buffer」就停（实机调）。
+RELAY_BUFFER = 1
+
+
+def loose_count(world, raw):
+    # type: (Any, str) -> int
+    """场上散落的该料数量（投掷落地后变成 loose）。"""
+    want = str(raw).lower()
+    n = 0
+    for it in world.items or ():
+        if str(it.get("n") or "").lower() == want:
+            n += 1
+    return n
+
+
+def need_count(world, name):
+    # type: (Any, str) -> int
+    """订单里需要该料的份数（需煮的熟料、需切的生料都在 composition 里，通用）。"""
+    want = str(name).lower()
+    n = 0
+    for order in world.orders:
+        comp = [str(c).lower() for c in (order.get("composition") or [])]
+        if want in comp:
+            n += 1
+    return n

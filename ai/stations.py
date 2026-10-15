@@ -25,6 +25,21 @@ PLATE_STACKS = {
     "Sushi_1_4_2P": [(-1, 0), (1, 0), (-1, -1), (1, -1)],
 }
 
+# 中转台（左右两区之间的交接柜台）。1-3 实测：中间 gx=0 列的 6 个 counter。
+# ⚠️ 仅 Sushi_1_3_2P 标注，未知关卡空集（同 BELTS / PLATE_STACKS 模式）。
+# 已停用（2026-10 实机）：P2 现在自取盘→自组装→自送餐，不需要把干净盘放
+# 中转台传给 P1；PlaceToRelay 带 1.5 分后每次进关都被选中、白跑一趟。
+# 需要恢复时把下面的 1-3 中转台格填回即可。
+RELAY_CELLS = {
+    # "Sushi_1_3_2P": [(0, -3), (0, -2), (0, -1), (0, 0), (0, 1), (0, 2)],
+}
+
+
+def relay_cells_for(world):
+    # type: (World) -> List[Tuple[int, int]]
+    """当前关卡的中转台 counter 格。未知关卡空集（不崩、不改变行为）。"""
+    return list(RELAY_CELLS.get(getattr(world, "level", None)) or [])
+
 
 def _pos(st):
     # type: (Dict) -> Optional[Tuple[float, float]]

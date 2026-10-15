@@ -8,9 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ai import predicates as P
 from ai import primitives as PR
-from ai.bt import Node, Sequence
+from ai import stations as S
+from ai.bt import Condition, Node, Selector, Sequence
+from ai.recipes import find_ingredient
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           ingredient_available, ingredient_source)
+                           ingredient_available, ingredient_source,
+                           loose_count)
 
 # ---------- 切菜常量 ----------
 
@@ -73,17 +76,65 @@ class FetchToBoard(Task):
     def build(self):
         # type: () -> Node
         board_id, raw = self.board_id, self.item
-        return PR.Timeout(Sequence([
-            # 树首清手：被抢占时手里可能还端着上一 task 的盘子/料（spec §7.4）；
-            # keep：手里已经是目标生料就别放下再捡（planner 按 held_matches 放行）
-            PR.EnsureHandsFree(keep=lambda c: P.held_matches(c["chef"], raw)),
-            PR.InteractWith(
-                lambda c: ingredient_source(c, raw), "pickup",
-                lambda c: P.held_matches(c["chef"], raw)),
-            PR.InteractWith(
-                lambda c: board_station(c, board_id), "placement",
-                lambda c: P.board_item(
-                    c["w"].workstations, str(board_id)) == str(raw).lower()),
+
+        def crate(c):
+            return S.find_crate(c["w"].stations, raw)
+
+        def holding(c):
+            return P.held_matches(c["chef"], raw)
+
+        def has_loose(c):
+            return loose_count(c["w"], raw) > 0
+
+        def source_is_crate(c):
+            # 只有箱子有料时才投：find_ingredient 优先级 held→board→loose→
+            # crate，能落到 crate 说明别处都没有（散落/在手走别的分支）。
+            loc = find_ingredient(c["w"], raw, exclude_plate=True)
+            return loc is not None and loc.get("kind") == "crate"
+
+        def board(c):
+            return board_station(c, board_id)
+
+        def placed(c):
+            return P.board_item(c["w"].workstations,
+                                str(board_id)) == str(raw).lower()
+
+        def pickup():
+            # 散落料没有 m_gridLocation 朝向信号，face=False（同 FetchToCooker）。
+            return PR.InteractWith(
+                lambda x: ingredient_source(x, raw), "pickup", holding,
+                face=False)
+
+        def drop():
+            return PR.InteractWith(board, "placement", placed)
+
+        return PR.Timeout(Selector([
+            # 分支1：地上有散落生料 → 直接捡散落放上砧板（不投、不碰箱子）
+            Sequence([
+                Condition(has_loose),
+                PR.EnsureHandsFree(keep=holding),
+                pickup(),
+                drop(),
+            ]),
+            # 分支2：只有箱子有 → 从箱子取一份直接放上砧板。
+            #
+            # 这里曾是「RepeatUntil 批量取+投 N 份，再捡散落上板」，与
+            # FetchToCooker 单料同构、也同样坏：必须投满 N 份才轮到 drop()，
+            # 一轮取+投约 80 拍而整树只有 TASK_TIMEOUT_TICKS=200，第二轮
+            # 没结束就被砍 → 料全堆在地上、板上一直空着。
+            # 砧板一次只放一根（feasible 要求板上为空），批量投更没有意义。
+            Sequence([
+                Condition(source_is_crate),
+                PR.EnsureHandsFree(keep=holding),
+                PR.InteractWith(crate, "pickup", holding),
+                drop(),
+            ]),
+            # 分支3：生料已在手上（pickup 靠 expect 短路）→ 直接放上砧板
+            Sequence([
+                PR.EnsureHandsFree(keep=holding),
+                pickup(),
+                drop(),
+            ]),
         ]), TASK_TIMEOUT_TICKS)
 
 

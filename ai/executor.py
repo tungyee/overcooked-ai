@@ -98,7 +98,10 @@ class Executor:
         # 构建新树并装饰 Timeout。task.build() 不接 ctx——树跨拍复用，
         # 构造时绑定的每拍状态第二拍就过期；原语在 tick(ctx) 时现取。
         raw_tree = task.build()
-        self.active_tree = Timeout(raw_tree, MAX_TASK_TICKS)
+        # 超时上限可由 task 自己声明：默认 MAX_TASK_TICKS，长差事（灭火
+        # 要先端锅、再取灭火器，两趟）用 task.TIMEOUT_TICKS 调高。
+        cap = getattr(task, "TIMEOUT_TICKS", MAX_TASK_TICKS)
+        self.active_tree = Timeout(raw_tree, cap)
         self.active_task_id = task.key
         # 留住 Task 对象本身：Agent 要靠它判断"这棵树的后置条件是否已经
         # 成立"，从而决定这一拍能不能让 planner 换任务（见 agent ⑨.5）。

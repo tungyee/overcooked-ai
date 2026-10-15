@@ -77,13 +77,22 @@ def loose_cookware(ctx):
 
 def item_wanted_by_orders(ctx, item):
     # type: (Dict, Optional[str]) -> int
-    """该料被几张现存订单需要（按订单成分名比较）。"""
+    """该料被几张**还有救的**现存订单需要（按订单成分名比较）。
+
+    判死的单不计入（第 4 组 4.2）：给来不及做完的单提前备料是纯损失，取回来
+    的料没人要。判死表由 planner.mark_doomed_orders 每拍写入 bb.doomed_orders。
+    """
     if not item:
         return 0
     want = str(item).lower()
     book = ctx["book"]
+    bb = ctx.get("bb")
+    doomed = getattr(bb, "doomed_orders", None) or {}
+    tick = getattr(bb, "tick", 0) if bb is not None else 0
     n = 0
     for order in ctx["w"].orders:
+        if doomed.get(order.get("id"), 0) > tick:
+            continue
         for ing in book.requirements(order):
             if str(ing).lower() == want:
                 n += 1
@@ -269,7 +278,9 @@ class StashHeld(Task):
     落点走 placement（Task 6），与 RescueCooked 共用。
 
     手持锅具不走这里（走 ReturnPot / RecoverLoosePot）：锅扔台面上会让
-    灶位空着没锅可用。
+    灶位空着没锅可用。**糊锅是例外**——ReturnPot 不收它（返灶＝再烧
+    一次）、RecoverLoosePot 只认地上的锅、Discard 只管灶上还在烧的那口，
+    不该让它一直攥在手里占着手。
 
     与订单无关，order_id 为 None——打分时订单价值项记 0（spec §6.0）。
     """
@@ -289,7 +300,11 @@ class StashHeld(Task):
         if P.hands_free(chef):
             return False
         if P.held_is_cookware(chef, ctx["w"].recipes):
-            return False       # 锅走 ReturnPot / RecoverLoosePot
+            # 例外：糊锅（见类注释）。别的锅走 ReturnPot / RecoverLoosePot。
+            state = P.held_cookware_state(chef, ctx["w"].items,
+                                          ctx["w"].recipes)
+            if state != P.COOKWARE_BURNT:
+                return False
         if P.held_is_plate(chef):
             return False       # 盘走 PlaceCleanPlate / DeliverPlate / ResetPlate
         held = P.held_name(chef)

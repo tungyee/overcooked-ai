@@ -103,18 +103,36 @@ def held_is_plate(chef):
     return PLATE_KEYWORD in held_name(chef)
 
 
+def held_throwable(chef):
+    # type: (Optional[Dict]) -> bool
+    """手里拿的是否可投掷（插件输出 held_throwable；旧帧无字段 → False）。"""
+    if not chef:
+        return False
+    return chef.get("held_throwable") is True
+
+
+def item_throwable(item):
+    # type: (Optional[Dict]) -> bool
+    """散落物是否可投掷（插件输出 items[].throwable；旧帧无字段 → False）。"""
+    if not item:
+        return False
+    return item.get("throwable") is True
+
+
 # 手持锅具的内容状态。插件在 items[] 里给每口锅都带 has_contents / cooked
 # （实测 27725 帧里手持锅那条跟着厨师的位置走，倒完饭同一拍就翻成
 # has_contents=False）——所以"我手里这口锅是空的还是有料的"是**可观测**的。
 COOKWARE_EMPTY = "empty"
 COOKWARE_RAW = "raw"          # 有料但没熟（在煮 / 刚下锅）
 COOKWARE_COOKED = "cooked"
+COOKWARE_BURNT = "burnt"      # 糊了（items[].cooked == "Burnt"）
 COOKWARE_UNKNOWN = "unknown"  # 是锅具，但 items[] 里找不到它的状态
 
 
 def held_cookware_state(chef, items, recipes=None):
     # type: (Optional[Dict], Optional[List[Dict]], Optional[List[Dict]]) -> Optional[str]
-    """手持锅具的内容状态：不是锅具 → None；否则 empty / raw / cooked / unknown。
+    """手持锅具的内容状态：不是锅具 → None；否则 empty / raw / cooked /
+    burnt / unknown。
 
     为什么要单独一个谓词：`held_is_cookware` 只回答"手里是不是锅"。拿它
     当"我拿到熟料了"用（`TakeCookedToPlate.feasible` 与它树首 pickup 的
@@ -123,7 +141,12 @@ def held_cookware_state(chef, items, recipes=None):
     熟锅绝不能上灶台（会重新点火接着烧糊）。
 
     状态取值（实测）：has_contents=False → cooked 字段是 "Raw"；有熟料时
-    cooked="Cooked"。
+    cooked="Cooked"；糊了是 "Burnt"（69 个历史 trace 里出现 4861 条）。
+
+    糊锅为什么得单独一档：它既不是"生料锅"（不能回灶台归位——糊料留在
+    灶上会接着烧），也不是"熟锅"（不能拿去装盘）。早期实现在这两个分支
+    之间把它并进 `raw`，于是落点表把它当生料锅处理：EnsureHandsFree 优先
+    挑**空灶**、ReturnPot 也愿意把它带回灶台——火灭之后等于又点一次火。
     """
     if not held_is_cookware(chef, recipes):
         return None
@@ -146,8 +169,11 @@ def held_cookware_state(chef, items, recipes=None):
         return COOKWARE_UNKNOWN
     if not best.get("has_contents"):
         return COOKWARE_EMPTY
-    if str(best.get("cooked") or "").lower() == "cooked":
+    cooked = str(best.get("cooked") or "").lower()
+    if cooked == "cooked":
         return COOKWARE_COOKED
+    if cooked == "burnt":
+        return COOKWARE_BURNT
     return COOKWARE_RAW
 
 
@@ -173,6 +199,16 @@ def plate_count(plate):
     if contents:
         return len(contents)
     return plate.get("count") or 0
+
+
+def clean_plate_count(plates):
+    # type: (Optional[List[Dict]]) -> int
+    """干净空盘数量（count==0 且 contents 空）。"""
+    n = 0
+    for p in plates or ():
+        if plate_count(p) == 0:
+            n += 1
+    return n
 
 
 def plate_lacks(plate, ingredient):

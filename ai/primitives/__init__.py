@@ -12,8 +12,9 @@ from ai.primitives.base import (
 )
 from ai.primitives.move import Approach, Face
 from ai.primitives.tap import Tap, Confirm, Settle
-from ai.primitives.hold import HoldUntil, TapWhileHolding
+from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitUntil
 from ai.primitives.interact import EnsureHandsFree, InteractWith
+from ai.primitives.throw import ThrowTo
 from ai.primitives.stuck import (
     MarkBlocked,
     Nudge,
@@ -31,8 +32,10 @@ __all__ = [
     "Settle",
     "HoldUntil",
     "TapWhileHolding",
+    "WaitUntil",
     "EnsureHandsFree",
     "InteractWith",
+    "ThrowTo",
     "MarkBlocked",
     "Nudge",
     "AbandonTarget",

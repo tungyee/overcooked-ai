@@ -482,6 +482,20 @@ def test_held_cookware_state_empty_raw_cooked(chef_holding):
     assert P.held_cookware_state(chef, pot(True, None)) == P.COOKWARE_RAW
 
 
+def test_held_cookware_state_burnt_is_its_own_state(chef_holding):
+    """糊锅必须单独一档，不许并进 raw。
+
+    并进去就会被当成"生料锅"：EnsureHandsFree 优先挑空灶、ReturnPot 也愿意
+    把它送回灶台——火灭之后等于又点一次火。items[].cooked 实测取值
+    Raw / Cooked / Burnt（历史 trace 里 Burnt 4861 条）。
+    """
+    chef = chef_holding("utensil_pot_01")
+    burnt = [{"n": "utensil_pot_01", "x": 0.0, "z": 0.0,
+              "has_contents": True, "cooked": "Burnt"}]
+    assert P.held_cookware_state(chef, burnt) == P.COOKWARE_BURNT
+    assert P.held_cookware_state(chef, burnt) != P.COOKWARE_RAW
+
+
 def test_held_cookware_state_none_when_not_cookware(chef_empty, chef_holding):
     assert P.held_cookware_state(chef_empty, []) is None
     assert P.held_cookware_state(chef_holding("Cucumber"), []) is None

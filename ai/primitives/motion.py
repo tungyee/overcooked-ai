@@ -13,6 +13,11 @@ FRAME_MAX_AGE = 0.75
 WAIT_MAX_SECONDS = 1.0
 PROGRESS_MAX_SECONDS = 1.6
 POSITION_EPSILON = 0.08
+# 多久没位移就算"空转"并写进 trace。必须早于 PROGRESS_MAX_SECONDS 的
+# FAILURE：等到判失败才记就没有预警价值，而实机 51% 的移动拍都没产生位移
+# （trace-20261014-120406：2326/4577，cruise 占 2234），这些拍里绝大多数
+# 并不会走到 no_progress，光看失败率是看不见的。
+STALL_WARN_SECONDS = 0.3
 
 
 class MotionControl:
@@ -32,6 +37,7 @@ class MotionControl:
         self._steps = 0
         self._settle = True   # 当前/上一次 observe 是否要求停稳确认
         self._final = True    # 当前这一步是否落到目标格（决定中间步是否可免停稳）
+        self._dash = False    # 长距离巡航时按住冲刺
 
     def _wait(self, ctx, now, seq, pos, settle=True):
         # type: (...) -> None
@@ -50,10 +56,11 @@ class MotionControl:
         return Status.FAILURE
 
     def tick(self, ctx, direction, extra, near, arrived, error=None, belt=False,
-             final=True):
+             final=True, dash=False):
         # type: (...) -> str
         self._calls += 1
         self._final = final
+        self._dash = dash
         # 未携带收帧信息的离线原语调用按理想的逐拍新观测处理；正式入口
         # 明确传 frame_seq / now，绝不拿循环 tick 当游戏帧编号。
         timed = ctx.get("frame_seq") is not None
@@ -83,6 +90,13 @@ class MotionControl:
             if improved:
                 self._progress_since, self._progress_pos = now, pos
             self._near = near
+
+        # 空转时长暴露给 trace：内部早就为 no_progress 维护了这个量，但只在
+        # 判失败时才用，于是「按着键没走动」这种不致命的损耗全程不可见。
+        stall = max(0.0, now - self._progress_since)
+        ctx["motion"]["stall_seconds"] = round(stall, 3)
+        if stall >= STALL_WARN_SECONDS:
+            ctx["motion"]["stalled"] = True
 
         # 离线调用给出的到位观测视为已落定，不要求测试凭空模拟物理时钟。
         if not timed and arrived:
@@ -124,13 +138,16 @@ class MotionControl:
         if now - self._progress_since >= PROGRESS_MAX_SECONDS and (self._steps >= 3 or self.stage == "cruise"):
             return self._fail(ctx, "no_progress")
 
-        if hands.move_dir is not None and near:
-            # 只有震荡中的近处才先消惯性再短按。90° 拐弯即时换向，不再
-            # 每拐一次就等停稳——实机：每次拐弯都停顿，legacy 即时拐弯
-            # 没有这个卡顿（set_move 本身就会按差集 release 旧键 press 新键）。
+        # 精确站位：震荡中（near）或「下一步即目标格」（final）都走短按+停稳，
+        # 避免巡航满速冲过目标格来回振荡（实机：端饭时在盘旁上下振荡、米烧糊）。
+        # 中间格仍巡航（快）；只有最后一步需要精确，不回到「每格都等停稳」的慢法。
+        precise = near or final
+        if hands.move_dir is not None and precise:
+            # 巡航中要切短按：先松键消惯性，再短按。90° 拐弯仍即时换向，
+            # 不在这里停顿（legacy 即时拐弯没有这个卡顿）。
             self._wait(ctx, now, seq, pos)
             return Status.RUNNING
-        if near:
+        if precise:
             if not hands.pulse_move(direction, STEP_SECONDS, extra, now,
                                     seq if timed else None):
                 return Status.RUNNING
@@ -138,7 +155,8 @@ class MotionControl:
             self._steps += 1
             self.stage = "pulse"
         else:
-            if not hands.move_on_frame(direction, extra, seq if timed else None):
+            if not hands.move_on_frame(direction, extra, seq if timed else None,
+                                       dash=self._dash):
                 return Status.RUNNING
             self.stage = "cruise"
         ctx["motion"]["phase"] = self.stage

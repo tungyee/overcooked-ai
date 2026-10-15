@@ -181,6 +181,25 @@ class World(object):
             self._node_map, self._nm_rows, self._nm_cols = parsed
 
         self.bounds = occupancy.playable_bounds(self.stations)
+        # nodeMap 只覆盖 gz=-4..4，实际地板（Col_Floor）往下延伸到 gz=-6，
+        # 底部有连接左右半边的通道。用 floor 站点的 AABB 把 bounds 的 gz
+        # 下限扩到地板底部，让 make_walkable 把这几行当作可走（障碍由墙
+        # 碰撞体 station_blocked 兜底）。
+        if self.bounds is not None:
+            floor_bottom_gz = None
+            for st in self.stations:
+                if not isinstance(st, dict) or st.get("t") != "floor":
+                    continue
+                minz = st.get("minz")
+                if minz is None:
+                    continue
+                _, gz = self.mapping.to_grid(0, minz)
+                if floor_bottom_gz is None or gz < floor_bottom_gz:
+                    floor_bottom_gz = gz
+            if floor_bottom_gz is not None:
+                min_gx, max_gx, min_gz, max_gz = self.bounds
+                self.bounds = (min_gx, max_gx,
+                               min(min_gz, floor_bottom_gz), max_gz)
         self.station_blocked = occupancy.station_blocked_cells(
             self.stations, self.mapping)
         self.belt_cells, self.belt_dir = occupancy.belt_cells_and_dirs(

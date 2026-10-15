@@ -9,10 +9,48 @@ from typing import Any, Dict, Optional, Tuple
 from ai import predicates as P
 from ai import primitives as PR
 from ai import stations as S
-from ai.bt import Node, Sequence
+from ai.bt import Guard, Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            ingredient_available, ingredient_source,
                            plate_by_id)
+
+
+def _plate_on_serving_hatch(ctx, plate):
+    # type: (Dict, Optional[Dict]) -> bool
+    """这只盘是不是已经放在出餐口上了（即「已经交出去了」）。
+
+    送餐成功后盘还会在快照里滞留约 11 拍（游戏侧动画 + 插件 5 Hz 推帧的
+    延迟）。`feasible` 只看「盘存在 + 料齐」时，Planner 就把这只已经交出
+    去的盘绑给下一单，11 拍后盘真的消失才 failure——每送一单都白搭一次，
+    还往连续失败计数里灌脏数据（`scratch.abandoned` 会拉黑好盘）。
+    实机复现：trace-20261014-004742 t=4134→4146、t=3238→3249。
+
+    判据是**当前快照里的观测事实**（盘的坐标落在出餐口站点范围内），不靠
+    「上一拍送过餐」这种记忆——符合无状态重算的约定（spec §6.4）。
+
+    站点有 minx/minz/maxx/maxz 时按矩形判（出餐口是多格站点）；只有中心点
+    坐标时退化为半格容差。
+    """
+    if not plate:
+        return False
+    px, pz = plate.get("x"), plate.get("z")
+    if px is None or pz is None:
+        return False
+    for st in ctx["w"].stations or ():
+        if not isinstance(st, dict) or st.get("t") != S.PLATE_STATION:
+            continue
+        minx, minz = st.get("minx"), st.get("minz")
+        maxx, maxz = st.get("maxx"), st.get("maxz")
+        if None not in (minx, minz, maxx, maxz):
+            if minx <= px <= maxx and minz <= pz <= maxz:
+                return True
+            continue
+        sx, sz = st.get("x"), st.get("z")
+        if sx is None or sz is None:
+            continue
+        if abs(px - sx) < 0.7 and abs(pz - sz) < 0.7:
+            return True
+    return False
 
 
 def delivery_baseline_from(world):
@@ -184,6 +222,8 @@ class DeliverPlate(Task):
         p = plate_by_id(ctx, self.plate_id)
         if p is None:
             return False
+        if _plate_on_serving_hatch(ctx, p):
+            return False       # 已经交出去了，别用它再送下一单（见该函数注释）
         order = self._order(ctx)
         if order is None:
             return False       # 订单没了 → 该走 ResetPlate
@@ -202,13 +242,23 @@ class DeliverPlate(Task):
             p = plate_by_id(c, plate_id)
             return p is not None and P.held_matches(c["chef"], p.get("name"))
 
+        def not_grabbed_by_p1(c):
+            # Observer Abort（同灭火 Guard）：P1 把目标盘端走了就立刻 halt 本树、
+            # FAILURE 交还 Planner 重新绑定。只排除 P1——P2 自己端着的正是
+            # held_target 要送的那块，不能误 abort。
+            p = plate_by_id(c, plate_id)
+            if p is None:
+                return False       # 盘没了 → 交还 Planner
+            p1 = P.chef_by_name(c["w"].chefs, P.P1_NAME)
+            return not (p1 is not None and P.held_matches(p1, p.get("name")))
+
         def serving(c):
             # 出餐口是 plate_station；plate_return 是脏盘回收口/晾干架，
             # 把组装好的盘放那里永远不结算（实机：端盘在回收口附近打转）。
             return S.find_station(c["w"].stations, S.PLATE_STATION,
                                   (c["chef"]["x"], c["chef"]["z"]))
 
-        return PR.Timeout(Sequence([
+        return PR.Timeout(Guard(not_grabbed_by_p1, Sequence([
             # 树首清手：被抢占时手里可能还端着料/别的盘，先放下再端目标盘（spec §7.4）；
             # keep：手里已经是目标盘就别放下再端
             PR.EnsureHandsFree(keep=held_target),
@@ -216,4 +266,4 @@ class DeliverPlate(Task):
                             held_target),
             PR.InteractWith(serving, "placement",
                             lambda c: P.hands_free(c["chef"])),
-        ]), TASK_TIMEOUT_TICKS)
+        ])), TASK_TIMEOUT_TICKS)

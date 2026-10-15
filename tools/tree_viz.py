@@ -172,6 +172,7 @@ def placeholder_task(cls):
         "RescueCooked": ("cooker0",),
         "Discard": ("cooker0",),
         "RecoverLoosePot": ("cooker0",),
+        "Extinguish": (),
         "FetchToBoard": ("board0",),
         "Chop": ("board0",),
         "FetchToPlate": ("p0",),

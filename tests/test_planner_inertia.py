@@ -260,6 +260,33 @@ def test_commitment_bypasses_inertia_when_about_to_burn():
     assert result == top_task
 
 
+def test_commitment_bypasses_inertia_when_cooked():
+    """锅一熟（pressure 1.0）就要跳过承诺惯性去端盘，不能等快糊。
+
+    实机：米熟了 P2 还在给下一单下锅，因为分差 1.23 < COMMITMENT_MARGIN(2.0)，
+    赖在 FetchToCooker 上不去盛饭。
+    """
+    w = _make_world()
+    # 12/12 → ratio = 12/(2*12) = 0.5（刚熟）
+    w.cookers = [{"n": "workstation_cooker_01", "cooked": True,
+                  "cooking_progress": 12.0, "cooking_time": 12.0}]
+    current_task = T.FetchToCooker("order3", ("workstation_cooker_01 (5)",),
+                                   "BoiledSushiRice")
+    commitment = Commitment(active_task=current_task, started_tick=5,
+                            steps_done=0, infeasible_streak=0)
+    bb = _make_bb(commitment)
+
+    top_task = T.TakeCookedToPlate("order1", ("workstation_cooker_01", "p1"),
+                                   "BoiledSushiRice")
+    scored = [
+        (current_task, 0.54, {}),
+        (top_task, 1.77, {}),   # 差距 1.23 < COMMITMENT_MARGIN，但熟了要抢
+    ]
+
+    result = _apply_commitment_inertia(scored, w, bb)
+    assert result == top_task
+
+
 def test_empty_scored_returns_none():
     """空候选列表返回 None。"""
     w = _make_world()

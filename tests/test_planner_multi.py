@@ -339,6 +339,54 @@ def test_interleave_resume_after_completion():
     assert bb.commitment.steps_done == 5, "应恢复已完成步数"
 
 
+def test_interleave_resume_when_commitment_is_none():
+    """场景 2b：穿插完成后恢复，但 commitment 已被清成 None（真实运行路径）。
+
+    agent.py ⑬ 在穿插的那个 task 成功/失败后会把 bb.commitment 整个设为 None
+    （而非测试里模拟的 active_task=None）。旧代码直接 .steps_done 会崩：
+    AttributeError: 'NoneType' object has no attribute 'steps_done'（实机复现）。
+    """
+    from ai.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_CHOP
+
+    recipes = [
+        {"dish": "CucumberSushi", "composition": ["Plate", "Cucumber"]}
+    ]
+    orders = [
+        {"id": "order1", "dish": "CucumberSushi",
+         "composition": ["Plate", "Cucumber"], "remaining": 50}
+    ]
+    stations = [
+        {"t": "chopping", "n": "board_01", "gx": 2, "gz": 1, "item": "cucumber"}
+    ]
+
+    world = _make_world(orders, stations, recipes)
+    world.workstations = stations
+    bb = _make_bb()
+    book = RecipeBook(recipes, stations)
+
+    paused_task = T.Chop("order1", ("board_01",), "Cucumber")
+    bb.paused_task = {"task_id": paused_task.key, "steps_done": 5}
+    # 真实运行：上一个（穿插的）task 结束后 agent.py 把 commitment 设为 None
+    bb.commitment = None
+
+    cand_chop = Candidate(
+        task=paused_task,
+        preconditions=[],
+        estimated_steps=EST_CHOP,
+    )
+    scored = _score_tasks([paused_task], [cand_chop], world, bb)
+
+    chosen = _apply_commitment_inertia(scored, world, bb)
+
+    assert chosen is not None, "应恢复暂停的任务"
+    assert chosen.TYPE == "Chop", f"应恢复 Chop，实际: {chosen.TYPE if chosen else None}"
+    assert chosen.order_id == "order1", "应恢复 order1 的任务"
+    assert bb.paused_task is None, "恢复后应清空 paused_task"
+    assert bb.commitment is not None, "应为恢复的任务重建 commitment"
+    assert bb.commitment.active_task == paused_task, "active_task 应指向被恢复的 task"
+    assert bb.commitment.steps_done == 5, "应恢复已完成步数"
+
+
 def test_no_interleave_when_remaining_steps_low():
     """场景 3：剩余步数不足，不穿插。
 

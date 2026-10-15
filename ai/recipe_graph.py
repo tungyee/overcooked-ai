@@ -266,12 +266,27 @@ def _mix_done(world, book, node):
 
 # ---------- 发射（实例化：绑资源 + 认领） ----------
 
-def _in_flight_cook_claim(ctx):
-    # type: (Dict) -> bool
-    """该单是否已有在途的 下锅/取熟/救熟 认领（等价 _order_needs_cooked 第 2 源）。"""
+def _in_flight_cook_claim(ctx, item=None):
+    # type: (Dict, Any) -> bool
+    """该单是否已有在途的 下锅/取熟/救熟 认领（等价 _order_needs_cooked 第 2 源）。
+
+    作用域按**熟料**而非整单（第 1 组 1.3）：原先只问「这单有没有任意烹饪
+    类认领」，于是一单要两份熟料（或多料菜）时，第一份一下锅就把第二份的
+    候选全压掉——AI 站着等、灶空着。认领的本意是「同一份熟料别重复下锅」。
+
+    认领没记 item（老认领 / 非烹饪路径）时退化回整单作用域：宁可少发一个
+    候选，也不要重复下锅。
+    """
+    want = str(item).lower() if item is not None else None
     for (_res, action), claim in ctx["bb"].claims.items():
-        if (getattr(claim, "order_id", None) == ctx["order_id"]
-                and action in ("fetch_to", "take_cooked", "rescue")):
+        if getattr(claim, "order_id", None) != ctx["order_id"]:
+            continue
+        if action not in ("fetch_to", "take_cooked", "rescue"):
+            continue
+        claimed = getattr(claim, "item", None)
+        if want is None or claimed is None:
+            return True
+        if str(claimed).lower() == want:
             return True
     return False
 
@@ -280,7 +295,9 @@ def _takeable_cooked_source(world, book, cid):
     # type: (Any, RecipeBook, Any) -> bool
     c = P.cooker_for(world.cookers, str(cid))
     if c is not None:
-        return P.cooker_cooked(c) and not P.cooker_burning(c)
+        # 煮中也算可去取：TakeCookedToPlate 现在「提前端盘到锅前等熟」，
+        # 不能等熟了才发射，否则取盘那几秒会让饭烧糊（实机复现）。
+        return P.cooker_started(c) and not P.cooker_burning(c)
     for src in cooked_sources(world, book):
         if src["kind"] == "loose" and str(src["id"]) == str(cid):
             return True
@@ -323,10 +340,16 @@ def _inst_fetch_to_plate(node, ctx):
 
 def _inst_fetch_to_cooker(node, ctx):
     # type: (Dict, Dict) -> List[Any]
-    if _in_flight_cook_claim(ctx):
-        return []
     item = node["item"]
+    if _in_flight_cook_claim(ctx, item):
+        return []
     tasks = []  # type: List[Any]
+    # 去重按**熟料**分桶：`used_cookers` 原先是整单共享的一个 set，而本函数
+    # 会遍历所有空灶各发一个候选——于是第一样熟料就把所有空灶"用掉"，第二样
+    # 一个候选都发不出来（第 1 组 1.3 的第二层结构限制，由
+    # tests/test_cook_claim_scope.py 暴露）。候选只是选项，真正的互斥由
+    # claims 负责，所以同一口灶出现在不同熟料的候选里没有问题。
+    used = ctx["used_cookers"].setdefault(str(item).lower(), set())
     for c in _cookers(ctx["world"]):
         cid = c.get("n")
         if not cid or _claimed(cid, "fetch_to", ctx["bb"]):
@@ -335,9 +358,9 @@ def _inst_fetch_to_cooker(node, ctx):
             continue
         if P.cooker_started(c) or P.cooker_burning(c):
             continue
-        if cid in ctx["used_cookers"]:
+        if cid in used:
             continue
-        ctx["used_cookers"].add(cid)
+        used.add(cid)
         raws = ctx["book"].raws_of(item)
         tasks.append(T.FetchToCooker(ctx["order_id"], (cid, tuple(raws)), item))
     return tasks
@@ -476,7 +499,7 @@ def emit(world, bb, book, order, plate_match, cooker_match):
         ctx = {
             "world": world, "bb": bb, "book": book, "order": order,
             "order_id": order_id, "plate_id": plate_id,
-            "cooker_match": cooker_match, "used_cookers": set(),
+            "cooker_match": cooker_match, "used_cookers": {},
         }
         _walk(root, ctx, out)
     return out

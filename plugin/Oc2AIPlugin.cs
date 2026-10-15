@@ -25,6 +25,11 @@ namespace Oc2AI
         int _staticTries;
         int _droppedStates;
 
+        // P2 的 WorkstationInteract(chop/投掷) 键按住时长监控：用于实测
+        // 「按住是否影响投掷距离」。-1 = 未按住；>=0 = 当前按住起始的 unscaledTime。
+        float _chopDownSince = -1f;
+        float _chopHoldMs = 0f;
+
         // 网格映射（world -> gx/gz）。出餐口等功能站没有 m_gridIndex，需要
         // 用 StaticGridLocation 反解原点后，把世界坐标换算成网格坐标。
         float _cellX = 1.2f;
@@ -55,9 +60,15 @@ namespace Oc2AI
                 _all = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>();
                 if (!_inputDumped) { _inputDumped = true; LogInput(); }
                 RefreshLevel();
-                if (!_discoveryDone && IsInLevel()) { _discoveryDone = true; Discover(); }
+                // 不在关卡内（菜单 / 选关 / 加载中）就不序列化、不推帧：
+                // 这些帧 phase != "level"，agent 侧本来也跳过决策，纯属白跑；
+                // 而且 BuildState + 全量 LogInfo 每 0.2s 跑一次会把游戏卡到选关页掉帧
+                // （实机：游戏进程 150% CPU、agent 只有 0.6%）。推给 agent 也没用。
+                if (!IsInLevel()) return;
+                if (!_discoveryDone) { _discoveryDone = true; Discover(); }
                 string state = BuildState();
-                Logger.LogInfo("[STATE] " + state);
+                // 不再把整帧状态写进游戏日志：这是卡顿大户，决策复盘走 Python 侧
+                // trace-*.jsonl，不依赖这里的 [STATE] 日志。
                 Push(state);
             }
             catch (Exception e)
@@ -435,55 +446,90 @@ namespace Oc2AI
             catch (Exception e) { Logger.LogWarning("[OCCUPANCY] error: " + e.Message); }
         }
 
+        int AppendColliderLine(StringBuilder sb, List<string> seen, Component c, int n, int cap)
+        {
+            if (c == null || n >= cap) return n;
+            object trigger = GetProp(c, "isTrigger");
+            if (trigger is bool t && t) return n;   // 触发体不挡人
+            object bounds = GetProp(c, "bounds");
+            if (bounds == null) return n;
+            object mn = GetProp(bounds, "min");
+            object mx = GetProp(bounds, "max");
+            if (mn == null || mx == null) return n;
+            object ax = GetField(mn, "x"), az = GetField(mn, "z");
+            object bx = GetField(mx, "x"), bz = GetField(mx, "z");
+            if (ax == null || az == null || bx == null || bz == null) return n;
+            float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
+            if (bxf <= axf || bzf <= azf) return n;
+            float cx = (axf + bxf) / 2f, cz = (azf + bzf) / 2f;
+            if (cx < -4f || cx > 17f || cz < 0f || cz > 13f) return n;
+            string key = c.name + "|" + c.GetType().Name + "|"
+                + axf.ToString("0.0") + "," + azf.ToString("0.0")
+                + "," + bxf.ToString("0.0") + "," + bzf.ToString("0.0");
+            if (seen.Contains(key)) return n;
+            seen.Add(key);
+            sb.Append(c.name).Append('[').Append(c.GetType().Name).Append("](")
+              .Append(axf.ToString("0.0")).Append(',').Append(azf.ToString("0.0"))
+              .Append(")-(").Append(bxf.ToString("0.0")).Append(',').Append(bzf.ToString("0.0"))
+              .Append(") ");
+            return n + 1;
+        }
+
         void DumpLevelColliders()
         {
             try
             {
-                // 用反射调 Object.FindObjectsOfType(Collider)，拿到场景里所有
-                // 非触发 collider（含纯 GameObject 上的墙，不必引用 PhysicsModule）。
-                Type colType = FindType("Collider");
-                if (colType == null) colType = FindType("UnityEngine.Collider");
-                if (colType == null) { Logger.LogWarning("[COLLIDERS] Collider type not found"); return; }
-                MethodInfo mi = typeof(UnityEngine.Object).GetMethod(
-                    "FindObjectsOfType", BindingFlags.Public | BindingFlags.Static,
-                    null, new Type[] { typeof(Type) }, null);
-                if (mi == null) { Logger.LogWarning("[COLLIDERS] FindObjectsOfType(Type) not found"); return; }
-                object[] objs = (object[])mi.Invoke(null, new object[] { colType });
-
                 StringBuilder sb = new StringBuilder("[COLLIDERS] ");
                 List<string> seen = new List<string>();
                 int n = 0;
-                foreach (object o in objs)
+
+                // 方案A：扫场景所有 GameObject 直接挂的 collider（含纯 GameObject 墙）。
+                // FindObjectsOfType(Collider) 之前返回空（类型转发到 PhysicsModule 后
+                // 反射拿不到子类），改扫 GameObject 再逐个看它的 collider 组件最稳。
+                Type goType = FindType("UnityEngine.GameObject");
+                if (goType == null) goType = FindType("GameObject");
+                MethodInfo mi = typeof(UnityEngine.Object).GetMethod(
+                    "FindObjectsOfType", BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type) }, null);
+                object[] gos = (mi != null && goType != null)
+                    ? (object[])mi.Invoke(null, new object[] { goType })
+                    : null;
+                int goCount = gos == null ? -1 : gos.Length;
+                if (gos != null && gos.Length > 0)
                 {
-                    if (o == null) continue;
-                    Component c = o as Component;
-                    if (c == null) continue;
-                    object trigger = GetProp(c, "isTrigger");
-                    if (trigger is bool t && t) continue;
-                    object bounds = GetProp(c, "bounds");
-                    if (bounds == null) continue;
-                    object mn = GetProp(bounds, "min");
-                    object mx = GetProp(bounds, "max");
-                    if (mn == null || mx == null) continue;
-                    object ax = GetField(mn, "x"), az = GetField(mn, "z");
-                    object bx = GetField(mx, "x"), bz = GetField(mx, "z");
-                    if (ax == null || az == null || bx == null || bz == null) continue;
-                    float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
-                    if (bxf <= axf || bzf <= azf) continue;
-                    float cx = (axf + bxf) / 2f, cz = (azf + bzf) / 2f;
-                    if (cx < -4f || cx > 17f || cz < 0f || cz > 13f) continue;
-                    string key = c.name + "|" + c.GetType().Name + "|"
-                        + axf.ToString("0.0") + "," + azf.ToString("0.0")
-                        + "," + bxf.ToString("0.0") + "," + bzf.ToString("0.0");
-                    if (seen.Contains(key)) continue;
-                    seen.Add(key);
-                    sb.Append(c.name).Append('[').Append(c.GetType().Name).Append("](")
-                      .Append(axf.ToString("0.0")).Append(',').Append(azf.ToString("0.0"))
-                      .Append(")-(").Append(bxf.ToString("0.0")).Append(',').Append(bzf.ToString("0.0"))
-                      .Append(") ");
-                    n++;
-                    if (n >= 300) break;
+                    foreach (object o in gos)
+                    {
+                        GameObject go = o as GameObject;
+                        if (go == null) continue;
+                        foreach (Component c in go.GetComponents<Component>())
+                        {
+                            if (c == null) continue;
+                            if (c.GetType().Name.ToLowerInvariant().IndexOf("collider") < 0) continue;
+                            n = AppendColliderLine(sb, seen, c, n, 2000);
+                            if (n >= 2000) break;
+                        }
+                        if (n >= 2000) break;
+                    }
                 }
+
+                // 方案B（兜底）：扫所有 MonoBehaviour 子物体。
+                if (n == 0)
+                {
+                    foreach (MonoBehaviour mb in _all)
+                    {
+                        if (mb == null) continue;
+                        foreach (Component c in mb.GetComponentsInChildren<Component>(true))
+                        {
+                            if (c == null) continue;
+                            if (c.GetType().Name.ToLowerInvariant().IndexOf("collider") < 0) continue;
+                            n = AppendColliderLine(sb, seen, c, n, 2000);
+                            if (n >= 2000) break;
+                        }
+                        if (n >= 2000) break;
+                    }
+                }
+
+                sb.Insert("[COLLIDERS] ".Length, "gos=" + goCount + " n=" + n + " ");
                 Logger.LogInfo(sb.ToString());
             }
             catch (Exception e) { Logger.LogWarning("[COLLIDERS] error: " + e.Message); }
@@ -589,6 +635,21 @@ namespace Oc2AI
             }
             catch { }
             return false;
+        }
+
+        // 可投掷 = GameObject 上挂了 ThrowableItem 组件（食材有，锅/盘没有）。
+        bool IsThrowable(object o)
+        {
+            try
+            {
+                GameObject go = o as GameObject;
+                if (go == null && o is Component comp) go = comp.gameObject;
+                if (go == null) return false;
+                Type tt = FindType("ThrowableItem");
+                if (tt == null) return false;
+                return go.GetComponent(tt) != null;
+            }
+            catch { return false; }
         }
 
         // ---------- JSON 工具 ----------
@@ -719,6 +780,7 @@ namespace Oc2AI
             sb.Append(",\"chefs\":[");
             int chefCount = AppendChefs(sb);
             sb.Append("],\"chefCount\":").Append(chefCount);
+            AppendChopMonitor(sb);
 
             sb.Append(",\"plates\":[");
             AppendPlates(sb);
@@ -747,6 +809,37 @@ namespace Oc2AI
 
             sb.Append('}');
             return sb.ToString();
+        }
+
+        // 监控 P2 的 chop/投掷键(WorkstationInteract)按住时长。IsUseDown() 是
+        // 纯状态查询、无副作用，可每拍调用；按键上/下沿靠 unscaledTime 差值计时。
+        void AppendChopMonitor(StringBuilder sb)
+        {
+            float now = Time.unscaledTime;
+            bool down = false;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                if (mb.GetType().Name == "PlayerControls" && mb.name == "Player 2")
+                {
+                    down = CallBool(GetField(mb, "m_controlScheme"), "IsUseDown") == "true";
+                    break;
+                }
+            }
+            if (down)
+            {
+                if (_chopDownSince < 0f) _chopDownSince = now;
+                _chopHoldMs = (now - _chopDownSince) * 1000f;
+            }
+            else if (_chopDownSince >= 0f)
+            {
+                _chopHoldMs = (now - _chopDownSince) * 1000f;
+                _chopDownSince = -1f;
+            }
+            sb.Append(",\"chop_held\":").Append(down ? "true" : "false")
+              .Append(",\"chop_hold_ms\":").Append(_chopHoldMs.ToString("0"))
+              .Append(",\"chop_down_since\":")
+              .Append(_chopDownSince < 0f ? "null" : _chopDownSince.ToString("0.000"));
         }
 
         string Phase()
@@ -861,6 +954,7 @@ namespace Oc2AI
                   .Append(",\"yaw\":").Append(mb.transform.eulerAngles.y.ToString("0"))
                   .Append(",\"respawning\":").Append(resp is bool b ? (b ? "true" : "false") : "null")
                   .Append(",\"held\":").Append(Fmt(held))
+                  .Append(",\"held_throwable\":").Append(IsThrowable(held) ? "true" : "false")
                   .Append(",\"interactions\":").Append(Interactions(mb))
                   .Append('}');
                 i++;
@@ -1288,6 +1382,7 @@ namespace Oc2AI
                   .Append(",\"has_contents\":").Append(has == "true" ? "true" : has == "false" ? "false" : "null")
                   .Append(",\"cooked\":").Append(cooked == "null" ? "null" : Jstr(cooked))
                   .Append(",\"detail\":").Append(PotContents(mb))
+                  .Append(",\"throwable\":").Append(IsThrowable(mb) ? "true" : "false")
                   .Append('}');
                 i++;
                 if (i >= 32) break;
@@ -1410,6 +1505,9 @@ namespace Oc2AI
                     si++;
                 }
 
+                // 墙体/障碍碰撞体：nodeMap 外围一圈误标可走，需按真实 collider 挡掉
+                AppendWallStations(stations, ref si);
+
                 object list = null;
                 foreach (string nm in new[] { "ServerCampaignFlowController", "ClientCampaignFlowController", "CampaignFlowController" })
                 {
@@ -1499,6 +1597,74 @@ namespace Oc2AI
             {
                 Logger.LogWarning("[STATIC] collider bounds error: " + e.Message);
             }
+        }
+
+        // 关卡墙体/障碍/地板碰撞体（Col_Walls / Col_Objects / Col_Floor）。
+        // 这些是纯 GameObject 上的 collider，不进 GridManager 占用表、nodeMap
+        // 又只覆盖 gz=-4..4（GridNavSpace 半尺寸 7x4），报成站点交给 Python：
+        //   - Col_Walls/Col_Objects → "wall"，station_blocked_cells 按 AABB 标不可走
+        //   - Col_Floor → "floor"，world.py 用它的 minz 把 bounds 扩到底部地板，
+        //     make_walkable 再把 nodeMap 外的底部两行当作可走（连接左右半边的通道）
+        // 跳过角色胶囊（CapsuleCollider）。
+        void AppendWallStations(StringBuilder sb, ref int si)
+        {
+            try
+            {
+                Type goType = FindType("UnityEngine.GameObject");
+                if (goType == null) goType = FindType("GameObject");
+                MethodInfo mi = typeof(UnityEngine.Object).GetMethod(
+                    "FindObjectsOfType", BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type) }, null);
+                object[] gos = (mi != null && goType != null)
+                    ? (object[])mi.Invoke(null, new object[] { goType })
+                    : null;
+                if (gos == null) return;
+                List<string> seen = new List<string>();
+                foreach (object o in gos)
+                {
+                    GameObject go = o as GameObject;
+                    if (go == null) continue;
+                    foreach (Component c in go.GetComponents<Component>())
+                    {
+                        if (c == null) continue;
+                        if (c.GetType().Name.ToLowerInvariant().IndexOf("collider") < 0) continue;
+                        string nm = c.name;
+                        if (nm == null) continue;
+                        string stype;
+                        if (nm.StartsWith("Col_Floor"))
+                            stype = "floor";       // 地板：可走，用于扩展 bounds
+                        else if (nm.StartsWith("Col_Walls") || nm.StartsWith("Col_Objects"))
+                            stype = "wall";        // 墙/障碍：不可走
+                        else
+                            continue;
+                        object trigger = GetProp(c, "isTrigger");
+                        if (trigger is bool t && t) continue;
+                        object bounds = GetProp(c, "bounds");
+                        if (bounds == null) continue;
+                        object mn = GetProp(bounds, "min");
+                        object mx = GetProp(bounds, "max");
+                        if (mn == null || mx == null) continue;
+                        object ax = GetField(mn, "x"), az = GetField(mn, "z");
+                        object bx = GetField(mx, "x"), bz = GetField(mx, "z");
+                        if (ax == null || az == null || bx == null || bz == null) continue;
+                        float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
+                        if (bxf <= axf || bzf <= azf) continue;
+                        string key = nm + "|" + axf.ToString("0.0") + "," + azf.ToString("0.0")
+                            + "," + bxf.ToString("0.0") + "," + bzf.ToString("0.0");
+                        if (seen.Contains(key)) continue;
+                        seen.Add(key);
+                        if (si > 0) sb.Append(',');
+                        sb.Append("{\"t\":").Append(Jstr(stype)).Append(",\"n\":").Append(Jstr(nm))
+                          .Append(",\"minx\":").Append(axf.ToString("0.##"))
+                          .Append(",\"minz\":").Append(azf.ToString("0.##"))
+                          .Append(",\"maxx\":").Append(bxf.ToString("0.##"))
+                          .Append(",\"maxz\":").Append(bzf.ToString("0.##"))
+                          .Append('}');
+                        si++;
+                    }
+                }
+            }
+            catch (Exception e) { Logger.LogWarning("[WALL] error: " + e.Message); }
         }
 
         string ClassifyStation(MonoBehaviour mb, string go)

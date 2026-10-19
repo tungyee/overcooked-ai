@@ -113,6 +113,9 @@ class Discard(Task):
     """
 
     TYPE = "Discard"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把没用的东西扔进垃圾桶"
+    LABEL = "扔垃圾"
 
     @property
     def cooker_id(self):
@@ -176,6 +179,9 @@ class RecoverLoosePot(Task):
     """
 
     TYPE = "RecoverLoosePot"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把放在台面/地上的锅拿回灶上"
+    LABEL = "捡锅"
 
     @property
     def cooker_id(self):
@@ -274,6 +280,9 @@ class StashHeld(Task):
     """
 
     TYPE = "StashHeld"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把手里暂时用不上的东西放到台面"
+    LABEL = "放下手里的东西"
 
     def claims(self):
         return ()
@@ -329,6 +338,9 @@ class Prefetch(Task):
     """
 
     TYPE = "Prefetch"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "提前取一份多单都要的料放台面"
+    LABEL = "预取"
 
     def claims(self):
         return ()

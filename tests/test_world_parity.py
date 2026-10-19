@@ -28,9 +28,16 @@ GX_RANGE = range(-14, 15)
 GZ_RANGE = range(-14, 15)
 
 
+# 对话层的小样本帧只服务 tests/test_dialog_integration.py，不属于新旧 World
+# parity 的 1102 帧基线；混进来会把帧数断言变成假失败。
+_DIALOG_SCENARIO_FIXTURE = "dialog_scenarios.ndjson.gz"
+
+
 def _fixture_files():
     # type: () -> list
-    return sorted(glob.glob(os.path.join(FIXTURES, "*.ndjson.gz")))
+    return sorted(
+        path for path in glob.glob(os.path.join(FIXTURES, "*.ndjson.gz"))
+        if os.path.basename(path) != _DIALOG_SCENARIO_FIXTURE)
 
 
 if _REQUIRE and not os.path.exists(LEGACY_WORLD):

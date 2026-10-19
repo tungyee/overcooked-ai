@@ -61,6 +61,10 @@ class FetchToCooker(Task):
     """
 
     TYPE = "FetchToCooker"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把生料下进锅里煮（为某张订单）"
+    LABEL = "下锅"
+    PROCESS = "煮"
 
     @property
     def TIMEOUT_TICKS(self):
@@ -338,6 +342,9 @@ class FillCooker(FetchToCooker):
     """
 
     TYPE = "FillCooker"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "趁灶空着先下锅备料（不绑订单）"
+    LABEL = "填灶"
     HANDS = "empty"
 
     def __init__(self, order_id=None, resources=(), item=None):
@@ -405,6 +412,9 @@ class TakeCookedToPlate(Task):
     """
 
     TYPE = "TakeCookedToPlate"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "端着盘把煮好的料盛进盘里"
+    LABEL = "盛盘"
     HANDS = "empty"       # 要空手去端盘；手不空时打分加腾手代价（spec §6.1(b)）
     NO_ABANDON = True     # 盛饭是停烧糊的必经之路；拉黑期(200拍)比烧糊倒计时还长 → 必着火
 
@@ -576,6 +586,9 @@ class ReturnPot(Task):
     """
 
     TYPE = "ReturnPot"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把空锅放回灶上"
+    LABEL = "放回锅"
 
     @property
     def cooker_id(self):
@@ -629,6 +642,9 @@ class RescueCooked(Task):
     """
 
     TYPE = "RescueCooked"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把快糊的锅端离火"
+    LABEL = "端锅离火"
     NO_ABANDON = True     # 端锅离灶是停烧糊的兜底：拉黑它就等于判这口锅死刑
 
     @property

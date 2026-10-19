@@ -13,13 +13,14 @@ from ai.primitives.base import Primitive, resolve
 from ai.primitives.hold import TapWhileHolding
 from ai.primitives.move import Approach, Face
 from ai.primitives.tap import Tap, Confirm
+from ai.primitives.interaction_recovery import InteractionRecovery
 
 # 放下动作的后置校验重试上限。插件 5 Hz 推帧（200ms），按键后"手空了"
 # 至少要等下一帧才体现；正式运行按新观测计重试，不消耗旧帧预算。
 PUT_DOWN_RETRIES = 5
 
 # EnsureHandsFree 的四个阶段（形态对齐 InteractWith）。
-_P_APPROACH, _P_FACE, _P_ALIGN, _P_TAP, _P_CONFIRM = 0, 1, 2, 3, 4
+_P_APPROACH, _P_FACE, _P_ALIGN, _P_REFACE, _P_TAP, _P_CONFIRM = range(6)
 
 
 def _belt_hold_key(ctx):
@@ -101,15 +102,18 @@ class EnsureHandsFree(Primitive):
         # 台面落点才对齐：裸地板格插件不给 placement 信号，interact_ready
         # 恒 False，收紧会一路白走到 max_ticks（见 align.py 模块注释）。
         self._align_station = AlignToCell(lambda c: self._tgt, "placement")
+        self._reface_station = Face(lambda c: self._tgt)
         self._tap_station = TapWhileHolding(
             "pickup", _belt_hold_key, lambda c: self._tgt, "placement")
         self._tap_floor = Tap("pickup")
         self._confirm = Confirm(lambda c: P.hands_free(c["chef"]),
                                 PUT_DOWN_RETRIES)
+        self._recovery = InteractionRecovery()
+        self._drop_held = None
 
     def _nodes(self):
         return (self._approach, self._floor_approach, self._face,
-                self._align_station, self._tap_station,
+                self._align_station, self._reface_station, self._tap_station,
                 self._tap_floor, self._confirm)
 
     def reset(self):
@@ -118,6 +122,8 @@ class EnsureHandsFree(Primitive):
         self._tgt = None
         self._on_station = False
         self._phase = _P_APPROACH
+        self._recovery = InteractionRecovery()
+        self._drop_held = None
         for n in self._nodes():
             n.reset()
 
@@ -130,12 +136,43 @@ class EnsureHandsFree(Primitive):
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
+        if not self._recovery.ready(ctx):
+            return Status.RUNNING
+        # 目标随平台移动时用本帧站点；不能拿锁定落点时的旧世界坐标一直走。
+        if self._on_station and self._tgt is not None:
+            rid = P.resource_id(self._tgt)
+            self._tgt = next((s for s in ctx['w'].stations if P.resource_id(s) == rid), self._tgt)
+        if (ctx.get('frame_seq') is not None and self._on_station
+                and self._phase not in (_P_APPROACH, _P_CONFIRM)
+                and not self._tap_station._fired
+                and self._approach.needs_reapproach(ctx)):
+            if self._recovery.retry(ctx, self._tgt, 'stance', 'lost_stance', blacklist=False):
+                self._restart_movement()
+                return Status.RUNNING
+            self.reset()
+            return Status.FAILURE
         s = self._step(ctx)
         if s == Status.FAILURE:
+            phase = (ctx.get('interaction') or {}).get('phase', '')
+            if (self._on_station and phase != 'approach'
+                    and P.held_name(ctx['chef']) == self._drop_held
+                    and self._recovery.retry(ctx, self._tgt, phase)):
+                self._restart_movement()
+                return Status.RUNNING
             # 与 InteractWith 同一约定：失败即复位，下一拍从锁定落点重来，
             # 不把半截状态（锁定的落点 / 已按过的键）留给下一次激活。
             self.reset()
         return s
+
+    def _restart_movement(self):
+        for node in self._nodes():
+            node.halt()
+        self._phase = _P_APPROACH
+
+    def _call(self, node, phase, ctx):
+        ctx['interaction'] = {'phase': phase, 'attempt': self._recovery.attempts,
+                              'target': P.resource_id(self._tgt), 'kind': 'placement'}
+        return node.tick(ctx)
 
     def _step(self, ctx):
         # type: (Dict) -> str
@@ -153,33 +190,39 @@ class EnsureHandsFree(Primitive):
 
         if self._tgt is None:
             self._lock_target(ctx)
+            self._drop_held = P.held_name(chef)
             if self._tgt is None:
                 hands.set_move(None)
                 return Status.FAILURE      # 无处可放 → 交还 Planner
 
         if self._phase == _P_APPROACH:
-            s = (self._approach.tick(ctx) if self._on_station
+            s = (self._call(self._approach, 'approach', ctx) if self._on_station
                  else self._floor_approach.tick(ctx))
             if s != Status.SUCCESS:
                 return s
             self._phase = _P_FACE if self._on_station else _P_TAP
         if self._phase == _P_FACE:
-            s = self._face.tick(ctx)
+            s = self._call(self._face, 'face', ctx)
             if s != Status.SUCCESS:
                 return s
             self._phase = _P_ALIGN
         if self._phase == _P_ALIGN:
-            s = self._align_station.tick(ctx)
+            s = self._call(self._align_station, 'align', ctx)
+            if s != Status.SUCCESS:
+                return s
+            self._phase = _P_REFACE
+        if self._phase == _P_REFACE:
+            s = self._call(self._reface_station, 'reface', ctx)
             if s != Status.SUCCESS:
                 return s
             self._phase = _P_TAP
         if self._phase == _P_TAP:
-            s = (self._tap_station.tick(ctx) if self._on_station
+            s = (self._call(self._tap_station, 'tap', ctx) if self._on_station
                  else self._tap_floor.tick(ctx))
             if s != Status.SUCCESS:
                 return s
             self._phase = _P_CONFIRM
-        return self._confirm.tick(ctx)
+        return self._call(self._confirm, 'confirm', ctx)
 
     def _lock_target(self, ctx):
         # type: (Dict) -> None
@@ -255,9 +298,12 @@ class InteractWith(Primitive):
         self._approach = Approach(target, kind)
         self._face = Face(target) if face else None
         self._align = AlignToCell(target, kind)
+        self._reface = Face(target) if face else None
         self._tap = TapWhileHolding("pickup", _belt_hold_key, target, kind)
         self._confirm = Confirm(expect, retries)
         self._phase = 0
+        self._recovery = InteractionRecovery()
+        self._attempt_held = None
 
     def _children(self):
         # type: () -> list
@@ -273,13 +319,18 @@ class InteractWith(Primitive):
         out = [self._approach]
         if self._face is not None:
             out.append(self._face)
-        out.extend([self._align, self._tap, self._confirm])
+        out.append(self._align)
+        if self._reface is not None:
+            out.append(self._reface)
+        out.extend([self._tap, self._confirm])
         return out
 
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
         self._phase = 0
+        self._recovery = InteractionRecovery()
+        self._attempt_held = None
         for c in self._children():
             c.reset()
 
@@ -298,6 +349,12 @@ class InteractWith(Primitive):
         if self.expect(ctx):
             self.reset()
             return Status.SUCCESS
+
+        if not self._recovery.ready(ctx):
+            return Status.RUNNING
+
+        if self._attempt_held is None:
+            self._attempt_held = P.held_name(ctx['chef'])
 
         # 手部连续性不变式（spec §7.5 第三类故障）：我没按键，手里的东西
         # 却变了——被 P1 换走、传送带冲掉、误拾。停下来让 Planner 按现实
@@ -318,15 +375,39 @@ class InteractWith(Primitive):
             self.reset()
             return Status.FAILURE
 
+        if (ctx.get('frame_seq') is not None and self._phase > 0
+                and not self._tap._fired and self._approach.needs_reapproach(ctx)):
+            if self._recovery.retry(ctx, resolve(self.target, ctx), 'stance',
+                                    'lost_stance', blacklist=False):
+                self._restart_movement()
+                return Status.RUNNING
+            self.halt()
+            return Status.FAILURE
+
         # 与有记忆 Sequence 一致：转向、按键、等待确认期间不重跑 Approach。
         children = self._children()
         while self._phase < len(children):
-            s = children[self._phase].tick(ctx)
+            child = children[self._phase]
+            phase = ('approach' if child is self._approach else 'face' if child is self._face
+                     else 'align' if child is self._align else 'reface' if child is self._reface
+                     else 'tap' if child is self._tap else 'confirm')
+            ctx['interaction'] = {'phase': phase, 'attempt': self._recovery.attempts,
+                                  'target': P.resource_id(resolve(self.target, ctx)), 'kind': self.kind}
+            s = child.tick(ctx)
             if s == Status.RUNNING:
                 return Status.RUNNING
             if s == Status.FAILURE:
+                if (phase != 'approach' and P.held_name(ctx['chef']) == self._attempt_held
+                        and self._recovery.retry(ctx, resolve(self.target, ctx), phase)):
+                    self._restart_movement()
+                    return Status.RUNNING
                 self.halt()
                 return Status.FAILURE
             self._phase += 1
         self.reset()
         return Status.SUCCESS
+
+    def _restart_movement(self):
+        for child in self._children():
+            child.halt()
+        self._phase = 0

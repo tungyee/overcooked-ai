@@ -14,12 +14,14 @@
 键位沿用 legacy 项目实机验证过的 P2 分屏键位。
 """
 import subprocess
+import sys
 
-import Quartz
+if sys.platform == 'darwin':
+    import Quartz
 
 from ai.output.key_scheduler import DeadlineKeys
 
-KEY = {
+MAC_KEY = {
     "up": 126,
     "down": 125,
     "left": 123,
@@ -28,17 +30,34 @@ KEY = {
     "chop": 44,     # P2 分屏：切菜 / 洗盘 / 喷火同键（WorkstationInteract = /）
     "dash": 61,     # P2 分屏：冲刺（LogicalButtonID.Dash = 右 Alt / 右 Option）
 }
+KEY = MAC_KEY if sys.platform == 'darwin' else {
+    'up': 'up', 'down': 'down', 'left': 'left', 'right': 'right',
+    'pickup': 'right_shift', 'chop': 'right_ctrl',
+}
 
 
 class Controller(object):
     """CGEvent 键盘注入。构造时先松全部键并聚焦游戏窗口。"""
 
-    def __init__(self):
-        self._keys = DeadlineKeys(lambda name, down: self._key(KEY[name], down))
-        self.release_all_hard()
+    def __init__(self, bindings=None):
+        self._windows = None
+        if sys.platform == 'win32':
+            from ai.output.windows_input import WindowsInput
+            self._windows = WindowsInput(bindings)
+            # 本机右 Alt 会干扰 P1，Windows 暂不发送冲刺键。
+            send = lambda name, down: self._windows.send(name, down) if name != 'dash' else None
+        elif sys.platform == 'darwin':
+            send = lambda name, down: self._key(MAC_KEY[name], down)
+        else:
+            raise RuntimeError('真实输入支持 Windows/macOS；其他平台使用 --dry-run')
+        self._keys = DeadlineKeys(send)
+        if self._windows is None:
+            self.release_all_hard()
         self.focus_game()
 
     def focus_game(self):
+        if self._windows is not None:
+            return self._windows.focus_game()
         # 让游戏窗口成为前台，否则注入的键进不到游戏
         try:
             subprocess.run(
@@ -48,6 +67,10 @@ class Controller(object):
                 check=False)
         except Exception:
             pass
+
+    def is_game_foreground(self):
+        # type: () -> bool
+        return self._windows is None or self._windows.is_game_foreground()
 
     def _key(self, kc, down):
         ev = Quartz.CGEventCreateKeyboardEvent(None, kc, down)

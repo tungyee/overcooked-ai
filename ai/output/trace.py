@@ -19,7 +19,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def default_path(root=None, now=None):
@@ -149,6 +149,9 @@ def execution_record(status, task, ctx, frame_seq=None, received_at=None):
         result["task"] = repr(task)
     if "motion" in ctx:
         result["motion"] = ctx["motion"]
+    for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment'):
+        if name in ctx:
+            result[name] = ctx[name]
     if frame_seq is not None and received_at is not None:
         result["observation"] = {"frame_seq": frame_seq,
                                  "age": round(time.monotonic() - received_at, 3)}
@@ -173,6 +176,7 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         "t": tick,
         "mode": mode,
         "mode_reason": record.get("mode_reason", ""),
+        "waiting": record.get("waiting", {}),
         "p1": record.get("p1", {}),
         "candidates": _format_candidates(record.get("candidates", [])),
         "bindings": record.get("bindings", {}),

@@ -72,6 +72,8 @@ class StuckScratch:
     # 不直接清 bb.commitment：§4.5 规定 Executor 对 commitment 只有
     # steps_done / retries 的写权，Planner 在可行性过滤时读这里。
     abandoned: Dict[Any, int] = field(default_factory=dict)
+    # 动作失败只限制 (资源, 动作)；显式 AbandonTarget 的资源级表仍兼容。
+    abandoned_actions: Dict[Tuple[Any, str], int] = field(default_factory=dict)
     # (资源 id, 落脚格) → 失效拍号。AlignToCell 写、Approach 读。
     #
     # 为什么必须是二元而不能复用上面两个：只拉黑格（bad_cells）会废掉该格对

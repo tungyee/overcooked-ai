@@ -72,11 +72,17 @@ class AlignToCell(Primitive):
         self.kind = kind
         self.max_ticks = max_ticks
         self._motion = MotionControl()
+        self._last_seq = None
+        self._last_offset = None
+        self._contact_samples = 0
 
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
         self._motion = MotionControl()
+        self._last_seq = None
+        self._last_offset = None
+        self._contact_samples = 0
 
     def halt(self):
         # type: () -> None
@@ -108,6 +114,21 @@ class AlignToCell(Primitive):
             hands.set_move(None)
             return Status.FAILURE
 
+        # 贴墙时物理碰撞会把人挡在格心外。保留一次收紧尝试，随后连续两个
+        # 新观测都没有收紧、且句柄正确，就交给受 Confirm 保护的交互验证。
+        # 不再每次机械地耗尽 1.6 秒 no_progress；旧帧不能消耗这个预算。
+        seq = ctx.get("frame_seq", self._ticks)
+        if seq != self._last_seq:
+            if self._last_offset is not None:
+                self._contact_samples = (self._contact_samples + 1
+                    if abs(off - self._last_offset) < 0.04 else 0)
+            self._last_seq, self._last_offset = seq, off
+        if self._contact_samples >= 2 and P.interact_ready(chef, st, self.kind, w.to_grid):
+            hands.set_move(None)
+            ctx["alignment"] = {"result": "contact_ready", "offset": round(off, 3)}
+            self.reset()
+            return Status.SUCCESS
+
         # 只有「已站到格心容差内」才允许用句柄判定成功。句柄（pickup/placement
         # 的 ScanForObject 结果）是纯距离扫描：偏离格心时它仍会指向目标柜台，
         # 但实际拾取/放置够不着，于是 tap 发出、世界不变、Confirm 超时 → 整棵树
@@ -126,6 +147,8 @@ class AlignToCell(Primitive):
             return Status.FAILURE
 
         if self._ticks > self.max_ticks:
+            self._blacklist_pair(ctx, st, P.chef_cell(chef, w.to_grid))
+            ctx["interaction_failure"] = {"phase": "align", "reason": "alignment_timeout"}
             hands.set_move(None)
             self.reset()
             return Status.FAILURE
@@ -171,6 +194,8 @@ class AlignToCell(Primitive):
         """
         from ai.primitives.stuck import _ensure_stuck_scratch
         scratch = _ensure_stuck_scratch(ctx)
+        if cell is None:
+            return
         key = (P.resource_id(station), tuple(cell))
         scratch.bad_pairs[key] = (ctx.get("tick") or 0) + ALIGN_PAIR_TTL_TICKS
 

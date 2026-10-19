@@ -11,8 +11,8 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.13.0")]
-    public class Oc2AIPlugin : BaseUnityPlugin
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.19.0")]
+    public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
 
@@ -51,7 +51,8 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.12] loaded");
+            Logger.LogInfo("[OC2AI v0.19.0 Windows upstream] loaded");
+            _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             StartSocket();
             Invoke("Snapshot", 3f);   // 之后由 Snapshot 自己按关卡内外决定下次间隔
         }
@@ -60,6 +61,9 @@ namespace Oc2AI
         {
             // 关卡内 5 Hz；非关卡降到 1 Hz，只做「进关了吗」的探测。
             float next = 0.2f;
+            lock (_lock)
+                if (_clients.Count == 0) { Invoke("Snapshot", 0.5f); return; }
+            var watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 // 每拍重扫，避免新出现的灭火器/掉落物延迟 1s 才进状态
@@ -68,11 +72,12 @@ namespace Oc2AI
                 if (IsInLevel())
                 {
                     RefreshLevel();
-                    if (!_discoveryDone) { _discoveryDone = true; Discover(); }
+                    if (_discoverEnabled.Value && !_discoveryDone) { _discoveryDone = true; Discover(); }
                     string state = BuildState();
                     // 不再把整帧状态写进游戏日志：这是卡顿大户，决策复盘走 Python 侧
                     // trace-*.jsonl，不依赖这里的 [STATE] 日志。
                     Push(state);
+                    SavePerformance(watch);
                 }
                 else
                 {
@@ -109,31 +114,34 @@ namespace Oc2AI
 
         void AcceptLoop()
         {
-            while (true)
+            while (!_stopping)
             {
-                try { TcpClient c = _listener.AcceptTcpClient(); lock (_lock) _clients.Add(c); }
+                try { TcpClient c = _listener.AcceptTcpClient(); c.NoDelay = true; c.SendTimeout = 250; lock (_lock) _clients.Add(c); }
                 catch { return; }
             }
         }
 
         void WriteLoop()
         {
-            while (true)
+            while (!_stopping)
             {
                 string msg = null;
-                lock (_lock) { if (_out.Count > 0) msg = _out.Dequeue(); }
-                if (msg == null) { Thread.Sleep(20); continue; }
-                byte[] data = Encoding.UTF8.GetBytes(msg);
-                List<TcpClient> dead = null;
+                TcpClient[] clients;
                 lock (_lock)
                 {
-                    foreach (TcpClient c in _clients)
+                    if (_out.Count > 0) msg = _out.Dequeue();
+                    clients = _clients.ToArray();
+                }
+                if (msg == null) { Thread.Sleep(20); continue; }
+                byte[] data = Encoding.UTF8.GetBytes(msg);
+                foreach (TcpClient c in clients)
+                {
+                    try { c.GetStream().Write(data, 0, data.Length); }
+                    catch
                     {
-                        try { NetworkStream ns = c.GetStream(); if (ns.CanWrite) ns.Write(data, 0, data.Length); }
-                        catch { if (dead == null) dead = new List<TcpClient>(); dead.Add(c); }
+                        lock (_lock) _clients.Remove(c);
+                        try { c.Close(); } catch { }
                     }
-                    if (dead != null)
-                        foreach (TcpClient d in dead) { _clients.Remove(d); try { d.Close(); } catch { } }
                 }
             }
         }
@@ -142,14 +150,8 @@ namespace Oc2AI
         {
             lock (_lock)
             {
-                if (_out.Count < 20)
-                {
-                    _out.Enqueue(json + "\n");
-                }
-                else if (_droppedStates++ % 50 == 0)
-                {
-                    Logger.LogWarning("[SOCKET] out queue full, dropping state #" + _droppedStates);
-                }
+                _out.Clear();
+                _out.Enqueue(json + "\n");
             }
         }
 
@@ -200,14 +202,12 @@ namespace Oc2AI
         {
             string cur = ReadLevel();
             if (cur == null) return;      // 菜单/加载中：读不到关卡，保持原值
-            if (_level == null)
+            MonoBehaviour flow = FindServerFlowController();
+            int flowId = flow != null ? flow.GetInstanceID() : 0;
+            if (cur != _level || flowId != _flowId)
             {
                 _level = cur;
-                return;
-            }
-            if (cur != _level)
-            {
-                _level = cur;
+                _flowId = flowId; _sceneEpoch++;
                 _staticJson = null;       // 下一拍 BuildState() 会重建 stations/recipes
                 // 网格校准也要重来：_originX/Z 是从上一关的 StaticGridLocation
                 // 反解出来的，切关后仍沿用会让功能站（出餐口/洗碗池）的 gx/gz
@@ -918,7 +918,9 @@ namespace Oc2AI
             if (_staticJson == null && IsInLevel()) BuildStatic();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"phase\":").Append(Jstr(Phase()))
+            sb.Append("\"plugin_version\":\"0.19.0\",\"protocol_version\":4,\"session_id\":").Append(Jstr(_sessionId))
+              .Append(",\"scene_epoch\":").Append(_sceneEpoch)
+              .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))
               .Append(",\"paused\":").Append(IsPaused() ? "true" : "false");
 
@@ -993,6 +995,7 @@ namespace Oc2AI
 
             if (_staticJson != null) sb.Append(',').Append(_staticJson);
 
+            sb.Append(",\"diagnostics\":").Append(_performanceJson);
             sb.Append('}');
             return sb.ToString();
         }

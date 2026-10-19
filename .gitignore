@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+.runtime/
+.tools/
 venv/
 
 # 运行时产物

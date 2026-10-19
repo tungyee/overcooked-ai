@@ -245,7 +245,7 @@ class DeliverPlate(Task):
             # 送餐那一步永远走不到（实机：端盘在空柜台反复放/捡、出餐口
             # 看起来像找不到）。所以先按 id 反查盘，再用盘名去匹配手。
             p = plate_by_id(c, plate_id)
-            return p is not None and P.held_matches(c["chef"], p.get("name"))
+            return P.holds_plate(c["chef"], p)
 
         def not_grabbed_by_p1(c):
             # Observer Abort（同灭火 Guard）：P1 把目标盘端走了就立刻 halt 本树、
@@ -255,7 +255,7 @@ class DeliverPlate(Task):
             if p is None:
                 return False       # 盘没了 → 交还 Planner
             p1 = P.chef_by_name(c["w"].chefs, P.P1_NAME)
-            return not (p1 is not None and P.held_matches(p1, p.get("name")))
+            return not P.holds_plate(p1, p)
 
         def serving(c):
             # 出餐口是 plate_station；plate_return 是脏盘回收口/晾干架，

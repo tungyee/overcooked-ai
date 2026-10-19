@@ -40,7 +40,41 @@ def resolve(target, ctx):
         got = target(ctx)
     else:
         got = target
-    return got if isinstance(got, dict) and got else None
+    return _surface_hint(got, ctx) if isinstance(got, dict) and got else None
+
+
+def _surface_hint(target, ctx):
+    # type: (Dict, Dict) -> Dict
+    """台面上的盘/散物借用容器交互坐标，保留物品自身身份与世界位置。
+
+    物品没有 GridLocation 不代表在地面。将它一律跳过 Face 会在 1-4
+    唯一可用站位上校验失败，然后规划器反复重选。只借同位置的真实静态
+    台面，不借远处/相邻台面，也不改原始快照或资源认领键。
+    """
+    if (target.get('held_by') or (target.get('gx') is not None and target.get('gz') is not None)
+            or not any(k in target for k in ('name', 'detail', 'contents'))):
+        return target
+    w = ctx.get('w')
+    x, z = target.get('x'), target.get('z')
+    if w is None or not isinstance(x, (int, float)) or not isinstance(z, (int, float)):
+        return target
+    cell = getattr(getattr(w, 'mapping', None), 'cell', 1.2)
+    best, best_dist = None, (cell / 4.) ** 2
+    for station in getattr(w, 'stations', ()):
+        if station.get('t') not in ('counter', 'chopping', 'cooking', 'cooker'):
+            continue
+        if station.get('gx') is None or station.get('gz') is None:
+            continue
+        sx, sz = station.get('x'), station.get('z')
+        if not isinstance(sx, (int, float)) or not isinstance(sz, (int, float)):
+            continue
+        distance = (sx - x) ** 2 + (sz - z) ** 2
+        if distance <= best_dist:
+            best, best_dist = station, distance
+    if best is None:
+        return target
+    return dict(target, interaction_surface=best.get('n'), interaction_grid=best.get('grid'),
+                interaction_gx=best['gx'], interaction_gz=best['gz'])
 
 
 def _blocked_cells(ctx, resource_id=None):
@@ -121,7 +155,7 @@ def target_grid_callbacks(world, target):
     """
     grid_name = None
     if isinstance(target, dict):
-        grid_name = target.get("grid")
+        grid_name = target.get("interaction_grid") or target.get("grid")
     grids = getattr(world, "grids", None)
     if grid_name and grids is not None:
         gid = str(grid_name)

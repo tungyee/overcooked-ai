@@ -490,7 +490,7 @@ class TakeCookedToPlate(Task):
 
         def holding_plate(c):
             p = plate_by_id(c, plate_id)
-            return p is not None and P.held_matches(c["chef"], p.get("name"))
+            return P.holds_plate(c["chef"], p)
 
         def plate_target(c):
             return plate_by_id(c, plate_id)
@@ -543,7 +543,7 @@ def _holding_plate(ctx, plate_id):
     先按 id 反查盘、再用盘名匹配手（与 DeliverPlate.held_target 同源）。
     """
     p = plate_by_id(ctx, plate_id)
-    return p is not None and P.held_matches(ctx["chef"], p.get("name"))
+    return P.holds_plate(ctx["chef"], p)
 
 
 def _holding_cooked(ctx):

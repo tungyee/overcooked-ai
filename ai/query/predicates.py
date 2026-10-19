@@ -39,6 +39,20 @@ def held_matches(chef, item):
     return bool(h) and bool(it) and h == it
 
 
+def holds_plate(chef, plate):
+    # type: (Optional[Dict], Optional[Dict]) -> bool
+    """按盘实例的持有者判断；同名盘不能通过物品名互相冒认。
+
+    新协议显式给出 held_by（含未持有时的 null）。只有旧帧没有该字段
+    才沿用按名字匹配，不能拿名字覆盖当前协议的归属事实。
+    """
+    if not chef or not plate:
+        return False
+    if "held_by" in plate:
+        return bool(plate["held_by"]) and plate["held_by"] == chef.get("name")
+    return held_matches(chef, plate.get("name"))
+
+
 def held_is_pot(chef):
     # type: (Optional[Dict]) -> bool
     h = held_name(chef)
@@ -508,6 +522,10 @@ def _target_cell(target, to_grid):
     """
     if not target:
         return (None, None)
+    # 台面盘/锅没有自己的 GridLocation，执行层可提供同位置容器的原生坐标。
+    ix, iz = target.get('interaction_gx'), target.get('interaction_gz')
+    if ix is not None and iz is not None:
+        return (int(round(ix)), int(round(iz)))
     gx, gz = target.get("gx"), target.get("gz")
     if gx is not None and gz is not None:
         return (int(round(gx)), int(round(gz)))
@@ -579,7 +597,7 @@ def interact_ready(chef, target, kind=None, to_grid=None):
         return False
 
     tgx, tgz = _target_cell(target, to_grid)
-    tn = str(target.get("n") or "").strip()
+    tn = str(target.get('interaction_surface') or target.get("n") or "").strip()
 
     # 放置句柄指向出餐口而目标不是出餐口 → 拒绝（防盘子误放上菜口）
     if kind == "placement":

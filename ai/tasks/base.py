@@ -329,7 +329,9 @@ def ingredient_available(ctx, raw):
     """
     if not raw:
         return False
-    loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True)
+    from ai.space import reachability
+    loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True,
+        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st))
     if loc is None or loc.get("kind") == "plate":
         return False
     if _source_on_moving_platform(ctx, loc):
@@ -340,7 +342,9 @@ def ingredient_available(ctx, raw):
 def ingredient_source(ctx, raw):
     # type: (Dict, Optional[str]) -> Optional[Dict]
     """生料的取用站点 dict。在手上时返回 None（无需再取）。"""
-    loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True)
+    from ai.space import reachability
+    loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True,
+        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st))
     if loc is None or loc.get("kind") in ("plate", "held"):
         return None
     st = loc.get("st")

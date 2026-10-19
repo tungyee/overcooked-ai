@@ -1787,6 +1787,30 @@ def test_assembly_tasks_are_registered():
         assert name in T.TASK_TYPES
 
 
+@pytest.mark.parametrize("owner,allowed,holding", [
+    ("Player 2", True, True),
+    ("Player 1", False, False),
+    (None, True, False),
+])
+def test_same_name_plates_use_instance_owner(owner, allowed, holding):
+    """实机 t=1154：两人都拿 equipment_plate_01，不得中止 P2 自己的盘。"""
+    p = plate("p1", 0, 0, FULL)
+    p.update(name="equipment_plate_01", held_by=owner)
+    p1 = {"name": "Player 1", "held": "equipment_plate_01"}
+    p2 = {"name": "Player 2", "x": 0., "z": 0.,
+          "held": "equipment_plate_01", "interactions": inter()}
+    w = FakeWorld(stations=[PLATE_STATION], recipes=RECIPES, orders=[ORDER],
+                  plates=[p], chefs=[p1, p2])
+    ctx, _ = make_ctx(w, chef=p2)
+    guard = T.DeliverPlate("1", ("p1",)).build().child
+    assert guard.pred(ctx) is allowed
+    assert guard.child.children[0]._keep(ctx) is holding
+    from ai.tasks.cook import _holding_plate
+    assert _holding_plate(ctx, "p1") is holding
+    take = T.TakeCookedToPlate("1", ("cooker", "p1"), "BoiledSushiRice")
+    assert take.build().child.children[0]._keep(ctx) is holding
+
+
 # ---------- 异常清理与预取（spec §6.1 第 11/12/13/15 号）----------
 
 BIN = {"t": "bin", "n": "Bin 1", "gx": -7, "gz": 2,

@@ -34,7 +34,7 @@ mkdir -p "$OUT"
   -r:"$M/mscorlib.dll" -r:"$M/System.dll" -r:"$M/UnityEngine.dll" \
   -r:"$M/UnityEngine.CoreModule.dll" -r:"$BE/BepInEx.dll" \
   -out:"$OUT/Oc2AIPlugin.dll" \
-  "$ROOT/plugin/Oc2AIPlugin.cs"
+  "$ROOT"/plugin/*.cs
 
 echo "built: $OUT/Oc2AIPlugin.dll"
 echo "deploy: cp \"$OUT/Oc2AIPlugin.dll\" \"$G/BepInEx/plugins/Oc2AIPlugin.dll\"  # 然后重启游戏"

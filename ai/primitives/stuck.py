@@ -64,8 +64,8 @@ def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
     # bad_cells 仍照写——寻路绕开被堵的那一格，只废格、不废整个资源。
     if getattr(task, "NO_ABANDON", False):
         return
-    for resource, _action in task.claims():
-        scratch.abandoned[resource] = tick + ABANDON_TTL_TICKS
+    from ai.core.recovery import abandon_actions
+    abandon_actions(bb, task, tick + ABANDON_TTL_TICKS)
 
 
 class MarkBlocked(Primitive):

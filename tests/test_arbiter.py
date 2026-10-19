@@ -69,8 +69,8 @@ def _make_extinguisher(n, held=None):
     return {"n": n, "x": 2.0, "z": 2.0, "t": "extinguisher", "held": held}
 
 
-def test_stuck_guard_takes_precedence_over_firefighting():
-    """火中被堵：Stuck 守卫先生效，不死锁在 Firefighting。"""
+def test_stationary_guard_does_not_block_firefighting():
+    """原地可能是在切菜；位置诊断不能屏蔽新火情。"""
     # 构造：cooker onFire、AI 在原地连续 3 拍、灭火器可得
     cookers = [_make_cooker("cooker_1", on_fire=True)]
     extinguishers = [_make_extinguisher("ext_1", held=None)]
@@ -89,9 +89,9 @@ def test_stuck_guard_takes_precedence_over_firefighting():
 
     mode, reason = arbiter.select_mode(world, bb)
 
-    # 断言：检测到卡住，进入 Stuck 处理，mode 保持原值
-    assert mode == "Normal"
-    assert "stuck" in reason.lower()
+    # 没有实际执行脱困的旧守卫只能保留旧模式，会导致永远不灭火。
+    assert mode == "Firefighting"
+    assert "fire" in reason.lower()
     assert isinstance(bb.scratch, StuckScratch)
 
 

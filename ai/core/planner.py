@@ -17,6 +17,7 @@ from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.query.recipes import RecipeBook, find_ingredient
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
 from ai.state.world import World
+from ai.space import reachability
 
 # Plan 3 固定估计步数（spec §7.3.4）
 EST_FETCH, EST_CHOP, EST_COOK_OPS, EST_SERVE = 10, 20, 15, 5
@@ -330,6 +331,9 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     #     return False, "endgame"
     if not task.feasible(ctx):
         return False, "infeasible"
+    route_veto = reachability.task_veto(task, ctx)
+    if route_veto:
+        return False, route_veto
     return True, ""
 
 
@@ -441,11 +445,11 @@ def _is_abandoned(task, bb):
         return False
     scratch = getattr(bb, "scratch", None)
     abandoned = getattr(scratch, "abandoned", None)
-    if not abandoned:
-        return False
+    actions = getattr(scratch, "abandoned_actions", None) or {}
+    abandoned = abandoned or {}
     tick = getattr(bb, "tick", 0)
-    for res_id, _action in task.claims():
-        if abandoned.get(res_id, 0) > tick:
+    for res_id, action in task.claims():
+        if abandoned.get(res_id, 0) > tick or actions.get((res_id, action), 0) > tick:
             return True
     return False
 
@@ -465,6 +469,7 @@ def _make_context(world, bb, book=None):
     }
     if book is not None:
         ctx["book"] = book
+    ctx['field'] = reachability.field_for(world, bb)
     return ctx
 
 

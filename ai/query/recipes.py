@@ -49,6 +49,7 @@ class RecipeBook(object):
             ing = st.get("ing")
             if ing:
                 self._crates[str(ing).lower()] = st
+        self._branches = None   # type: Optional[Dict[str, str]]
 
     def recipe(self, ing):
         # type: (Optional[str]) -> Optional[Dict]
@@ -116,6 +117,53 @@ class RecipeBook(object):
         return tuple(ing for ing in self.requirements(order)
                      if not (self.want_tokens(ing) & have))
 
+    # ---------- 分支归一（dialog 分支作用域，spec §4.5）----------
+    def ingredient_branch(self, item):
+        # type: (Optional[str]) -> Optional[str]
+        """熟料/切好的名字归一到生料分支；生料返回自身，未知原样返回。
+
+        dialog 的分支作用域只认生料名（spec §4.5）：说「饭我来」时，
+        BoiledSushiRice / ChoppedSushiFish 这类名字要先折回 SushiRice /
+        SushiFish，整条链上的候选才命中同一条分支。多生料的熟料节点
+        不拆分支，保持熟料名本身。空输入给 None。
+        """
+        if not item:
+            return None
+        if self._branches is None:
+            self._branches = self._build_branches()
+        return self._branches.get(str(item).lower(), item)
+
+    def _build_branches(self):
+        # type: () -> Dict[str, str]
+        """反向索引：生料→自身、chop 产物→生料、单生料熟料→生料。
+
+        多生料的熟料节点取熟料名本身作 branch（spec §4.5），不强行拆成
+        多个生料——否则「我来做这道混合菜」会被折成其中某一种生料。
+        数据全部来自本帧已有的 _by_name / _crates，不另建配方表。键统一
+        小写（与 _by_name 一致），值保留配方里的原始大小写。
+        """
+        out = {}  # type: Dict[str, str]
+        for name, r in self._by_name.items():
+            canonical = r.get("name") or name
+            if self.needs_cooking(name):
+                raws = self.raws_of(canonical)
+                out[str(canonical).lower()] = (
+                    raws[0] if len(raws) == 1 else canonical)
+            elif self.node_kind(name) == "leaf":
+                out[name] = canonical
+                # chop 产物也折回生料分支：chop_target 优先读配方字段、箱子兜底，
+                # 这样「鱼我来」能命中传送带供料、无箱子的 Chop 链。
+                chop = self.chop_target(canonical)
+                if chop:
+                    out[str(chop).lower()] = canonical
+        for ing, st in self._crates.items():
+            raw = st.get("ing") or ing
+            out[ing] = raw
+            chop = st.get("chop")
+            if not _is_null(chop):
+                out[str(chop).lower()] = raw
+        return out
+
     # ---------- 烹饪 ----------
     def needs_cooking(self, ing):
         # type: (Optional[str]) -> bool
@@ -174,13 +222,20 @@ class RecipeBook(object):
         # type: (Optional[str]) -> Optional[str]
         """该生料切好后的产物名；不可切则 None。
 
-        从**箱子**的 chop 字段读，不做 "Chopped" 前缀匹配（spec §7.3）：
-        多阶段切配或产物命名不以 Chopped 开头时前缀匹配会误判"已切好"。
-        实测 {"ing":"Cucumber","chop":"ChoppedCucumber","chop_stages":8}。
+        优先读配方叶子节点自带的 chop 字段（新插件把「切成什么/几刀」随
+        配方一起下发，跟着食材走、不依赖箱子，传送带供料也覆盖）；旧插件/
+        旧帧配方没有该字段时退回箱子的 chop。不做 "Chopped" 前缀匹配
+        （spec §7.3）：多阶段切配或产物命名不以 Chopped 开头时前缀匹配会
+        误判"已切好"。实测 {"ing":"Cucumber","chop":"ChoppedCucumber","chop_stages":8}。
         """
         if not ing:
             return None
-        st = self._crates.get(str(ing).lower())
+        key = str(ing).lower()
+        r = self._by_name.get(key)
+        if r is not None and "chop" in r:
+            chop = r.get("chop")
+            return None if _is_null(chop) else str(chop)
+        st = self._crates.get(key)
         if not st:
             return None
         chop = st.get("chop")
@@ -188,10 +243,19 @@ class RecipeBook(object):
 
     def chop_stages(self, ing):
         # type: (Optional[str]) -> int
-        """需切几轮。缺失给 0（= 不可切）。"""
+        """需切几轮。缺失给 0（= 不可切）。与 chop_target 同源：优先配方
+        字段，旧帧退回箱子。"""
         if not ing:
             return 0
-        st = self._crates.get(str(ing).lower())
+        key = str(ing).lower()
+        r = self._by_name.get(key)
+        if r is not None and "chop_stages" in r:
+            n = r.get("chop_stages")
+            try:
+                return int(n or 0)
+            except (TypeError, ValueError):
+                return 0
+        st = self._crates.get(key)
         if not st:
             return 0
         n = st.get("chop_stages")

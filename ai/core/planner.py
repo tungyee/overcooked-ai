@@ -5,6 +5,8 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ai.dialog.schema import (NO_BRANCH_TYPES, RESCUE_TYPES,
+                              preference_matches_task)
 from ai.revenue import cook_supply as CS
 from ai.revenue import economy as ECON
 from ai.revenue import eta as ETA
@@ -33,6 +35,48 @@ class Candidate:
     task: Any
     preconditions: List[str]
     estimated_steps: int
+    # 对话分支作用域（spec §4.5）：RecipeBook 归一后的生料名。放最后并给
+    # 默认值，既有构造点不必改；共享/整单/清理动作没有分支。
+    branch: Optional[str] = None
+
+
+def branch_of_task(task, book):
+    # type: (Any, Optional[RecipeBook]) -> Optional[str]
+    """候选的分支名：由 RecipeBook 把熟料/切好的名字折回生料（spec §4.5）。
+
+    共享/整单/清理动作（NO_BRANCH_TYPES）与没有 item 的 task 一律 None；
+    没有配方视图时也无法归一，返回 None（branch 级偏好不会命中，但不会炸）。
+    """
+    if getattr(task, "TYPE", None) in NO_BRANCH_TYPES:
+        return None
+    item = getattr(task, "item", None)
+    if not item or book is None:
+        return None
+    return book.ingredient_branch(item)
+
+
+def _order_is_abandoned(bb, order_id):
+    # type: (Blackboard, Any) -> bool
+    """玩家说「别管这单」的硬排除期（spec §4.4）。
+
+    `abandoned_orders` 是 order id → 失效拍号；到期的条目不再过滤（清理归
+    主循环，这里只读）。值为 0 / 缺失都表示未放弃。
+    """
+    if order_id is None:
+        return False
+    table = getattr(bb, "abandoned_orders", None) or {}
+    return table.get(order_id, 0) > getattr(bb, "tick", 0)
+
+
+def _dialog_live_orders(world, bb):
+    # type: (World, Blackboard) -> List[Dict]
+    """未被放弃（`bb.abandoned_orders`）的订单。
+
+    放弃是**订单级**的，不只是「不给它发候选」：盘/灶 1:1 匹配、判死队列与
+    打分 slack 都必须只看这些单，否则被放弃的单会替活单占掉匹配或队列容量
+    （两单同菜 + 一张盘时，活单会拿不到盘）。
+    """
+    return [o for o in world.orders if not _order_is_abandoned(bb, o.get("id"))]
 
 
 def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=None):
@@ -52,12 +96,16 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
     hands_empty = P.hands_free(chef)
 
+    # 被放弃的订单整单不发候选（spec §4.4：硬排除，不是打低分）。
+    orders = _dialog_live_orders(world, bb)
+
     # 配方驱动的候选（放盘 + 备菜 + 上盘 + 出餐），逐订单从 DAG 发射
-    for ord in world.orders:
+    for ord in orders:
         for task in recipe_graph.emit(world, bb, book, ord,
                                       plate_match, cooker_match):
             pre, est = _CAND_META.get(task.TYPE, ([], EST_FETCH))
-            candidates.append(Candidate(task, list(pre), est))
+            candidates.append(Candidate(task, list(pre), est,
+                                        branch=branch_of_task(task, book)))
 
     # 与订单无关的清理 / 回收 / 待命 task（第 2/5/6/11/12/13/14/15 号）
     candidates.extend(_gen_misc(world, bb, book, chef, hands_empty))
@@ -67,8 +115,11 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     # hands_empty 门挡掉。不重新加入，正在执行的任务就会被 Planner 自己
     # 饿死（每拍候选为空 → select_task 返回 None → AI 停摆）。
     cur = bb.commitment.active_task if bb.commitment else None
-    if getattr(cur, "TYPE", None) and not any(c.task == cur for c in candidates):
-        candidates.append(Candidate(cur, [], _estimate_task_steps(cur)))
+    if (getattr(cur, "TYPE", None)
+            and not _order_is_abandoned(bb, getattr(cur, "order_id", None))
+            and not any(c.task == cur for c in candidates)):
+        candidates.append(Candidate(cur, [], _estimate_task_steps(cur),
+                                    branch=branch_of_task(cur, book)))
 
     return candidates
 
@@ -137,6 +188,18 @@ def _has_bin(world):
     return False
 
 
+def _has_dirty_plate(world, sink):
+    # type: (World, Dict) -> bool
+    """洗碗池是否有活可干：场上有 DirtyPlateStack，或池里已有待洗的盘。
+
+    直接复用 `ai.tasks.plate.dirty_plate_exists`，两边不再各写一份口径；
+    候选生成阶段先做这层过滤，让「没有脏盘」时根本不存在 WashPlate 候选
+    （ack 才能是 pending）。
+    """
+    from ai.tasks.plate import dirty_plate_exists
+    return dirty_plate_exists({"w": world}, (sink or {}).get("n"))
+
+
 def _gen_misc(world, bb, book, chef, hands_empty):
     # type: (World, Blackboard, RecipeBook, Any, bool) -> List[Candidate]
     """与订单无关的 task：锅具回收 / 清理 / 待命（spec §6.1 第 2/5/6/11/12/13/14/15 号）。
@@ -147,10 +210,13 @@ def _gen_misc(world, bb, book, chef, hands_empty):
     """
     cands = []  # type: List[Candidate]
 
-    # 第 2 号 WashPlate：有洗碗池就生成，feasible 判"没干净盘且场上有脏盘"
+    # 第 2 号 WashPlate：有洗碗池且有脏盘才生成；feasible 再判"没干净盘"。
+    # 只按洗碗池生成会把「没有脏盘」也当成一个当前候选，玩家说「去洗碗」
+    # 时 ack 会误报 accepted（spec §4.7：目标不存在时应 pending，等盘出现）。
     if hands_empty:
         for st in world.stations:
-            if st.get("t") == "washing" and st.get("n"):
+            if (st.get("t") == "washing" and st.get("n")
+                    and _has_dirty_plate(world, st)):
                 cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
                                        ["hands_empty"], EST_FETCH))
 
@@ -173,9 +239,10 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             # 第 12 号 RecoverLoosePot：空灶 + 地上有锅（feasible 再判）
             if not P.cooker_has_pot(c):
                 for pot in _loose_pots(world):
-                    cands.append(Candidate(
-                        T.RecoverLoosePot(resources=(cid,), item=pot.get("n")),
-                        [], EST_FETCH))
+                    task = T.RecoverLoosePot(resources=(cid,),
+                                             item=pot.get("n"))
+                    cands.append(Candidate(task, [], EST_FETCH,
+                                           branch=branch_of_task(task, book)))
 
     if hands_empty:
         # 第 14 号 ResetPlate：绑盘当前所在格为拼装格（feasible 判是否错料盘）
@@ -188,11 +255,15 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         # 第 15 号 Prefetch：多单都要的料（feasible 再判）
         seen = set()
         for order in world.orders:
+            if _order_is_abandoned(bb, order.get("id")):
+                continue
             for ing in book.requirements(order):
                 if ing in seen or book.needs_cooking(ing):
                     continue
                 seen.add(ing)
-                cands.append(Candidate(T.Prefetch(item=ing), [], EST_FETCH))
+                task = T.Prefetch(item=ing)
+                cands.append(Candidate(task, [], EST_FETCH,
+                                       branch=branch_of_task(task, book)))
     else:
         # 第 13 号 StashHeld：手里有无用物（feasible 再判）
         cands.append(Candidate(T.StashHeld(), [], EST_FETCH))
@@ -207,8 +278,9 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         for p in world.plates:
             pid = p.get("n")
             if pid and P.plate_count(p) == 0:
-                cands.append(Candidate(
-                    T.PlaceToRelay(item=pid), [], EST_FETCH))
+                task = T.PlaceToRelay(item=pid)
+                cands.append(Candidate(task, [], EST_FETCH,
+                                       branch=branch_of_task(task, book)))
 
     # 第 18 号 FillCooker：订单无关的填灶（第 1 组 1.1）。
     # 按单发射的 FetchToCooker 受「同单只发一个 + 灶↔单 1:1」限制，无法把
@@ -227,16 +299,16 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             # 炊具类型匹配（煮意面配炖锅、煎西红柿配煎锅）；灶上炊具未知时不过滤。
             if want and ck and not P.cookware_matches(ck, want):
                 continue
-            cands.append(Candidate(
-                T.FillCooker(None, (cid, tuple(raws)), item),
-                ["hands_empty"], EST_COOK_OPS))
+            task = T.FillCooker(None, (cid, tuple(raws)), item)
+            cands.append(Candidate(task, ["hands_empty"], EST_COOK_OPS,
+                                   branch=branch_of_task(task, book)))
 
     # 散锅回收：空灶 + 可捡的散锅（空/生）→ 捡锅上灶再下料（第 1 组 1.5）。
     for c, pot_name, item, raws in CS.recoverable_cookers(world, book):
         cid = P.resource_id(c)
-        cands.append(Candidate(
-            T.FillCooker(None, (cid, tuple(raws), pot_name), item),
-            ["hands_empty"], EST_COOK_OPS))
+        task = T.FillCooker(None, (cid, tuple(raws), pot_name), item)
+        cands.append(Candidate(task, ["hands_empty"], EST_COOK_OPS,
+                               branch=branch_of_task(task, book)))
 
     return cands
 
@@ -305,12 +377,37 @@ def _targets_moving_platform(task, ctx):
     return False
 
 
+def _is_stopped(task, bb):
+    # type: (Any, Blackboard) -> bool
+    """task 是否落在账本 `stop`（「先别做」）的硬压制里（spec §4.6）。
+
+    stop 条目编译成 `kind="stop"` 的偏好，按作用域命中、到期即失效。
+
+    **救援动作不受压制**：玩家说「先别煮饭」不等于「饭要糊了也别管」；
+    `TakeCookedToPlate` / `RescueCooked` / `ReturnPot` / `RecoverLoosePot` /
+    `Extinguish` 同理（spec §4.5 末段）。
+    """
+    if _is_rescue_action(task):
+        return False
+    tick = getattr(bb, "tick", 0) or 0
+    for pref in getattr(bb, "preferences", None) or ():
+        if getattr(pref, "kind", None) != "stop":
+            continue
+        expires = getattr(pref, "expires_tick", 0) or 0
+        if expires and tick >= expires:
+            continue
+        if preference_matches_task(pref, task):
+            return True
+    return False
+
+
 def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     # type: (Candidate, Dict, Blackboard, bool, Optional[float]) -> Tuple[bool, str]
     """判断单个候选是否可行，返回 (ok, 否决原因)。
 
     否决原因供 trace 排查：claimed（资源被他人认领）/ abandoned（L3 拉黑）
-    / infeasible（task.feasible() 为假）。ok=True 时原因为空串。
+    / p2_suppressed（账本 stop：玩家让先别做）/ infeasible（task.feasible()
+    为假）。ok=True 时原因为空串。
 
     ignore_abandon=True 给火情用：拉黑是按资源 id 记的，别的 task 在同一
     口灶上反复失败也会把着火的那口灶写进 scratch.abandoned（比如 Normal
@@ -321,6 +418,8 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
         return False, "claimed"
     if _targets_moving_platform(task, ctx):
         return False, "platform_moving"
+    if _is_stopped(task, bb):
+        return False, "p2_suppressed"
     if not ignore_abandon and _is_abandoned(task, bb):
         return False, "abandoned"
     if _is_doomed_investment(task, bb):
@@ -382,22 +481,25 @@ def _is_doomed_investment(task, bb):
     return doomed.get(oid, 0) > getattr(bb, "tick", 0)
 
 
-def mark_doomed_orders(world, bb, book, plate_match=None, cooker_match=None):
-    # type: (World, Blackboard, RecipeBook, Optional[Dict], Optional[Dict]) -> None
+def mark_doomed_orders(world, bb, book, plate_match=None, cooker_match=None,
+                       orders=None):
+    # type: (World, Blackboard, RecipeBook, Optional[Dict], Optional[Dict], Optional[List[Dict]]) -> None
     """算一遍 slack，把来不及的订单写进 bb.doomed_orders（带 TTL）。
 
     每拍在 plan() 开头调用。只**新增/续期**判死，不主动撤销——撤销靠 TTL
     自然过期，这样 slack 抖动不会让候选集抖动。
 
     入口同样有迟滞：要连续 DOOM_CONFIRM_TICKS 拍算出必死才真的写表，中间
-    任何一拍「有救」就把确认计数清零。
+    任何一拍「有救」就把确认计数清零。orders 显式传入时只排这些单（放弃的
+    单不该占队列容量）；缺省仍读 world.orders。
     """
     table = getattr(bb, "doomed_orders", None)
     if table is None:
         return
     tick = getattr(bb, "tick", 0)
     try:
-        doomed = ETA.doomed_order_ids(world, book, plate_match, cooker_match)
+        doomed = ETA.doomed_order_ids(world, book, plate_match, cooker_match,
+                                      orders=orders)
     except Exception:                       # noqa: BLE001
         return                              # 残帧算不出来就不判死（保守）
     streak = getattr(bb, "doom_streak", None)
@@ -737,9 +839,12 @@ def _pinned_plate_order(world, bb, book):
     return (pid, oid)
 
 
-def _match_plates_to_orders(world, bb, book):
-    # type: (World, Blackboard, RecipeBook) -> Dict[Any, Any]
+def _match_plates_to_orders(world, bb, book, orders=None):
+    # type: (World, Blackboard, RecipeBook, Optional[List[Dict]]) -> Dict[Any, Any]
     """盘↔订单 1:1 匹配（每拍重算、不写黑板）。返回 {plate_id: order_id}。
+
+    orders 显式传入时只用这些单（planner 传 `_dialog_live_orders`，避免被
+    放弃的单占住盘）；缺省仍读 world.orders。
 
     带成本的贪心边选取：边 (盘, 单) 兼容当且仅当 盘token ⊆ 单需求token，
     成本 missing = |单需求token − 盘token|。空盘 missing=整道菜，自然排最后、
@@ -749,7 +854,8 @@ def _match_plates_to_orders(world, bb, book):
     否则空盘会先配给「需求更少」的虾单、米饭单没盘 → 熟锅无盘可接 → 烧糊
     （实机复现：锅 4 米熟了却没人端，因为空盘全被虾单抢走）。
     """
-    orders = [o for o in world.orders if o.get("id") is not None]
+    raw_orders = orders if orders is not None else world.orders
+    orders = [o for o in raw_orders if o.get("id") is not None]
     if not orders:
         return {}
     want = {o["id"]: book.order_want_tokens(o) for o in orders}
@@ -894,9 +1000,12 @@ def _burn_eta_ticks(c):
     return max(0.0, (burn_at - prog) * TICKS_PER_SECOND)
 
 
-def _match_cookers_to_orders(world, bb, book, plate_match):
-    # type: (World, Blackboard, RecipeBook, Dict[Any, Any]) -> Dict[Any, Any]
+def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
+    # type: (World, Blackboard, RecipeBook, Dict[Any, Any], Optional[List[Dict]]) -> Dict[Any, Any]
     """熟料源↔订单 1:1 匹配（每拍重算）。返回 {source_id: order_id}。
+
+    orders 显式传入时只用这些单（同 `_match_plates_to_orders`）；缺省仍读
+    world.orders。
 
     源两类：
       - 灶上有料的锅（在煮/熟/糊/着火）：pot_contents 反查熟料名。在煮的
@@ -941,7 +1050,8 @@ def _match_cookers_to_orders(world, bb, book, plate_match):
     if not sources:
         return {}
     needy = {}  # type: Dict[str, List[Tuple[Any, Dict]]]
-    for o in world.orders:
+    raw_orders = orders if orders is not None else world.orders
+    for o in raw_orders:
         oid = o.get("id")
         if oid is None:
             continue
@@ -1003,27 +1113,46 @@ def plan(world, bb, order, book):
     返回 (chosen_task, decision_record)。decision_record 形如：
       {"candidates": [(task, score, terms, ok, veto, chosen, layer, in_top_layer), ...],
        "top_layer": int | None,
-       "layers": {str(task.key): layer}}
+       "layers": {str(task.key): layer},
+       "branches": {str(task.key): 生料名 | None}}
     与 trace._format_candidates 的入参格式一致（spec §8.3 决策可观测性）。
     尾部两项由分层添加：layer 是该候选所在层，in_top_layer 标记它是否进了打分
-    （spec §6）。plan_firefighting 不分层，仍发 6 元组。
+    （spec §6）。`top_layer` 是**实际选中**的层：本层全被认领且截止闸没开时
+    会逐层向下掉（spec §4.6）。闸被打开且抢到的候选还会写 `rescue_override`
+    （订单 id）。plan_firefighting 不分层，仍发 6 元组。
 
     candidates 含**全部**生成候选：被可行性过滤掉的（ok=False）也保留，
     并用 veto 标注被否决原因，方便复盘「为什么没选拿熟饭」。
     """
+    # ⓪ 玩家认领/派活命中当前承诺 → 立刻放弃承诺（spec §4.6）。
+    # 必须在生成候选之前：否则本拍的候选仍会围绕旧承诺打分。
+    _clear_claimed_commitment(bb)
+    # ⓪.1 抢回保护期只保护「还在执行的那个 task」：承诺已清（做完/失败/
+    # 被换掉）或保护期已过就释放，别把一条旧 hold 带进下一轮。
+    _release_stale_rescue_hold(bb)
+
+    # ⓪.5 放弃的订单是整单硬排除：匹配、判死队列、打分 slack 都只算活单，
+    # 否则它会替活单占掉 1:1 盘/灶匹配或队列容量。
+    live_orders = _dialog_live_orders(world, bb)
+
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
-    plate_match = _match_plates_to_orders(world, bb, book)
-    cooker_match = _match_cookers_to_orders(world, bb, book, plate_match)
+    plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
+    cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
+                                            orders=live_orders)
 
     # ①.5 判死（第 2 组 2.3）：算 slack，把来不及的单写进黑板（带 TTL 迟滞）。
     # 必须在可行性过滤之前——否决必死单的新投入，把手让给能救的单。
-    mark_doomed_orders(world, bb, book, plate_match, cooker_match)
+    mark_doomed_orders(world, bb, book, plate_match, cooker_match,
+                       orders=live_orders)
 
     # ② 生成候选（多订单模式：枚举所有订单）
     candidates = generate_candidates(world, bb, order, book,
                                      plate_match, cooker_match)
     if not candidates:
-        return None, _record([], plate_match, cooker_match)
+        _finalize_rescue_hold(bb, None)
+        record = _record([], plate_match, cooker_match)
+        record["branches"] = {}
+        return None, record
 
     # ③ 可行性过滤（同时记下每个候选的否决原因）
     ctx = _make_context(world, bb, book)
@@ -1040,14 +1169,18 @@ def plan(world, bb, order, book):
     score_map = {}      # type: Dict[Any, Tuple[float, Dict]]
     top_layer = None    # type: Optional[int]
     layer_map = {}      # type: Dict[Any, int]
+    in_layer = []       # type: List[Candidate]
+    rescue_order = None  # type: Optional[Any]
     if feasible:
-        # ③.5 分层（spec §6）：只有最高层的候选进入打分。
+        # ③.5 分层（spec §6）。**层判定不变**，只是选择集合从「最高层的
+        # 全部候选」换成「第一个还有未认领候选的层」——本层全被 claim/
+        # assign 认领时逐层向下掉（spec §4.6 fallthrough）。
         #
         # 层是**派生值**——每拍从 feasible 重算。所以「高层动作不可达」
         # （盘被 P1 拿走 / 锅被端走）自然表现为该候选从 feasible 消失、
         # top_layer 自己掉下来，不需要降层动作或失效检测（spec §8.1）。
         from ai.core.planner_layers import layer_filter
-        top_layer, in_layer, layer_map = layer_filter(feasible, world)
+        _ignored_top, _ignored_in_layer, layer_map = layer_filter(feasible, world)
 
         # ④ 打分选择
         # 打分读**独立** slack，不读队列累计 slack：后者是判死口径，队尾单
@@ -1055,8 +1188,29 @@ def plan(world, bb, order, book):
         # 实机 trace-20261014-204822 有 94% 的可比候选组（3516/3745）urgency
         # 与到期顺序反向；t=890 选了到期最晚、盘里还空的 order#3，放着盘里
         # 已有米饭的 order#1 不管。
+        #
+        # slack_map 必须在选层之前算好：选层要用它当截止闸的 cushion
+        # （spec §4.6）。
         slack_map = ETA.solo_slack_by_order(world, book, plate_match,
-                                            cooker_match)
+                                            cooker_match, orders=live_orders)
+        top_layer, in_layer = _select_layer(
+            feasible, world, layer_map, bb, slack_map, bb.tick)
+
+        # 闸只对「本来会被认领负分压掉」的候选生效。记下它们对应的订单，
+        # 选中后写冷却与对话事件（让 Agent 能转告玩家「这单要来不及了」）。
+        gate_orders = {}  # type: Dict[Any, Any]
+        for cand in in_layer:
+            if _claim_penalty(cand, bb, top_layer) >= 0:
+                continue
+            cushion = _candidate_cushion(cand, world, slack_map)
+            if _rescue_gate_open(cand, cushion, bb, bb.tick):
+                # 不绑订单的 housekeeping 用最紧的那张单代言（上下文里报菜名）
+                oid = _effective_order_id(world, cand.task)
+                if oid is None:
+                    oid = _tightest_order(slack_map)
+                if oid is not None:
+                    gate_orders[cand.task.key] = oid
+
         scored = _score_tasks([c.task for c in in_layer], in_layer, world, bb,
                               book, plate_match, slack_map, cooker_match,
                               top_layer)
@@ -1068,23 +1222,39 @@ def plan(world, bb, order, book):
             chosen_task = _apply_commitment_inertia(scored, world, bb)
             score_map = {task.key: (score, terms)
                          for task, score, terms in scored}
+            rescue_order = gate_orders.get(getattr(chosen_task, "key", None))
+            if rescue_order is not None:
+                bb.rescue_cooldown_until = bb.tick + 100
+                bb.dialog.pending_event = ("rescue", rescue_order)
+                # 闸只开一瞬。把抢回的 task 钉住 200 拍（= task 超时），
+                # 让它在冷却期内继续参与选择、且不被同一条 claim 清掉。
+                # 只钉这一个 task：别的单仍受全局冷却约束。
+                bb.dialog.rescue_task_key = chosen_task.key
+                bb.dialog.rescue_hold_until = bb.tick + 200
 
     chosen_key = getattr(chosen_task, "key", None)
+    scored_keys = set(c.task.key for c in in_layer)
     record_cands = []
     for cand in candidates:
         key = cand.task.key
         ok, veto = ok_map[key]
         score, terms = score_map.get(key, (0.0, {}))
         # layer / in_top_layer 让 trace 能区分「这个候选被否决了」与「它
-        # 可行但层不够高」——分层最大的可观测性收益（spec §6）。
+        # 可行但层不够高（或被认领且闸没开）」——分层最大的可观测性收益
+        # （spec §6）。
         layer = layer_map.get(key)
         record_cands.append((cand.task, score, terms, ok, veto,
                              key == chosen_key, layer,
-                             layer is not None and layer == top_layer))
+                             key in scored_keys))
 
     record = _record(record_cands, plate_match, cooker_match)
     record["top_layer"] = top_layer
     record["layers"] = {str(k): v for k, v in layer_map.items()}
+    record["branches"] = {str(c.task.key): c.branch for c in candidates}
+    if rescue_order is not None:
+        record["rescue_override"] = rescue_order
+    # 本拍没再选抢回的那个 task（做完 / 不可行 / 被更高层抢走）→ 保护期结束。
+    _finalize_rescue_hold(bb, chosen_task)
     return chosen_task, record
 
 
@@ -1178,6 +1348,289 @@ def _score_tasks(tasks, candidates, world, bb, book=None, plate_match=None,
     return scored
 
 
+def _matching_preferences(candidate, bb, layer):
+    # type: (Candidate, Blackboard, Optional[int]) -> List[Tuple[Any, float]]
+    """命中候选、且未被免疫规则跳过的 (preference, weight)（spec §4.5）。
+
+    - 过期的 preference 跳过（非零 `expires_tick` 且 `bb.tick >= expires_tick`，
+      与 `prune_expired_preferences` 同界：到期那一拍即失效）；
+    - 匹配走 schema.preference_matches_task 的优先级规则；
+    - 负分在 L0/L1/L2 与救援类上整体跳过，正分照常生效。
+
+    纯读：不在打分路径里删 preference（清理归 Task 12 / Agent）。
+    """
+    task = candidate.task
+    tick = getattr(bb, "tick", 0) or 0
+    immune = layer in (0, 1, 2) or task.TYPE in RESCUE_TYPES
+    out = []  # type: List[Tuple[Any, float]]
+    for pref in getattr(bb, "preferences", None) or ():
+        expires = getattr(pref, "expires_tick", 0) or 0
+        if expires and tick >= expires:
+            continue
+        if not preference_matches_task(pref, task):
+            continue
+        weight = float(getattr(pref, "weight", 0.0) or 0.0)
+        if weight < 0 and immune:
+            continue
+        out.append((pref, weight))
+    return out
+
+
+def _preference_score(candidate, bb, layer):
+    # type: (Candidate, Blackboard, Optional[int]) -> float
+    """偏好权重项：命中候选的 role/claim/assign/direct 之和（spec §4.5）。"""
+    return sum(weight for _pref, weight
+               in _matching_preferences(candidate, bb, layer))
+
+
+def _claim_penalty(candidate, bb, layer):
+    # type: (Candidate, Blackboard, Optional[int]) -> float
+    """候选身上的认领负分（spec §4.6 截止闸用）。
+
+    只汇总负的 claim：direct 的「让 P2 做」不是认领冲突，不应影响「本层
+    是否全被认领」的判断。
+    """
+    return sum(weight for pref, weight
+               in _matching_preferences(candidate, bb, layer)
+               if getattr(pref, "kind", None) == "claim" and weight < 0)
+
+
+# ---------- 截止闸与层内 fallthrough（spec §4.6）----------
+
+def _rescue_margin_ticks(task_type):
+    # type: (Any) -> int
+    """截止闸的余量（拍）：5 秒起步、长链封顶 10 秒（spec §4.6）。
+
+    `D` 是「做完这个动作、再送到出餐口」的耗时。DeliverPlate 本身就是
+    送餐，不再加送餐段；其它动作都要留出 `COST_DELIVER`。
+    """
+    d = ETA.task_cost_ticks(task_type)
+    if task_type != "DeliverPlate":
+        d += ETA.COST_DELIVER
+    return int(max(100, min(int(0.3 * d), 200)))
+
+
+def _rescue_gate_open(candidate, cushion, bb, tick=None):
+    # type: (Candidate, Optional[float], Blackboard, Optional[int]) -> bool
+    """截止闸（spec §4.6）：还等得起就尊重认领，只有最后窗口才允许抢。
+
+    `cushion` 是 `ETA.solo_slack_by_order` 的**独立 slack**（剩余拍 − 该单
+    完整 solo ETA），不是剩余时间。不要再减一次 D——ETA 已经扣过了，重复
+    扣会让闸永远不会开。
+
+    `cushion < 0` 是必死单，不为它抢；`cushion` 为 None（算不出 / 订单
+    不在 slack_map 里）同样关闸，宁可不抢也不要用错的量级。
+    """
+    if cushion is None:
+        return False
+    now = (getattr(bb, "tick", 0) or 0) if tick is None else tick
+    if now <= getattr(bb, "rescue_cooldown_until", 0):
+        return False
+    margin = _rescue_margin_ticks(getattr(candidate.task, "TYPE", None))
+    return 0 <= cushion < margin
+
+
+def _effective_order_id(world, task):
+    # type: (World, Any) -> Any
+    """候选求值用的订单 id（spec §10，见 `_credited_order_id`）。
+
+    送餐记给游戏实际会记账的那一单，不是 task 绑的那单；其它 task 用
+    自己绑的 order_id。打分与截止闸必须共用这一条，否则闸会对着一个
+    游戏根本不会结算的订单开。
+    """
+    order_id = getattr(task, "order_id", None)
+    if getattr(task, "TYPE", None) == "DeliverPlate" and order_id is not None:
+        credited = _credited_order_id(
+            world.orders, _dish_of_order(world.orders, order_id))
+        if credited is not None:
+            return credited
+    return order_id
+
+
+def _candidate_cushion(candidate, world, slack_map):
+    # type: (Candidate, World, Optional[Dict[Any, float]]) -> Optional[float]
+    """候选对应订单的独立 slack（拍）；订单不在表里返回 None。
+
+    不绑订单的候选（洗盘 / 填灶 / 预取等 housekeeping）取**最紧的活单**
+    slack：它们服务于所有订单，玩家认领后迟迟不做时，截止闸要能按最急
+    的那张单把活抢回来，否则「我来洗碗」之后盘子耗尽、全部订单一起饿死。
+    已判死（slack < 0）的单不参与，与按单的口径一致。
+    """
+    oid = _effective_order_id(world, candidate.task)
+    if oid is not None:
+        return (slack_map or {}).get(oid)
+    live = [v for v in (slack_map or {}).values()
+            if v is not None and v >= 0]
+    return min(live) if live else None
+
+
+def _tightest_order(slack_map):
+    # type: (Optional[Dict[Any, float]]) -> Any
+    """slack 最小（且没判死）的订单 id；没有返回 None。"""
+    live = [(v, oid) for oid, v in (slack_map or {}).items()
+            if v is not None and v >= 0]
+    return min(live, key=lambda r: r[0])[1] if live else None
+
+
+def _rescue_hold_live(bb, task, tick=None):
+    # type: (Blackboard, Any, Optional[int]) -> bool
+    """这个 task 是否处在截止闸抢回后的保护期内（spec §4.6）。
+
+    闸只在最后窗口开一瞬，冷却期内同一 task 的 claim 仍然有效。若没有
+    保护期，下一拍 `_select_layer` 会把它排除、`_clear_claimed_commitment`
+    又会按同一条 claim 清掉 active_task —— "抢回"只维持一拍。
+    """
+    if task is None:
+        return False
+    dialog = getattr(bb, "dialog", None)
+    if dialog is None:
+        return False
+    key = getattr(dialog, "rescue_task_key", None)
+    if key is None or getattr(task, "key", None) != key:
+        return False
+    now = (getattr(bb, "tick", 0) or 0) if tick is None else tick
+    return now < (getattr(dialog, "rescue_hold_until", 0) or 0)
+
+
+def _clear_rescue_hold(bb):
+    # type: (Blackboard) -> None
+    """释放抢回保护期。"""
+    dialog = getattr(bb, "dialog", None)
+    if dialog is None:
+        return
+    dialog.rescue_task_key = None
+    dialog.rescue_hold_until = 0
+
+
+def _release_stale_rescue_hold(bb):
+    # type: (Blackboard) -> None
+    """起拍清理：抢回的 task 已不是当前承诺（做完 / 失败 / 被换掉）或
+    保护期已过 → 释放，让选择回到正常认领规则。"""
+    dialog = getattr(bb, "dialog", None)
+    if dialog is None or getattr(dialog, "rescue_task_key", None) is None:
+        return
+    commitment = getattr(bb, "commitment", None)
+    active = getattr(commitment, "active_task", None) if commitment else None
+    if not _rescue_hold_live(bb, active):
+        _clear_rescue_hold(bb)
+
+
+def _finalize_rescue_hold(bb, chosen_task):
+    # type: (Blackboard, Optional[Any]) -> None
+    """选完 task 之后：本拍没再选它 → 保护期结束（任务已完成或被换掉）。"""
+    dialog = getattr(bb, "dialog", None)
+    if dialog is None or getattr(dialog, "rescue_task_key", None) is None:
+        return
+    if chosen_task is None \
+            or getattr(chosen_task, "key", None) != dialog.rescue_task_key:
+        _clear_rescue_hold(bb)
+
+
+def _select_layer(feasible, world, layer_map, bb, slack_map, tick):
+    # type: (List[Candidate], World, Dict[Any, int], Blackboard, Optional[Dict[Any, float]], int) -> Tuple[Optional[int], List[Candidate]]
+    """按层向下找第一个还有「未被认领」候选的层（spec §4.6）。
+
+    层内 eligibility：
+      - `_claim_penalty >= 0`（没有被认领/派活负分）；
+      - 或者截止闸开着（本层全被认领、但有单进入最后窗口）；
+      - 或者是闸抢回后仍处在保护期内的那个 task（闸/冷却已关，但它还没
+        做完——否则抢回只维持一拍）。
+
+    **逐层向下**，不是只掉一层：本层全部候选都被认领且没有单要丢时，
+    继续看下一层，直到找到可用层或没有可行候选。
+
+    返回 `(选中的层, 该层可用候选)`；全层都不可用返回 `(None, [])`。
+    候选顺序保持 `feasible` 的原顺序——下游同分时靠稳定排序决定胜者。
+    """
+    by_layer = {}  # type: Dict[int, List[Candidate]]
+    for cand in feasible:
+        layer = layer_map.get(cand.task.key)
+        if layer is None:
+            continue
+        by_layer.setdefault(layer, []).append(cand)
+
+    for layer in sorted(by_layer):
+        eligible = []  # type: List[Candidate]
+        for cand in by_layer[layer]:
+            if _claim_penalty(cand, bb, layer) >= 0:
+                eligible.append(cand)
+                continue
+            if _rescue_hold_live(bb, cand.task, tick):
+                eligible.append(cand)
+                continue
+            cushion = _candidate_cushion(cand, world, slack_map)
+            if _rescue_gate_open(cand, cushion, bb, tick):
+                eligible.append(cand)
+        if eligible:
+            return layer, eligible
+    return None, []
+
+
+def _clear_claimed_commitment(bb):
+    # type: (Blackboard) -> None
+    """硬意图命中当前承诺 → 立刻放弃当前 task（spec §4.6）。
+
+    三种来源都算硬意图，不走 3 拍承诺惯性宽限：
+      1. 玩家的 `claim` 负分命中（认领到了就停手）；
+      2. 当前 task 落在账本 `stop` 的作用域里；
+      3. 当前 task 属于被放弃的订单（`abandoned_orders`）。
+
+    只清 `active_task` 与 `infeasible_streak`，**不替换 Commitment 对象**：
+    Executor / Arbiter 持有它的引用并继续写 steps_done / retries，换成新对象
+    会让那些写入落到孤儿上。已到期的 preference / 排除表与正分（direct
+    的正向鼓励）不触发放弃。
+
+    **L0–L2 救援动作免疫**：`RESCUE_TYPES`、`Extinguish`、
+    `TakeCookedToPlate` 一律不清——玩家说「先别煮饭」不等于「饭要糊了也别
+    管」（spec §4.5 末段）。
+
+    **截止闸抢回保护期**：`bb.dialog` 里记着被闸抢回的 task key 时，它在
+    保护期内同样不清——否则冷却期一开、同一条 claim 又命中，抢回的 task
+    下一拍就没了（spec §4.6）。
+    """
+    commitment = getattr(bb, "commitment", None)
+    active = getattr(commitment, "active_task", None) if commitment else None
+    if active is None:
+        return
+    # 截止闸抢回的 task 在保护期内不吃 claim：闸只开一瞬、冷却期内
+    # 同一条 claim 仍然有效，放开就会被清掉，"抢回"退化成装饰。
+    if _rescue_hold_live(bb, active):
+        return
+    if _is_rescue_action(active):
+        return
+    if _is_stopped(active, bb) \
+            or _order_is_abandoned(bb, getattr(active, "order_id", None)):
+        commitment.active_task = None
+        commitment.infeasible_streak = 0
+        return
+    tick = getattr(bb, "tick", 0) or 0
+    for pref in getattr(bb, "preferences", None) or ():
+        if getattr(pref, "kind", None) != "claim":
+            continue
+        if float(getattr(pref, "weight", 0.0) or 0.0) >= 0:
+            continue
+        expires = getattr(pref, "expires_tick", 0) or 0
+        if expires and tick >= expires:
+            continue
+        if preference_matches_task(pref, active):
+            commitment.active_task = None
+            commitment.infeasible_streak = 0
+            return
+
+
+def _is_rescue_action(task):
+    # type: (Any) -> bool
+    """是否属于 L0–L2 的救援动作（不吃 claim/assign，也不被硬压制清承诺）。
+
+    除 `RESCUE_TYPES` 外还要带上 `Extinguish`（L0 灭火）与
+    `TakeCookedToPlate`（L1/L2 端熟料/救锅）——它们没有收进
+    `RESCUE_TYPES`，但 spec §4.6 同样豁免。
+    """
+    task_type = getattr(task, "TYPE", None)
+    return task_type in RESCUE_TYPES or task_type in (
+        "Extinguish", "TakeCookedToPlate")
+
+
 def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                      slack_map=None, cooker_match=None, layer=None):
     # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
@@ -1192,13 +1645,8 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # 送餐的「有效订单」是游戏会记账的那一单，不是 task 绑的那个（实测 55/0：
     # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 新鲜度 / 完成度都该
     # 按它求值——否则同一盘菜绑给不同 order_id 会算出不同分数，而实机行为完全
-    # 一样，纯属自欺。见 _credited_order_id。
-    effective_order_id = task.order_id
-    if task.TYPE == "DeliverPlate" and task.order_id is not None:
-        credited = _credited_order_id(
-            world.orders, _dish_of_order(world.orders, task.order_id))
-        if credited is not None:
-            effective_order_id = credited
+    # 一样，纯属自欺。见 _credited_order_id / _effective_order_id。
+    effective_order_id = _effective_order_id(world, task)
 
     # ① 订单紧迫：读 slack（remaining - ETA）而非裸 remaining（第 3 组 3.1）。
     # 旧曲线 W_URGENCY/remaining 在 60s 处只有 0.08、100s 处 0.05，中段分不出
@@ -1381,6 +1829,11 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
         terms["no_plate_placed"] = W_NO_PLATE_PLACED
     else:
         terms["no_plate_placed"] = 0.0
+
+    # ⑱ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
+    # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；
+    # layer=None（扁平老路）时照常全量求和。
+    terms["pref"] = _preference_score(candidate, bb, layer)
 
     # 总分 = terms 的和。**不要**改回手写加法：旧版把 16 项重抄一遍、还混用
     # 局部变量与 terms[...]，加一项要改两处；漏掉求和那处的症状是「trace 里

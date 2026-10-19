@@ -31,7 +31,15 @@ Windows 最新运行见 `../notes/windows-live-validation-2026-10-19.md`：已�
 
 ## 2. 当前状态
 
-分支 `feat/bt-opt`，全量测试 **1184 passed, 77 skipped**。
+分支 `feat/voice-dialog-interaction-v2`（语音对话 worktree），全量测试 **1498 passed, 80 skipped**。
+
+**语音对话（2026-10-19 实机验证）**：
+
+- TTS 2.0（`seed-tts-2.0` + `zh_female_vv_uranus_bigtts`）、ASR 2.0（`volc.seedasr.sauc.duration`）、方舟 plan 端点（`/api/plan/v3`）均已用真实 key 跑通；游戏内 `ASR → LLM → 命令 ack → TTS` 完整链路验证通过。
+- 输入切句推荐 **PTT**：`OC2_VOICE_PTT_KEY=f8`，按住录音、松开发送，一次按住只触发一轮对话。macOS 笔记本默认 F8 是媒体键，需要 Fn+F8 或启用「标准功能键」。
+- **已知限制**：`run_game.sh` 直接启动游戏，Steam Input 的“游戏布局”不保证生效，手柄按钮映射到 F8 尚未在游戏内验证；需要时改用 Steam 桌面布局或实现原生手柄监听（未实现）。
+- 方舟 plan key 必须配 `ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3`；普通 key 用 `/api/v3`。`OC2_LLM_TIMEOUT` 默认 10s，3s 会频繁超时。
+- 实机环境默认输入曾是 AirPods，PortAudio 报 `-10863` 且会阻塞；改用 MacBook 麦克风/扬声器后正常。v1 仍只用系统默认音频设备。
 
 **2026-10-16 修的三个实机卡死**（都是「可行性算对了、动作发不出去」一类）：
 

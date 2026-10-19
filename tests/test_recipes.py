@@ -66,6 +66,44 @@ def test_requirements_unknown_order_is_empty():
     assert book().requirements(None) == ()
 
 
+# ---------- 分支归一（dialog 分支作用域，spec §4.5）----------
+
+def test_ingredient_branch_maps_cooked_rice():
+    assert book().ingredient_branch("BoiledSushiRice") == "SushiRice"
+
+
+def test_ingredient_branch_maps_chopped_cucumber():
+    assert book().ingredient_branch("ChoppedCucumber") == "Cucumber"
+
+
+def test_ingredient_branch_keeps_raw_name():
+    assert book().ingredient_branch("Cucumber") == "Cucumber"
+
+
+def test_ingredient_branch_unknown_identity():
+    assert book().ingredient_branch("UnknownItem") == "UnknownItem"
+
+
+def test_ingredient_branch_empty_is_none():
+    b = book()
+    assert b.ingredient_branch(None) is None
+    assert b.ingredient_branch("") is None
+
+
+def test_ingredient_branch_multi_raw_cooked_keeps_cooked_name():
+    """spec §4.5：多生料的熟料节点取熟料名本身作 branch，不拆成单个生料。"""
+    b = R.RecipeBook(RECIPES + [
+        {"name": "MultiCooked", "t": "CookedCompositeOrderNode",
+         "comp": ["RawA", "RawB"], "cook": "Pot"},
+        {"name": "RawA", "t": "IngredientOrderNode", "comp": [],
+         "cook": "null"},
+        {"name": "RawB", "t": "IngredientOrderNode", "comp": [],
+         "cook": "null"},
+    ])
+    assert b.ingredient_branch("MultiCooked") == "MultiCooked"
+    assert b.ingredient_branch("BoiledSushiRice") == "SushiRice"
+
+
 def test_needs_cooking():
     b = book()
     assert b.needs_cooking("BoiledSushiRice") is True
@@ -235,6 +273,63 @@ def test_case_insensitive_lookups():
     b = book()
     assert b.chop_target("cucumber") == "ChoppedCucumber"
     assert b.needs_cooking("boiledsushirice") is True
+
+
+# ---------- 配方自带 chop（新插件：切配信息随配方下发，不依赖箱子）----------
+
+# 模拟新插件输出：叶子节点带 chop/chop_stages，chop 不可切时写 "null"。
+RECIPES_WITH_CHOP = [
+    {"name": "Sushi_Fish", "t": "CompositeOrderNode",
+     "comp": ["Seaweed", "BoiledSushiRice", "SushiFish"], "cook": "null"},
+    {"name": "BoiledSushiRice", "t": "CookedCompositeOrderNode",
+     "comp": ["SushiRice"], "cook": "Pot", "plate": "CompositeSushi"},
+    {"name": "Seaweed", "t": "IngredientOrderNode", "comp": [],
+     "cook": "null", "plate": "CompositeSushi", "chop": "null",
+     "chop_stages": "null"},
+    {"name": "SushiFish", "t": "IngredientOrderNode", "comp": [],
+     "cook": "null", "plate": "CompositeSushi",
+     "chop": "ChoppedSushiFish", "chop_stages": "8"},
+    {"name": "SushiRice", "t": "IngredientOrderNode", "comp": [],
+     "cook": "null", "plate": "null", "chop": "null", "chop_stages": "null"},
+]
+
+
+def test_chop_target_from_recipe_without_crate():
+    """1-6 鱼只走传送带、没有箱子：chop 信息必须来自配方字段本身。"""
+    b = R.RecipeBook(RECIPES_WITH_CHOP, [])
+    assert b.chop_target("SushiFish") == "ChoppedSushiFish"
+    assert b.chop_stages("SushiFish") == 8
+    assert b.needs_chopping("SushiFish") is True
+    assert b.chop_target("Seaweed") is None
+    assert b.chop_target("SushiRice") is None
+
+
+def test_recipe_chop_takes_priority_over_crate():
+    """配方字段优先；箱子只兜底旧帧。配方明确说不可切时不被箱子带偏。"""
+    recipes = RECIPES_WITH_CHOP + [
+        {"name": "Cucumber", "t": "IngredientOrderNode", "comp": [],
+         "cook": "null", "chop": "null", "chop_stages": "null"},
+    ]
+    stations = [{"t": "crate", "ing": "Cucumber",
+                 "chop": "ChoppedCucumber", "chop_stages": 8}]
+    b = R.RecipeBook(recipes, stations)
+    assert b.chop_target("Cucumber") is None
+    assert b.needs_chopping("Cucumber") is False
+
+
+def test_crate_fallback_when_recipe_has_no_chop_field():
+    """旧插件配方没有 chop 字段：退回箱子，原有行为不变。"""
+    b = R.RecipeBook(RECIPES, STATIONS)
+    assert b.chop_target("SushiFish") == "ChoppedSushiFish"
+    assert b.chop_stages("Cucumber") == 8
+
+
+def test_ingredient_branch_chop_without_crate():
+    """分支归一也走配方 chop：无箱子时 ChoppedSushiFish 仍折回 SushiFish。"""
+    b = R.RecipeBook(RECIPES_WITH_CHOP, [])
+    assert b.ingredient_branch("ChoppedSushiFish") == "SushiFish"
+    assert b.ingredient_branch("SushiFish") == "SushiFish"
+    assert b.ingredient_branch("BoiledSushiRice") == "SushiRice"
 
 
 # ---------- 找料 ----------

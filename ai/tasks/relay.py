@@ -38,6 +38,9 @@ class PlaceToRelay(Task):
     """
 
     TYPE = "PlaceToRelay"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把东西放到中转台交给对面"
+    LABEL = "放中转台"
     HANDS = "empty"
 
     def claims(self):

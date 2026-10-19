@@ -283,8 +283,8 @@ def _too_fresh_to_doom(order):
     return remaining / lifetime > DOOM_FRESHNESS_FLOOR
 
 
-def order_queue(world, book, plate_match=None, cooker_match=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict]) -> List[OrderETA]
+def order_queue(world, book, plate_match=None, cooker_match=None, orders=None):
+    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> List[OrderETA]
     """按最早截止（EDF）排队后，算每单的累计完工时刻与 slack。
 
     为什么必须排队：P2 只有一双手，每单单独算都「来得及」是幻觉。本局
@@ -292,8 +292,12 @@ def order_queue(world, book, plate_match=None, cooker_match=None):
 
     P1 的产能不计入：本局 P1 整局只移动 55 拍、几乎站桩，按两人算会系统性
     乐观。等 p1_model 能给出可信的活跃度，再按它折扣这里的累计工时。
+
+    orders 显式传入时只排这些单（planner 传「未被放弃」的列表）；缺省仍读
+    world.orders，保持既有调用点不变。
     """
-    orders = list(getattr(world, "orders", None) or ())
+    raw = orders if orders is not None else getattr(world, "orders", None)
+    orders = list(raw or ())
     if not orders:
         return []
     orders.sort(key=lambda o: (_remaining_of(o), str(o.get("id"))))
@@ -321,27 +325,32 @@ def order_queue(world, book, plate_match=None, cooker_match=None):
     return rows
 
 
-def doomed_order_ids(world, book, plate_match=None, cooker_match=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict]) -> List[Any]
+def doomed_order_ids(world, book, plate_match=None, cooker_match=None,
+                     orders=None):
+    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> List[Any]
     """来不及做完的订单 id。可行性层据此停止投入（别再给它备料）。"""
     return [r.order_id
-            for r in order_queue(world, book, plate_match, cooker_match)
+            for r in order_queue(world, book, plate_match, cooker_match,
+                                 orders=orders)
             if r.doomed]
 
 
-def slack_by_order(world, book, plate_match=None, cooker_match=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict]) -> Dict[Any, float]
+def slack_by_order(world, book, plate_match=None, cooker_match=None,
+                   orders=None):
+    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> Dict[Any, float]
     """{order_id: 队列累计 slack（拍）}。**判死口径**。
 
     打分不要用它：队尾单背着全队工时，slack 必然最小，拿它当紧迫度会得出
     「排得越后越紧急」（实机 94% 的候选组倒挂）。打分走 solo_slack_by_order。
     """
     return {r.order_id: r.slack
-            for r in order_queue(world, book, plate_match, cooker_match)}
+            for r in order_queue(world, book, plate_match, cooker_match,
+                                 orders=orders)}
 
 
-def solo_slack_by_order(world, book, plate_match=None, cooker_match=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict]) -> Dict[Any, float]
+def solo_slack_by_order(world, book, plate_match=None, cooker_match=None,
+                        orders=None):
+    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> Dict[Any, float]
     """{order_id: 独立 slack（拍）}。打分的 urgency 口径。
 
     只看这一单自己的关键路径，不含别单占用 —— 于是同款菜下它对 remaining
@@ -349,4 +358,5 @@ def solo_slack_by_order(world, book, plate_match=None, cooker_match=None):
     累计 slack 恰好把那个结论**反向**排列。
     """
     return {r.order_id: r.solo_slack
-            for r in order_queue(world, book, plate_match, cooker_match)}
+            for r in order_queue(world, book, plate_match, cooker_match,
+                                 orders=orders)}

@@ -63,6 +63,27 @@ class Approach(Primitive):
         self._oscillating = False
         self._last_dir = None
 
+    def needs_reapproach(self, ctx):
+        # type: (Dict) -> bool
+        """按键前若被推离交互区域，交给移动阶段重新接近当前目标。"""
+        w, chef = ctx['w'], ctx['chef']
+        st = resolve(self.target, ctx)
+        cell = target_cell(st, ctx)
+        cur = P.chef_cell(chef, w.to_grid)
+        if cell is None or cur is None:
+            return True
+        if cur == cell and (w.walkable(*cell) or P.interact_ready(chef, st, self.kind, w.to_grid)):
+            return False
+        footprint = {cell}
+        if st.get('t') == PLATE_STATION:
+            footprint = O.station_block_cells(st, getattr(w, 'terrain', {}),
+                                               getattr(w, 'mapping', None)) or footprint
+        elif st.get('t') == 'washing' and self.kind == 'placement':
+            footprint = sink_place_cells(st, w.stations, w.to_grid)
+        goals = navigation.interact_cells_multi(footprint, w.walkable,
+                                                w.belt_cells, include_belts=True)
+        return cur not in goals
+
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
@@ -116,7 +137,12 @@ class Approach(Primitive):
         soft = ctx.get("soft_cost")
         # 传资源 id：除了全局拉黑的格，还要避开「这一格对这个目标用不了」
         # 的二元拉黑（AlignToCell 写，见 blackboard.StuckScratch.bad_pairs）。
-        blocked = _blocked_cells(ctx, P.resource_id(st))
+        unusable_goals = _blocked_cells(ctx, P.resource_id(st))
+        blocked = _blocked_cells(ctx)
+        # 目标局部重寻路也必须保留本拍的移动平台隔离，不能因坏站位重算而
+        # 重新开放正在远离的篮子（主场已排除它，局部场不能反向放开）。
+        blocked |= set(ctx.get('navigation_blocked') or ())
+        unusable_goals |= blocked
         if blocked:
             field = navigation.distance_field(
                 cur, w.walkable, w.belt_dir, blocked, soft_cost=soft,
@@ -158,8 +184,8 @@ class Approach(Primitive):
             goals = [cell]
 
         got = ((self._goal, field[self._goal])
-               if self._goal in goals and self._goal in field and self._goal not in blocked
-               else navigation.nearest_cost(field, [g for g in goals if g not in blocked]))
+               if self._goal in goals and self._goal in field and self._goal not in unusable_goals
+               else navigation.nearest_cost(field, [g for g in goals if g not in unusable_goals]))
         if got is None:
             # 非传送带交互位全不可达 → 放回传送带位再试。站在传送带上会被
             # 推走，交互由 TapWhileHolding 顶住反向键兜底（spec §7.2），
@@ -167,8 +193,8 @@ class Approach(Primitive):
             goals = navigation.interact_cells_multi(
                 interact_cells_src, w.walkable, w.belt_cells, include_belts=True)
             got = ((self._goal, field[self._goal])
-                   if self._goal in goals and self._goal in field and self._goal not in blocked
-                   else navigation.nearest_cost(field, [g for g in goals if g not in blocked]))
+                   if self._goal in goals and self._goal in field and self._goal not in unusable_goals
+                   else navigation.nearest_cost(field, [g for g in goals if g not in unusable_goals]))
         if got is None:
             hands.set_move(None)
             return Status.FAILURE      # 不可达 → 交还 Planner
@@ -187,7 +213,8 @@ class Approach(Primitive):
                 self._motion = MotionControl()
                 self._oscillating = False
                 self._last_dir = None
-        path = navigation.trace_back(field, self._goal, w.belt_dir, soft)
+        path = navigation.trace_back(field, self._goal, w.belt_dir, soft,
+                                     edge_blocked=getattr(w, "edge_blocked", None))
         if not path:
             hands.set_move(None)
             return Status.FAILURE
@@ -217,10 +244,10 @@ class Approach(Primitive):
         # 导致永远检不出来。
         if d is not None:
             if len(path) <= 3:
-                # 震荡检测暂时注释掉（实机：捡脚下散料时 left/right 折返，
-                # 一触发就短按停稳、卡住恼火）。后续重新设计震荡处理再启用。
-                # if self._last_dir is not None and d == OPPOSITE.get(self._last_dir):
-                #     self._oscillating = True
+                # 近目标跨过后反向折返，进入精确档直到真正停稳到位。
+                # 脚下散落物已在前面的 cur==cell 分支完成，不在此来回拉扯。
+                if self._last_dir is not None and d == OPPOSITE.get(self._last_dir):
+                    self._oscillating = True
                 self._last_dir = d
             else:
                 self._last_dir = d
@@ -256,7 +283,8 @@ class Approach(Primitive):
                                    self._oscillating and not against_belt,
                                    arrived, error, cur in w.belt_cells,
                                    final=final, dash=dash, wall_ahead=wall_ahead,
-                                   against_belt=against_belt)
+                                   against_belt=against_belt, replan_after_drift=True,
+                                   contact_ready=P.interact_ready(chef, st, self.kind, w.to_grid))
         if status == Status.SUCCESS:
             self._oscillating = False
             self._last_dir = None
@@ -304,7 +332,8 @@ class Face(Primitive):
         # 稳定的 interactions.gx/gz，Face 转不到位，只会反复短按把角色一点
         # 点挪走（实机 trace-20261016-122733，米饭捡不起来）。直接 SUCCESS，
         # 交 Tap 用 pickup 句柄判断。
-        if isinstance(st, dict) and st.get("grid") is None and st.get("gx") is None:
+        if (isinstance(st, dict) and st.get("grid") is None and st.get("gx") is None
+                and st.get('interaction_gx') is None):
             hands.set_move(None)
             self.reset()
             return Status.SUCCESS
@@ -336,18 +365,27 @@ class Face(Primitive):
         if cur is None:
             hands.set_move(None)
             return Status.FAILURE
-        d = _dir_towards(cur, cell)
+        # 多格站点应面向眼前这一半占地，而非追逐唯一的逻辑锚点。
+        # 1-2 实机 t=2777：站 (3,2)，出餐口占 (2,3)/(3,3)，应向上。
+        aim = cell
+        if st.get("t") == PLATE_STATION:
+            footprint = O.station_block_cells(st, getattr(w, 'terrain', {}),
+                                               getattr(w, 'mapping', None))
+            if footprint:
+                aim = min(footprint, key=lambda p: (
+                    abs(p[0] - cur[0]) + abs(p[1] - cur[1]), p))
+        d = _dir_towards(cur, aim)
         if d is None:
             # 不相邻：按世界坐标的主轴差压方向（Approach 还在路上时的过渡）
-            dx = cell[0] - cur[0]
-            dz = cell[1] - cur[1]
+            wx, wz = w.to_world(*aim)
+            dx, dz = wx - chef["x"], wz - chef["z"]
             if abs(dx) >= abs(dz):
                 d = "right" if dx > 0 else "left"
             else:
                 d = "up" if dz > 0 else "down"
         status = self._motion.tick(ctx, d, None, True, arrived,
                                    belt=cur in w.belt_cells)
-        ctx["motion"].update(target=list(cell))
+        ctx["motion"].update(target=list(cell), facing_target=list(aim))
         if status != Status.RUNNING:
             self.reset()
         return status

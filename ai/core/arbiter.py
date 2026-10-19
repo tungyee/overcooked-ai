@@ -34,9 +34,9 @@ def select_mode(world, bb):
     返回: (mode, reason)
     reason 用于日志，例 "cooker#2 onFire" / "no fire"
     """
-    # ① Stuck 前置守卫（跨模式生效，先于一切检查）
-    if _is_stuck(world, bb):
-        return _handle_stuck(world, bb)
+    # 原地并不等于动作失败（切菜/洗碗/喷火器都需站定）。只记录，不能
+    # 提前返回旧模式，否则既进不了灭火、灭完也退不出。移动恢复由原语负责。
+    stuck = _is_stuck(world, bb)
 
     # ② 中断 task 连续失败降级
     if _should_degrade_from_failure(bb):
@@ -49,7 +49,7 @@ def select_mode(world, bb):
         return "Firefighting", fire_reason
 
     # 默认 Normal（Assigned 对话层指派曾在这里，空壳已删）
-    return "Normal", "default"
+    return "Normal", "stuck detected" if stuck else "default"
 
 
 def _should_degrade_from_failure(bb):

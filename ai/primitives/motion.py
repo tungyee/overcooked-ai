@@ -56,7 +56,8 @@ class MotionControl:
         return Status.FAILURE
 
     def tick(self, ctx, direction, extra, near, arrived, error=None, belt=False,
-             final=True, dash=False, wall_ahead=False, against_belt=False):
+             final=True, dash=False, wall_ahead=False, against_belt=False,
+             replan_after_drift=False, contact_ready=False):
         # type: (...) -> str
         self._calls += 1
         self._final = final
@@ -127,8 +128,15 @@ class MotionControl:
             # 中间格只是路过，exact 停点无所谓，等一个新鲜帧就继续走——
             # 每格都等停稳是近处「一顿一顿」变慢的根源（实机复现）。传送带
             # 持续有外力，不能要求绝对静止，到位后由交互按键的反向顶带兜底。
-            if self._settle and moved > POSITION_EPSILON and not belt:
+            if (self._settle and moved > POSITION_EPSILON and not belt
+                    and not (arrived and contact_ready)
+                    and not (replan_after_drift and not arrived
+                             and now - self._wait_since >= 2 * OBSERVE_SECONDS)):
                 return Status.RUNNING
+            if replan_after_drift and not arrived and moved > POSITION_EPSILON:
+                ctx["motion"]["replanned_after_drift"] = True
+            if arrived and contact_ready:
+                ctx["motion"]["contact_ready"] = True
             self.stage = "idle"
 
         if not fresh:

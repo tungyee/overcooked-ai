@@ -9,13 +9,14 @@ import time
 from typing import Any, Dict, Optional
 
 from ai.core import arbiter, executor, planner
-from ai.space import navigation
+from ai.space import navigation, reachability
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
 from ai.state.blackboard import Blackboard, Claim, Commitment
 from ai.output.hands import Hands
 from ai.primitives.stuck import ABANDON_TTL_TICKS, note_motion_failure
+from ai.core.recovery import FailureHistory, abandon_actions, waiting_reason
 from ai.primitives.motion import FRAME_MAX_AGE
 from ai.query.recipes import RecipeBook
 from ai.state.world import StateClient, World
@@ -25,10 +26,29 @@ from ai.state.world import StateClient, World
 # 20 Hz 理解，与插件 5 Hz 推帧（200 ms）不是一个量级——混用会让阈值差 4 倍。
 TICK_INTERVAL = 0.05
 
-# L3 兜底：同一 task 连续执行失败满 N 次，就把它的认领资源写进
-# scratch.abandoned 拉黑一段时间（TTL 见 ABANDON_TTL_TICKS），让 planner
-# 跳过它、去做别的任务（实机复现：切菜被传送带反复推走时 flap）。
+# L3 兜底：同一物理操作在 TTL 内失败满 N 次，对其认领动作短暂退避。
+# 按操作独立累计，切换任务/订单不能清零；不同动作不会互相拉黑。
 ABANDON_FAIL_STREAK = 3
+
+
+def _timer_expired(timer):
+    # type: (Any) -> bool
+    """只认有效有限时长的权威计时器；未知/无时限关卡不按归零处理。"""
+    if not isinstance(timer, dict):
+        return False
+    for side in ('server', 'client'):
+        part = timer.get(side)
+        if not isinstance(part, dict):
+            continue
+        try:
+            limit, left = float(part['limit']), float(part['left'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if limit > 0 and left <= 0:
+            return True
+        if limit > 0 and left > 0:
+            return False
+    return False
 
 
 def _p1_record(p1_model):
@@ -76,8 +96,10 @@ class Agent:
         self.book = None  # type: Optional[RecipeBook]
         self.tick = 0
         self.idle_logged = False  # 暂停/非关卡的心跳日志是否已写过
-        self._fail_task_key = None  # 连续执行失败计数：上一个失败的 task key
-        self._fail_streak = 0       # 同一 task 的连续失败次数（L3 兜底用）
+        self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)
+        self._scene_key = None
+        self._left_level = False
+        self.require_live_protocol = False
         self._frame_seq = None      # 游戏收帧编号，与 Python tick 分开
         self._frame_received_at = None
         # 气球篮移动检测（跨帧）：prev 存上一帧篮子的 (minz, maxz)，
@@ -86,11 +108,12 @@ class Agent:
         self._balloon_moving = False
         self._balloon_frame_seq = None
 
-    def run(self):
+    def run(self, max_seconds=None, stop_requested=None):
         """主循环入口（20 Hz）。插件 5 Hz 推帧，中间 4 拍复用最新帧重 tick。"""
         latest = None  # type: Optional[Any]
+        end_at = time.monotonic() + max_seconds if max_seconds is not None else None
         try:
-            while True:
+            while (end_at is None or time.monotonic() < end_at) and not (stop_requested and stop_requested()):
                 started = time.monotonic()
                 self.hands.service(started)
                 snapshot = self.client.read_latest()
@@ -115,10 +138,18 @@ class Agent:
     def _tick_once(self, world):
         # type: (World) -> None
         """执行一拍的 13 步主循环。"""
+        self._observe_scene(world)
         # 生命周期守卫（spec §8.1）：暂停 / 非关卡 → 松键、不做任何决策。
         stale = (self._frame_received_at is not None and
                  time.monotonic() - self._frame_received_at > FRAME_MAX_AGE)
-        if stale or world.paused or world.phase != "level":
+        foreground = getattr(self.ctrl, 'is_game_foreground', None)
+        unfocused = callable(foreground) and not foreground()
+        missing_protocol = self.require_live_protocol and not (
+            world.raw.get('grids') and (world.terrain.get(9) or world.raw.get('level_bounds')))
+        missing_player = self.require_live_protocol and any(
+            P.chef_by_name(world.chefs, name) is None for name in (P.P1_NAME, P.P2_NAME))
+        round_finished = _timer_expired(world.raw.get('timer'))
+        if stale or unfocused or missing_protocol or missing_player or round_finished or world.paused or world.phase != "level":
             self.hands.release_all()
             self.executor_inst.halt_and_discard()
             self.bb.commitment = Commitment()
@@ -127,7 +158,10 @@ class Agent:
             # "trace 里什么都没有"到底是 agent 没起来还是 AI 没决策。
             if not self.idle_logged:
                 self.idle_logged = True
-                reason = ("stale_frame" if stale else "paused" if world.paused
+                reason = ("stale_frame" if stale else 'unfocused' if unfocused
+                          else 'protocol_unavailable' if missing_protocol else 'missing_player' if missing_player
+                          else 'round_finished' if round_finished
+                          else "paused" if world.paused
                           else "phase=%s" % world.phase)
                 trace.emit({"mode_reason": reason, "p1": {}, "candidates": []},
                            self.bb.mode, self.bb.commitment,
@@ -237,6 +271,10 @@ class Agent:
         }
 
         # ⑩ 写回认领
+        # 认领属于当前任务；被抢占的任务不能继续占住锅/板等待 TTL 到期。
+        for key, claim in list(self.bb.claims.items()):
+            if claim.owner == "P2" and key not in claims_new:
+                self.bb.claims.pop(key, None)
         self.bb.claims.update(claims_new)
 
         # ⑪ 登记 commitment（存 Task 对象本身：承诺惯性按四元身份比较）
@@ -256,19 +294,22 @@ class Agent:
             # 锅被 P1 端走变不可行后，角色卡在原地一直按 right）。
             self.executor_inst.halt_and_discard()
             status = "idle"
+            record['waiting'] = waiting_reason(plan_record.get('candidates', []), world.orders)
+            record['mode_reason'] = record['waiting']['reason']
 
         # ⑬ 处理结果
         success_task = None  # type: Optional[Any]
         if status == "success":
             success_task = chosen_task  # 保存成功的 task（trace 记录用）
-            self._fail_task_key = None
-            self._fail_streak = 0
+            self._note_success(chosen_task)
             if chosen_task and hasattr(chosen_task, "claims"):
                 for res_id, action in chosen_task.claims():
                     self.bb.claims.pop((res_id, action), None)
             self.bb.commitment = None
         elif status == "failure":
             if chosen_task is not None:
+                for resource, action in chosen_task.claims():
+                    self.bb.claims.pop((resource, action), None)
                 self._note_motion_failure(chosen_task, ctx)
                 self._note_failure(chosen_task)
             if self.bb.commitment:
@@ -306,35 +347,32 @@ class Agent:
 
     def _note_failure(self, task):
         # type: (Any) -> None
-        """记录同一 task 的连续执行失败，满阈值拉黑其认领资源（L3 兜底）。
+        if self._failures.failed(task, self.tick):
+            abandon_actions(self.bb, task, self.tick + ABANDON_TTL_TICKS)
 
-        自愈层（HoldUntil 位置感知）已处理单次"被推离目标"；这里兜住
-        "重新走位也反复失败"的情况——连续 ABANDON_FAIL_STREAK 次失败就
-        把该 task 的资源写进 scratch.abandoned，planner 过滤时跳过它，
-        让 AI 先去做别的任务（实机复现：切菜被传送带反复推走时 flap）。
+    def _note_success(self, task):
+        # type: (Any) -> None
+        if task is not None:
+            self._failures.succeeded(task)
 
-        task 声明 NO_ABANDON（灭火 / 端锅 / 盛饭等停火关键任务）时整条跳过：
-        这些任务的拉黑期（200 拍）比烧糊倒计时还长，拉黑就等于放弃救锅 → 必着火。
-        """
-        if getattr(task, "NO_ABANDON", False):
-            self._fail_task_key = None
-            self._fail_streak = 0
+    def _observe_scene(self, world):
+        # type: (World) -> None
+        if world.phase != 'level':
+            self._left_level = True
             return
-        key = task.key
-        if key == self._fail_task_key:
-            self._fail_streak += 1
-        else:
-            self._fail_task_key = key
-            self._fail_streak = 1
-        if self._fail_streak < ABANDON_FAIL_STREAK:
-            return
-        from ai.state.blackboard import StuckScratch
-        if not isinstance(self.bb.scratch, StuckScratch):
-            self.bb.scratch = StuckScratch()
-        for res_id, _action in task.claims():
-            self.bb.scratch.abandoned[res_id] = self.tick + ABANDON_TTL_TICKS
-        self._fail_task_key = None
-        self._fail_streak = 0
+        raw = getattr(world, 'raw', {})
+        key = (raw.get('session_id'), raw.get('scene_epoch'), world.level)
+        if self._scene_key is not None and (key != self._scene_key or self._left_level):
+            self.executor_inst.halt_and_discard()
+            self.hands.release_all()
+            self.bb = Blackboard()
+            self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)
+            self.book = None
+            self._prev_balloon_box = None
+            self._balloon_moving = False
+            self._balloon_frame_seq = None
+            trace.reset_revenue_state()
+        self._scene_key, self._left_level = key, False
 
     def _note_motion_failure(self, task, ctx):
         # type: (Any, Dict) -> None
@@ -377,6 +415,7 @@ class Agent:
         chef = P.chef_by_name(world.chefs, P.P2_NAME)
         field = {}
         soft = {}
+        blocked = set()
         # 篮子移动检测每拍更新一次黑板，供 planner 可行性过滤（方案 B）：
         # 篮子动时「目标在篮子上的 task」判不可行，而不是选出来再执行失败。
         self.bb.balloon_moving = self._update_balloon_motion(world)
@@ -394,15 +433,17 @@ class Agent:
                     if cell not in balloon_cells:
                         blocked |= balloon_cells
                 soft = p1model.p1_soft_cost_map(world, self.bb.p1_model)
-                field = navigation.distance_field(
-                    cell, world.walkable, world.belt_dir, blocked, soft_cost=soft,
-                    edge_blocked=world.edge_blocked)
+                field = reachability.field_for(world, self.bb, soft_cost=soft)
+                if field is None:  # 缺地形的历史测试仍使用旧距离场。
+                    field = navigation.distance_field(
+                        cell, world.walkable, world.belt_dir, blocked, soft_cost=soft,
+                        edge_blocked=world.edge_blocked)
         ctx = {
             "w": world,
             "chef": chef,
             "hands": self.hands,
             "bb": self.bb,
-            "field": field, "soft_cost": soft,
+            "field": field, "soft_cost": soft, "navigation_blocked": blocked,
             "book": self.book,
             "tick": self.tick,
         }

@@ -228,7 +228,7 @@ def test_firefighting_task_is_never_abandoned():
     normal = T.ReturnPot(resources=("cooker_01",))
     for _ in range(3):
         agent._note_failure(normal)
-    assert agent.bb.scratch.abandoned["cooker_01"] > agent.tick
+    assert agent.bb.scratch.abandoned_actions[normal.claims()[0]] > agent.tick
 
 
 def test_cooked_pot_tasks_are_never_abandoned():

@@ -21,6 +21,7 @@ Ctrl-C / SIGTERM 退出时会松开所有按键。
 import argparse
 import signal
 import sys
+from pathlib import Path
 
 from ai.agent import Agent
 
@@ -29,7 +30,14 @@ def _parse_args(argv):
     ap = argparse.ArgumentParser(description="Overcooked! 2 AI 陪玩")
     ap.add_argument("--dry-run", action="store_true",
                     help="不注入按键（用 NullController），只跑决策")
-    return ap.parse_args(argv)
+    ap.add_argument('--seconds', type=float, help='限时运行后自动松键退出')
+    ap.add_argument('--stop-file', type=Path)
+    ap.add_argument('--pickup-key', default='right_shift', choices=('right_shift','right_ctrl','slash'))
+    ap.add_argument('--chop-key', default='right_ctrl', choices=('right_shift','right_ctrl','slash'))
+    args = ap.parse_args(argv)
+    if args.seconds is not None and args.seconds <= 0:
+        ap.error('--seconds 必须大于 0')
+    return args
 
 
 def main(argv=None):
@@ -39,17 +47,19 @@ def main(argv=None):
     if not args.dry_run:
         try:
             from ai.output.controller import Controller
-            ctrl = Controller()
+            ctrl = Controller(bindings={'pickup': args.pickup_key, 'chop': args.chop_key})
         except Exception as exc:               # noqa: BLE001
-            print("[run] 初始化 CGEvent controller 失败: %s" % exc,
+            print("[run] 初始化输入 controller 失败: %s" % exc,
                   file=sys.stderr)
-            print("[run] 需要 macOS + pyobjc，并给终端「辅助功能」权限；"
+            print("[run] Windows 请使用启动器匹配游戏权限；macOS 需要 pyobjc/辅助功能；"
                   "或先用 --dry-run 只跑决策。", file=sys.stderr)
             return 2
 
     try:
         agent = Agent(ctrl=ctrl)
     except OSError as exc:
+        if ctrl is not None:
+            ctrl.release_all()
         print("[run] 连接游戏失败（插件没起？127.0.0.1:27411）: %s" % exc,
               file=sys.stderr)
         return 1
@@ -61,9 +71,15 @@ def main(argv=None):
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    print("[run] 已连接 127.0.0.1:27411，开始决策（Ctrl-C 退出）",
+    agent.require_live_protocol = True
+    print("[run] 已连接；等待新版地形协议、双人关卡和游戏前台后开始决策",
           file=sys.stderr)
-    agent.run()
+    try:
+        agent.run(max_seconds=args.seconds,
+                  stop_requested=args.stop_file.exists if args.stop_file else None)
+    finally:
+        agent.hands.release_all()
+        agent.client.close()
     return 0
 
 

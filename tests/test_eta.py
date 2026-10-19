@@ -14,9 +14,9 @@
 """
 import pytest
 
-from ai import eta as E
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.revenue import eta as E
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 RECIPES = [

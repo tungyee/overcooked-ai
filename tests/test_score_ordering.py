@@ -15,9 +15,10 @@
 表的形态是 (局面, 必须赢的 task, 必须输的 task 们, 为什么)，一条一行。加新
 权重时在这里加一行，比在 17 条注释里描述关系可靠。
 """
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
 from tests.test_fill_cooker_priority import STATIONS, _cooker, _world
 
 
@@ -152,7 +153,7 @@ def test_wash_outranks_all_when_no_clean_plate():
     **若分层被移除**，必须把本断言恢复成按分数比较，并重标 `W_PLATE_PRESSURE`
     使 0 盘档压过 `W_COOKER_IDLE`。
     """
-    from ai import planner_layers as PL
+    from ai.core import planner_layers as PL
 
     w = _world([_cooker("c1"), _cooker("c2")], plates=[])
     wash = PL.layer_of_task(T.WashPlate(resources=("sink",)), w)

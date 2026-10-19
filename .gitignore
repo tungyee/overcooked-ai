@@ -19,3 +19,4 @@ tests/fixtures/*.ndjson
 # macOS
 .DS_Store
 .worktrees/
+.worktrees/

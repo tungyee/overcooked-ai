@@ -34,14 +34,42 @@ plate / cook / chop / assembly / cleanup 各放一组 task。外部一律
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import predicates as P
-from ai import recipes as R
-from ai.bt import Node
-from ai.plate_tokens import parse_plate_detail, parse_pot_contents
+from ai.query import predicates as P
+from ai.query import recipes as R
+from ai.exec.bt import Node
+from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 
 # 认领的所有者标识。AI 控制的是 P2（spec §6.7：AI 自己的意图写在 claims
 # 里，不需要推断）。
 OWNER = "P2"
+
+
+def _unpack_resource_id(rid):
+    # type: (Any) -> Tuple[Optional[str], str]
+    """兼容过渡：rid 可能是 (grid, name) 元组，也可能是裸名字字符串
+    （Task 12 之前的旧调用点）。统一拆成 (grid_or_None, name)。
+
+    grid 为 None 时查找退化为"只比名字"（旧行为，向后兼容）；grid 非
+    None 时要求站点/灶的 grid 字段也匹配，解决同名跨网格撞车（spec §5.2）。
+    """
+    if isinstance(rid, tuple) and len(rid) == 2:
+        return (rid[0], str(rid[1]))
+    return (None, str(rid))
+
+
+def _grid_matches(entry_grid, want_grid):
+    # type: (Any, Optional[str]) -> bool
+    """比较站点/灶的 grid 字段与候选 id 携带的 grid 分量是否一致。
+
+    want_grid 为 None 时不比较（旧裸字符串调用点，向后兼容，恒 True）。
+    两侧都按"缺失 → 空字符串"归一化后再比：`P.resource_id` 在构造候选 id
+    时已把缺字段归一化成 ""，但真实世界 dict（旧 fixture、尚未带 grid
+    字段的测试）里缺字段读出来是 None，不归一化会让 "" != None 恒假
+    （正是 task-12-brief 提醒要修的那个坑：候选侧 "" vs 世界侧 None）。
+    """
+    if want_grid is None:
+        return True
+    return str(entry_grid or "") == str(want_grid or "")
 
 # task 级超时的默认上限（拍）。20 Hz 下 200 拍 = 10 秒，够走完全图最长
 # 路径再做一次交互；超过说明卡住了，交还 Planner（spec §7.2）。
@@ -61,6 +89,11 @@ class Task(object):
     # 打分上加"腾手代价"（见 planner._score_candidate），执行时由树首
     # EnsureHandsFree 清手。
     HANDS = "any"
+    # 声明为 True 的任务不受 L3 拉黑（scratch.abandoned）约束：端锅/盛饭/
+    # 灭火这类停火关键任务，拉黑期（200 拍）比烧糊倒计时还长，拉黑就等于
+    # 放弃救锅 → 必着火。写侧（_note_failure / note_motion_failure）与读侧
+    # （planner._is_abandoned）都据此跳过。
+    NO_ABANDON = False
 
     __slots__ = ("_order_id", "_resources", "_item")
 
@@ -181,7 +214,7 @@ def plate_by_id(ctx, plate_id):
 
     资源 id 规则（spec §4.4）：盘用实例名 n 为主。
     """
-    for p in ctx["w"].plates:
+    for p in P.all_plates(ctx["w"]):
         if str(p.get("n")) == str(plate_id):
             return p
     return None
@@ -237,25 +270,52 @@ def station_at_cell(ctx, cell, kinds=None):
             "x": x, "z": z}
 
 
-def cooker_state(ctx, cooker_name):
+def cooker_state(ctx, cooker_id):
     # type: (Dict, Any) -> Optional[Dict]
-    """按站点实例名取灶的状态条目（资源 id 规则：站点实例名 n）。
+    """按资源 id 取灶的状态条目（spec §5.2：id 可能是 (grid,name) 元组，
+    过渡期也接受裸字符串——见 _unpack_resource_id）。
 
     灶的**状态**在 `cookers[]` 里、**位置**在 `stations[]` 里，两个 dict
     各取所需。cook / fire 两组都要用，故放在 base。
     """
-    return P.cooker_for(ctx["w"].cookers, str(cooker_name))
+    grid, name = _unpack_resource_id(cooker_id)
+    for c in ctx["w"].cookers:
+        if not P.station_name_matches(str(c.get("n") or ""), name):
+            continue
+        if not _grid_matches(c.get("grid"), grid):
+            continue
+        return c
+    return None
 
 
-def cooker_station(ctx, cooker_name):
+def cooker_station(ctx, cooker_id):
     # type: (Dict, Any) -> Optional[Dict]
-    """按实例名取灶的站点 dict（原语要 gx/gz 定位）。"""
+    """按资源 id 取灶的站点 dict（原语要 gx/gz 定位）。"""
+    grid, name = _unpack_resource_id(cooker_id)
     for st in ctx["w"].stations:
         if st.get("t") != "cooking":
             continue
-        if P.station_name_matches(str(st.get("n") or ""), str(cooker_name)):
-            return st
+        if not P.station_name_matches(str(st.get("n") or ""), name):
+            continue
+        if not _grid_matches(st.get("grid"), grid):
+            continue
+        return st
     return None
+
+
+def _source_on_moving_platform(ctx, loc):
+    # type: (Dict, Optional[Dict]) -> bool
+    """生料来源是否在「正在移动的非主网格平台」（气球篮）上。
+
+    共享判据见 P.on_moving_platform；这里只从 find_ingredient 的 loc 里
+    取出来源站点的 grid 再委托过去。
+    """
+    if not loc:
+        return False
+    st = loc.get("st")
+    if not isinstance(st, dict):
+        return False
+    return P.on_moving_platform(st.get("grid"), ctx)
 
 
 def ingredient_available(ctx, raw):
@@ -270,7 +330,11 @@ def ingredient_available(ctx, raw):
     if not raw:
         return False
     loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True)
-    return loc is not None and loc.get("kind") != "plate"
+    if loc is None or loc.get("kind") == "plate":
+        return False
+    if _source_on_moving_platform(ctx, loc):
+        return False
+    return True
 
 
 def ingredient_source(ctx, raw):
@@ -279,7 +343,35 @@ def ingredient_source(ctx, raw):
     loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True)
     if loc is None or loc.get("kind") in ("plate", "held"):
         return None
-    return loc.get("st")
+    st = loc.get("st")
+    if loc.get("kind") == "loose":
+        # 散落物若挂在某个站点上（on_station），返回站点而非裸 item——
+        # 站点有 grid/gx/gz 朝向信号，interact_ready/AlignToCell/Face 才能用
+        # 本地网格判对。裸 item 只有 x/z，投主网格会跟游戏句柄的本地坐标
+        # 恒不等（trace-20261018-005334 t=32314：番茄在篮子台面上，句柄
+        # 指向旁边的箱子，永远拿不到料）。
+        resolved = _station_for_item(ctx["w"], st)
+        if resolved is not None:
+            return resolved
+    return st
+
+
+def _station_for_item(world, item):
+    # type: (Any, Optional[Dict]) -> Optional[Dict]
+    """散落 item 所在站点（插件的 on_station 字段反查）。找不到返回 None。"""
+    if not isinstance(item, dict):
+        return None
+    os = str(item.get("on_station") or "")
+    if ":" not in os:
+        return None
+    # on_station 形如 "attach:<站点名>" / "cooking:<灶名>"，取冒号后的名字
+    name = os.split(":", 1)[1].strip()
+    if not name:
+        return None
+    for st in getattr(world, "stations", None) or ():
+        if str(st.get("n") or "") == name:
+            return st
+    return None
 
 
 def cooked_sources(world, book):
@@ -306,15 +398,11 @@ def cooked_sources(world, book):
         if toks:
             out.append({"kind": "cooker", "id": cid, "tokens": toks})
 
-    cooker_cells = _cooker_cells(world)
     for it in world.items:
-        x, z = it.get("x"), it.get("z")
-        if x is None or z is None:
-            continue
         if not P.held_is_cookware({"held": it.get("n")}, world.recipes):
             continue
-        if world.to_grid(x, z) in cooker_cells:
-            continue                       # 在灶台上 = 在用，不是散锅
+        if P.item_on_cooker(it):
+            continue                       # 在灶台上 = 在用，不是散锅（字段判据）
         toks = parse_plate_detail(it.get("detail") or [])
         if not any(t.startswith("cooked:") for t in toks):
             # 手持/散熟锅的 detail 可能只报原始料名（ing:SushiRice），
@@ -345,19 +433,6 @@ def _cooker_cooked_tokens(c, book):
             if t:
                 toks.add(t)
     return toks
-
-
-def _cooker_cells(world):
-    # type: (Any) -> Set[Tuple[int, int]]
-    """所有灶台格（散锅判定的排除区）。"""
-    cells = set()  # type: Set[Tuple[int, int]]
-    for st in world.stations:
-        if st.get("t") != "cooking":
-            continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is not None and gz is not None:
-            cells.add((gx, gz))
-    return cells
 
 
 # 批量取+投的 buffer：散落料够「订单数 + buffer」就停（实机调）。

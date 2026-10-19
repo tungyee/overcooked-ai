@@ -13,11 +13,11 @@
   3. 灶台本身还 onFire 时，喷到火灭才算完成。
 """
 from ai import tasks as T
-from ai.bt import Status
-from ai.blackboard import Blackboard
-from ai.hands import Hands
-from ai.navigation import distance_field
-from ai.recipes import RecipeBook
+from ai.exec.bt import Status
+from ai.state.blackboard import Blackboard
+from ai.output.hands import Hands
+from ai.space.navigation import distance_field
+from ai.query.recipes import RecipeBook
 
 CELL = 1.2
 COOKER = (5, 0)          # 灶台格

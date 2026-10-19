@@ -13,7 +13,7 @@ FillCooker 的谓词是纯世界谓词（照 Prefetch 的形态）：有空灶 +
 import pytest
 
 from ai import tasks as T
-from ai.recipes import RecipeBook
+from ai.query.recipes import RecipeBook
 from tests.test_cook_supply import RECIPES, W, cooker, order, plate
 
 

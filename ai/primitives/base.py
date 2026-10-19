@@ -22,9 +22,9 @@ target 一律可以是 dict（静态）或 ctx -> Optional[Dict] 的可调用。
 """
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
-from ai import predicates as P
-from ai.bt import Node
-from ai.hands import DIR2D
+from ai.query import predicates as P
+from ai.exec.bt import Node
+from ai.output.hands import DIR2D
 
 # "还没看过手里有什么"的哨兵。不能用 None 或 ""——held_name 对空手正是
 # 返回 ""，两者混用会让"首次 tick"与"手本来就空"无法区分。
@@ -43,33 +43,101 @@ def resolve(target, ctx):
     return got if isinstance(got, dict) and got else None
 
 
-def _blocked_cells(ctx):
-    # type: (Dict) -> Set[Tuple[int, int]]
+def _blocked_cells(ctx, resource_id=None):
+    # type: (Dict, Any) -> Set[Tuple[int, int]]
     """脱困拉黑的格子（MarkBlocked 写进 scratch，这里读）。
 
     TTL 按拍计：值是失效拍号，当前拍 >= 它就不再算拉黑。
+
+    `resource_id` 非 None 时，额外并入 `scratch.bad_pairs` 里属于该资源的
+    格 —— 那是「这一格对这个目标用不了，但对别的目标还行」的二元粒度
+    （AlignToCell 写、Approach 读，理由见 blackboard.StuckScratch.bad_pairs）。
+    不传时逐字等价于旧行为，既有调用点无需改。
     """
     bb = ctx.get("bb")
     scratch = getattr(bb, "scratch", None)
-    bad = getattr(scratch, "bad_cells", None)
-    if not bad:
-        return set()
     tick = ctx.get("tick") or 0
-    return set(cell for cell, expire in bad.items() if expire > tick)
+    out = set()  # type: Set[Tuple[int, int]]
+
+    bad = getattr(scratch, "bad_cells", None)
+    if bad:
+        out |= set(cell for cell, expire in bad.items() if expire > tick)
+
+    if resource_id is not None:
+        pairs = getattr(scratch, "bad_pairs", None)
+        if pairs:
+            out |= set(cell for (res, cell), expire in pairs.items()
+                       if res == resource_id and expire > tick)
+    return out
 
 
 def target_cell(target, ctx):
     # type: (Optional[Dict], Dict) -> Optional[Tuple[int, int]]
-    """目标所在格：优先 gx/gz，缺失时用 World.to_grid 从 x/z 换算。"""
+    """目标所在格：优先用世界坐标 x/z 经 World.to_grid 投影，缺失时才退回
+    站点自带的 gx/gz（spec §7 的发现：站点的 gx/gz 是它所在网格的局部
+    索引，多网格下与调用方坐标系——通常是主网格——不是一回事；x/z 永远
+    是全局世界坐标，经 to_grid 投影才能跟 walkable/distance_field 的坐标
+    系统对齐）。
+
+    退回 gx/gz 只用于缺 x/z 的旧 fixture / 合成测试数据，不是真实站点的
+    主路径——AppendStations 对所有真实站点都发 x/z。
+    """
     if not target:
         return None
+    x, z = target.get("x"), target.get("z")
+    if x is not None and z is not None:
+        return ctx["w"].to_grid(x, z)
     gx, gz = target.get("gx"), target.get("gz")
     if gx is not None and gz is not None:
         return (int(round(gx)), int(round(gz)))
-    x, z = target.get("x"), target.get("z")
-    if x is None or z is None:
+    return None
+
+
+def target_identity(target):
+    # type: (Optional[Dict]) -> Any
+    """目标的身份（spec §5.2/§7）：优先用 (grid, n)，没有 n 时退化为
+    None（调用方据此退回按坐标比较——拼装格这类无实例名的目标仍只能
+    按坐标判断"换了没有"，这是合理的，因为它们本来就没有稳定身份）。
+    """
+    if not target:
         return None
-    return ctx["w"].to_grid(x, z)
+    n = target.get("n")
+    if not n:
+        return None
+    return (target.get("grid"), str(n))
+
+
+def target_grid_callbacks(world, target):
+    # type: (Any, Optional[Dict]) -> Tuple[Any, Any, float]
+    """target 所属网格的 (to_grid, to_world, cell_size)。
+
+    多网格关卡下「格心/朝向」必须用目标自己网格的本地坐标：插件对篮子
+    上的功能站/料箱报的 gx/gz 是篮子本地索引，而 `world.to_grid`/
+    `world.to_world` 是主网格（GridManager）——两者原点差 10.0，统一走
+    主网格会把篮子上的站位方向算反（trace-20261018-005334 t=16903）。
+
+    优先用 target 的 grid 名查 world.grids；target 无 grid、或该网格不在
+    world.grids 里时退回主网格（旧行为，合成帧/旧 fixture 无 grids 数据）。
+    """
+    grid_name = None
+    if isinstance(target, dict):
+        grid_name = target.get("grid")
+    grids = getattr(world, "grids", None)
+    if grid_name and grids is not None:
+        gid = str(grid_name)
+
+        def _to_grid(x, z):
+            # type: (float, float) -> Optional[Tuple[int, int]]
+            return grids.to_grid(gid, x, z)
+
+        def _to_world(gx, gz):
+            # type: (int, int) -> Optional[Tuple[float, float]]
+            return grids.to_world(gid, gx, gz)
+
+        if _to_world(0, 0) is not None:   # 该网格确实存在
+            return _to_grid, _to_world, grids.cell_size(gid)
+    cell = getattr(getattr(world, "mapping", None), "cell", 1.2)
+    return world.to_grid, world.to_world, cell
 
 
 def _dir_towards(cur, nxt):

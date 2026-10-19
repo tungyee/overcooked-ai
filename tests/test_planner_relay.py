@@ -5,10 +5,10 @@
 """
 import pytest
 
-from ai import planner
+from ai.core import planner
 from ai import tasks as T
-from ai.blackboard import Blackboard
-from ai.world import World
+from ai.state.blackboard import Blackboard
+from ai.state.world import World
 
 
 def _world(level):

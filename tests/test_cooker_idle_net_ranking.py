@@ -10,9 +10,10 @@ pressure 分不扣同量 eta —— 所以必须比**算出来的净分**，不�
 """
 import pytest
 
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
 from tests.test_fill_cooker_priority import _cooker, _world
 
 

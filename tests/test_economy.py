@@ -4,7 +4,7 @@
 样本来自 trace-20261013-* / trace-20261014-*（52 次送达），每条
 `(combo, remaining, lifetime) -> tip` 都是实测值，不是推演。
 """
-from ai import economy as E
+from ai.revenue import economy as E
 
 
 # (combo, remaining, lifetime, 实测 tip) —— 全部 52 个样本

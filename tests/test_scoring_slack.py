@@ -12,8 +12,8 @@ order#4/#5 全程饿死。
 """
 import pytest
 
-from ai import planner
-from ai.planner import W_URGENCY
+from ai.core import planner
+from ai.core.planner import W_URGENCY
 
 
 def test_urgency_discriminates_in_the_mid_range():

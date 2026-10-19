@@ -17,7 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ai.record import FrameRecorder
+from ai.exec.record import FrameRecorder
 
 
 def _chef_summary(c):

@@ -12,9 +12,9 @@ import time
 import pytest
 from fnmatch import fnmatch
 
-from ai import trace
+from ai.output import trace
 from ai import tasks as T
-from ai.blackboard import Blackboard, Commitment
+from ai.state.blackboard import Blackboard, Commitment
 
 
 @pytest.fixture(autouse=True)
@@ -306,7 +306,7 @@ def test_trace_state_defaults_to_empty():
 
 
 def test_trace_bindings_field():
-    """bindings 字段落盘（盘↔订单 / 灶↔订单 / 认领 / 分单归属）。"""
+    """bindings 字段落盘（盘↔订单 / 灶↔订单 / 认领）。"""
     record = {
         "mode_reason": "",
         "p1": {},
@@ -315,7 +315,6 @@ def test_trace_bindings_field():
             "plate_order": {"Plate_1": "order1"},
             "cooker_order": {"cooker_01": "order1"},
             "claims": {"cooker_01:fetch_to": {"owner": "P2", "order": "order1", "age": 0}},
-            "order_assignment": {"order1": "P2"},
         },
     }
 

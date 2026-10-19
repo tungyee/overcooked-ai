@@ -8,14 +8,17 @@ Spec: §8.1 主循环
 import time
 from typing import Any, Dict, Optional
 
-from ai import arbiter, executor, navigation, p1model, planner, reconcile, state_dump, trace
-from ai import predicates as P
-from ai.blackboard import Blackboard, Claim, Commitment
-from ai.hands import Hands
+from ai.core import arbiter, executor, planner
+from ai.space import navigation
+from ai.state import p1model, reconcile
+from ai.output import state_dump, trace
+from ai.query import predicates as P
+from ai.state.blackboard import Blackboard, Claim, Commitment
+from ai.output.hands import Hands
 from ai.primitives.stuck import ABANDON_TTL_TICKS, note_motion_failure
 from ai.primitives.motion import FRAME_MAX_AGE
-from ai.recipes import RecipeBook
-from ai.world import StateClient, World
+from ai.query.recipes import RecipeBook
+from ai.state.world import StateClient, World
 
 # 主循环周期（秒）= 50 ms，即 20 Hz。全项目代码里的"拍"（tick）统一指
 # **本循环拍**：所有按拍计的阈值（task 超时、按键冷却、卡住判定等）都按
@@ -30,18 +33,11 @@ ABANDON_FAIL_STREAK = 3
 
 def _p1_record(p1_model):
     # type: (Any) -> Dict
-    """把 P1 推断压成可序列化 dict，供 trace 的 p1 字段记录。"""
+    """把 P1 事实压成可序列化 dict，供 trace 的 p1 字段记录。"""
     if not p1_model:
         return {}
-    conf = getattr(p1_model, "confidence", 0.0) or 0.0
-    try:
-        conf = round(float(conf), 3)
-    except (TypeError, ValueError):
-        conf = 0.0
     return {
         "holding": getattr(p1_model, "holding", None),
-        "task": getattr(p1_model, "p1_active_task", None),
-        "confidence": conf,
     }
 
 
@@ -57,15 +53,6 @@ def _claims_binding(bb):
             "age": max(0, tick - getattr(c, "claimed_tick", 0)),
         }
     return out
-
-
-def _order_assignment_binding(bb):
-    # type: (Any) -> Dict
-    """分单归属：订单 → 归属玩家（split 模式用，当前多为空）。"""
-    return {
-        str(oid): (owner or None)
-        for oid, owner in (getattr(bb, "order_assignment", None) or {}).items()
-    }
 
 
 class NullController:
@@ -93,6 +80,11 @@ class Agent:
         self._fail_streak = 0       # 同一 task 的连续失败次数（L3 兜底用）
         self._frame_seq = None      # 游戏收帧编号，与 Python tick 分开
         self._frame_received_at = None
+        # 气球篮移动检测（跨帧）：prev 存上一帧篮子的 (minz, maxz)，
+        # balloon_moving 是「最近一帧是否在动」的结论，同一帧内 4 拍复用。
+        self._prev_balloon_box = None  # type: Optional[Tuple[float, float]]
+        self._balloon_moving = False
+        self._balloon_frame_seq = None
 
     def run(self):
         """主循环入口（20 Hz）。插件 5 Hz 推帧，中间 4 拍复用最新帧重 tick。"""
@@ -181,8 +173,12 @@ class Agent:
 
         # ⑨ 规划（多订单模式：不再选择单个订单）
         ctx = self._exec_context(world)
+        planner_choice = None  # type: Optional[Any]
         if new_mode == "Normal":
             chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
+            # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
+            # 两者永远相等，那条可观测性就是假的。
+            planner_choice = chosen_task
             # ⑨.5 正在跑的那棵树：如果它的后置条件**已经成立**，这一拍先让
             # 它把 SUCCESS 报完，别被 planner 抢走。
             #
@@ -218,7 +214,7 @@ class Agent:
                     # Firefighting task 不绑订单（灭火与订单无关）
                     claims_new[(res_id, action)] = Claim("P2", None, self.tick)
         else:
-            # 其他模式（Assigned 等）暂无实现，留空壳
+            # Arbiter 目前只产出 Normal / Firefighting，此分支为防御性兜底。
             chosen_task = None
             claims_new = {}
             plan_record = {"candidates": []}
@@ -231,8 +227,13 @@ class Agent:
                 "plate_order": plan_record.get("plate_match", {}),
                 "cooker_order": plan_record.get("cooker_match", {}),
                 "claims": _claims_binding(self.bb),
-                "order_assignment": _order_assignment_binding(self.bb),
             },
+            # 「这一拍选在哪层」是分层复盘的第一步（spec §6）。planner.plan()
+            # 一直算好放在 decision_record 里，但这里原先没转抄，于是
+            # trace.emit 读到的恒为 None —— 实机 trace-20261015-165358 的
+            # 3637 行里 top_layer 全是 null，只能靠逐候选 layer 反推 min()。
+            "top_layer": plan_record.get("top_layer"),
+            "chosen": str(planner_choice) if planner_choice is not None else None,
         }
 
         # ⑩ 写回认领
@@ -312,8 +313,8 @@ class Agent:
         把该 task 的资源写进 scratch.abandoned，planner 过滤时跳过它，
         让 AI 先去做别的任务（实机复现：切菜被传送带反复推走时 flap）。
 
-        task 声明 NO_ABANDON（灭火）时整条跳过：火情没有"先去做别的"
-        这个选项，拉黑只会让 P2 站在着火的灶前不动。
+        task 声明 NO_ABANDON（灭火 / 端锅 / 盛饭等停火关键任务）时整条跳过：
+        这些任务的拉黑期（200 拍）比烧糊倒计时还长，拉黑就等于放弃救锅 → 必着火。
         """
         if getattr(task, "NO_ABANDON", False):
             self._fail_task_key = None
@@ -327,7 +328,7 @@ class Agent:
             self._fail_streak = 1
         if self._fail_streak < ABANDON_FAIL_STREAK:
             return
-        from ai.blackboard import StuckScratch
+        from ai.state.blackboard import StuckScratch
         if not isinstance(self.bb.scratch, StuckScratch):
             self.bb.scratch = StuckScratch()
         for res_id, _action in task.claims():
@@ -337,7 +338,33 @@ class Agent:
 
     def _note_motion_failure(self, task, ctx):
         # type: (Any, Dict) -> None
-        note_motion_failure(self.bb, task, self.tick, ctx.get("motion_failure") or {})
+        note_motion_failure(self.bb, task, self.tick,
+                            ctx.get("motion_failure") or {},
+                            world=ctx.get("w"), chef=ctx.get("chef"))
+
+    def _update_balloon_motion(self, world):
+        # type: (World) -> bool
+        """跨帧检测气球篮是否在移动；同一帧内 4 拍复用同一结论。
+
+        只在收到新帧时比较一次篮子地板 AABB 的 z 向位置，避免 20Hz 循环
+        把同一个 World 反复比较（那样只会得到"没动"）。
+        """
+        box = world.balloon_ground_box()
+        if box is None:
+            self._prev_balloon_box = None
+            self._balloon_moving = False
+            return False
+        if self._balloon_frame_seq == self._frame_seq:
+            return self._balloon_moving
+        self._balloon_frame_seq = self._frame_seq
+        key = (round(box[2], 3), round(box[3], 3))
+        prev = self._prev_balloon_box
+        self._prev_balloon_box = key
+        if prev is None:
+            return False
+        self._balloon_moving = (abs(key[0] - prev[0]) > 0.05
+                                or abs(key[1] - prev[1]) > 0.05)
+        return self._balloon_moving
 
     def _exec_context(self, world):
         # type: (World) -> dict
@@ -350,15 +377,26 @@ class Agent:
         chef = P.chef_by_name(world.chefs, P.P2_NAME)
         field = {}
         soft = {}
+        # 篮子移动检测每拍更新一次黑板，供 planner 可行性过滤（方案 B）：
+        # 篮子动时「目标在篮子上的 task」判不可行，而不是选出来再执行失败。
+        self.bb.balloon_moving = self._update_balloon_motion(world)
         if chef is not None:
             cell = P.chef_cell(chef, world.to_grid)
             if cell is not None:
                 scratch = self.bb.scratch
                 bad = getattr(scratch, "bad_cells", None) or {}
                 blocked = {c for c, expire in bad.items() if expire > self.tick}
+                # 气球篮移动时避开篮子的格子：角色正站在篮子上则放行（它随
+                # 篮子一起动，仍能在篮子上移动），否则跨网格踩空会掉下去
+                # （trace-20261017-215633 t=1121 respawn 5s）。
+                if self.bb.balloon_moving:
+                    balloon_cells = world.balloon_cells()
+                    if cell not in balloon_cells:
+                        blocked |= balloon_cells
                 soft = p1model.p1_soft_cost_map(world, self.bb.p1_model)
                 field = navigation.distance_field(
-                    cell, world.walkable, world.belt_dir, blocked, soft_cost=soft)
+                    cell, world.walkable, world.belt_dir, blocked, soft_cost=soft,
+                    edge_blocked=world.edge_blocked)
         ctx = {
             "w": world,
             "chef": chef,
@@ -382,28 +420,34 @@ class Agent:
         误判为"资源消失"而释放：站点/锅/盘用实例名（scalar），拼装格用
         网格坐标 (gx,gz)（spec §4.4"坐标即身份"）。
         """
-        from ai.reconcile import ResourceView
+        from ai.state.reconcile import ResourceView
         existing_ids = set()
         contents = {}
         for st in world.stations:
             sid = st.get("n")
             if not sid:
                 continue
-            existing_ids.add(sid)
+            rid = P.resource_id(st)
+            existing_ids.add(sid)      # 旧：裸名字（过渡期保留，§5.2）
+            existing_ids.add(rid)      # 新：(grid, name) 元组
             if (st.get("t") == "counter"
                     and st.get("gx") is not None and st.get("gz") is not None):
                 existing_ids.add((st.get("gx"), st.get("gz")))
             item = st.get("item")
             if item:
                 contents[sid] = item
+                contents[rid] = item
         for cooker in world.cookers:
             cid = cooker.get("n")
             if cid:
+                rid = P.resource_id(cooker)
                 existing_ids.add(cid)
+                existing_ids.add(rid)
                 item = cooker.get("item")
                 if item:
                     contents[cid] = item
-        for plate in world.plates:
+                    contents[rid] = item
+        for plate in P.all_plates(world):
             pid = plate.get("n")
             if pid:
                 existing_ids.add(pid)

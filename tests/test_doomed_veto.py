@@ -10,9 +10,10 @@
 """
 import pytest
 
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard, Commitment, StuckScratch
-from ai.recipes import RecipeBook
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard, Commitment, StuckScratch
+from ai.query.recipes import RecipeBook
 from tests.test_eta import RECIPES, STATIONS, order, plate, world
 
 
@@ -122,7 +123,7 @@ def test_doom_survives_mode_switches():
     stuck 原语四处都会整体 new 一个。若判死存在 scratch 里，灭个火回来所有
     单又都"有救"了，这道闸等于没有。
     """
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     w = world(orders=[order("1", "Sushi_Cucumber", 2.0)], plates=[])
     bb, book = _bb(tick=50), RecipeBook(w.recipes, w.stations)
     _mark_until_doomed(w, bb, book, plate_match={})

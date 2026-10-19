@@ -6,7 +6,7 @@
 """
 import pytest
 
-from ai import planner_layers as PL
+from ai.core import planner_layers as PL
 
 
 class _T(object):
@@ -38,15 +38,13 @@ def test_pressure_splits_same_task_across_three_layers():
     的全部意义。静态按类型分层做不到这件事，而「锅快糊了压过一切」正是它
     存在的理由。
 
-    低 pressure 时落 **L7 清理**而不是 L6 备菜：spec §4.2 的 L6 列表不含
-    TakeCookedToPlate，因为锅还没熟时「端盘去盛饭」没有任何东西在倒计时。
-    （_time_pressure 的 0.25~0.5 渐变段是为「提前去端盘等着」设的；若将来
-    确认那个提前量有价值，要把本 task 加进 L6 或给它单独一层。）
+    低 pressure（快熟阶段）落 **L6 备菜**：靠 pressure 项与其它备菜同层竞争，
+    实现「提前去端盘等熟」。pressure >= 1.0 才升 L1/L2（刚熟/快糊）。
     """
     t = _T("TakeCookedToPlate")
     assert PL.layer_of(t, None, rules=_rules(pressure=1.9)) == PL.L_IRREVERSIBLE
     assert PL.layer_of(t, None, rules=_rules(pressure=1.2)) == PL.L_RESCUE
-    assert PL.layer_of(t, None, rules=_rules(pressure=0.3)) == PL.L_CLEANUP
+    assert PL.layer_of(t, None, rules=_rules(pressure=0.3)) == PL.L_PREP
 
 
 def test_pressure_thresholds_are_inclusive():
@@ -69,8 +67,16 @@ def test_plate_tasks_move_between_unblock_and_cleanup():
         assert PL.layer_of(t, None, rules=_rules(plate_pressure=0.0)) == PL.L_CLEANUP
 
 
-def test_fill_cooker_is_capacity_layer():
-    assert PL.layer_of(_T("FillCooker"), None, rules=_rules()) == PL.L_CAPACITY
+def test_capacity_layer_has_no_members():
+    """L_CAPACITY 是空层：没有任何 TYPE 落进去。
+
+    它原先装 FillCooker，那是设计错误 —— 层序判据是「有倒计时的压过没倒
+    计时的」，而空灶没有倒计时。填灶现在在 L_PREP 按缺口大小与备菜数值
+    竞争（见 tests/test_fill_cooker_layer.py 的实测依据）。
+    """
+    for name in ("FillCooker", "FetchToCooker", "Extinguish", "DeliverPlate",
+                 "WashPlate", "Chop", "StashHeld", "SomeFutureTask"):
+        assert PL.layer_of(_T(name), None, rules=_rules()) != PL.L_CAPACITY
 
 
 def test_prep_types_land_in_prep_layer():
@@ -86,12 +92,11 @@ def test_unknown_and_cleanup_types_fall_to_cleanup():
 
 
 def test_prep_types_is_not_combo_prep_types():
-    """两张表必须不同：_COMBO_PREP_TYPES 含 TakeCookedToPlate 与
-    PlaceCleanPlate，而它们分层后在 L2 / L4，不在备菜层。混用会把救料
-    和摆盘错划进 L6。"""
-    from ai import planner
+    """两张表有重叠但不等价：TakeCookedToPlate 现在（快熟阶段）也在备菜层，
+    但 PlaceCleanPlate 仍在 L4、不在备菜层。混用会把摆盘错划进 L6。"""
+    from ai.core import planner
     assert "TakeCookedToPlate" in planner._COMBO_PREP_TYPES
-    assert "TakeCookedToPlate" not in PL.LAYER_PREP_TYPES
+    assert "TakeCookedToPlate" in PL.LAYER_PREP_TYPES
     assert "PlaceCleanPlate" in planner._COMBO_PREP_TYPES
     assert "PlaceCleanPlate" not in PL.LAYER_PREP_TYPES
 
@@ -108,17 +113,17 @@ def test_rules_table_is_replaceable_by_remapping_layers():
     """
     base = _rules()
     by_layer = dict((layer, pred) for layer, pred in base)
-    # 把 FillCooker 的谓词映射到 L_RESCUE（比 L_REDEEM 高），送餐不动
+    # 把备菜的谓词映射到 L_RESCUE（比 L_REDEEM 高），送餐不动
     remapped = (
         (PL.L_FIRE,    by_layer[PL.L_FIRE]),
-        (PL.L_RESCUE,  by_layer[PL.L_CAPACITY]),   # 填灶改挂到更高层号
+        (PL.L_RESCUE,  by_layer[PL.L_PREP]),   # 备菜改挂到更高层号
         (PL.L_REDEEM,  by_layer[PL.L_REDEEM]),
     )
-    fill = _T("FillCooker")
+    prep = _T("Chop")
     deliver = _T("DeliverPlate")
-    assert PL.layer_of(fill, None, rules=remapped) < PL.layer_of(deliver, None, rules=remapped)
-    # 原表里是反的（兑现 > 产能，spec §4.3）
-    assert PL.layer_of(deliver, None, rules=base) < PL.layer_of(fill, None, rules=base)
+    assert PL.layer_of(prep, None, rules=remapped) < PL.layer_of(deliver, None, rules=remapped)
+    # 原表里是反的（兑现 > 备菜，spec §4.3）
+    assert PL.layer_of(deliver, None, rules=base) < PL.layer_of(prep, None, rules=base)
 
 
 def test_rules_table_is_replaceable_by_deletion():
@@ -181,18 +186,16 @@ def test_layer_of_task_reads_real_pressure_curve():
 def test_cooking_progress_maps_to_three_layers():
     """走一遍一个烹饪周期：生 → 快熟 → 刚熟 → 快糊。
 
-    progress 在周期内**单调递增**，所以 L6→L2→L1 是单向的，一个周期内
-    不会来回跳——这是 spec §8.4 否掉「降层迟滞」的依据之一。
-
-    注意 progress=2.0（刚下锅）落 **L_CLEANUP** 而不是 L_PREP：spec §4.2 的
-    L6 备菜层列表不含 TakeCookedToPlate，因为锅还没熟时「端盘去盛饭」没有任何
-    东西在倒计时（同 Task 1 的 test_pressure_splits_same_task_across_three_layers）。
+    progress 在周期内**单调递增**，所以层序单向，一个周期内不会来回跳。
+    progress=2.0（刚下锅）也落 L_PREP：TakeCookedToPlate 在快熟阶段靠 pressure
+    项与备菜竞争（ratio 0.15 起 pressure 才 > 0，刚下锅 pressure=0 不抢）。
     """
     t = _CookTask("TakeCookedToPlate", "cooker1")
     cases = [
-        (2.0,  PL.L_CLEANUP),       # ratio 0.08，刚下锅
-        (12.0, PL.L_RESCUE),        # ratio 0.50，刚熟 → pressure 1.0
-        (18.0, PL.L_IRREVERSIBLE),  # ratio 0.75，pressure 1.5
+        (2.0,  PL.L_PREP),          # ratio 0.08，刚下锅（pressure 0）
+        (7.8,  PL.L_PREP),          # ratio 0.325，快熟中（pressure 0.7）
+        (12.0, PL.L_RESCUE),        # ratio 0.50，已过刚熟(0.4) → pressure 1.17
+        (18.0, PL.L_IRREVERSIBLE),  # ratio 0.75，pressure 1.58
         (24.0, PL.L_IRREVERSIBLE),  # ratio 1.00，快糊 → pressure 2.0
     ]
     for progress, expected in cases:
@@ -239,16 +242,16 @@ def test_missing_cooking_progress_falls_back_to_binary():
     w = _W(cookers=[{"n": "cooker1", "cooked": True}])   # 无 progress/time
     assert PL.layer_of_task(t, w) == PL.L_RESCUE
 
-    w_raw = _W(cookers=[{"n": "cooker1"}])               # 空灶，什么都没有
-    assert PL.layer_of_task(t, w_raw) == PL.L_CLEANUP
+    w_raw = _W(cookers=[{"n": "cooker1"}])               # 空灶，pressure 0 → L6 备菜
+    assert PL.layer_of_task(t, w_raw) == PL.L_PREP
 
 
 def test_unknown_cooker_id_does_not_crash():
     """task 绑的灶已不在 world.cookers（被 P1 端走等）→ _time_pressure
-    返回 0.0 → 落 L7。层判定不负责发现「资源没了」，那由 feasible 负责
-    （spec §8.1：候选消失本身就是信号）。"""
+    返回 0.0 → 落 L6 备菜层。层判定不负责发现「资源没了」，那由 feasible
+    负责（spec §8.1：候选消失本身就是信号）。"""
     t = _CookTask("TakeCookedToPlate", "ghost_cooker")
-    assert PL.layer_of_task(t, _W(cookers=[_cooker(progress=20.0)])) == PL.L_CLEANUP
+    assert PL.layer_of_task(t, _W(cookers=[_cooker(progress=20.0)])) == PL.L_PREP
 
 
 class _Cand(object):
@@ -427,8 +430,8 @@ def test_filter_terms_keeps_only_whitelisted():
 
 # planner 当前产出的全部 term 键（与 ai/planner.py 的 terms[...] 对齐）。
 _ALL_TERMS = (
-    "urgency", "pressure", "eta", "p1_conflict", "async_resource",
-    "relay_bonus", "completion_ratio", "ingredient_reuse", "combo_head",
+    "urgency", "pressure", "eta", "async_resource",
+    "completion_ratio", "ingredient_reuse", "combo_head",
     "combo_break", "freshness", "deadline_lookahead", "hands", "move_penalty",
     "deliver_bonus", "plate_pressure", "relay_1_3_bonus", "cooker_idle",
     "no_plate_placed",
@@ -493,7 +496,15 @@ def test_filter_terms_sums_negative_contributions():
              "urgency": 3.0, "completion_ratio": 1.33}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
     assert score == pytest.approx(-1.5 - 1.0 - 5.0 + 3.0 + 1.33)
-    assert "pressure" not in kept
+
+
+def test_prep_layer_scores_take_cooked_pressure():
+    """快熟阶段的 TakeCookedToPlate 在 L6 要能吃到 pressure 项，否则
+    「提前端盘等熟」的压力梯度又会被白名单架空（实机烧糊的根因之一）。"""
+    terms = {"pressure": 2.5, "eta": -1.5, "hands": -1.0, "urgency": 3.0}
+    score, kept = PL.filter_terms(terms, PL.L_PREP)
+    assert "pressure" in kept
+    assert score == pytest.approx(2.5 - 1.5 - 1.0 + 3.0)
 
 
 def test_filter_terms_with_none_layer():

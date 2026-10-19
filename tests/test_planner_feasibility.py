@@ -8,10 +8,10 @@
 """
 import pytest
 
-from ai.blackboard import Blackboard, Commitment
-from ai.planner import Candidate, filter_feasible
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard, Commitment
+from ai.core.planner import Candidate, filter_feasible
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 from ai import tasks as T
 
 

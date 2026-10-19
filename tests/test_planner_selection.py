@@ -9,10 +9,10 @@
 """
 import pytest
 
-from ai.blackboard import Blackboard
-from ai.planner import Candidate, _score_candidate
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard
+from ai.core.planner import Candidate, _score_candidate
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 from ai import tasks as T
 
 
@@ -113,7 +113,7 @@ def test_score_urgency_boosts_with_lower_remaining():
 
 def test_returns_none_when_no_order():
     """无订单时返回 None。"""
-    from ai.planner import select_task
+    from ai.core.planner import select_task
 
     w = _make_world(orders=[])
     bb = _make_bb()
@@ -126,7 +126,7 @@ def test_returns_none_when_no_order():
 
 def test_plan_returns_decision_record():
     """plan() 返回 (chosen_task, record)，record 含 candidates 明细（spec §8.3）。"""
-    from ai.planner import plan, select_task
+    from ai.core.planner import plan, select_task
 
     w = _make_world(orders=[])
     bb = _make_bb()

@@ -14,9 +14,9 @@
 """
 from typing import Any, Callable, Dict, Optional
 
-from ai import predicates as P
-from ai.bt import Status
-from ai.hands import DIR2D
+from ai.query import predicates as P
+from ai.exec.bt import Status
+from ai.output.hands import DIR2D
 from ai.primitives.base import Primitive, resolve, target_cell
 from ai.primitives.tap import Confirm, Tap
 

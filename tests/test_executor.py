@@ -9,9 +9,9 @@
   5. 超时自动转 FAILURE。
 """
 import pytest
-from ai.executor import Executor
-from ai.bt import Node, Status, Sequence
-from ai.blackboard import Blackboard
+from ai.core.executor import Executor
+from ai.exec.bt import Node, Status, Sequence
+from ai.state.blackboard import Blackboard
 
 
 class MockTask:

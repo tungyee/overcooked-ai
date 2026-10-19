@@ -4,9 +4,9 @@ import os
 
 import pytest
 
-from ai import occupancy as O
-from ai.geometry import GridMapping
-from ai.replay import load_frames
+from ai.space import occupancy as O
+from ai.space.geometry import GridMapping
+from ai.exec.replay import load_frames
 
 
 def test_parse_node_map_basic():
@@ -197,34 +197,6 @@ def test_station_blocked_ndjson_frame_with_aabb():
         assert cell in blocked, cell
 
 
-def test_belt_cells_known_level():
-    """已知关卡：返回格集合与每格的方向向量。实测 Sushi_1_4 有 18 格。
-
-    方向是 (dx, dz) 向量而非方位字符串——navigation.step_cost 直接拿它
-    与移动向量比对，判断是否逆向通行。
-    """
-    cells, dirs = O.belt_cells_and_dirs("Sushi_1_4_2P")
-    assert len(cells) == 18
-    assert len(dirs) == 18
-    assert set(dirs.keys()) == cells
-    assert all(isinstance(d, tuple) and len(d) == 2 for d in dirs.values())
-    # K 排 (gz=2) 向右 (1,0)，Y 排 (gz=-3) 向左 (-1,0)
-    assert dirs[(0, 2)] == (1, 0)
-    assert dirs[(0, -3)] == (-1, 0)
-
-
-def test_belt_cells_unknown_level_degrades_empty():
-    """Review Focus 4：换关卡时 BELTS 查不到 → 空集，不抛异常。
-
-    spec §9 的退化保证：BELTS 泛化需改插件（§10.1），本轮残留硬编码，
-    但未知关卡必须安全退化——walkable 退回纯 nodeMap + 站点占用。
-    """
-    for level in ("Unknown_Level_9P", "", None):
-        cells, dirs = O.belt_cells_and_dirs(level)
-        assert cells == set()
-        assert dirs == {}
-
-
 def test_make_walkable_priority_order():
     """四条规则的优先级：站点占用 > 越界 > 传送带 > nodeMap。
 
@@ -291,7 +263,7 @@ def test_make_walkable_real_frame_baseline():
     parsed = O.parse_node_map(frame["grid"].get("nodeMap"))
     assert parsed is not None
     nm, rows, cols = parsed
-    cells, _ = O.belt_cells_and_dirs(frame.get("level"))
+    cells, _ = O.parse_belts(frame.get("belts"))
     walk = O.make_walkable(
         nm, rows, cols,
         O.playable_bounds(frame["stations"]),
@@ -442,3 +414,343 @@ def test_dedupe_extinguishers_keeps_first_non_rigidbody():
     got = O.dedupe_extinguishers(raw)
     assert len(got) == 1
     assert got[0]["n"] == "ext_plain"
+
+
+MAPPING = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=9.6, origin_z=-2.4)
+
+
+def test_parse_terrain_groups_by_layer():
+    raw = [
+        {"layer": 9, "boxes": [[3.6, 15.6, -8.6, 3.4]]},
+        {"layer": 10, "boxes": [[0.0, 1.0, 0.0, 1.0], [2.0, 3.0, 2.0, 3.0]]},
+    ]
+    got = O.parse_terrain(raw)
+    assert got[9] == [(3.6, 15.6, -8.6, 3.4)]
+    assert got[10] == [(0.0, 1.0, 0.0, 1.0), (2.0, 3.0, 2.0, 3.0)]
+
+
+def test_parse_terrain_skips_malformed_boxes():
+    raw = [{"layer": 9, "boxes": [[1, 2, 3], None, "junk"]}]
+    assert O.parse_terrain(raw) == {}
+
+
+def test_walkable_blocks_outside_ground():
+    """格中心不在任何 Ground AABB 内 -> 不可走（§5.3 第 1 步）。"""
+    terrain = {9: [(0.0, 2.4, 0.0, 2.4)]}   # 覆盖 gx 0..2, gz 2..4（世界坐标）
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), MAPPING)
+    # 格 (0,0) -> 世界 (9.6, -2.4)，在 ground box 外
+    assert is_walkable(0, 0) is False
+
+
+def test_walkable_permissive_when_no_terrain_data():
+    """地形数据整体缺失（合成帧常见）-> 不拦，不能让现有测试全炸。"""
+    is_walkable = O.make_walkable_from_terrain({}, [], set(), MAPPING)
+    assert is_walkable(0, 0) is True
+    assert is_walkable(100, 100) is True
+
+
+def test_parse_level_bounds_basic():
+    raw = [{"minx": 3.6, "maxx": 15.6, "minz": -8.6, "maxz": 3.4}]
+    assert O.parse_level_bounds(raw) == [(3.6, 15.6, -8.6, 3.4)]
+
+
+def test_parse_level_bounds_skips_malformed():
+    """缺字段/非数值/非 dict 一律跳过，只保留完整的四条。"""
+    raw = [
+        None,
+        {"minx": 1.0},                                  # 缺三字段
+        {"minx": "a", "maxx": 2, "minz": 3, "maxz": 4},  # 非数值
+        {"minx": 0.0, "maxx": 1.0, "minz": 0.0, "maxz": 1.0},
+    ]
+    assert O.parse_level_bounds(raw) == [(0.0, 1.0, 0.0, 1.0)]
+
+
+def test_walkable_falls_back_to_level_bounds_when_no_ground():
+    """Ground(9) 缺失时用 level_bounds 兜底裁剪（1-6 掉出范围的根因）。
+
+    有 level_bounds 时不能再像旧实现那样整体放行——否则角色会被寻路
+    引到地板外坠落。
+    """
+    level_bounds = [(9.0, 10.2, -3.0, -1.8)]   # 只覆盖 (0,0) 世界 (9.6,-2.4)
+    is_walkable = O.make_walkable_from_terrain(
+        {}, [], set(), MAPPING, level_bounds=level_bounds)
+    assert is_walkable(0, 0) is True      # 在 bounds 内
+    assert is_walkable(1, 0) is False     # 世界 (10.8,-2.4) 在 bounds 外
+    assert is_walkable(100, 100) is False
+
+
+def test_walkable_ground_wins_over_level_bounds():
+    """Ground 与 level_bounds 同时存在时，Ground 优先（更细），level_bounds 不用。"""
+    terrain = {9: [(9.0, 10.2, -3.0, -1.8)]}          # 只覆盖 (0,0)
+    level_bounds = [(-100.0, 100.0, -100.0, 100.0)]   # 巨大：若生效则全放行
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, level_bounds=level_bounds)
+    assert is_walkable(0, 0) is True     # ground 内
+    assert is_walkable(1, 0) is False    # ground 外；level_bounds 不应放行
+
+
+def test_walkable_blocks_killplane():
+    terrain = {9: [(-100.0, 100.0, -100.0, 100.0)], 30: [(9.0, 10.2, -3.0, -1.8)]}
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), MAPPING)
+    assert is_walkable(0, 0) is False   # 世界 (9.6,-2.4) 落在 killplane box 内
+
+
+def test_walkable_blocks_wall_layers():
+    terrain = {
+        9: [(-100.0, 100.0, -100.0, 100.0)],
+        10: [(9.0, 10.2, -3.0, -1.8)],
+    }
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), MAPPING)
+    assert is_walkable(0, 0) is False
+
+
+def test_walkable_blocks_wall_edge_touching_cell_center():
+    """格中心恰好落在墙 AABB 边界上时，浮点误差不能把整行漏判成可走。
+
+    Sushi_1_3 的 gz=-6：墙 box 的 maxz=0.0，而该格中心 z = 7.2 + 1.2*(-6)
+    浮点算出来是 8.88e-16（略大于 0）。旧点判 `z <= maxz` 判定失败，整行
+    被判可走，角色被寻路引到墙里顶墙卡住（no_progress）。修复后边界格
+    算在墙内。
+    """
+    mapping = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=6.0, origin_z=7.2)
+    terrain = {
+        9: [(-2.4, 15.6, -0.6, 12.0)],     # ground 覆盖到 z=-0.6
+        10: [(-1.8, 15.0, -0.6, 0.0)],     # 墙：maxz=0.0 恰在 gz=-6 格中心
+    }
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), mapping)
+    assert is_walkable(0, -6) is False     # 格中心 z≈0，在墙内 → 不可走
+    assert is_walkable(0, -5) is True      # 格中心 z=1.2，在墙上方 → 可走
+
+
+def test_walkable_does_not_block_when_wall_edge_overlaps_neighbor():
+    """墙/站点 collider 只溢出到邻格边缘、盖不住邻格中心时，邻格仍可走。
+
+    实机 trace-20261017-193620（Balloon_1_5）：顶部墙 collider 底边 z=2.8
+    与 gz=4 地板格顶边 z=3.0 重叠 0.2，但这排是墙**前面**的可走地板。
+    若按「格子区域相交」判，整排上层地板会被误判不可走，把上左走廊和
+    上层全封死。格中心点判不会误伤：中心 z=2.4 不在墙 z[2.8,3.4] 内。
+    """
+    terrain = {
+        9: [(-100.0, 100.0, -100.0, 100.0)],
+        10: [(3.6, 15.61, 2.8, 3.4)],
+    }
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), MAPPING)
+    # gz=4 -> 世界 z = -2.4 + 4*1.2 = 2.4，格中心不在墙内 → 可走
+    assert is_walkable(0, 4) is True
+    assert is_walkable(3, 4) is True
+
+
+def test_edge_blocker_blocks_thin_wall_between_cells():
+    """薄墙夹在两格中心之间（点判漏掉），拦「跨过去」这条边，但不拦格子。"""
+    terrain = {10: [(10.1, 10.3, -3.0, -1.8)]}   # 竖薄墙：宽 0.2，跨 gx=0/1 边界
+    edge = O.make_edge_blocker(terrain, MAPPING)
+    # (0,0) 中心 (9.6,-2.4)、(1,0) 中心 (10.8,-2.4)；墙夹在中间且盖住 z=-2.4
+    assert edge((0, 0), (1, 0)) is True
+    assert edge((1, 0), (0, 0)) is True
+    # 垂直方向不拦
+    assert edge((0, 0), (0, 1)) is False
+    # 格中心不被墙覆盖：格子本身仍可走
+    is_walkable = O.make_walkable_from_terrain(
+        {9: [(-100.0, 100.0, -100.0, 100.0)], 10: [(10.1, 10.3, -3.0, -1.8)]},
+        [], set(), MAPPING)
+    assert is_walkable(0, 0) is True
+    assert is_walkable(1, 0) is True
+
+
+def test_edge_blocker_blocks_horizontal_wall():
+    """横薄墙夹在上下两格中心之间，拦垂直移动那条边。"""
+    terrain = {10: [(9.0, 10.2, -1.9, -1.7)]}   # 横薄墙：高 0.2，跨 gz=0/1 边界
+    edge = O.make_edge_blocker(terrain, MAPPING)
+    # (0,0) 中心 z=-2.4、(0,1) 中心 z=-1.2；墙夹在中间且盖住 x=9.6
+    assert edge((0, 0), (0, 1)) is True
+    assert edge((0, 1), (0, 0)) is True
+    assert edge((0, 0), (1, 0)) is False
+
+
+def test_edge_blocker_ignores_thick_station_block():
+    """厚块盖住自己格中心（点判拦格），不额外拦相邻可走格之间的边。"""
+    # 1.2×1.2 实心块盖住 (0,0) 中心 (9.6,-2.4)
+    terrain = {10: [(9.0, 10.2, -3.0, -1.8)]}
+    edge = O.make_edge_blocker(terrain, MAPPING)
+    # 相邻可走格 (0,1)-(1,1) 之间不应被这块拦住（它不夹在这两格中心间）
+    assert edge((0, 1), (1, 1)) is False
+    # 进入该块的边由点判负责（格子不可走），edge 层可以不管，但也不误报
+    is_walkable = O.make_walkable_from_terrain(
+        {9: [(-100.0, 100.0, -100.0, 100.0)], 10: [(9.0, 10.2, -3.0, -1.8)]},
+        [], set(), MAPPING)
+    assert is_walkable(0, 0) is False
+    assert is_walkable(0, 1) is True
+
+
+def test_walkable_blocks_hazard_boxes():
+    terrain = {9: [(-100.0, 100.0, -100.0, 100.0)]}
+    hazard_boxes = [(9.0, 10.2, -3.0, -1.8)]
+    is_walkable = O.make_walkable_from_terrain(terrain, hazard_boxes, set(), MAPPING)
+    assert is_walkable(0, 0) is False
+
+
+def test_walkable_blocks_occupancy_cells():
+    terrain = {9: [(-100.0, 100.0, -100.0, 100.0)]}
+    is_walkable = O.make_walkable_from_terrain(terrain, [], {(0, 0)}, MAPPING)
+    assert is_walkable(0, 0) is False
+    assert is_walkable(1, 0) is True
+
+
+def test_walkable_belt_cells_exempt_from_occupancy():
+    """传送带格即使在 m_gridOccupancy 里也必须可走（实机回归）。
+
+    ConveyorStation 自身占据它所在的格，所以运行时占用表把全部 18 格
+    传送带都标成占用。旧 `make_walkable` 有一条"传送带 → 可走"的放行
+    （第 4 步），`make_walkable_from_terrain` 漏掉了它：寿司关两排传送带
+    是左右两半唯一的通路，全标不可走后 P2 从出生点只够得到 6 格，
+    **全部 task 的 Approach 第一拍就 FAILURE、整局零按键**
+    （trace-20261016-175943，334 拍无一个按键）。
+    """
+    terrain = {9: [(-100.0, 100.0, -100.0, 100.0)]}
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], {(0, 0), (1, 0)}, MAPPING, belt_cells={(0, 0)})
+    assert is_walkable(0, 0) is True     # 传送带格：占用表不算
+    assert is_walkable(1, 0) is False    # 普通占用格仍不可走
+
+
+def test_walkable_belt_cells_still_blocked_by_terrain():
+    """放行只豁免运行时占用，不豁免地形/墙/落火。"""
+    terrain = {9: [(-100.0, 100.0, -100.0, 100.0)], 10: [(9.0, 10.2, -3.0, -1.8)]}
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, belt_cells={(0, 0)})
+    assert is_walkable(0, 0) is False
+
+
+# 气球关两块地板的真实 AABB（spec §4.3 实测，世界坐标）：
+# 主地板 x[3.6,15.6]，篮子地板 x[16.0,23.2]，z 向在篮子三个停靠位置下平移
+# ±4.9（§4.2）。为覆盖篮子移动的全部位置，Ground 层给两个并集框。
+BALLOON_GROUND_BOXES = [
+    (3.6, 15.6, -8.6, 3.4),                # 主地板（恒定）
+    (16.0, 23.2, -8.6 - 4.9, 3.4 + 0.1),  # 篮子地板，覆盖 BOT..TOP 全部位置
+]
+
+
+def _load_p1_track():
+    """加载 Balloon_1_5 P1 轨迹。"""
+    path = os.path.join(os.path.dirname(__file__), "fixtures", "balloon_1_5_p1_track.json")
+    if not os.path.exists(path):
+        pytest.skip("缺 balloon_1_5_p1_track.json，先跑 Task 1 的提取脚本")
+    return json.load(open(path))
+
+
+def test_ground_truth_p1_track_fully_walkable():
+    """spec §8 测试 1：P1 走过的每个真实位置必须可走。baseline 32.6% -> 目标 100%。
+
+    用真实地形数据（spec §4.3 手工实测）验证 make_walkable_from_terrain
+    在多网格关卡 Balloon_1_5 上的命中率。轨迹来自 Task 1 的提取。
+    """
+    track = _load_p1_track()
+    mapping = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=9.6, origin_z=-2.4)
+    terrain = {9: BALLOON_GROUND_BOXES}
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), mapping)
+
+    hit, total = 0, 0
+    misses = []
+    for x, z in track:
+        gx, gz = mapping.to_grid(x, z)
+        total += 1
+        if is_walkable(gx, gz):
+            hit += 1
+        else:
+            misses.append((round(x, 1), round(z, 1), gx, gz))
+
+    rate = hit / total
+    assert rate == 1.0, "命中率 %.1f%%，未命中样本（前10个）：%s" % (
+        rate * 100, misses[:10])
+
+
+def test_parse_hazards_basic():
+    """hazard 列表解析：提取 grid/x/z/ttl 四字段。"""
+    raw = [{"t": "fire", "grid": "GridManager", "x": 13.2, "z": -2.4, "ttl": 11.0}]
+    got = O.parse_hazards(raw)
+    assert got == [{"grid": "GridManager", "x": 13.2, "z": -2.4, "ttl": 11.0}]
+
+
+def test_parse_hazards_skips_expired_and_malformed():
+    """ttl<=0 或缺坐标的 hazard 丢弃；非 dict 条目忽略。"""
+    raw = [{"t": "fire", "x": 1.0, "z": 1.0, "ttl": 0.0},   # ttl<=0 已过期
+           {"t": "fire", "x": None, "z": 1.0, "ttl": 5.0},   # 缺坐标
+           "junk"]
+    assert O.parse_hazards(raw) == []
+
+
+def test_hazard_boxes_one_cell_square():
+    """每个 hazard 给边长=cell 的正方形框（x±cell/2, z±cell/2）。"""
+    hz = [{"grid": "G", "x": 10.0, "z": 10.0, "ttl": 5.0}]
+    boxes = O.hazard_boxes(hz, cell=1.2)
+    assert boxes == [(9.4, 10.6, 9.4, 10.6)]
+
+
+def test_parse_wind_zones_basic():
+    """风区解析：提取 AABB + 风向风速。"""
+    raw = [{"minx": 3.0, "maxx": 5.0, "minz": -2.0, "maxz": 1.0,
+            "vx": 0.0, "vz": 2.5}]
+    assert O.parse_wind_zones(raw) == [
+        {"minx": 3.0, "maxx": 5.0, "minz": -2.0, "maxz": 1.0,
+         "vx": 0.0, "vz": 2.5}]
+
+
+def test_parse_wind_zones_skips_malformed():
+    """缺 AABB 字段或非 dict 的丢弃；vx/vz 缺失按 0。"""
+    raw = [None,
+           {"minx": 1.0},                                  # 缺三字段
+           {"minx": 0.0, "maxx": 2.0, "minz": 0.0, "maxz": 1.0}]
+    assert O.parse_wind_zones(raw) == [
+        {"minx": 0.0, "maxx": 2.0, "minz": 0.0, "maxz": 1.0,
+         "vx": 0.0, "vz": 0.0}]
+
+
+def test_parse_belts_direction_from_velocity():
+    """传送带方向从 vx/vz 归一化，不信任任何枚举字段。"""
+    raw = [{"grid": "GridManager", "gx": -4, "gz": 2, "vx": 2.5, "vz": 0.0},
+           {"grid": "GridManager", "gx": -4, "gz": -3, "vx": -2.5, "vz": 0.0}]
+    cells, dirs = O.parse_belts(raw)
+    assert cells == {(-4, 2), (-4, -3)}
+    assert dirs[(-4, 2)] == (1, 0)
+    assert dirs[(-4, -3)] == (-1, 0)
+
+
+def test_parse_belts_empty_on_zero_velocity():
+    """vx/vz 都是 0 时该格仍算传送带（belt_cells），但不记方向。"""
+    raw = [{"grid": "G", "gx": 0, "gz": 0, "vx": 0.0, "vz": 0.0}]
+    cells, dirs = O.parse_belts(raw)
+    assert cells == {(0, 0)}
+    assert dirs == {}   # 方向不可定义，但格仍可走
+
+
+def test_station_block_cells_plate_station_uses_layer20():
+    """出餐口用 PLATEBLOCK(20) box 反算占地格（1×2），不是交互格单格。
+
+    Sushi_1_3 出餐口：交互格 (-6,-4)，layer20 box 覆盖 (-6,-3)/(-6,-4)
+    两格（竖 1×2）。collider AABB 报 2×2 是溢出的，不能用。
+    """
+    mapping = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=6.0, origin_z=7.2)
+    terrain = {20: [(-1.8, -0.6, 1.8, 4.2)]}
+    st = {"t": "plate_station", "gx": -6, "gz": -4, "x": -1.2, "z": 3.0}
+
+    assert O.station_block_cells(st, terrain, mapping) == {(-6, -4), (-6, -3)}
+
+
+def test_station_block_cells_other_stations_single_cell():
+    """非出餐口站点阻挡格 == gx/gz 单格，不查 terrain。"""
+    mapping = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=6.0, origin_z=7.2)
+    st = {"t": "cooking", "gx": 5, "gz": 3, "x": 12.0, "z": 10.8}
+
+    assert O.station_block_cells(st, {}, mapping) == {(5, 3)}
+
+
+def test_station_block_cells_plate_station_fallback_to_gx_gz():
+    """出餐口缺 x/z、或匹配不到 layer20 box 时退回交互格单格。"""
+    mapping = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=6.0, origin_z=7.2)
+    st = {"t": "plate_station", "gx": -6, "gz": -4}
+
+    assert O.station_block_cells(st, {}, mapping) == {(-6, -4)}
+
+
+def test_station_block_cells_non_dict_returns_empty():
+    assert O.station_block_cells(None, {}, None) == set()

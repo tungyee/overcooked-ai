@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from ai import planner
-from ai import planner_layers as PL
+from ai.core import planner
+from ai.core import planner_layers as PL
 
 
 def test_score_candidate_without_layer_is_unchanged():
@@ -36,10 +36,11 @@ def test_plan_only_scores_top_layer_candidates():
 
     场景取自 test_fill_cooker_priority.py 的 t=1800 形态（3 单要米、灶全空）。
     """
-    from ai import planner, tasks as T
-    from ai.blackboard import Blackboard
-    from ai.recipes import RecipeBook
-    from ai.world import World
+    from ai.core import planner
+    from ai import tasks as T
+    from ai.state.blackboard import Blackboard
+    from ai.query.recipes import RecipeBook
+    from ai.state.world import World
 
     recipes = [
         {"name": "Sushi_Cucumber", "comp": ["Seaweed", "BoiledSushiRice", "Cucumber"]},
@@ -80,32 +81,40 @@ def test_plan_only_scores_top_layer_candidates():
 
     chosen, record = planner.plan(w, bb, None, book)
 
+    # 缺 3 份米（3 单要米、灶全空）→ cooker_idle 拿满 5.6，填灶在 L_PREP
+    # **层内凭分数**胜出。这与分层期间的 L5>L6 结论相同，但机制不同：
+    # 现在缺口小的时候它会让位（见 tests/test_fill_cooker_layer.py）。
     assert chosen.TYPE == "FillCooker"
-    assert record["top_layer"] == PL.L_CAPACITY
+    assert record["top_layer"] == PL.L_PREP
 
     by_type = {}
     for task, score, terms, ok, veto, is_chosen, layer, in_top in record["candidates"]:
         by_type[task.TYPE] = (score, terms, ok, layer, in_top)
 
-    # FillCooker 落在 L_CAPACITY，是唯一进入打分的候选：terms 全量（不受
-    # 白名单裁剪，比 L_CAPACITY 的白名单 {cooker_idle, eta} 多得多），
-    # in_top_layer=True，分数只计白名单内的 cooker_idle + eta。
     fc_score, fc_terms, fc_ok, fc_layer, fc_in_top = by_type["FillCooker"]
     assert fc_ok is True
-    assert fc_layer == PL.L_CAPACITY
+    assert fc_layer == PL.L_PREP
     assert fc_in_top is True
-    assert set(fc_terms) > PL.TERM_WHITELIST[PL.L_CAPACITY]  # terms 全量，不是裁剪后的
-    expected_score, _ = PL.filter_terms(fc_terms, PL.L_CAPACITY)
+    assert set(fc_terms) > PL.TERM_WHITELIST[PL.L_PREP]  # terms 全量，不是裁剪后的
+    expected_score, _ = PL.filter_terms(fc_terms, PL.L_PREP)
     assert fc_score == pytest.approx(expected_score)
-    assert fc_score == pytest.approx(fc_terms["cooker_idle"] + fc_terms["eta"])
 
-    # FetchToCooker 可行但层不够高（L_PREP）：没进打分，terms 为空、分数 0。
+    # FetchToCooker 现在同层同样参与打分，但分数低于填灶（它没有
+    # cooker_idle，且 async_resource 要求「订单已有盘」—— 本场景 0 盘）。
     fetch_score, fetch_terms, fetch_ok, fetch_layer, fetch_in_top = by_type["FetchToCooker"]
     assert fetch_ok is True
     assert fetch_layer == PL.L_PREP
-    assert fetch_in_top is False
-    assert fetch_terms == {}
-    assert fetch_score == 0.0
+    assert fetch_in_top is True
+    assert fetch_score < fc_score
+
+    # L_CLEANUP 的 Prefetch 仍然被层挡在打分之外：terms 为空、分数 0。
+    # 这是分层的核心可观测性收益（spec §6），换层后依然要成立。
+    if "Prefetch" in by_type and by_type["Prefetch"][2]:
+        pf_score, pf_terms, pf_ok, pf_layer, pf_in_top = by_type["Prefetch"]
+        assert pf_layer == PL.L_CLEANUP
+        assert pf_in_top is False
+        assert pf_terms == {}
+        assert pf_score == 0.0
 
 
 def _world(cookers=(), plates=(), orders=()):
@@ -122,21 +131,28 @@ def _world(cookers=(), plates=(), orders=()):
     })()
 
 
-def test_fill_cooker_outranks_prep_structurally():
+def test_fill_cooker_shares_prep_layer_and_competes_by_shortfall():
     """AGENTS.md §10.2 记的那次静默回退：urgency 改读 slack 后，备菜候选
     在中段能拿到 3~4 分，把 W_COOKER_IDLE=4.0 的填灶顶了下去——第 1 组在
     真实帧上验证过的七个「灶空转该填灶」的拍全部回退，而 982 个测试一个
-    都没报警。当时的修法是把 4.0 提到 4.8。
+    都没报警。当时的修法是把 4.0 提到 4.8（后又到 5.6）。
 
-    分层后这件事不再靠数字：FillCooker 在 L5、备菜在 L6，**备菜压根不进
-    打分**。所以这条断言的是层，不是分数——数字怎么调都不会再翻车。
+    分层期间这条曾改成断言「层序」（L5 < L6），号称「数字怎么调都不会再
+    翻车」。那个结论**错了，而且方向相反**：层序把 W_COOKER_IDLE 整套标定
+    旁路掉了，于是填灶在缺口只有 1 份（cooker_idle 仅 1.9 分）时照样无条件
+    赢 —— 实机 trace-20261015-165358 有 **77% 的填灶拍处于这个局面**，
+    1043 拍全部压掉了本该做的备菜，1002 拍工时只换来 4 锅米。
+
+    现在填灶回到 L_PREP，这条重新断言**数值**关系，并且只在「缺口饱和」时
+    成立。层的那一半由 test_fill_cooker_layer.py 的 test_fill_cooker_is_prep_layer
+    守，缺口小时让位由同文件的 test_small_shortfall_yields_to_prep 守。
     """
     from ai import tasks as T
 
     fill = T.FillCooker(None, ("cooker1", ("SushiRice",)), "BoiledSushiRice")
     prep = T.FetchToPlate("order1", ("plate1", (3, 4)), "Seaweed")
     w = _world()
-    assert PL.layer_of_task(fill, w) < PL.layer_of_task(prep, w)
+    assert PL.layer_of_task(fill, w) == PL.layer_of_task(prep, w) == PL.L_PREP
 
 
 def test_redeem_outranks_capacity():
@@ -220,8 +236,7 @@ def test_full_layer_order_on_one_world():
         (PL.L_IRREVERSIBLE,  T.Discard(resources=("cooker1",))),
         (PL.L_REDEEM,        T.DeliverPlate("order1", ("plate1",))),
         (PL.L_UNBLOCK,       T.WashPlate(resources=("sink1",))),
-        (PL.L_CAPACITY,      T.FillCooker(None, ("cooker2", ("SushiRice",)),
-                                          "BoiledSushiRice")),
+        # L_CAPACITY 是空层（填灶已回 L_PREP 按缺口竞争），没有样本可放。
         (PL.L_PREP,          T.Chop("order1", ("board1",), "Cucumber")),
         (PL.L_CLEANUP,       T.StashHeld()),
     ]
@@ -233,22 +248,15 @@ def test_full_layer_order_on_one_world():
     assert len(set(observed)) == len(observed)
 
 
-def test_prewarm_ramp_lands_in_cleanup_known_tradeoff():
-    """渐变段（ratio 0.25~0.5）落 L7——这是分层的**已知代价**，显式钉住。
+def test_prewarm_ramp_lands_in_prep_layer():
+    """渐变段（ratio 0.15~0.4）落 L6 备菜层——「提前端盘等熟」生效。
 
-    `_time_pressure` 在 ratio 0.25~0.5 之间给 0→1.0 的渐变，注释写明它存在的
-    理由是「让 TakeCookedToPlate 提前去端盘、站到锅前等，否则等熟了才去拿盘会
-    来不及，**实机烧糊**」。
-
-    分层后这整段落 L7，严格弱于任何 L6 备菜候选；到 pressure 1.0 那一瞬才跳
-    L2。也就是说**预取信号对层选择零影响**——词典序表达不了「比备菜略高一点」
-    这种细粒度，而扁平加权和能（那是分层刻意放弃的能力，见 spec §3）。
-
-    这条测试不是说「这样是对的」，而是把隐性行为变成显性约定：若实机确认它
-    导致烧糊，正确的修法是改 spec §4.2 把 TakeCookedToPlate 纳入 L6，而不是
-    调权重——届时本测试会红，提醒改动者这是个设计决定而非回归。
+    之前这整段落 L7、严格弱于任何 L6 备菜候选，预取信号对层选择零影响，于是
+    饭熟了 AI 还没去端盘、烧糊（实机 trace-20261017-172221）。修复是把
+    TakeCookedToPlate 纳入 L6，靠 pressure 项与备菜同层竞争；pressure >= 1.0
+    （ratio 0.4，策略「刚熟」点）那一瞬跳 L2。
     """
-    from ai import planner_layers as PL
+    from ai.core import planner_layers as PL
 
     class _CookTask(object):
         TYPE = "TakeCookedToPlate"
@@ -257,14 +265,14 @@ def test_prewarm_ramp_lands_in_cleanup_known_tradeoff():
             # type: (str) -> None
             self.cooker_id = cooker_id
 
-    for progress in (6.0, 8.0, 10.0, 11.9):
+    for progress in (4.0, 5.0, 6.0, 8.0, 9.0):
         w = _world(cookers=[{"n": "c1", "cooking_time": 12.0,
                              "cooking_progress": progress}])
-        assert PL.layer_of_task(_CookTask("c1"), w) == PL.L_CLEANUP, \
-            "progress=%s 应落 L7（已知代价）" % progress
-    # 刚熟那一瞬跳 L2
+        assert PL.layer_of_task(_CookTask("c1"), w) == PL.L_PREP, \
+            "progress=%s 应落 L6（快熟阶段）" % progress
+    # 越过 ratio 0.4（刚熟策略点）跳 L2（用 10.0 避开 0.4 的浮点边界）
     w_done = _world(cookers=[{"n": "c1", "cooking_time": 12.0,
-                              "cooking_progress": 12.0}])
+                              "cooking_progress": 10.0}])
     assert PL.layer_of_task(_CookTask("c1"), w_done) == PL.L_RESCUE
 
 
@@ -275,7 +283,7 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
     → _apply_commitment_inertia 的 ③ 把它当「不在可行候选中」，走
     infeasible_streak 的 3 拍宽限再改选，而不是立即切。
     """
-    from ai.blackboard import Blackboard, Commitment
+    from ai.state.blackboard import Blackboard, Commitment
     from ai import tasks as T
 
     prep = T.Chop("order1", ("board1",), "Cucumber")
@@ -299,14 +307,15 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
 
 
 def test_unblock_layer_intra_order_matches_spec():
-    """L4 解卡层内序：0 盘 > 无盘就位 > 1 盘（spec §7）。
+    """L4 解卡层内序：0 盘洗盘 > 无盘就位摆盘（spec §7）。
 
     最终复审查出这条曾经是**反的**：W_PLATE_PRESSURE=3.5 时 1 盘档洗盘 3.5
-    压过摆盘 3.0。而 L4 的可达域只有 clean ∈ {0,1} 两档（_plate_pressure > 0
-    仅当 clean <= 1，WashPlate.feasible 要求 clean < PLATE_BUFFER=2），所以
-    错的那档占一半。
+    压过摆盘 3.0。如今 WashPlate.feasible 只在「干净盘 + 装配盘 = 0」时成立
+    （_plate_pressure 在可行时恒为 2.0），所以 L4 里洗盘只有 0 盘这一档，
+    「1 盘洗盘」已经不可达——下面仍保留 wash_1 这条是防御性权重检查：将来若
+    有人把 feasible 放宽回「1 盘也洗」，这个断言会提醒他 1 盘洗盘不能压过摆盘。
 
-    这一档正是 W_NO_PLATE_PLACED 当初定标要解决的局面：trace-20261014-221306
+    摆盘这一档正是 W_NO_PLATE_PLACED 当初定标要解决的局面：trace-20261014-221306
     里 PlaceCleanPlate 可行 1101 拍、选中 0 次，807 拍无盘就位，收盘挂 5 单。
 
     断言用 filter_terms 实算，不比权重常量——比常量查不出「某一项没乘上去」。
@@ -320,4 +329,5 @@ def test_unblock_layer_intra_order_matches_spec():
 
     assert wash_0 > place, "0 盘洗盘 %.1f 必须压过摆盘 %.1f" % (wash_0, place)
     assert place > wash_1, \
-        "摆盘 %.1f 必须压过 1 盘洗盘 %.1f（spec §7 的 L4 层内序）" % (place, wash_1)
+        "摆盘 %.1f 必须压过 1 盘洗盘 %.1f（防御性权重检查，见 docstring）" % (
+            place, wash_1)

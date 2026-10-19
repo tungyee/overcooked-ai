@@ -6,10 +6,10 @@
 """
 from typing import Any, Dict, Optional, Tuple
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Guard, Node, Sequence
+from ai.query import stations as S
+from ai.exec.bt import Guard, Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            ingredient_available, ingredient_source,
                            plate_by_id)
@@ -32,6 +32,11 @@ def _plate_on_serving_hatch(ctx, plate):
     坐标时退化为半格容差。
     """
     if not plate:
+        return False
+    # 被端着的盘不可能是「已经交出去」：P2 站在出餐口旁、面朝出餐口时，
+    # 手持盘的坐标略在角色前方，会落进出餐口矩形框内，被误判成已交付 →
+    # DeliverPlate 变不可行 → 送餐振荡（trace-20261019-122319）。
+    if plate.get("held_by"):
         return False
     px, pz = plate.get("x"), plate.get("z")
     if px is None or pz is None:

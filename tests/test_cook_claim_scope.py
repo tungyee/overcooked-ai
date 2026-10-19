@@ -6,10 +6,11 @@ rescue 认领」，于是一单要两份熟料（或多料菜）时，第一份�
 的候选全压掉——AI 站着等，灶空着。认领本是为了「同一份熟料别重复下锅」，
 作用域应该是**具体的熟料**，不是整单。
 """
-from ai import recipe_graph, tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.query import recipe_graph
+from ai import tasks as T
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 RECIPES = [

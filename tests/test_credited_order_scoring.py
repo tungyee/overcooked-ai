@@ -19,9 +19,9 @@ credited-order 逻辑后，旧测试仍然通过（因为它根本没走到 `_sc
 临时把第 ⑦ 项的 `effective_order_id` 换回 `task.order_id`（禁用 credited
 override）后，这个新测试会看到 0.0 vs 0.75 并翻红；改回来后恢复绿。
 """
-from ai import planner
+from ai.core import planner
 from ai import tasks as T
-from ai.blackboard import Blackboard
+from ai.state.blackboard import Blackboard
 
 
 def test_completion_ratio_uses_credited_order():

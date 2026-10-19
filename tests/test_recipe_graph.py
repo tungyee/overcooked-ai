@@ -3,10 +3,10 @@
 
 覆盖：切→煮链（阶段 2）、存在性 done 对逐板 Chop 的收敛（阶段 1 有意变更）。
 """
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
-from ai.world import World
-from ai import recipe_graph
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
+from ai.query import recipe_graph
 
 
 def _world(orders, recipes, stations, plates=None, cookers=None,
@@ -157,6 +157,75 @@ def test_multi_raw_cook_emits_fetch_to_cooker_with_raws():
     assert f2c[0].raws == ("Pasta", "Tomato")
 
 
+# ---------- Task 12：资源 id 切到 (grid,name) ----------
+
+def test_same_name_different_grid_cookers_are_independent_resources():
+    """§4.1/§5.2 的同名撞车场景：两口灶同名不同网格，候选 id 必须不同。"""
+    w = _world(
+        orders=[{"id": "order1", "dish": "FriedMushrooms",
+                 "composition": ["FriedMushrooms"], "remaining": 60}],
+        recipes=_FRIED_MUSHROOM_RECIPES,
+        stations=[
+            {"t": "crate", "n": "crate_mushroom", "ing": "Mushroom",
+             "chop": "ChoppedMushroom", "chop_stages": 8, "gx": 1, "gz": 1},
+            {"t": "chopping", "n": "board_01", "gx": 2, "gz": 2,
+             "item": "ChoppedMushroom"},
+            {"t": "counter", "n": "counter_01", "gx": 3, "gz": 3},
+        ],
+        plates=[{"n": "plate_01", "x": 6.0, "z": 6.0, "count": 0, "contents": []}],
+        cookers=[
+            {"n": "cooker_01", "grid": "GridManager", "x": 4.0, "z": 4.0, "cooked": False},
+            {"n": "cooker_01", "grid": "Balloon Basket", "x": 20.0, "z": 4.0, "cooked": False},
+        ],
+    )
+    book = RecipeBook(w.recipes, w.stations)
+    tasks = recipe_graph.emit(w, Blackboard(), book, w.orders[0],
+                              {"plate_01": "order1"}, {})
+    fetch_tasks = [t for t in tasks if t.TYPE == "FetchToCooker"]
+    assert len(fetch_tasks) == 2, "两口同名灶应各发一个候选"
+    cooker_ids = {t.resources[0] for t in fetch_tasks}
+    assert len(cooker_ids) == 2, (
+        "两个候选的 cooker_id 必须不同（%r），否则同名撞车" % cooker_ids)
+    assert all(isinstance(cid, tuple) and len(cid) == 2 for cid in cooker_ids)
+
+
+def test_fetch_to_cooker_skips_mismatched_cookware():
+    """煎蘑菇（FryingPan）只配煎锅，不配灶上放着的炖锅。"""
+    w = _world(
+        orders=[{"id": "order1", "dish": "FriedMushrooms",
+                 "composition": ["FriedMushrooms"], "remaining": 60}],
+        recipes=_FRIED_MUSHROOM_RECIPES,
+        stations=[
+            {"t": "crate", "n": "crate_mushroom", "ing": "Mushroom",
+             "chop": "ChoppedMushroom", "chop_stages": 8, "gx": 1, "gz": 1},
+            {"t": "chopping", "n": "board_01", "gx": 2, "gz": 2,
+             "item": "ChoppedMushroom"},
+            {"t": "counter", "n": "counter_01", "gx": 3, "gz": 3},
+        ],
+        plates=[{"n": "plate_01", "x": 6.0, "z": 6.0, "count": 0,
+                 "contents": []}],
+        cookers=[
+            {"n": "cooker_pot", "grid": "GridManager", "x": 4.0, "z": 4.0,
+             "cooked": False, "cookware": "Pot"},
+            {"n": "cooker_pan", "grid": "GridManager", "x": 5.0, "z": 4.0,
+             "cooked": False, "cookware": "FryingPan"},
+        ],
+    )
+    book = RecipeBook(w.recipes, w.stations)
+    tasks = recipe_graph.emit(w, Blackboard(), book, w.orders[0],
+                              {"plate_01": "order1"}, {})
+    fetch = [t for t in tasks if t.TYPE == "FetchToCooker"]
+    assert {t.resources[0][1] for t in fetch} == {"cooker_pan"}, fetch
+
+
+def test_fetch_to_cooker_not_filtered_when_cookware_unknown():
+    """旧帧/单测 fixture 没 cookware 字段 → 不过滤（向后兼容）。"""
+    w = _fried_world(board_item="ChoppedMushroom")
+    book = RecipeBook(w.recipes, w.stations)
+    types = _emit_types(w, book, {"plate_01": "order1"})
+    assert "FetchToCooker" in types
+
+
 # ---------- 阶段 4：拌合 ----------
 
 def test_mix_node_emits_fetch_first_then_mix():
@@ -192,3 +261,31 @@ def test_mix_node_emits_fetch_first_then_mix():
     # 胡萝卜需切 → 前沿是 FetchToBoard（生胡萝卜上板）；Mix 依赖未齐，尚不发
     assert "FetchToBoard" in types
     assert "Mix" not in types
+
+
+def test_emit_plate_skips_held_plate():
+    """P1 手持空盘不能当干净空盘，_emit_plate 不生成 PlaceCleanPlate。"""
+    w = _world(
+        orders=[{"id": "order1", "dish": "Sushi", "composition": ["Seaweed"],
+                 "remaining": 60}],
+        recipes=[],
+        stations=[{"t": "counter", "n": "counter_01", "gx": 3, "gz": 3}],
+        plates=[{"n": "plate_01", "x": 6.0, "z": 6.0, "count": 0,
+                 "contents": [], "held_by": "Player 1"}],
+    )
+    tasks = recipe_graph._emit_plate(w, Blackboard(), "order1")
+    assert [t.TYPE for t in tasks] == []
+
+
+def test_emit_plate_uses_non_held_empty_plate():
+    """非手持空盘照旧生成 PlaceCleanPlate（对照）。"""
+    w = _world(
+        orders=[{"id": "order1", "dish": "Sushi", "composition": ["Seaweed"],
+                 "remaining": 60}],
+        recipes=[],
+        stations=[{"t": "counter", "n": "counter_01", "gx": 3, "gz": 3}],
+        plates=[{"n": "plate_01", "x": 6.0, "z": 6.0, "count": 0,
+                 "contents": []}],
+    )
+    tasks = recipe_graph._emit_plate(w, Blackboard(), "order1")
+    assert [t.TYPE for t in tasks] == ["PlaceCleanPlate"]

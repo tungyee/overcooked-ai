@@ -3,8 +3,8 @@ import pytest
 from pathlib import Path
 
 from ai import primitives as PR
-from ai.bt import Status
-from ai.navigation import distance_field
+from ai.exec.bt import Status
+from ai.space.navigation import distance_field
 from tests.test_primitives import FakeWorld, make_ctx, _inter
 
 
@@ -12,9 +12,9 @@ from tests.test_primitives import FakeWorld, make_ctx, _inter
 def test_latest_trace_stall_moves_toward_actual_cooker():
     """固定真实 tick 1032：柜台前持米、离交互位不到一格也必须持续移动。"""
     from ai import tasks as T
-    from ai import predicates as P
-    from ai.replay import load_frames
-    from ai.world import World
+    from ai.query import predicates as P
+    from ai.exec.replay import load_frames
+    from ai.state.world import World
 
     path = Path(__file__).parent / "fixtures/motion/trace-stall-20261010.ndjson.gz"
     frame = load_frames(str(path))[0]
@@ -45,6 +45,38 @@ def observe(ctx, now, seq, x=None, z=None):
     w = ctx["w"]
     cur = w.to_grid(ctx["chef"]["x"], ctx["chef"]["z"])
     ctx["field"] = distance_field(cur, w.walkable, w.belt_dir)
+
+
+def test_motion_tracks_relative_position_when_reported():
+    """插件上报 rel_x/rel_z 时，进度追踪用相对坐标而非世界坐标。
+
+    根因：角色站在移动平台（篮子）上，世界 x/z 被平台带着漂，settle /
+    no_progress 判据会误判「没停稳」→ observation_timeout。
+    """
+    from ai.primitives.motion import MotionControl
+    ctx, _ = make_ctx(start=(0, 0))
+    chef = ctx["chef"]
+    chef["x"] = 1.0
+    chef["z"] = 2.0
+    chef["rel_x"] = 0.3
+    chef["rel_z"] = 0.4
+    mc = MotionControl()
+    ctx.update(now=0.0, frame_seq=1, frame_received_at=0.0)
+    mc.tick(ctx, "up", None, False, False, final=False)
+    # 用了相对坐标 (0.3,0.4)，不是世界坐标 (1.0,2.0)
+    assert mc._progress_pos == (0.3, 0.4)
+
+
+def test_motion_falls_back_to_world_position_without_relative():
+    """插件没报 rel_x/rel_z 时（旧协议/合成帧）退回世界坐标，行为不变。"""
+    from ai.primitives.motion import MotionControl
+    ctx, _ = make_ctx(start=(0, 0))
+    ctx["chef"]["x"] = 1.0
+    ctx["chef"]["z"] = 2.0
+    mc = MotionControl()
+    ctx.update(now=0.0, frame_seq=1, frame_received_at=0.0)
+    mc.tick(ctx, "up", None, False, False, final=False)
+    assert mc._progress_pos == (1.0, 2.0)
 
 
 def near_cooker():
@@ -278,6 +310,64 @@ def test_final_step_settles_before_pulse():
     assert ("release", "down") in ctrl.calls
 
 
+def test_final_step_with_wall_ahead_cruises_instead_of_pulse():
+    """最后一步前方有阻碍物时直接长按巡航，不切短按。
+
+    墙/站点会挡住角色，长按不会冲过目标格，省去「短按 + 停稳」的精确档，
+    加快正对灶台/柜台的最后一步收敛。
+    """
+    # 交互位 (6,1)，站 (6,2) 往下走；正下方 (6,0) 不可走 = 前方有阻碍物。
+    w = FakeWorld(walkable=lambda gx, gz: gx == 6 and 1 <= gz <= 4)
+    ctx, ctrl = make_ctx(w=w, start=(6, 2))
+    observe(ctx, 0.0, 1, x=7.2, z=2.2)
+    node = PR.Approach({"n": "cooker", "gx": 7, "gz": 1})
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "down"          # 长按，而非短按松键
+    assert ctx["motion"]["phase"] == "cruise"
+    assert ("press", "down") in ctrl.calls
+
+
+def test_belt_crossing_final_step_holds_not_pulses():
+    """最后一步垂直穿越传送带时按住方向+顶带键，不切 50ms 短按。
+
+    实机 trace（trace-20261017-172221 t=2191~2366）：端盘去取盘，最后一步要
+    从 z=2 传送带下到 z=1，却走短按——50ms 跨不过一格、松键又被带推回，在带上
+    左右兜圈 175 拍（~8.7s），熟饭在锅里烧糊。
+    """
+    # (0,0) 是向右推的传送带；站 (0,0) 向上穿越到 (0,1)，(0,2) 是空地（无墙）。
+    w = FakeWorld(walkable=lambda gx, gz: (gx, gz) in {(0, 0), (0, 1), (0, 2)},
+                  belt_cells={(0, 0)}, belt_dir={(0, 0): (1, 0)})
+    ctx, ctrl = make_ctx(w=w, start=(0, 0))
+    observe(ctx, 0.0, 1)
+    node = PR.Approach({"n": "c", "gx": 1, "gz": 1}, "placement")
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "up"       # 长按，不是短按
+    assert ctx["hands"].move_extra == "left"   # 顶住向右推的带
+    assert ctx["motion"]["phase"] == "cruise"
+    assert ("press", "up") in ctrl.calls
+    assert ("press", "left") in ctrl.calls
+
+
+def test_reverse_belt_walk_holds_dash_and_cruises_on_final_step():
+    """逆向行走（顶传送带）必须冲刺+长按，普通步速会被带抵消、卡住不动。
+
+    实机 trace（trace-20261017-171202 t≈3690~3740）：P2 端盘在 z=-3 传送带
+    上向右逆行（带向左推），最后一步却走短按——一松键就被带推回，一格打转
+    约 50 拍。
+    """
+    # (0,0) 是向左推的传送带；目标站 (1,-1) 的交互位是 (1,0)，站 (0,0) 向右逆行。
+    w = FakeWorld(walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 4,
+                  belt_cells={(0, 0)}, belt_dir={(0, 0): (-1, 0)})
+    ctx, ctrl = make_ctx(w=w, start=(0, 0))
+    observe(ctx, 0.0, 1)
+    node = PR.Approach({"n": "c", "gx": 1, "gz": -1}, "placement")
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "right"      # 长按，不是短按
+    assert ctx["hands"].move_dash is True        # 逆行必须冲刺
+    assert ctx["motion"]["phase"] == "cruise"
+    assert ("press", "dash") in ctrl.calls
+
+
 def test_face_step_is_released_before_new_facing_signal():
     ctx, ctrl = make_ctx()
     observe(ctx, 0.0, 1)
@@ -364,7 +454,7 @@ def test_confirm_has_deadline_when_no_new_frames_arrive():
 def test_fetch_to_cooker_finishes_with_delayed_position_and_turning():
     """柜台前持米→补步到灶→转向→下米：验证整棵树及真实后置条件。"""
     from ai import tasks as T
-    from ai.recipes import RecipeBook
+    from ai.query.recipes import RecipeBook
 
     ctx, ctrl, _ = near_cooker()
     w = ctx["w"]

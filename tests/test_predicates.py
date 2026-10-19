@@ -1,6 +1,6 @@
 import copy
 
-from ai import predicates as P
+from ai.query import predicates as P
 
 
 # ---------- 手持 ----------
@@ -108,6 +108,38 @@ def test_cooker_has_pot_uses_cooked_null_convention(cooker):
 
 def test_cooker_has_pot_false_for_missing_cooker():
     assert P.cooker_has_pot(None) is False
+
+
+def test_cooker_cookware_reads_field():
+    assert P.cooker_cookware({"cookware": "Pot"}) == "pot"
+    assert P.cooker_cookware({"cookware": "FryingPan"}) == "fryingpan"
+
+
+def test_cooker_cookware_prefers_cook_type_over_name():
+    # cook_type 与配方 cook 同词汇，优先；拿不到才退回 cookware（GameObject 名）
+    assert P.cooker_cookware({"cook_type": "Pot",
+                              "cookware": "utensil_frying_pan_01"}) == "pot"
+    assert P.cooker_cookware({"cook_type": "null",
+                              "cookware": "utensil_pot_01"}) == "utensil_pot_01"
+    assert P.cooker_cookware({"cook_type": "FryingPan"}) == "fryingpan"
+
+
+def test_cooker_cookware_none_for_missing_or_null():
+    assert P.cooker_cookware(None) is None
+    assert P.cooker_cookware({}) is None
+    assert P.cooker_cookware({"cookware": None}) is None
+    assert P.cooker_cookware({"cookware": "null"}) is None
+    assert P.cooker_cookware({"cookware": ""}) is None
+
+
+def test_cookware_matches_normalizes_underscore():
+    # 配方 cook "FryingPan" 与物品名 "utensil_frying_pan_01" 之间有下划线差异
+    assert P.cookware_matches("utensil_frying_pan_01", "FryingPan") is True
+    assert P.cookware_matches("utensil_pot_01", "Pot") is True
+    assert P.cookware_matches("utensil_frying_pan_01", "Pot") is False
+    assert P.cookware_matches("utensil_pot_01", "FryingPan") is False
+    assert P.cookware_matches("", "Pot") is False
+    assert P.cookware_matches("utensil_pot_01", None) is False
 
 
 def test_cooker_cooked_requires_explicit_true(cooker):
@@ -520,3 +552,77 @@ def test_held_cookware_state_takes_nearest_same_name(chef_holding):
              {"n": "utensil_pot_01", "x": 5.2, "z": 0.0,
               "has_contents": False, "cooked": "Raw"}]
     assert P.held_cookware_state(chef, items) == P.COOKWARE_EMPTY
+
+
+# ---------- 资源 id 构造 (§5.2) ----------
+
+def test_resource_id_from_station_with_grid():
+    st = {"n": "DispenserCrate 3 (1)", "grid": "Balloon Basket"}
+    assert P.resource_id(st) == ("Balloon Basket", "DispenserCrate 3 (1)")
+
+
+def test_resource_id_missing_grid_defaults_empty_string():
+    """旧协议帧没有 grid 字段：退化为空字符串，不是 None（§5.2 的向后兼容）。"""
+    st = {"n": "workstation_cooker_01"}
+    assert P.resource_id(st) == ("", "workstation_cooker_01")
+
+
+def test_resource_id_same_name_different_grid_are_distinct():
+    """§5.2 要解决的同名撞车：左右各一个同名台面，grid 不同则 id 不同。"""
+    left = {"n": "countertop_01_standard_dark_wood (4)", "grid": "GridManager"}
+    right = {"n": "countertop_01_standard_dark_wood (4)", "grid": "Balloon Basket"}
+    assert P.resource_id(left) != P.resource_id(right)
+
+
+def test_resource_id_for_direct_construction():
+    assert P.resource_id_for("GridManager", "cooker_01") == ("GridManager", "cooker_01")
+
+
+# ---------- _target_cell 坐标优先级（spec §7 / Task 19 实机回归修正） ----------
+#
+# Task 19 最初把这里也改成"世界坐标优先"，与 primitives/base.py 的
+# target_cell 对齐。但实机复现（trace-20261016-122733）：气球关料箱永远
+# 拿不到料——因为 interact_ready 比对的是游戏上报的
+# interactions.pickup_gx/gz，这些字段是站点自身网格的局部坐标（不随
+# 篮子世界位置变化），而不是主网格投影后的坐标。改成世界坐标优先后
+# _target_cell 产出的值游戏永远不会上报，interact_ready 从此恒 False。
+# 这里改回"gx/gz 优先"，与 target_cell 刻意不同——两者服务不同的坐标
+# 比对对象。
+
+def test_predicates_target_cell_prefers_raw_gx_gz():
+    """interact_ready 要跟游戏上报的局部坐标直接比，必须优先 gx/gz。"""
+    def to_grid(x, z):
+        return (int(round((x - 9.6) / 1.2)), int(round((z + 2.4) / 1.2)))
+
+    target = {"gx": 2, "gz": -1, "x": 22.0, "z": -3.6}
+    got = P._target_cell(target, to_grid)
+    assert got == (2, -1)
+    assert got != to_grid(22.0, -3.6)
+
+
+def test_predicates_target_cell_falls_back_to_world_without_gx_gz():
+    target = {"x": 1.2, "z": 2.4}
+    assert P._target_cell(target, lambda x, z: (1, 2)) == (1, 2)
+
+
+# ---------- 格心对齐（句柄反馈闭环 Task 1）----------
+
+def test_cell_center_offset_measures_plane_distance():
+    chef = {"x": 15.3, "z": -10.97}
+    # 格 (1,-4) 的中心按 to_world 给的 (15.6, -10.8)
+    to_world = lambda gx, gz: (15.6, -10.8)      # noqa: E731
+    got = P.cell_center_offset(chef, (1, -4), to_world)
+    assert abs(got - 0.3447) < 1e-3
+
+
+def test_cell_center_offset_none_without_coords():
+    assert P.cell_center_offset({"x": None, "z": 1.0}, (0, 0),
+                                lambda gx, gz: (0.0, 0.0)) is None
+    assert P.cell_center_offset(None, (0, 0), lambda gx, gz: (0.0, 0.0)) is None
+
+
+def test_align_epsilon_scales_with_cell_size():
+    """容差是格宽的函数，不是写死的 0.3（spec Review Focus 2）。"""
+    assert P.align_epsilon(1.2) == 0.3
+    assert P.align_epsilon(0.8) == 0.2
+    assert P.align_epsilon(2.0) == 0.5

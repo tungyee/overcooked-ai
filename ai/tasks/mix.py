@@ -7,18 +7,27 @@
 """
 from typing import Any, Dict, List, Tuple
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai.bt import Node, Sequence
-from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           ingredient_available, ingredient_source)
+from ai.exec.bt import Node, Sequence
+from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _grid_matches, _register,
+                           _unpack_resource_id, ingredient_available,
+                           ingredient_source)
 
 
-def _mix_station(ctx, name):
+def _mix_station(ctx, station_id):
     # type: (Dict, Any) -> Any
+    """按资源 id 取拌合站点（spec §5.2：id 可能是 (grid,name) 元组，
+    过渡期也接受裸字符串——见 _unpack_resource_id）。"""
+    grid, name = _unpack_resource_id(station_id)
     for st in ctx["w"].stations:
-        if st.get("t") == "mixing" and str(st.get("n")) == str(name):
-            return st
+        if st.get("t") != "mixing":
+            continue
+        if str(st.get("n")) != name:
+            continue
+        if not _grid_matches(st.get("grid"), grid):
+            continue
+        return st
     return None
 
 

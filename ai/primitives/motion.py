@@ -5,7 +5,7 @@
 """
 import math
 
-from ai.bt import Status
+from ai.exec.bt import Status
 
 STEP_SECONDS = 0.05
 OBSERVE_SECONDS = 0.15
@@ -56,7 +56,7 @@ class MotionControl:
         return Status.FAILURE
 
     def tick(self, ctx, direction, extra, near, arrived, error=None, belt=False,
-             final=True, dash=False):
+             final=True, dash=False, wall_ahead=False, against_belt=False):
         # type: (...) -> str
         self._calls += 1
         self._final = final
@@ -69,7 +69,12 @@ class MotionControl:
         fresh = seq != self._seq
         self._seq = seq
         chef, hands = ctx["chef"], ctx["hands"]
-        pos = (chef.get("x", 0.0), chef.get("z", 0.0))
+        # 停稳/无进展判定用「相对脚下平台」的位置：站在移动平台（篮子）上时，
+        # 世界坐标 x/z 被平台带着漂，会误判「没停稳」触发 observation_timeout。
+        # rel_x/rel_z 由插件上报（世界坐标减地面 collider 参考点），缺字段时
+        # 退回世界坐标（旧行为）。目标距离 error 仍在 Approach 里用世界坐标算。
+        pos = (chef.get("rel_x", chef.get("x", 0.0)),
+               chef.get("rel_z", chef.get("z", 0.0)))
         hands.service(now)
         ctx["motion"] = {"phase": self.stage, "frame_seq": seq,
                          "fresh": fresh, "direction": direction}
@@ -141,7 +146,14 @@ class MotionControl:
         # 精确站位：震荡中（near）或「下一步即目标格」（final）都走短按+停稳，
         # 避免巡航满速冲过目标格来回振荡（实机：端饭时在盘旁上下振荡、米烧糊）。
         # 中间格仍巡航（快）；只有最后一步需要精确，不回到「每格都等停稳」的慢法。
-        precise = near or final
+        # 例外一：最后一步若前进方向的前方有阻碍物，墙会挡住角色、不会冲过目标格，
+        # 可直接长按巡航（更快），省去短按+停稳。
+        # 例外二：逆向行走（against_belt）不许切短按——短按+松键会被传送带推回来，
+        # 必须长按+冲刺，最后一步也不例外。
+        # 例外三：垂直穿越传送带（extra 顶带键）也不许切短按——50ms 短按跨不过
+        # 一格、松键又被带推偏，实机表现为在带上左右兜圈到不了交互位
+        # （trace-20261017-172221 t=2191~2366：端盘去取盘，在 z=2 带上兜 175 拍）。
+        precise = near or (final and not wall_ahead and not against_belt and extra is None)
         if hands.move_dir is not None and precise:
             # 巡航中要切短按：先松键消惯性，再短按。90° 拐弯仍即时换向，
             # 不在这里停顿（legacy 即时拐弯没有这个卡顿）。

@@ -18,9 +18,9 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from ai.agent import Agent
-from ai.blackboard import Blackboard, Claim
-from ai.world import World
-from ai import trace
+from ai.state.blackboard import Blackboard, Claim
+from ai.state.world import World
+from ai.output import trace
 
 
 class MockStateClient:

@@ -5,10 +5,11 @@
 不会）。这四条分别对应 trace-20261014-120406 的 t=1800 / t=2760 / t=3226
 / t=2279，离线复验的分数写在断言旁。
 """
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 RECIPES = [

@@ -1,17 +1,16 @@
 """打分权重完整集测试（Task 4）。
 
-重点验证 Plan 4 新增的 6 项权重：
+重点验证 Plan 4 新增的 5 项权重：
   1. 异步资源优先：FetchToCooker > FetchToPlate
-  2. 接力加成：承接 P1 上游的下游 task
-  3. 完成度：盘里食材越接近完成优先级越高
-  4. 食材复用：一次取料满足多个订单
-  5. Combo 延续：连续送同类菜加分
-  6. 截止前瞻：会导致烧糊/超时的 task 惩罚
+  2. 完成度：盘里食材越接近完成优先级越高
+  3. 食材复用：一次取料满足多个订单
+  4. Combo 延续：连续送同类菜加分
+  5. 截止前瞻：会导致烧糊/超时的 task 惩罚
 """
 import pytest
-from ai import planner
-from ai.blackboard import Blackboard, Commitment, P1Model, Intents
-from ai.world import World
+from ai.core import planner
+from ai.state.blackboard import Blackboard, Commitment
+from ai.state.world import World
 from ai import tasks as T
 
 
@@ -47,8 +46,6 @@ def test_async_resource_priority_fetch_to_cooker():
     bb = Blackboard()
     bb.tick = 0
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     # 候选1: FetchToCooker（异步资源）
     cand1 = planner.Candidate(
@@ -75,39 +72,6 @@ def test_async_resource_priority_fetch_to_cooker():
 
     # 断言：在其他条件相同时，FetchToCooker 分数更高
     assert score1 > score2, f"FetchToCooker({score1}) 应高于 PlaceCleanPlate({score2})"
-
-
-def test_relay_bonus_when_p1_upstream_complete():
-    """接力加成：P1 完成上游任务（下锅），AI 的下游任务（取熟饭）加分。"""
-    world = _make_test_world(
-        orders=[{"id": "order1", "name": "Sushi", "remaining": 25, "composition": ["BoiledSushiRice"]}],
-        stations=[],
-        cookers=[{"t": "cooker", "n": "cooker1", "item": "Rice", "cooked": True, "burning": False, "gx": 5, "gz": 5}]
-    )
-    world.tick = 100
-
-    bb = Blackboard()
-    bb.tick = 100
-    bb.commitment = Commitment()
-    bb.intents = Intents()
-
-    # P1 刚完成 FetchToCooker（下锅）
-    bb.p1_model = P1Model()
-    bb.p1_model.p1_active_task = "just_completed_fetch_to_cooker1"
-    bb.p1_model.confidence = 0.8
-
-    # 候选：TakeCookedToPlate（接力任务）
-    cand = planner.Candidate(
-        task=T.TakeCookedToPlate("order1", (("cooker1",), (None,)), "BoiledSushiRice"),
-        preconditions=[],
-        estimated_steps=15
-    )
-
-    score, terms = planner._score_candidate(world, bb, cand)
-
-    # 断言：有接力加成
-    assert "relay_bonus" in terms
-    assert terms["relay_bonus"] > 0, "接力任务应有加成"
 
 
 def test_completion_ratio_high_when_plate_near_done():
@@ -137,8 +101,6 @@ def test_completion_ratio_high_when_plate_near_done():
     bb = Blackboard()
     bb.tick = 50
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     # 候选：放最后一个食材（完成度 2/3）
     cand = planner.Candidate(
@@ -172,8 +134,6 @@ def test_completion_ratio_zero_when_plate_not_attributed():
     bb = Blackboard()
     bb.tick = 50
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
     assert planner._order_completion_ratio(
         T.FetchToBoard("order1", ("board1",), "Seaweed"), world, bb) == 0.0
 
@@ -223,8 +183,6 @@ def test_ingredient_reuse_bonus_when_multiple_orders_need_same():
     bb = Blackboard()
     bb.tick = 30
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
     bb.plate_assignments = {"order1": ("plate1",), "order2": ("plate2",)}
 
     # 候选：取黄瓜（可复用，满足 2 个订单）
@@ -269,8 +227,6 @@ def test_ingredient_reuse_excludes_plates_already_holding_it():
     bb = Blackboard()
     bb.tick = 30
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     count = planner._ingredient_reuse_count(
         T.FetchToPlate("order1", ("plate1",), "Seaweed"), world, bb,
@@ -299,8 +255,6 @@ def test_ingredient_reuse_counts_only_plates_still_lacking():
     bb = Blackboard()
     bb.tick = 30
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     count = planner._ingredient_reuse_count(
         T.FetchToPlate("order2", ("plate2",), "Seaweed"), world, bb,
@@ -324,12 +278,14 @@ def test_wash_plate_tree_faces_the_sink_stack():
     直接拿去 Approach 要靠 to_grid 换算；用 stations 那条更稳。
     """
     from ai import primitives as PR
-    from ai.bt import Sequence
+    from ai.exec.bt import Selector, Sequence
 
     tree = T.WashPlate(resources=("WashingPart",)).build()
     seq = tree.child
     assert isinstance(seq, Sequence)
-    pickup = seq.children[0]
+    sel = seq.children[0]
+    assert isinstance(sel, Selector)
+    pickup = sel.children[0].children[0]
     assert isinstance(pickup, PR.InteractWith)
     assert pickup._face is not None, \
         "脏盘摞是固定站点，不转身则 pickup 句柄永远为 null"
@@ -343,7 +299,7 @@ def test_wash_plate_dirty_target_prefers_station_with_grid():
     才带网格，Approach / interact_ready 都按它判更稳。晾干架也是
     plate_return，但那是取**干净**盘的位置，必须排除。
     """
-    from ai.recipes import RecipeBook
+    from ai.query.recipes import RecipeBook
 
     world = _make_test_world(
         stations=[
@@ -355,7 +311,7 @@ def test_wash_plate_dirty_target_prefers_station_with_grid():
     world.items = [{"n": "DirtyPlateStack", "x": 13.2, "z": -12.0}]
 
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].target
+    dirty = tree.child.children[0].children[0].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     got = dirty(ctx)
     assert got is not None
@@ -365,14 +321,14 @@ def test_wash_plate_dirty_target_prefers_station_with_grid():
 
 def test_wash_plate_dirty_target_none_when_no_dirty_stack():
     """没有脏盘摞时返回 None（InteractWith 据此 FAILURE，交还 Planner）。"""
-    from ai.recipes import RecipeBook
+    from ai.query.recipes import RecipeBook
 
     world = _make_test_world(
         stations=[{"t": "plate_return", "n": "workstation_plate_return",
                    "gx": -1, "gz": -5, "x": 13.2, "z": -12.0}])
     world.items = []
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].target
+    dirty = tree.child.children[0].children[0].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     assert dirty(ctx) is None
 
@@ -395,8 +351,6 @@ def test_combo_bonus_goes_to_the_queue_head_order():
     bb = Blackboard()
     bb.tick = 200
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
     bb.plate_assignments = {"order1": ("plate1",)}
 
     cand = planner.Candidate(
@@ -435,8 +389,6 @@ def test_deadline_penalty_when_cooker_will_burn():
     bb = Blackboard()
     bb.tick = 100
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
     bb.cooker_assignments = {"order1": ("cooker1",)}
 
     # 候选：去做一个耗时长的任务（会错过取熟饭的时机）
@@ -509,8 +461,6 @@ def test_no_deadline_penalty_when_safe():
     bb = Blackboard()
     bb.tick = 50
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     # 候选：快速任务，不会错过截止
     cand = planner.Candidate(
@@ -540,8 +490,6 @@ def test_deliver_plate_hand_penalty_uses_pickup_not_clear():
     bb = Blackboard()
     bb.tick = 0
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     cand = planner.Candidate(
         task=T.DeliverPlate("order1", ("p1",)),
@@ -554,7 +502,7 @@ def test_deliver_plate_hand_penalty_uses_pickup_not_clear():
 
 
 def test_all_weights_integrated():
-    """综合测试：所有 10 项权重都参与打分。"""
+    """综合测试：所有权重都参与打分。"""
     world = _make_test_world(
         orders=[{"id": "order1", "name": "Sushi", "remaining": 15, "composition": ["BoiledSushiRice"]}]
     )
@@ -563,8 +511,6 @@ def test_all_weights_integrated():
     bb = Blackboard()
     bb.tick = 100
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     cand = planner.Candidate(
         task=T.FetchToCooker("order1", ("cooker1",), "Rice"),
@@ -574,11 +520,10 @@ def test_all_weights_integrated():
 
     score, terms = planner._score_candidate(world, bb, cand)
 
-    # 断言：基础 4 项存在
+    # 断言：基础 3 项存在
     assert "urgency" in terms
     assert "pressure" in terms
     assert "eta" in terms
-    assert "p1_conflict" in terms
 
     # 断言：总分是所有项的和（验证公式完整性）
     expected_total = sum(terms.values())
@@ -597,8 +542,6 @@ def test_deliver_plate_gets_delivery_bonus_and_outranks_prep():
     bb = Blackboard()
     bb.tick = 0
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     deliver = planner.Candidate(
         task=T.DeliverPlate("order1", ("p1",)),
@@ -624,8 +567,6 @@ def test_wash_plate_gets_pressure_scaled_by_clean_plate_count():
     world = _make_test_world(stations=[{"t": "washing", "n": "sink1"}])
     bb = Blackboard()
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
     cand = planner.Candidate(task=T.WashPlate(resources=("sink1",)),
                              preconditions=[], estimated_steps=10)
 
@@ -659,8 +600,6 @@ def test_async_resource_suppressed_when_order_has_no_plate():
                  "composition": ["BoiledSushiRice"]}])
     bb = Blackboard()
     bb.commitment = Commitment()
-    bb.p1_model = P1Model()
-    bb.intents = Intents()
 
     cand = planner.Candidate(
         task=T.FetchToCooker("order1", ("cooker1",), "Rice"),

@@ -1,7 +1,7 @@
 """真实非阻塞按键契约下的原语；假事件与手动截止时间，不碰游戏。"""
 from ai import primitives as PR
-from ai.bt import Status
-from ai.hands import Hands
+from ai.exec.bt import Status
+from ai.output.hands import Hands
 from tests.test_key_scheduler import scheduler
 from tests.test_primitives import make_ctx, _inter
 

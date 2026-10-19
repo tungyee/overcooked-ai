@@ -10,11 +10,11 @@ fallback，不参与打分，归 Plan 3。
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Node, Sequence
-from ai.plate_tokens import parse_plate_detail
+from ai.query import stations as S
+from ai.exec.bt import Node, Sequence
+from ai.query.plate_tokens import parse_plate_detail
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            ingredient_source)
 
@@ -36,41 +36,29 @@ def loose_cookware(ctx):
     （spec §9），不做名字关键词匹配——DeepFatFryer / OvenTray /
     OvenCakeTin / Steamer 四种名字里既无 pot 也无 pan。
 
-    **位置约束**：插件把"放在灶台/台面上的锅"也报进 items[]（实测
-    1102/1102 帧，位置正好落在灶台格上），只按名字判会把它们当散落锅，
-    于是 RecoverLoosePot 去端**灶台上**的锅、把锅挪来挪去。
-
-    但也不能把所有站点格上的锅都排除：**台面 / 地上的锅是"没归位、该
-    捡回灶台"**，排除掉它们会让锅（被放到台面后）再也回不了灶台（实机：
-    EnsureHandsFree 把锅放台面 → 灶位空着没锅）。所以只把**灶台格**上的锅
-    当"在用"。
+    **灶上排除（字段判据）**：插件把"放在灶台/台面上的锅"也报进 items[]。
+    现在靠 items[].on_station 区分——`cooking:*` 是灶上在用的锅（不算散落），
+    `attach:*`（台面）与 `null`（地上/手持）都是"没归位、该捡回灶台"的散锅。
+    不再用坐标 `to_grid(x,z) in cooker_cells` 判（旧实现把台面/地上的锅与
+    灶上锅都按位置区分，且依赖单网格坐标）。
 
     **内容约束**：熟锅（items[].detail 含 `cooked:*` token）不算散锅——
     那是 RescueCooked 救到台面「留料待用」的中间态，端回灶台会重新点火
     烧糊。判据与 cooked_sources 对散熟锅的识别同源。
     """
-    cooker_cells = set()
-    for st in ctx["w"].stations:
-        if st.get("t") != "cooking":
-            continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is not None and gz is not None:
-            cooker_cells.add((gx, gz))
     out = []
     recipes = ctx["w"].recipes
     for it in ctx["w"].items:
         if not P.held_is_cookware({"held": it.get("n")}, recipes):
             continue
+        if P.item_on_cooker(it):
+            continue                       # 在灶台上 → 在用，不是"散落"
         toks = parse_plate_detail(it.get("detail") or [])
         if any(t.startswith("cooked:") for t in toks):
             continue            # 熟锅留台面等盘，不算"该捡回灶台的散锅"
         # 与 cooked_sources 同款兜底：detail 只报原始料名时，cooked 字段才是熟
         if str(it.get("cooked") or "").lower() == "cooked":
             continue            # 熟锅（detail 无 cooked token，但 cooked 字段="Cooked"）
-        x, z = it.get("x"), it.get("z")
-        if x is not None and z is not None and \
-                ctx["w"].to_grid(x, z) in cooker_cells:
-            continue                       # 在灶台上 → 在用，不是"散落"
         out.append(it)
     return out
 
@@ -301,7 +289,7 @@ class StashHeld(Task):
             return False
         if P.held_is_cookware(chef, ctx["w"].recipes):
             # 例外：糊锅（见类注释）。别的锅走 ReturnPot / RecoverLoosePot。
-            state = P.held_cookware_state(chef, ctx["w"].items,
+            state = P.held_cookware_state(chef, P.held_items(ctx["w"]),
                                           ctx["w"].recipes)
             if state != P.COOKWARE_BURNT:
                 return False
@@ -374,16 +362,31 @@ class Prefetch(Task):
 
 # ---------- 本组内部辅助 ----------
 
-def _cooker(ctx, cooker_name):
+def _cooker(ctx, cooker_id):
     # type: (Dict, Any) -> Optional[Dict]
-    return P.cooker_for(ctx["w"].cookers, str(cooker_name))
+    """按资源 id 取灶的状态条目（spec §5.2：id 可能是 (grid,name) 元组，
+    过渡期也接受裸字符串）。"""
+    from ai.tasks.base import _grid_matches, _unpack_resource_id
+    grid, name = _unpack_resource_id(cooker_id)
+    for c in ctx["w"].cookers:
+        if not P.station_name_matches(str(c.get("n") or ""), name):
+            continue
+        if not _grid_matches(c.get("grid"), grid):
+            continue
+        return c
+    return None
 
 
-def _cooker_station(ctx, cooker_name):
+def _cooker_station(ctx, cooker_id):
     # type: (Dict, Any) -> Optional[Dict]
+    from ai.tasks.base import _grid_matches, _unpack_resource_id
+    grid, name = _unpack_resource_id(cooker_id)
     for st in ctx["w"].stations:
         if st.get("t") != "cooking":
             continue
-        if P.station_name_matches(str(st.get("n") or ""), str(cooker_name)):
-            return st
+        if not P.station_name_matches(str(st.get("n") or ""), name):
+            continue
+        if not _grid_matches(st.get("grid"), grid):
+            continue
+        return st
     return None

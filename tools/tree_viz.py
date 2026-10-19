@@ -27,15 +27,15 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
 
-from ai import primitives as PR            # noqa: E402
-from ai import tasks as T                  # noqa: E402
-from ai.blackboard import Blackboard       # noqa: E402
-from ai.bt import Node, Status             # noqa: E402
-from ai.hands import Hands                 # noqa: E402
-from ai.navigation import distance_field   # noqa: E402
-from ai.predicates import P2_NAME, chef_by_name   # noqa: E402
-from ai.recipes import RecipeBook          # noqa: E402
-from ai.world import World                 # noqa: E402
+from ai import primitives as PR  # noqa: E402
+from ai import tasks as T  # noqa: E402
+from ai.state.blackboard import Blackboard       # noqa: E402
+from ai.exec.bt import Node, Status             # noqa: E402
+from ai.output.hands import Hands                 # noqa: E402
+from ai.space.navigation import distance_field   # noqa: E402
+from ai.query.predicates import P2_NAME, chef_by_name   # noqa: E402
+from ai.query.recipes import RecipeBook          # noqa: E402
+from ai.state.world import World                 # noqa: E402
 
 
 class NullController(object):
@@ -140,7 +140,8 @@ def make_ctx(world, chef=None, tick=0, with_controller=False):
         "chef": chef,
         "hands": Hands(ctrl),
         "bb": Blackboard(),
-        "field": distance_field(start, world.walkable, world.belt_dir),
+        "field": distance_field(start, world.walkable, world.belt_dir,
+                                edge_blocked=getattr(world, "edge_blocked", None)),
         "book": RecipeBook(world.recipes, world.stations),
         "tick": tick,
     }
@@ -252,7 +253,7 @@ def load_frame(path, index=0):
     if path.endswith(".json"):
         with open(path) as f:
             return json.load(f)
-    from ai.replay import load_frames
+    from ai.exec.replay import load_frames
     frames = load_frames(path)
     if not frames:
         raise ValueError("帧文件为空: %s" % path)

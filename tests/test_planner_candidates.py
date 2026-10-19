@@ -9,10 +9,10 @@
 """
 import pytest
 
-from ai.blackboard import Blackboard, Commitment
-from ai.planner import Candidate, generate_candidates
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard, Commitment
+from ai.core.planner import Candidate, generate_candidates
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 def _make_order(dish, composition):
@@ -197,7 +197,7 @@ def test_raw_on_board_does_not_generate_fetch_to_board():
 def test_move_fetch_to_board_scores_below_chop():
     """打分兜底：FetchToBoard 来源是"另一块板"（搬料）被打低，Chop 分数更高。"""
     from ai import tasks as T
-    from ai.planner import _score_candidate
+    from ai.core.planner import _score_candidate
 
     order = _make_order("Sushi_Cucumber", ["Cucumber"])
     w = _make_world(

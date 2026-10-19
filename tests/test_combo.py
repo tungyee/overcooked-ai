@@ -18,9 +18,9 @@ B 是唯一无反例的解释。两者会分歧是因为订单过期后 id 会�
 """
 import pytest
 
-from ai import economy as ECON
-from ai import planner
-from ai.blackboard import Blackboard
+from ai.revenue import economy as ECON
+from ai.core import planner
+from ai.state.blackboard import Blackboard
 
 
 def _orders(*spec):

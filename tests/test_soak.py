@@ -23,9 +23,9 @@ from unittest.mock import patch
 from collections import defaultdict
 
 from ai.agent import Agent
-from ai.blackboard import Blackboard
-from ai.world import World
-from ai import trace
+from ai.state.blackboard import Blackboard
+from ai.state.world import World
+from ai.output import trace
 
 
 # ==================== Mock StateClient ====================

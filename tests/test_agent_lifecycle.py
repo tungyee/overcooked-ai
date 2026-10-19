@@ -10,12 +10,12 @@
 import pytest
 from unittest.mock import patch
 
-from ai import trace
-from ai import planner
+from ai.output import trace
+from ai.core import planner
 from ai.agent import Agent
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 class RecordingCtrl(object):
@@ -231,9 +231,51 @@ def test_firefighting_task_is_never_abandoned():
     assert agent.bb.scratch.abandoned["cooker_01"] > agent.tick
 
 
+def test_cooked_pot_tasks_are_never_abandoned():
+    """端锅/盛饭这类停火关键任务不写也不读 abandoned 拉黑。
+
+    拉黑期（200 拍）比烧糊倒计时还长：一旦把 RescueCooked / TakeCookedToPlate
+    拉黑，熟锅必糊必着火（实机 trace-20261018-153802：盛饭失败把端锅一起
+    拉黑 → 熟锅烧糊起火）。所以这两个 task 声明 NO_ABANDON，写侧与读侧
+    都不受 abandoned 约束；bad_cells（格子级绕路）仍照常写。
+    """
+    from ai import tasks as T
+    from ai.core.planner import _is_abandoned
+
+    agent = _agent(RecordingCtrl())
+
+    rescue = T.RescueCooked(resources=("cooker_01",))
+    take = T.TakeCookedToPlate("order1", ("cooker_01", "plate_01"),
+                               "BoiledSushiRice")
+
+    # ① 写侧：连续失败不拉黑资源
+    for _ in range(5):
+        agent._note_failure(rescue)
+        agent._note_failure(take)
+    assert agent.bb.scratch is None, "端锅/盛饭失败不该建 StuckScratch"
+
+    # ② 写侧：motion 失败也不拉黑资源，但 bad_cells 照写
+    class CalmWorld(object):
+        def chef_in_wind(self, chef):
+            return False
+
+    ctx = {"w": CalmWorld(),
+           "chef": {"name": "Player 2", "x": 1.0, "z": 1.0, "held": None},
+           "motion_failure": {"reason": "no_progress", "blocked_cell": (6, 1)}}
+    agent._note_motion_failure(rescue, ctx)
+    assert agent.bb.scratch is not None
+    assert agent.bb.scratch.bad_cells[(6, 1)] > agent.tick
+    assert not _is_abandoned(rescue, agent.bb), "端锅不该被拉黑"
+
+    # ③ 读侧：即使资源已在 abandoned 表里，端锅/盛饭也不被否决
+    agent.bb.scratch.abandoned["cooker_01"] = agent.tick + 200
+    assert not _is_abandoned(rescue, agent.bb)
+    assert not _is_abandoned(take, agent.bb)
+
+
 def test_motion_obstruction_is_shared_across_order_ids():
     from ai import tasks as T
-    from ai.planner import _is_abandoned
+    from ai.core.planner import _is_abandoned
 
     agent = _agent(RecordingCtrl())
     first = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
@@ -242,6 +284,51 @@ def test_motion_obstruction_is_shared_across_order_ids():
         "reason": "no_progress", "blocked_cell": (6, 1)}})
     assert _is_abandoned(second, agent.bb)
     assert agent.bb.scratch.bad_cells[(6, 1)] > agent.tick
+
+
+def test_motion_failure_in_wind_does_not_blacklist_resource():
+    """风区里被吹得动不了导致的 no_progress/observation_timeout 不拉黑资源。
+
+    只写 bad_cells 让寻路绕开这一格，不写 abandoned——否则一阵风就把端料
+    的整个资源判死刑（实机：端番茄时被风推、位置无法移动，料箱被拉黑）。
+    """
+    from ai import tasks as T
+    from ai.core.planner import _is_abandoned
+
+    agent = _agent(RecordingCtrl())
+    task = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
+
+    class WindyWorld(object):
+        def chef_in_wind(self, chef):
+            return True
+
+    ctx = {"w": WindyWorld(),
+           "chef": {"name": "Player 2", "x": 1.0, "z": 1.0, "held": None},
+           "motion_failure": {"reason": "observation_timeout",
+                              "blocked_cell": (6, 1)}}
+    agent._note_motion_failure(task, ctx)
+    assert agent.bb.scratch is not None
+    assert agent.bb.scratch.bad_cells[(6, 1)] > agent.tick
+    assert not _is_abandoned(task, agent.bb)
+
+
+def test_motion_failure_outside_wind_still_blacklists():
+    """不在风区里时，仍按旧逻辑拉黑资源。"""
+    from ai import tasks as T
+    from ai.core.planner import _is_abandoned
+
+    agent = _agent(RecordingCtrl())
+    task = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
+
+    class CalmWorld(object):
+        def chef_in_wind(self, chef):
+            return False
+
+    ctx = {"w": CalmWorld(),
+           "chef": {"name": "Player 2", "x": 1.0, "z": 1.0, "held": None},
+           "motion_failure": {"reason": "no_progress", "blocked_cell": (6, 1)}}
+    agent._note_motion_failure(task, ctx)
+    assert _is_abandoned(task, agent.bb)
 
 
 def test_recipe_book_rebuilt_each_frame():

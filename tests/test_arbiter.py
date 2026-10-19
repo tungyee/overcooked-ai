@@ -8,9 +8,9 @@
   4. 中断 task 连续失败降级。
 """
 import pytest
-from ai import arbiter
-from ai.blackboard import Blackboard, Commitment, StuckScratch, FireScratch
-from ai.world import World
+from ai.core import arbiter
+from ai.state.blackboard import Blackboard, Commitment, StuckScratch, FireScratch
+from ai.state.world import World
 
 
 def _make_world(cookers=None, extinguishers=None, chefs=None, items=None):

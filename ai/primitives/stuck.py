@@ -11,8 +11,8 @@ TTL 单位从秒改为拍：旧实现用 time.monotonic() + BAD_CELL_TTL=4.0
 """
 from typing import Any, Callable, Dict, Optional
 
-from ai.bt import Node, Status
-from ai.hands import DIR2D
+from ai.exec.bt import Node, Status
+from ai.output.hands import DIR2D
 from ai.primitives.base import Primitive
 
 # 脱困 TTL，单位**拍**。旧实现用 time.monotonic() + 秒数
@@ -30,7 +30,7 @@ def _ensure_stuck_scratch(ctx):
     卡住守卫是跨模式前置（spec §5.1），可能先于任何模式进入，此时
     scratch 还是 None。
     """
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     bb = ctx["bb"]
     if not isinstance(getattr(bb, "scratch", None), StuckScratch):
         bb.scratch = StuckScratch()
@@ -43,8 +43,8 @@ def _resolve_value(v, ctx):
     return v(ctx) if callable(v) else v
 
 
-def note_motion_failure(bb, task, tick, failure):
-    # type: (Any, Any, int, Dict) -> None
+def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
+    # type: (Any, Any, int, Dict, Any, Any) -> None
     """按位置 / 资源避让已证实的无进展；订单切换不能重置同一处故障。"""
     if failure.get("reason") not in ("no_progress", "observation_timeout") or bb.mode != "Normal":
         return
@@ -52,6 +52,18 @@ def note_motion_failure(bb, task, tick, failure):
     cell = failure.get("blocked_cell")
     if cell is not None:
         scratch.bad_cells[tuple(cell)] = tick + BAD_CELL_TTL_TICKS
+    # 风区里被吹得动不了：不是 AI 的错，只写 bad_cells 让寻路绕开这一格，
+    # **不拉黑资源**——否则一阵风就把端料/盛饭的整个资源判死刑（实机：
+    # 端番茄时被风推、位置无法移动，observation_timeout 把料箱拉黑 10 秒）。
+    if world is not None:
+        check = getattr(world, "chef_in_wind", None)
+        if callable(check) and check(chef):
+            return
+    # 端锅/盛饭/灭火这类任务不能拉黑资源：拉黑期(200拍)超过烧糊倒计时，
+    # 等于判那口锅死刑（实机：盛饭失败把端锅一起拉黑 → 熟锅烧糊起火）。
+    # bad_cells 仍照写——寻路绕开被堵的那一格，只废格、不废整个资源。
+    if getattr(task, "NO_ABANDON", False):
+        return
     for resource, _action in task.claims():
         scratch.abandoned[resource] = tick + ABANDON_TTL_TICKS
 

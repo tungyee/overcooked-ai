@@ -1,7 +1,7 @@
 import json
 
-from ai.record import FrameRecorder
-from ai.replay import iter_frames, load_frames
+from ai.exec.record import FrameRecorder
+from ai.exec.replay import iter_frames, load_frames
 
 
 def test_load_frames_reads_ndjson(tmp_path):

@@ -4,13 +4,14 @@
 插件新输出（Oc2AIPlugin.cs 的 DescribeNode）带来 detail / pot_contents 两个
 字段，这里钉住它们的解析与下游匹配行为。
 """
-from ai.blackboard import Blackboard
-from ai import planner, recipe_graph
+from ai.state.blackboard import Blackboard
+from ai.core import planner
+from ai.query import recipe_graph
 from ai import tasks as T
-from ai.plate_tokens import parse_pot_contents, parse_plate_detail
-from ai.recipes import RecipeBook
+from ai.query.plate_tokens import parse_pot_contents, parse_plate_detail
+from ai.query.recipes import RecipeBook
 from ai.tasks.base import cooked_sources
-from ai.world import World
+from ai.state.world import World
 
 
 # ---------- 解析 ----------
@@ -138,8 +139,9 @@ def test_match_cookers_assigns_to_most_urgent():
     bb = Blackboard()
     plate_match = planner._match_plates_to_orders(w, bb, book)
     got = planner._match_cookers_to_orders(w, bb, book, plate_match)
-    # 只有一口锅 → 给更紧的 order1
-    assert got == {"cooker_01": "order1"}, got
+    # 只有一口锅 → 给更紧的 order1。灶上源的 id 现在是 (grid,name) 元组
+    # （§5.2），本场景的灶没有 grid 字段，归一化为空字符串。
+    assert got == {("", "cooker_01"): "order1"}, got
 
 
 def test_match_cookers_ignores_empty_pots():
@@ -174,8 +176,9 @@ def test_match_cookers_prioritizes_cooked_to_plated_order():
     # 只有 order2 有盘就位（plate_01），order1 没盘
     plate_match = {"plate_01": "order2"}
     got = planner._match_cookers_to_orders(w, bb, book, plate_match)
-    assert got.get("cooker_cooked") == "order2", got
-    assert got.get("cooker_cooking") == "order1", got
+    # 灶上源的 id 是 (grid,name) 元组（§5.2），灶没有 grid 字段时归一化为 ""
+    assert got.get(("", "cooker_cooked")) == "order2", got
+    assert got.get(("", "cooker_cooking")) == "order1", got
 
 
 def test_match_cookers_prioritizes_burning_cooker_over_loose_pot():
@@ -199,7 +202,8 @@ def test_match_cookers_prioritizes_burning_cooker_over_loose_pot():
     # 只有 order1 有盘（plate_01）
     plate_match = {"plate_01": "order1"}
     got = planner._match_cookers_to_orders(w, bb, book, plate_match)
-    assert got.get("cooker_burning") == "order1", got
+    # 灶上源 id 是 (grid,name) 元组（§5.2）；散锅（loose）id 仍是裸 item 名。
+    assert got.get(("", "cooker_burning")) == "order1", got
     assert got.get("utensil_pot_01") == "order2", got
 
 
@@ -244,10 +248,10 @@ def test_match_cookers_includes_loose_cooked_pot():
 
 
 def test_match_plates_ignores_drying_rack_and_held_plates():
-    """只有落在 counter 拼装格上的盘才参与盘↔订单匹配。
+    """沥碗架里的空盘、P1 手里端着的空盘仍不参与盘↔订单匹配。
 
-    沥碗架（plate_return+DryingPart）里的盘、P1 手里端着的盘不能倒料，
-    也不能算作某张单的拼装盘（实机：P2 往沥碗架的盘倒料）。
+    两者都不能往上倒料（实机：P2 往沥碗架的盘倒料）；空盘该走 PlaceCleanPlate。
+    地上的**带料**盘现在会参与匹配，见 test_match_plates_includes_ground_plate_with_contents。
     """
     w = _loose_cooked_world()
     # 沥碗架上的盘（plate_return 站，不是 counter）
@@ -282,6 +286,114 @@ def test_match_plates_includes_p2_held_plate():
     bb = Blackboard()
     got = planner._match_plates_to_orders(w, bb, book)
     assert got == {"plate_01": "order1"}, got
+
+
+def test_match_plates_includes_ground_plate_with_contents():
+    """掉在地上的带料盘参与匹配（实机：盘被碰掉成孤儿，见 trace-20261018-104804）。
+
+    带料盘（count>0）非手持且不在台面 = 散落在地上；中间层/底层的空盘
+    （count==0）永远不满足，所以堆叠里只有顶层已倒料的那只会被匹配。
+    """
+    w = World({
+        "orders": [
+            {"id": "order1",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"],
+             "remaining": 30},
+            {"id": "order2",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"],
+             "remaining": 60},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [{"name": "BoiledSushiRice", "comp": ["SushiRice"],
+                     "cook": "Pot"}],
+        "chefs": [{"name": "Player 2", "x": 4.0, "z": 4.0, "held": None}],
+        "plates": [
+            {"n": "plate_ground", "name": "equipment_plate_01",
+             "x": 4.0, "z": 4.0, "count": 1, "contents": ["Seaweed"]},
+            {"n": "plate_counter", "name": "equipment_plate_01 (1)",
+             "x": 1.0, "z": 1.0, "count": 1, "contents": ["Cucumber"]},
+        ],
+        "workstations": [], "cookers": [], "items": [], "extinguishers": [],
+        "grid": {"nodeMap": None},
+    })
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    got = planner._match_plates_to_orders(w, bb, book)
+    assert got == {"plate_counter": "order1", "plate_ground": "order2"}, got
+
+
+def test_match_plates_still_ignores_p1_held_plate_with_contents():
+    """P1 手里端着的盘（即使带料）仍排除：P2 没法往 P1 手里的盘倒料/端走。"""
+    w = World({
+        "orders": [
+            {"id": "order1",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"],
+             "remaining": 30},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [{"name": "BoiledSushiRice", "comp": ["SushiRice"],
+                     "cook": "Pot"}],
+        "chefs": [
+            {"name": "Player 2", "x": 4.0, "z": 4.0, "held": None},
+            {"name": "Player 1", "x": 5.0, "z": 5.0,
+             "held": "equipment_plate_01 (2)"},
+        ],
+        "plates": [
+            {"n": "plate_held", "name": "equipment_plate_01 (2)",
+             "x": 5.0, "z": 5.0, "count": 1, "contents": ["Seaweed"]},
+            {"n": "plate_counter", "name": "equipment_plate_01 (1)",
+             "x": 1.0, "z": 1.0, "count": 1, "contents": ["Cucumber"]},
+        ],
+        "workstations": [], "cookers": [], "items": [], "extinguishers": [],
+        "grid": {"nodeMap": None},
+    })
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    got = planner._match_plates_to_orders(w, bb, book)
+    assert got == {"plate_counter": "order1"}, got
+
+
+def test_match_plates_pins_committed_plate_to_its_order():
+    """P2 承诺绑定的盘钉死在所属订单，不因贪心 tiebreak 被改绑。
+
+    实机 trace-20261017-172221 t=663：P1 往另一块盘放料 → 两块盘 missing 并列
+    → 字符串 tiebreak 翻盘 → P2 手里的盘被改绑 → 丢盘、熟饭烧糊。
+    """
+    w = World({
+        "orders": [
+            {"id": "order1",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"],
+             "remaining": 30},
+            {"id": "order2",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"],
+             "remaining": 60},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [{"name": "BoiledSushiRice", "comp": ["SushiRice"],
+                     "cook": "Pot"}],
+        "chefs": [{"name": "Player 2", "x": 4.0, "z": 4.0,
+                   "held": "equipment_plate_01 (3)"}],
+        "plates": [
+            {"n": "plate_18", "name": "equipment_plate_01 (3)",
+             "x": 4.0, "z": 4.0, "count": 1, "contents": ["Cucumber"]},
+            {"n": "plate_16", "name": "equipment_plate_01 (2)",
+             "x": 1.0, "z": 1.0, "count": 1, "contents": ["Seaweed"]},
+        ],
+        "workstations": [], "cookers": [],
+        "items": [], "extinguishers": [], "grid": {"nodeMap": None},
+    })
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    # P2 承诺：端 plate_18 去给 order1 盛熟饭
+    bb.commitment.active_task = T.TakeCookedToPlate(
+        "order1", ("cooker_x", "plate_18"), "BoiledSushiRice")
+
+    got = planner._match_plates_to_orders(w, bb, book)
+    # 无钉时贪心会按字符串 tiebreak 给成 {plate_16: order1, plate_18: order2}
+    assert got == {"plate_18": "order1", "plate_16": "order2"}, got
 
 
 def test_order_needs_cooked_false_with_loose_cooked_pot():
@@ -339,9 +451,14 @@ def test_take_cooked_feasible_for_loose_pot_without_cooked_token():
     assert task.feasible(ctx) is True
 
 
-def test_filter_feasible_drops_abandoned_resource():
-    """L3 兜底：资源在 abandoned 拉黑期 → 候选被过滤，过期后恢复。"""
-    from ai.blackboard import StuckScratch
+def test_filter_feasible_keeps_cooked_pot_task_despite_abandoned():
+    """停火关键任务不受 abandoned 拉黑约束（NO_ABANDON）。
+
+    散熟锅即使被写进 scratch.abandoned，TakeCookedToPlate（盛饭）也仍然
+    可行——拉黑期（200 拍）比烧糊倒计时还长，过滤掉它熟锅必糊必着火
+    （实机 trace-20261018-153802：盛饭失败把端锅一起拉黑 → 熟锅烧糊起火）。
+    """
+    from ai.state.blackboard import StuckScratch
     w = _loose_cooked_world()
     book = RecipeBook(w.recipes, w.stations)
     bb = Blackboard()
@@ -353,9 +470,10 @@ def test_filter_feasible_drops_abandoned_resource():
     cands = [planner.Candidate(t, [], 10) for t in tasks]
     assert cands, "前置：应能生成取熟候选"
     assert planner.filter_feasible(w, bb, cands, book), "前置：未拉黑时应可行"
-    # 拉黑散熟锅资源 → 过滤后为空
+    # 拉黑散熟锅资源 → 盛饭是 NO_ABANDON 停火任务，仍应可行
     bb.scratch.abandoned["utensil_pot_01"] = 300
-    assert planner.filter_feasible(w, bb, cands, book) == []
-    # 过期 → 恢复
+    assert planner.filter_feasible(w, bb, cands, book), \
+        "盛饭是停火关键任务，拉黑不该过滤它"
+    # 过期前后行为一致（拉黑对它本就不生效）
     bb.scratch.abandoned["utensil_pot_01"] = 50
     assert planner.filter_feasible(w, bb, cands, book)

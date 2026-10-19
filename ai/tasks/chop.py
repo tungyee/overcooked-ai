@@ -6,11 +6,11 @@
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Condition, Node, Selector, Sequence
-from ai.recipes import find_ingredient
+from ai.query import stations as S
+from ai.exec.bt import Condition, Node, Selector, Sequence
+from ai.query.recipes import find_ingredient
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            ingredient_available, ingredient_source,
                            loose_count)
@@ -28,14 +28,20 @@ CHOP_MAX_STAGES = 12
 # ---------- 板相关谓词（仅本组用） ----------
 
 
-def board_station(ctx, board_name):
+def board_station(ctx, board_id):
     # type: (Dict, Any) -> Optional[Dict]
-    """按实例名取切菜板的站点 dict。"""
+    """按资源 id 取切菜板的站点 dict（spec §5.2：id 可能是 (grid,name)
+    元组，过渡期也接受裸字符串）。"""
+    from ai.tasks.base import _grid_matches, _unpack_resource_id
+    grid, name = _unpack_resource_id(board_id)
     for st in ctx["w"].stations:
         if st.get("t") != "chopping":
             continue
-        if P.station_name_matches(str(st.get("n") or ""), str(board_name)):
-            return st
+        if not P.station_name_matches(str(st.get("n") or ""), name):
+            continue
+        if not _grid_matches(st.get("grid"), grid):
+            continue
+        return st
     return None
 
 
@@ -100,10 +106,12 @@ class FetchToBoard(Task):
                                 str(board_id)) == str(raw).lower()
 
         def pickup():
-            # 散落料没有 m_gridLocation 朝向信号，face=False（同 FetchToCooker）。
+            # ingredient_source 现在对「挂在站点上的散落料」返回站点（带朝向
+            # 信号），故 face=True 让 Face 转身面向站点；裸散落料（无站点）
+            # 时 interact_ready 走名字兜底，Face 仍能到位。
             return PR.InteractWith(
                 lambda x: ingredient_source(x, raw), "pickup", holding,
-                face=False)
+                face=True)
 
         def drop():
             return PR.InteractWith(board, "placement", placed)

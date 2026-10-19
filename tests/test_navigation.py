@@ -1,10 +1,12 @@
 import pytest
 
-from ai import navigation as N
-from ai.navigation import (
+from ai.space import navigation as N
+from ai.space.navigation import (
     BELT_REVERSE_COST,
+    cross_grid_bridges,
     distance_field,
     interact_cells,
+    interact_cells_multi,
     interact_cells_with_belts,
     nearest_cost,
     step_cost,
@@ -54,6 +56,17 @@ def test_distance_field_respects_blocked_cells():
     assert field[(0, 2)] == 2
 
 
+def test_distance_field_respects_edge_blocker():
+    """薄墙拦边不拦格：从 (0,0) 不能直接跨到 (1,0)，只能绕行到达。"""
+    walkable = lambda gx, gz: 0 <= gx <= 1 and 0 <= gz <= 1
+    edge_blocked = lambda cur, nxt: {cur, nxt} == {(0, 0), (1, 0)}
+
+    field = distance_field((0, 0), walkable, {}, edge_blocked=edge_blocked)
+
+    # (1,0) 仍可到达，但只能绕行：代价 3 而非直连的 1
+    assert field[(1, 0)] == 3
+
+
 def test_distance_field_prefers_cheap_path_around_belt():
     """逆带代价 8，绕路 1+1+1=3 更便宜，距离场应取 3。"""
     walkable = lambda gx, gz: 0 <= gx <= 1 and 0 <= gz <= 1
@@ -97,6 +110,39 @@ def test_interact_cells_with_belts_includes_belt_cells():
         1, 1, open_3x3(), belt_cells={(0, 1), (2, 1)})
 
     assert set(cells) == {(0, 1), (1, 0), (2, 1), (1, 2)}
+
+
+def test_interact_cells_multi_union_of_block_cells():
+    """多格站点（出餐口 1×2）的交互位 = 各占地格四邻并集。
+
+    占地格 (0,1)/(1,1) 本身不可走（站点），所以不会被并进结果。
+    """
+    walkable = lambda gx, gz: (0 <= gx <= 2 and 0 <= gz <= 2
+                               and (gx, gz) not in {(0, 1), (1, 1)})
+
+    cells = interact_cells_multi({(0, 1), (1, 1)}, walkable)
+
+    assert set(cells) == {(0, 0), (0, 2), (1, 0), (1, 2), (2, 1)}
+
+
+def test_interact_cells_multi_dedupes_shared_neighbor():
+    """相邻占地格共享一个邻格时，并集只保留一份。"""
+    walkable = lambda gx, gz: (0 <= gx <= 2 and 0 <= gz <= 2
+                               and (gx, gz) not in {(0, 0), (1, 0)})
+
+    cells = interact_cells_multi({(0, 0), (1, 0)}, walkable)
+
+    # (0,1) 同时是 (0,0) 和 (1,0) 的邻格，应只出现一次
+    assert set(cells) == {(0, 1), (1, 1), (2, 0)}
+
+
+def test_interact_cells_multi_include_belts():
+    """include_belts=True 放行传送带格（与 interact_cells_with_belts 同语义）。"""
+    walkable = lambda gx, gz: (gx, gz) in {(0, 0), (2, 0)}
+    cells = interact_cells_multi(
+        {(1, 0)}, walkable, belt_cells={(0, 0), (2, 0)}, include_belts=True)
+
+    assert set(cells) == {(0, 0), (2, 0)}
 
 
 def test_nearest_cost_picks_minimum():
@@ -208,13 +254,49 @@ def test_first_step_unreachable_returns_none():
     assert N.first_step(field, (9, 9), {}) is None
 
 
+class _FakeMultiGridWorld:
+    """最小化双网格 World：主网格 x[0,12]，附属网格 x[16,24]，世界坐标
+    只差 0.4（§4.3），用于验证跨网格桥接。"""
+
+    def __init__(self):
+        self.grids = None  # 本测试不需要真的 GridSet，用 to_world 模拟
+        self.belt_dir = {}
+
+    def to_world(self, gx, gz):
+        return (gx * 1.2, gz * 1.2)   # 主网格坐标系
+
+    def walkable(self, gx, gz):
+        return -10 <= gx <= 10 and -10 <= gz <= 10
+
+
+def test_cross_grid_bridges_connects_adjacent_grids():
+    """给定两网格的世界坐标映射，边界格互相可达（§4.3：间隙 0.4 < cell）。"""
+    w = _FakeMultiGridWorld()
+    # 主网格 gx=12 (世界 x=14.4) 与附属网格某格世界 x=14.8 相邻（间隙 0.4）
+    bridges = cross_grid_bridges(
+        primary_to_world=w.to_world,
+        other_cells_world=[((20, -2), (14.8, -2.4))],  # (附属网格局部格, 世界坐标)
+        max_gap=0.5,
+    )
+    assert (12, -2) in bridges   # 主网格边界格有一条到附属网格的桥
+
+
+def test_distance_field_crosses_bridge():
+    w = _FakeMultiGridWorld()
+    bridges = {(5, 0): (100, 0)}   # 虚拟映射：主网格(5,0) <-> 附属(100,0)
+    field = distance_field((0, 0), w.walkable, {}, bridges=bridges)
+    assert (5, 0) in field
+    assert (100, 0) in field
+    assert field[(100, 0)] == field[(5, 0)] + 1
+
+
 def test_trace_back_on_real_frame_all_reachable_cells(level_frame):
     """真实帧全覆盖：每个可达格都能回溯出一条合法路径。
 
     spec 记梯度下降在真实帧 60 个可达格里有 2 个选出非法前驱
     （均在传送带排）。这个测试就是那条断言的反面——正确谓词应 0 失败。
     """
-    from ai.world import World
+    from ai.state.world import World
     w = World(level_frame)
     chef = None
     for c in w.chefs:

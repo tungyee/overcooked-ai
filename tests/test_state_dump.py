@@ -56,6 +56,15 @@ def test_snapshot_is_json_serializable():
     json.dumps(snap, ensure_ascii=False)
 
 
+def test_snapshot_preserves_held_plate_identity():
+    w = _world()
+    w.held_plates = [{"n": "bound-plate", "name": "equipment_plate_01",
+                      "held_by": "Player 2", "detail": ["pasta"]}]
+    snap = snapshot(w)
+    assert snap["held_plates"] == w.held_plates
+    assert snap["held_plates"][0] is not w.held_plates[0]
+
+
 def test_snapshot_covers_all_entity_sections():
     """各类实体都在：盘 / 灶 / 散落锅 / 箱子 / 地图。"""
     snap = state_dump.snapshot(_world())

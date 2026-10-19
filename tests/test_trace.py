@@ -31,6 +31,8 @@ def test_default_path_is_repo_local_trace_jsonl():
     """默认落盘在仓库根目录的 trace-<时间戳>.jsonl，与 .gitignore 对应。"""
     path = trace.default_path()
     assert os.path.dirname(path) == trace.REPO_ROOT
+    assert os.path.dirname(trace.REPO_ROOT) != trace.REPO_ROOT
+    assert os.path.isfile(os.path.join(trace.REPO_ROOT, "run_agent.py"))
     assert fnmatch(os.path.basename(path), "trace-*.jsonl")
 
     # /tmp 会被系统清理、且每局互相覆盖，正是实机复盘时日志凭空消失的原因

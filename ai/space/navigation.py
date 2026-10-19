@@ -182,7 +182,7 @@ def nearest_cost(field, cells):
     return best
 
 
-def _predecessor(field, cur, belt_dir, soft_cost=None):
+def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
     # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[Tuple[int, int]]
     """cur 在距离场里的合法前驱。
 
@@ -204,13 +204,16 @@ def _predecessor(field, cur, belt_dir, soft_cost=None):
         c = field.get(n)
         if c is None:
             continue
+        # 同代价邻居未必是建场时走过的边：薄墙两侧的格可能绕路可达。
+        if edge_blocked is not None and edge_blocked(n, cur):
+            continue
         # 软代价按进入的格子收费，必须与 distance_field 的账一致。
         if c + step_cost(belt_dir, n, cur) + extra == want:
             return n
     return None
 
 
-def trace_back(field, goal, belt_dir, soft_cost=None):
+def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
     # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[List[Tuple[int, int]]]
     """从距离场回溯 start → goal 的格子序列（含两端）。
 
@@ -225,7 +228,7 @@ def trace_back(field, goal, belt_dir, soft_cost=None):
         if field[cur] == 0:
             path.reverse()
             return path
-        prev = _predecessor(field, cur, belt_dir, soft_cost)
+        prev = _predecessor(field, cur, belt_dir, soft_cost, edge_blocked)
         if prev is None:
             return None          # 距离场被破坏，交还调用方（原语会转 FAILURE）
         path.append(prev)
@@ -233,14 +236,14 @@ def trace_back(field, goal, belt_dir, soft_cost=None):
     return None
 
 
-def first_step(field, goal, belt_dir, soft_cost=None):
+def first_step(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
     # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[Tuple[int, int]]
     """从 start 出发朝 goal 的下一格。
 
     已站在 goal 上，或 goal 不可达，都返回 None——调用方据此区分
     "到了"（配合自己的到位判定）与"去不了"。
     """
-    path = trace_back(field, goal, belt_dir, soft_cost)
+    path = trace_back(field, goal, belt_dir, soft_cost, edge_blocked)
     if not path or len(path) < 2:
         return None
     return path[1]

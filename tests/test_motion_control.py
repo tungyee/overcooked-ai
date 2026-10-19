@@ -259,9 +259,10 @@ def test_arrival_is_rechecked_after_coasting_out_of_goal():
     assert node.tick(ctx) == Status.RUNNING
     observe(ctx, 0.40, 3, z=0.5)
     assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "up", "滑出目标格后应提前纠偏，不再等满停稳"
     observe(ctx, 0.60, 4)
     assert node.tick(ctx) == Status.RUNNING
-    assert ctx["hands"].move_dir == "up"
+    assert ctx["hands"].move_dir is None, "纠偏短按必须按时释放"
 
 
 def test_real_obstruction_fails_before_task_timeout():

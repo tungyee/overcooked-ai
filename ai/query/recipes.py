@@ -322,11 +322,11 @@ def _merge_station_coords(entry, stations):
     return entry
 
 
-def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False):
-    # type: (object, Optional[str], str, bool) -> Optional[Dict]
+def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_access=None):
+    # type: (object, Optional[str], str, bool, object) -> Optional[Dict]
     """定位食材当前位置，返回 {"kind": ..., "st"/"chef": ...}。
 
-    kind 优先级：held（被**自己**拿着）→ board（砧板上）→ plate（已装盘）
+    可达来源的 kind 优先级：held（被**自己**拿着）→ board（砧板上）→ plate（已装盘）
     → loose（散落）→ crate（箱子里）。优先级就是"离可用最近"的顺序：
     已经拿着的东西不该再去箱子取一份；P1 手里的不算 held（拿不到）。
 
@@ -353,24 +353,29 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False):
         if P.held_name(c) == il:
             return {"kind": "held", "chef": c.get("name")}
 
+    if can_access is None:
+        from ai.space import reachability
+        route = reachability.context(world, name=self_name)
+        can_access = lambda st: reachability.can_interact(route, st)
+
     for ws in getattr(world, "workstations", None) or ():
         if str(ws.get("item") or "").lower() == il:
-            return {"kind": "board",
-                    "st": _merge_station_coords(
-                        ws, getattr(world, "stations", None))}
+            station = _merge_station_coords(ws, getattr(world, "stations", None))
+            if can_access(station):
+                return {"kind": "board", "st": station}
 
     if not exclude_plate:
         for p in getattr(world, "plates", None) or ():
-            if il in P.plate_contents(p):
+            if il in P.plate_contents(p) and can_access(p):
                 return {"kind": "plate", "st": p}
 
     for it in getattr(world, "items", None) or ():
-        if str(it.get("n") or "").lower() == il:
+        if str(it.get("n") or "").lower() == il and can_access(it):
             return {"kind": "loose", "st": it}
 
     for st in getattr(world, "stations", None) or ():
         if not isinstance(st, dict) or st.get("t") != "crate":
             continue
-        if str(st.get("ing") or "").lower() == il:
+        if str(st.get("ing") or "").lower() == il and can_access(st):
             return {"kind": "crate", "st": st}
     return None

@@ -20,6 +20,7 @@ namespace Oc2AI
         bool _inputDumped;
         bool _orderFieldsDumped;
         bool _discoveryDone;
+        bool _terrainFilterLogged;
         string _staticJson;
         string _level;
         int _staticTries;
@@ -37,6 +38,9 @@ namespace Oc2AI
         float _originX = 14.4f;
         float _originZ = -6.0f;
         bool _gridReady = false;
+        // 主网格管理器（CalibrateGrid 里确定）。功能站用它判断该走主网格投影
+        // 还是非主网格（气球篮）的本地投影。
+        UnityEngine.Object _mainGrid = null;
 
         TcpListener _listener;
         Thread _acceptThread;
@@ -49,32 +53,42 @@ namespace Oc2AI
         {
             Logger.LogInfo("[OC2AI v0.12] loaded");
             StartSocket();
-            InvokeRepeating("Snapshot", 3f, 0.2f);
+            Invoke("Snapshot", 3f);   // 之后由 Snapshot 自己按关卡内外决定下次间隔
         }
 
         void Snapshot()
         {
+            // 关卡内 5 Hz；非关卡降到 1 Hz，只做「进关了吗」的探测。
+            float next = 0.2f;
             try
             {
                 // 每拍重扫，避免新出现的灭火器/掉落物延迟 1s 才进状态
                 _all = UnityEngine.Object.FindObjectsOfType<MonoBehaviour>();
                 if (!_inputDumped) { _inputDumped = true; LogInput(); }
-                RefreshLevel();
-                // 不在关卡内（菜单 / 选关 / 加载中）就不序列化、不推帧：
-                // 这些帧 phase != "level"，agent 侧本来也跳过决策，纯属白跑；
-                // 而且 BuildState + 全量 LogInfo 每 0.2s 跑一次会把游戏卡到选关页掉帧
-                // （实机：游戏进程 150% CPU、agent 只有 0.6%）。推给 agent 也没用。
-                if (!IsInLevel()) return;
-                if (!_discoveryDone) { _discoveryDone = true; Discover(); }
-                string state = BuildState();
-                // 不再把整帧状态写进游戏日志：这是卡顿大户，决策复盘走 Python 侧
-                // trace-*.jsonl，不依赖这里的 [STATE] 日志。
-                Push(state);
+                if (IsInLevel())
+                {
+                    RefreshLevel();
+                    if (!_discoveryDone) { _discoveryDone = true; Discover(); }
+                    string state = BuildState();
+                    // 不再把整帧状态写进游戏日志：这是卡顿大户，决策复盘走 Python 侧
+                    // trace-*.jsonl，不依赖这里的 [STATE] 日志。
+                    Push(state);
+                }
+                else
+                {
+                    // 非关卡（菜单 / 选关 / 加载中）：不序列化、不推帧，且只低频
+                    // 探测。BuildState + 全量 LogInfo 每 0.2s 会把游戏卡到选关页
+                    // 掉帧（实机 150% CPU）；FindObjectsOfType + FindMB 反射也降到
+                    // 1 Hz，把非关卡开销压到最小。
+                    next = 1.0f;
+                }
             }
             catch (Exception e)
             {
                 Logger.LogWarning("[STATE] error: " + e.Message);
+                next = 0.2f;   // 出错保持高频，尽快重试
             }
+            Invoke("Snapshot", next);
         }
 
         // ---------- socket ----------
@@ -162,7 +176,13 @@ namespace Oc2AI
 
         bool IsInLevel()
         {
-            return FindMB("ServerCampaignFlowController") != null;
+            // 判据用 FindServerFlowController()（同时认 Campaign 与 Dynamic 两套
+            // 流程控制器类名），而不是 PlayerControls.m_levelConfigBase：
+            // 流程控制器是关卡场景对象，退出到选关页时随关卡销毁 → 返回 null，
+            // 选关页据此正确早退、不再每 0.2s 做全量 BuildState 序列化（否则选关页
+            // 掉帧卡顿，见 Snapshot() 里的注释）。m_levelConfigBase 是配置资产引用，
+            // 退出关卡后不一定被清空，会误判成"仍在关卡内"。
+            return FindServerFlowController() != null;
         }
 
         string ReadLevel()
@@ -195,6 +215,7 @@ namespace Oc2AI
                 _gridReady = false;
                 _originX = 0f;
                 _originZ = 0f;
+                _mainGrid = null;
             }
         }
 
@@ -583,6 +604,24 @@ namespace Oc2AI
             return null;
         }
 
+        // 服务端流程控制器：Campaign 系列是 ServerCampaignFlowController，而
+        // Dynamic 系列（1_6_Dynamic_Lvl_01_2P）是它的子类 ServerDynamicFlowController。
+        // FindMB 按类名精确匹配会漏掉子类，导致 Dynamic 关 Phase() 恒为 "menu"、
+        // orders/score/timer 全 null（实机：1-6 角色一动不动）。这里把两者都认。
+        MonoBehaviour FindServerFlowController()
+        {
+            MonoBehaviour fc = FindMB("ServerCampaignFlowController");
+            if (fc == null) fc = FindMB("ServerDynamicFlowController");
+            return fc;
+        }
+
+        MonoBehaviour FindClientFlowController()
+        {
+            MonoBehaviour fc = FindMB("ClientCampaignFlowController");
+            if (fc == null) fc = FindMB("ClientDynamicFlowController");
+            return fc;
+        }
+
         object GetField(object o, string name)
         {
             if (o == null) return null;
@@ -623,6 +662,67 @@ namespace Oc2AI
             if (mi == null) return null;
             try { return mi.Invoke(o, null); }
             catch { return null; }
+        }
+
+        // 组件所属 GridManager 的名字，找不到返回 null。
+        //
+        // 为什么要逐级找而不是直接读字段：网格归属挂在 StaticGridLocation /
+        // DynamicGridLocation 上，而灶的状态挂在 ServerCookingStation 上
+        // ——两者是同一 GameObject 的**不同组件**，所以 AppendCookers 直接
+        // 读 m_gridManager / get_AccessGridManager 恒为 null，而 AppendStations
+        // 枚举的就是 GridLocation 本体，读得到 "GridManager"。
+        //
+        // 同一口灶在两张表里 grid 一个有一个没有，是 Python 侧 (grid,name)
+        // 资源 id 的致命不一致：候选 id 从 cookers[] 构造 → grid=""，
+        // cooker_state 查 cookers[] 命中（null→"" 归一化相等），
+        // cooker_station 查 stations[] 落空（"GridManager" != ""）。
+        // 后果是 FillCooker 取到米却解析不出灶的位置，放锅那步 target=None
+        // 直接 FAILURE、下一棵树的 EnsureHandsFree 把米放下 —— 表现为
+        // 「拿起米又放下」，整局 1148 拍零烹饪（trace-20261016-215154）。
+        object GridManagerObj(MonoBehaviour mb)
+        {
+            // 功能站（ServerWashingStation / ServerPlateStation 等）没有
+            // GridLocation 组件，m_gridManager / get_AccessGridManager 直接
+            // 读恒为 null。这里沿用 GridName 的逐级回退：本组件 → 同 GameObject
+            // 其它组件 → 子物体。不往父级找：父级可能是整关容器，网格未必
+            // 是这口灶自己的。
+            if (mb == null) return null;
+            object gm = GridManagerOf(mb);
+            if (gm == null)
+            {
+                try
+                {
+                    foreach (Component c in mb.GetComponents<Component>())
+                    {
+                        gm = GridManagerOf(c);
+                        if (gm != null) break;
+                    }
+                    if (gm == null)
+                    {
+                        foreach (Component c in mb.GetComponentsInChildren<Component>(true))
+                        {
+                            gm = GridManagerOf(c);
+                            if (gm != null) break;
+                        }
+                    }
+                }
+                catch { return null; }
+            }
+            return gm is UnityEngine.Object ugm && ugm != null ? ugm : null;
+        }
+
+        string GridName(MonoBehaviour mb)
+        {
+            object gm = GridManagerObj(mb);
+            return gm is UnityEngine.Object ugm && ugm != null ? ugm.name : null;
+        }
+
+        object GridManagerOf(object o)
+        {
+            if (o == null) return null;
+            object gm = GetField(o, "m_gridManager");
+            if (gm == null) gm = CallMethod(o, "get_AccessGridManager");
+            return gm;
         }
 
         bool HasComponent(MonoBehaviour mb, string sub)
@@ -709,11 +809,19 @@ namespace Oc2AI
         {
             // origin = pos - cell * grid，取任一 Static/DynamicGridLocation 反解。
             // 与 Python 侧 GridMapping 校准一致（本关 14.4 / -6.0 @ cell 1.2）。
-            MonoBehaviour qgm = FindMB("QuadGridManager");
-            if (qgm == null) qgm = FindMB("GridManager");
-            if (qgm != null)
+            //
+            // _mainGrid / _cellX / _cellZ 必须和校准原点同源（取自校准用的那条
+            // Static/DynamicGridLocation 所属网格），否则 GridIndexOn 的「主/非主」
+            // 判定与 GridIndex 的坐标系不一致。FindMB 只取第一个 QuadGridManager，
+            // 枚举顺序可能先拿到附属网格（气球关实测 #0 Balloon Basket），于是把
+            // 篮子误当主网格、功能站 gx/gz 报成主网格投影（实机 WashingPart (7,4)
+            // vs 游戏句柄篮子本地 (-1,2)，interact_ready 恒 False）。
+            MonoBehaviour fallback = FindMB("QuadGridManager");
+            if (fallback == null) fallback = FindMB("GridManager");
+            _mainGrid = fallback;   // 兜底：循环找不到站点时用
+            if (fallback != null)
             {
-                object size = GetField(qgm, "m_size");
+                object size = GetField(fallback, "m_size");
                 if (size is Vector3 sz && sz.x > 0f && sz.z > 0f)
                 {
                     _cellX = sz.x;
@@ -730,6 +838,22 @@ namespace Oc2AI
                 object gx = GetField(gi, "m_x");
                 object gz = GetField(gi, "m_z");
                 if (gx == null || gz == null) continue;
+                // 校准用哪条站点，主网格和格宽就取它所属网格，保证同源。
+                object gm = GridManagerOf(mb);
+                if (gm is UnityEngine.Object ugm && ugm != null)
+                {
+                    _mainGrid = ugm;
+                    object gsize = GetField(gm, "m_size");
+                    if (gsize is Vector3 gsz && gsz.x > 0f && gsz.z > 0f)
+                    {
+                        _cellX = gsz.x;
+                        _cellZ = gsz.z;
+                    }
+                }
+                else
+                {
+                    continue;   // 网格归属不明，不能拿它校准（否则 _mainGrid 与原点不同源）
+                }
                 Vector3 p = mb.transform.position;
                 // 与 Python 侧 _calibrate 一致：反解后吸到 4 位小数，
                 // 抹掉 float 噪声（否则 14.4 会变成 14.3999996，半格边界出错一格）。
@@ -754,6 +878,40 @@ namespace Oc2AI
             return gx + "," + gz;
         }
 
+        string GridIndexOn(object gm, Vector3 p)
+        {
+            // 按**指定网格**的 origin / cell 反解本地 gx/gz，供功能站
+            // （洗碗池/盘架）使用。功能站挂在 Balloon Basket 这类非主网格上，
+            // 用主网格的 GridIndex(p) 会算出错误的帧（实机 WashingPart 报
+            // (7,2) 而游戏句柄是篮子本地 (-1,2)，interact_ready 恒 False）。
+            // gm 为 null 或就是主网格时退回主网格投影（旧行为）：主网格的
+            // transform.position 不是网格原点，必须用校准过的 _originX/Z。
+            if (!_gridReady) CalibrateGrid();   // 先校准，保证 _mainGrid 已就绪
+            if (gm == null)
+                return GridIndex(p);
+            if (_mainGrid != null && gm is UnityEngine.Object uo && uo == _mainGrid)
+                return GridIndex(p);
+            Vector3 origin;
+            if (gm is Component comp)
+                origin = comp.transform.position;
+            else if (gm is GameObject go)
+                origin = go.transform.position;
+            else
+                return GridIndex(p);
+            float cellX = 1.2f, cellZ = 1.2f;
+            object size = GetField(gm, "m_size");
+            if (size is Vector3 sz && sz.x > 0f && sz.z > 0f)
+            {
+                cellX = sz.x;
+                cellZ = sz.z;
+            }
+            double rx = ((double)p.x - origin.x) / cellX;
+            double rz = ((double)p.z - origin.z) / cellZ;
+            int gx = (int)Math.Round(Math.Round(rx, 4));
+            int gz = (int)Math.Round(Math.Round(rz, 4));
+            return gx + "," + gz;
+        }
+
         // ---------- 状态 ----------
         string BuildState()
         {
@@ -768,9 +926,9 @@ namespace Oc2AI
             AppendScore(sb);
 
             sb.Append(",\"timer\":{");
-            AppendTimer(sb, FindMB("ClientCampaignFlowController"), "client");
+            AppendTimer(sb, FindClientFlowController(), "client");
             sb.Append(',');
-            AppendTimer(sb, FindMB("ServerCampaignFlowController"), "server");
+            AppendTimer(sb, FindServerFlowController(), "server");
             sb.Append("}");
 
             sb.Append(",\"orders\":[");
@@ -782,8 +940,11 @@ namespace Oc2AI
             sb.Append("],\"chefCount\":").Append(chefCount);
             AppendChopMonitor(sb);
 
+            // 手持物 -> 持有者名，本帧只算一次，plates/items/extinguishers 共用。
+            Dictionary<GameObject, string> heldBy = BuildHeldByMap();
+
             sb.Append(",\"plates\":[");
-            AppendPlates(sb);
+            AppendPlates(sb, heldBy);
             sb.Append("]");
 
             sb.Append(",\"workstations\":[");
@@ -795,15 +956,40 @@ namespace Oc2AI
             sb.Append("]");
 
             sb.Append(",\"extinguishers\":[");
-            AppendExtinguishers(sb);
+            AppendExtinguishers(sb, heldBy);
             sb.Append("]");
 
             sb.Append(",\"items\":[");
-            AppendItems(sb);
+            AppendItems(sb, heldBy);
             sb.Append("]");
 
             sb.Append(",\"grid\":");
             AppendGrid(sb);
+
+            sb.Append(",\"grids\":");
+            AppendGrids(sb);
+
+            sb.Append(",\"terrain\":");
+            AppendTerrain(sb);
+
+            sb.Append(",\"level_bounds\":");
+            AppendLevelBounds(sb);
+
+            sb.Append(",\"occupancy\":");
+            AppendOccupancy(sb);
+
+            sb.Append(",\"belts\":");
+            AppendBelts(sb);
+
+            sb.Append(",\"hazards\":");
+            AppendHazards(sb);
+
+            sb.Append(",\"wind_zones\":");
+            AppendWindZones(sb);
+
+            sb.Append(",\"stations\":[");
+            AppendStations(sb);
+            sb.Append(']');
 
             if (_staticJson != null) sb.Append(',').Append(_staticJson);
 
@@ -844,7 +1030,7 @@ namespace Oc2AI
 
         string Phase()
         {
-            if (FindMB("ServerCampaignFlowController") == null) return "menu";
+            if (FindServerFlowController() == null) return "menu";
             return CountChefs() >= 1 ? "level" : "lobby";
         }
 
@@ -864,7 +1050,7 @@ namespace Oc2AI
 
         void AppendScore(StringBuilder sb)
         {
-            object score = GetField(GetField(FindMB("ServerCampaignFlowController"), "m_teamMonitor"), "m_score");
+            object score = GetField(GetField(FindServerFlowController(), "m_teamMonitor"), "m_score");
             sb.Append('{');
             AppendK(sb, "deliveries", GetField(score, "TotalSuccessfulDeliveries"), false);
             AppendK(sb, "base", GetField(score, "TotalBaseScore"), false);
@@ -891,7 +1077,7 @@ namespace Oc2AI
 
         void AppendOrders(StringBuilder sb)
         {
-            object ao = GetField(GetField(GetField(FindMB("ServerCampaignFlowController"), "m_teamMonitor"), "m_ordersController"), "m_activeOrders");
+            object ao = GetField(GetField(GetField(FindServerFlowController(), "m_teamMonitor"), "m_ordersController"), "m_activeOrders");
             if (!(ao is IEnumerable)) { sb.Append("null"); return; }
 
             int i = 0;
@@ -948,9 +1134,35 @@ namespace Oc2AI
                 object resp = GetField(mb, "m_bRespawning");
                 object held = Held(mb);
 
+                // 相对脚下地面的位置：站在移动平台（篮子）上时，世界坐标会被
+                // 平台带着漂，settle 判定会误判「没停稳」。这里减掉地面 collider
+                // 的参考点，得到相对位置；静态地面上 collider 固定，等价于世界
+                // 坐标（旧行为）。无 collider 时退回世界坐标。
+                float relX = p.x, relZ = p.z;
+                try
+                {
+                    object mov = GetField(mb, "m_surfaceMovable");
+                    object gc = mov != null ? GetField(mov, "m_groundCast") : null;
+                    object gcol = gc != null ? GetField(gc, "m_groundCollider") : null;
+                    if (gcol is UnityEngine.Object uc && uc != null)
+                    {
+                        GameObject cGo = gcol as GameObject;
+                        if (cGo == null && gcol is Component cc) cGo = cc.gameObject;
+                        if (cGo != null)
+                        {
+                            Vector3 cp = cGo.transform.position;
+                            relX = p.x - cp.x;
+                            relZ = p.z - cp.z;
+                        }
+                    }
+                }
+                catch { }
+
                 sb.Append("{\"name\":").Append(Jstr(mb.name))
                   .Append(",\"x\":").Append(p.x.ToString("0.00"))
                   .Append(",\"z\":").Append(p.z.ToString("0.00"))
+                  .Append(",\"rel_x\":").Append(relX.ToString("0.00"))
+                  .Append(",\"rel_z\":").Append(relZ.ToString("0.00"))
                   .Append(",\"yaw\":").Append(mb.transform.eulerAngles.y.ToString("0"))
                   .Append(",\"respawning\":").Append(resp is bool b ? (b ? "true" : "false") : "null")
                   .Append(",\"held\":").Append(Fmt(held))
@@ -1083,7 +1295,7 @@ namespace Oc2AI
                  + "}";
         }
 
-        void AppendPlates(StringBuilder sb)
+        void AppendPlates(StringBuilder sb, Dictionary<GameObject, string> heldBy)
         {
             int i = 0;
             foreach (MonoBehaviour mb in _all)
@@ -1100,6 +1312,8 @@ namespace Oc2AI
                   .Append(",\"count\":").Append(ContentsCount(ingr))
                   .Append(",\"contents\":").Append(ListContents(ingr))
                   .Append(",\"detail\":").Append(ListContentsDetail(ingr))
+                  .Append(",\"held_by\":").Append(
+                      Jstr(heldBy.TryGetValue(mb.gameObject, out string hb) ? hb : null))
                   .Append('}');
                 i++;
                 if (i >= 8) break;
@@ -1219,6 +1433,17 @@ namespace Oc2AI
 
         // 读锅里是什么料：锅对象的某个子组件就是 IngredientContainer，
         // 用和盘完全相同的方式（GetContents / m_contents + DescribeNode）读。
+        string CookwareName(object pot)
+        {
+            // 灶上炊具的 GameObject 名（如 utensil_pot_01 / utensil_frying_pan_01）。
+            // m_itemPot 是 ICookable（Component 或 GameObject），名字能区分锅/煎锅，
+            // 而 get_AccessCookingType 的返回值未离线验证，先不依赖。
+            if (pot == null) return null;
+            if (pot is Component pc) return pc.gameObject.name;
+            if (pot is GameObject go) return go.name;
+            return null;
+        }
+
         string PotContents(object pot)
         {
             if (pot == null) return "[]";
@@ -1324,7 +1549,10 @@ namespace Oc2AI
                 // GetCookingProgress() 与 get_AccessCookingTime，同一单位 float。
                 object cookingProgress = CallMethod(pot, "GetCookingProgress");
                 object cookingTime = CallMethod(pot, "get_AccessCookingTime");
+                // grid 必须与 AppendStations 对同一口灶报的值一致（见 GridName
+                // 注释）：Python 侧的 (grid,name) 资源 id 两张表都要查得到。
                 sb.Append("{\"n\":").Append(Jstr(mb.name))
+                  .Append(",\"grid\":").Append(Jstr(GridName(mb)))
                   .Append(",\"x\":").Append(p.x.ToString("0.0"))
                   .Append(",\"z\":").Append(p.z.ToString("0.0"))
                   .Append(",\"isCooking\":").Append(isCooking is bool b ? (b ? "true" : "false") : "null")
@@ -1334,6 +1562,8 @@ namespace Oc2AI
                   .Append(",\"onFire\":").Append(onFire)
                   .Append(",\"cooking_progress\":").Append(Fmt(cookingProgress))
                   .Append(",\"cooking_time\":").Append(Fmt(cookingTime))
+                  .Append(",\"cookware\":").Append(Jstr(CookwareName(pot)))
+                  .Append(",\"cook_type\":").Append(Fmt(CallMethod(pot, "get_AccessCookingType")))
                   .Append(",\"pot_contents\":").Append(PotContents(pot))
                   .Append('}');
                 i++;
@@ -1341,7 +1571,7 @@ namespace Oc2AI
             }
         }
 
-        void AppendExtinguishers(StringBuilder sb)
+        void AppendExtinguishers(StringBuilder sb, Dictionary<GameObject, string> heldBy)
         {
             int i = 0;
             foreach (MonoBehaviour mb in _all)
@@ -1355,16 +1585,88 @@ namespace Oc2AI
                 sb.Append("{\"n\":").Append(Jstr(mb.name))
                   .Append(",\"x\":").Append(p.x.ToString("0.0"))
                   .Append(",\"z\":").Append(p.z.ToString("0.0"))
+                  .Append(",\"held_by\":").Append(
+                      Jstr(heldBy.TryGetValue(mb.gameObject, out string hb) ? hb : null))
                   .Append('}');
                 i++;
                 if (i >= 8) break;
             }
         }
 
-        void AppendItems(StringBuilder sb)
+        // 每帧一次：反查「可携带物挂在哪个站点上」（字段判据，替代 Python 侧按
+        // 坐标排除灶上那口被重复报进 items 的锅）。返回 GameObject -> 描述：
+        //   "cooking:<灶名>" —— 锅在灶上（读到 m_itemPot）
+        //   "attach:<站点名>" —— 挂在普通挂载站（读到 AttachStation.m_item）
+        // 不在表里 = 地上 / 手持 / 没匹配到。灶的映射后填、覆盖 attach（锅在灶上
+        // 时优先算 cooking）。整个 O(_all) 一遍，不能每个 item 都扫两遍——那样
+        // 5Hz 每帧几十万次 ToLowerInvariant 分配，游戏会一卡一卡（实机复现）。
+        Dictionary<GameObject, string> BuildStationMap()
         {
-            // 散落物品（可携带物：地面/柜台/传送带上的原料、鱼片、盘子等）
+            var map = new Dictionary<GameObject, string>();
+            try
+            {
+                // ① 通用挂载站（先填）
+                foreach (MonoBehaviour att in _all)
+                {
+                    if (att == null) continue;
+                    if (att.GetType().Name.IndexOf("AttachStation") < 0) continue;
+                    object item = GetField(att, "m_item");
+                    if (item == null) continue;
+                    GameObject go = item is Component c ? c.gameObject : (item as GameObject);
+                    if (go == null) continue;
+                    object station = GetField(att, "m_station");
+                    string stName = station == null ? "null"
+                        : (station is UnityEngine.Object su && su != null ? su.name : station.GetType().Name);
+                    map[go] = "attach:" + stName;
+                }
+                // ② 灶（后填，覆盖 attach → 灶优先）
+                foreach (MonoBehaviour mb in _all)
+                {
+                    if (mb == null) continue;
+                    string tn = mb.GetType().Name;
+                    if (tn.IndexOf("CookingStation") < 0 && tn.IndexOf("HeatedCooking") < 0) continue;
+                    object pot = GetField(mb, "m_itemPot");
+                    if (pot == null) continue;
+                    GameObject go = pot is Component c2 ? c2.gameObject : (pot as GameObject);
+                    if (go == null) continue;
+                    map[go] = "cooking:" + mb.name;
+                }
+            }
+            catch { }
+            return map;
+        }
+
+        // 每帧一次：手持物 -> 持有者名（"Player 1" / "Player 2"）。AppendItems
+        // 用它给 items[] 打 held_by 标记——Python 侧据此把手持物与散落物分开。
+        // 手持物坐标跟着厨师走，散落语义的取料谓词不能把它当散落料（否则
+        // 会出现 P2 追着拿料的 P1 跑，trace-20261018-150454）。
+        Dictionary<GameObject, string> BuildHeldByMap()
+        {
+            var map = new Dictionary<GameObject, string>();
+            try
+            {
+                foreach (MonoBehaviour mb in _all)
+                {
+                    if (mb == null) continue;
+                    if (mb.GetType().Name != "PlayerControls") continue;
+                    object held = Held(mb);
+                    GameObject go = null;
+                    if (held is GameObject g) go = g;
+                    else if (held is Component c) go = c.gameObject;
+                    if (go == null) continue;
+                    map[go] = mb.name;
+                }
+            }
+            catch { }
+            return map;
+        }
+
+        void AppendItems(StringBuilder sb, Dictionary<GameObject, string> heldBy)
+        {
+            // 可携带物（地面/柜台/传送带上的原料、鱼片、盘子等；手持物也在此，
+            // 靠 held_by 与散落物区分——手持锅的内容状态要在这里读）。
             int i = 0;
+            Dictionary<GameObject, string> stationMap = BuildStationMap();
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null) continue;
@@ -1383,6 +1685,10 @@ namespace Oc2AI
                   .Append(",\"cooked\":").Append(cooked == "null" ? "null" : Jstr(cooked))
                   .Append(",\"detail\":").Append(PotContents(mb))
                   .Append(",\"throwable\":").Append(IsThrowable(mb) ? "true" : "false")
+                  .Append(",\"on_station\":").Append(
+                      Jstr(stationMap.TryGetValue(mb.gameObject, out string os) ? os : null))
+                  .Append(",\"held_by\":").Append(
+                      Jstr(heldBy.TryGetValue(mb.gameObject, out string hb) ? hb : null))
                   .Append('}');
                 i++;
                 if (i >= 32) break;
@@ -1425,96 +1731,451 @@ namespace Oc2AI
             sb.Append('}');
         }
 
-        // ---------- 静态: 站点 + 配方 ----------
+        // 替代 CalibrateGrid/GridIndex 的单网格假设（§4.1 根因：取第一个
+        // QuadGridManager、第一个站点就 return，多网格下必然只拿到一个）。
+        // 直接枚举全部 QuadGridManager 实例，每个的 transform.position 就是
+        // 它的世界原点——m_origin 字段恒为 (0,0,0)，原点在 transform 上，不在
+        // 字段里（§4.1 实测）。
+        void AppendGrids(StringBuilder sb)
+        {
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                if (mb.GetType().Name != "QuadGridManager") continue;
+                object size = GetField(mb, "m_size");
+                float cell = 1.2f;
+                if (size is Vector3 sz && sz.x > 0f) cell = sz.x;
+                Vector3 p = mb.transform.position;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"id\":").Append(Jstr(mb.name))
+                  .Append(",\"ox\":").Append(p.x.ToString("0.####"))
+                  .Append(",\"oz\":").Append(p.z.ToString("0.####"))
+                  .Append(",\"cell\":").Append(cell.ToString("0.####"))
+                  .Append('}');
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 取代 Col_Floor/Col_Walls/Col_Objects 名字前缀匹配（§2 根因 2：Sushi_1_4
+        // 命中 41 个、Balloon_1_5 命中 0 个）。按层号分组输出，层名是 Unity 工程
+        // 配置，跨关稳定（§4.4）。只收这几层：Ground(9)/Walls(10)/
+        // PlateStationBlock(20)/CookingStationBlock(22)/TableBlock(26)/KillPlane(30)。
+        static readonly int[] TERRAIN_LAYERS = { 9, 10, 20, 22, 26, 30 };
+
+        void AppendTerrain(StringBuilder sb)
+        {
+            sb.Append('[');
+            Dictionary<int, List<float[]>> byLayer = new Dictionary<int, List<float[]>>();
+            foreach (int l in TERRAIN_LAYERS) byLayer[l] = new List<float[]>();
+
+            Type goType = FindType("UnityEngine.GameObject");
+            if (goType == null) goType = FindType("GameObject");
+            MethodInfo mi = typeof(UnityEngine.Object).GetMethod(
+                "FindObjectsOfType", BindingFlags.Public | BindingFlags.Static,
+                null, new Type[] { typeof(Type) }, null);
+            object[] gos = (mi != null && goType != null)
+                ? (object[])mi.Invoke(null, new object[] { goType }) : null;
+            if (gos != null)
+            {
+                foreach (object o in gos)
+                {
+                    GameObject go = o as GameObject;
+                    if (go == null || !byLayer.ContainsKey(go.layer)) continue;
+                    foreach (Component c in go.GetComponents<Component>())
+                    {
+                        if (c == null) continue;
+                        if (c.GetType().Name.ToLowerInvariant().IndexOf("collider") < 0) continue;
+                        object trig = GetProp(c, "isTrigger");
+                        if (trig is bool tb && tb) continue;
+                        object bd = GetProp(c, "bounds");
+                        if (bd == null) continue;
+                        object mn = GetProp(bd, "min"), mx = GetProp(bd, "max");
+                        if (mn == null || mx == null) continue;
+                        object ax = GetField(mn, "x"), az = GetField(mn, "z");
+                        object bx = GetField(mx, "x"), bz = GetField(mx, "z");
+                        if (ax == null || az == null || bx == null || bz == null) continue;
+                        float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
+                        if (bxf <= axf || bzf <= azf) continue;
+                        byLayer[go.layer].Add(new float[] { axf, bxf, azf, bzf });
+                    }
+                }
+            }
+            // 过滤：阻挡层（10/20/22/26）里与 Ground(9) 几乎重合的 box 不是墙，
+            // 是地板自己的 collider / KillPlane（反编译 LevelBounds：KillPlane 挂
+            // RespawnCollider，其 collider 覆盖整块地板）。不滤掉的话
+            // make_walkable_from_terrain 会把整块地板判成墙，角色一步都走不动
+            // （实测 Balloon_1_5_2P：主地板/篮子地板各有一块这样的假墙，导致
+            // distance_field 只有 P2 脚下 1 格可走）。
+            List<float[]> groundBoxes = byLayer[9];
+            for (int li = 0; li < TERRAIN_LAYERS.Length; li++)
+            {
+                int l = TERRAIN_LAYERS[li];
+                if (l == 9 || l == 30) continue;   // Ground 保留；KillPlane(30) 保留
+                List<float[]> src = byLayer[l];
+                if (src == null || src.Count == 0) continue;
+                List<float[]> kept = new List<float[]>(src.Count);
+                List<string> dropped = null;
+                foreach (float[] b in src)
+                {
+                    if (_NearlyMatchesAnyGround(b, groundBoxes))
+                    {
+                        if (!_terrainFilterLogged)
+                        {
+                            if (dropped == null) dropped = new List<string>();
+                            dropped.Add(string.Format("[{0},{1},{2},{3}]",
+                                b[0], b[1], b[2], b[3]));
+                        }
+                        continue;
+                    }
+                    kept.Add(b);
+                }
+                if (dropped != null)
+                {
+                    Logger.LogInfo("[TERRAIN] 过滤掉与 Ground 重合的假墙 layer=" + l
+                        + " : " + string.Join(" ", dropped.ToArray()));
+                }
+                byLayer[l] = kept;
+            }
+            _terrainFilterLogged = true;
+
+            int i = 0;
+            foreach (int l in TERRAIN_LAYERS)
+            {
+                List<float[]> boxes = byLayer[l];
+                if (boxes.Count == 0) continue;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"layer\":").Append(l).Append(",\"boxes\":[");
+                for (int k = 0; k < boxes.Count; k++)
+                {
+                    if (k > 0) sb.Append(',');
+                    float[] b = boxes[k];
+                    sb.Append('[').Append(b[0].ToString("0.##")).Append(',')
+                      .Append(b[1].ToString("0.##")).Append(',')
+                      .Append(b[2].ToString("0.##")).Append(',')
+                      .Append(b[3].ToString("0.##")).Append(']');
+                }
+                sb.Append("]}");
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        static bool _NearlyMatchesAnyGround(float[] box, List<float[]> grounds)
+        {
+            const float eps = 0.05f;
+            if (grounds == null) return false;
+            foreach (float[] g in grounds)
+            {
+                if (Math.Abs(box[0] - g[0]) <= eps &&
+                    Math.Abs(box[1] - g[1]) <= eps &&
+                    Math.Abs(box[2] - g[2]) <= eps &&
+                    Math.Abs(box[3] - g[3]) <= eps)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // 可玩区域 AABB（LevelBounds.m_bounds）。反编译确认 LevelBounds 是关卡
+        // 边界组件：SetupLevelBounds() 从 4 个侧壁 collider + Ceiling + KillPlane
+        // 的 bounds 求中心平均得到 m_bounds。它不依赖 Unity 层号，跨关稳定。
+        //
+        // 用途：1-6（Dynamic）掉出范围的根因是 AppendTerrain 的 Ground/KillPlane
+        // 层号扫描在该关拿不到东西 → terrain 为空 → Python 侧「不在 Ground 内即
+        // 不可走」这层约束整体失效，角色被寻路引到地板外坠落。这里把 LevelBounds
+        // 的 AABB 单独报出去，让 Python 在 Ground 缺失时用它兜底裁剪可走范围。
+        void AppendLevelBounds(StringBuilder sb)
+        {
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "LevelBounds") continue;
+                object bd = GetField(mb, "m_bounds");
+                if (bd == null) continue;
+                object mn = GetProp(bd, "min");
+                object mx = GetProp(bd, "max");
+                if (mn == null || mx == null) continue;
+                object ax = GetField(mn, "x"), az = GetField(mn, "z");
+                object bx = GetField(mx, "x"), bz = GetField(mx, "z");
+                if (ax == null || az == null || bx == null || bz == null) continue;
+                float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
+                // 未初始化（SetupLevelBounds 尚未跑）的 Bounds 是退化 AABB，跳过
+                if (bxf <= axf || bzf <= azf) continue;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"minx\":").Append(axf.ToString("0.##"))
+                  .Append(",\"maxx\":").Append(bxf.ToString("0.##"))
+                  .Append(",\"minz\":").Append(azf.ToString("0.##"))
+                  .Append(",\"maxz\":").Append(bzf.ToString("0.##"))
+                  .Append('}');
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 运行时占用表（§5.3 第 5 步），比 nodeMap 权威——nodeMap 11×11 覆盖不全
+        // 且关内从不更新（§4.3），这里直接读 GridManager/QuadGridManager 的
+        // m_gridOccupancy，每个网格单独一组 cells。
+        void AppendOccupancy(StringBuilder sb)
+        {
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                string tn = mb.GetType().Name;
+                if (tn != "QuadGridManager" && tn != "GridManager") continue;
+                object occ = GetField(mb, "m_gridOccupancy");
+                if (!(occ is IEnumerable)) continue;
+                StringBuilder cells = new StringBuilder();
+                int n = 0;
+                foreach (object e in (IEnumerable)occ)
+                {
+                    object key = GetProp(e, "Key");
+                    if (key == null) continue;
+                    object gx = GetField(key, "m_x");
+                    object gz = GetField(key, "m_z");
+                    if (gx == null || gz == null) continue;
+                    if (n > 0) cells.Append(',');
+                    cells.Append('[').Append(gx).Append(',').Append(gz).Append(']');
+                    n++;
+                }
+                if (n == 0) continue;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"grid\":").Append(Jstr(mb.name))
+                  .Append(",\"cells\":[").Append(cells).Append("]}");
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 取代 occupancy.BELTS 关卡硬编码表（§4.5：与手标表 18/18 格零差异，
+        // 可证的等价替换）。方向必须用 GetSurfaceVelocity()，不能用
+        // m_directionXZ 枚举——后者是局部朝向，两排传送带都报 Rightwards，
+        // 真实方向需乘 transform.rotation（§4.5 实测对比表）。
+        void AppendBelts(StringBuilder sb)
+        {
+            // 只扫 Travelator（Sushi_1_4 那种地板齐平的、角色能走上去的传送带）。
+            // 1-6 的 ConveyorStation 是台面高度、物料在上面的传送带，角色走不上去，
+            // 语义上是「站点/柜台」不是「可走的地板传送带」，不能混进 belt_cells
+            // （混进来会让 occupancy 豁免把不可走的台面当成可走）。
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "Travelator") continue;
+                object gi = GetField(mb, "m_gridIndex");
+                object gm = GetField(mb, "m_gridManager");
+                object vel = CallMethod(mb, "GetSurfaceVelocity");
+                if (gi == null) continue;
+                object gx = GetField(gi, "m_x"), gz = GetField(gi, "m_z");
+                if (gx == null || gz == null) continue;
+                float vx = 0f, vz = 0f;
+                if (vel is Vector3 v) { vx = v.x; vz = v.z; }
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"grid\":").Append(gm is UnityEngine.Object ugm && ugm != null
+                                               ? Jstr(ugm.name) : "null")
+                  .Append(",\"gx\":").Append(gx).Append(",\"gz\":").Append(gz)
+                  .Append(",\"vx\":").Append(vx.ToString("0.##"))
+                  .Append(",\"vz\":").Append(vz.ToString("0.##"))
+                  .Append('}');
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 1-6 的落火（§4.7）：TTL 16s、批量下落。实时扫 FireHazard（取基类本体，
+        // 不是 ServerFireHazard/ClientFireHazard 子类——子类上该字段读不到，
+        // §4.7 诊断已验证）。ttl 用 m_lifetime 减去已过去的时间——FireHazard
+        // 没有直接暴露"剩余时间"的字段，用 m_destroyTime（诊断里恒为 1，可能是
+        // 别的含义）之外没有更好的信号；这里退而用「本对象存在即未到期」的事实：
+        // hazards 列表只要包含它、ttl 填 m_lifetime 的名义值即可——Python 侧
+        // 只用 hazards 的"存在性"来挡格子（§5.3 第 3 步），不消费精确剩余秒数，
+        // ttl 字段留给未来做"等 hazard 消失"类功能时再精确化（spec §10 待办已
+        // 排除本次做等待语义）。
+        void AppendHazards(StringBuilder sb)
+        {
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "FireHazard") continue;
+                object life = GetField(mb, "m_lifetime");
+                Vector3 p = mb.transform.position;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"t\":\"fire\",\"x\":").Append(p.x.ToString("0.##"))
+                  .Append(",\"z\":").Append(p.z.ToString("0.##"))
+                  .Append(",\"ttl\":").Append(life == null ? "1.0" : life.ToString())
+                  .Append('}');
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 风区（WindVolume）：反编译确认 WindVolume.GetVelocity() =
+        // m_windSpeed * transform.right（enabled 时），m_volumeBounds 是风区
+        // AABB。角色走进风区会被持续推着动不了，Python 侧据此在「被风吹得
+        // 动不了」时豁免 motion 失败的资源拉黑。
+        void AppendWindZones(StringBuilder sb)
+        {
+            sb.Append('[');
+            int i = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "WindVolume") continue;
+                if (!mb.enabled) continue;   // 关闭的风区不起风，不报
+                object spd = GetField(mb, "m_windSpeed");
+                float speed = spd is float f ? f : 0f;
+                if (speed <= 0f) continue;   // 风速 0 = 无风，不报
+                object bd = GetField(mb, "m_volumeBounds");
+                if (bd == null) continue;
+                object mn = GetProp(bd, "min");
+                object mx = GetProp(bd, "max");
+                if (mn == null || mx == null) continue;
+                object ax = GetField(mn, "x"), az = GetField(mn, "z");
+                object bx = GetField(mx, "x"), bz = GetField(mx, "z");
+                if (ax == null || az == null || bx == null || bz == null) continue;
+                float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
+                if (bxf <= axf || bzf <= azf) continue;
+                Vector3 right = mb.transform.right;
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"minx\":").Append(axf.ToString("0.##"))
+                  .Append(",\"maxx\":").Append(bxf.ToString("0.##"))
+                  .Append(",\"minz\":").Append(azf.ToString("0.##"))
+                  .Append(",\"maxz\":").Append(bzf.ToString("0.##"))
+                  .Append(",\"vx\":").Append((speed * right.x).ToString("0.##"))
+                  .Append(",\"vz\":").Append((speed * right.z).ToString("0.##"))
+                  .Append('}');
+                i++;
+            }
+            sb.Append(']');
+        }
+
+        // 原来在 BuildStatic() 里的四段 stations 循环，现在每帧单独调用——
+        // stations 不是真正的静态数据（§5.5：x/z/gx/gz/AABB 全部要跟着移动平台
+        // 刷新），和 cookers/plates/items 一样每帧重新扫 _all 构建，不进
+        // _staticJson 缓存。副作用：关内阶段切换后新厨房的站点下一帧自动出现，
+        // 不需要额外的 staleness/结构跳变检测（§5.6/§4.9）。
+        void AppendStations(StringBuilder sb)
+        {
+            int si = 0;
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                string tn = mb.GetType().Name;
+                if (tn != "StaticGridLocation" && tn != "DynamicGridLocation") continue;
+                string type = ClassifyStation(mb, mb.name);
+                if (type == null) continue;
+                object gi = GetField(mb, "m_gridIndex");
+                Vector3 p = mb.transform.position;
+                object stGm = GetField(mb, "m_gridManager");
+                // StaticGridLocation 没有 m_gridManager 直接字段时，退而找
+                // get_AccessGridManager（IGridLocation 接口，§2 根因 1）。
+                if (stGm == null) stGm = CallMethod(mb, "get_AccessGridManager");
+                if (si > 0) sb.Append(',');
+                sb.Append("{\"t\":").Append(Jstr(type))
+                    .Append(",\"n\":").Append(Jstr(mb.name))
+                    .Append(",\"grid\":").Append(
+                        stGm is UnityEngine.Object ugm && ugm != null ? Jstr(ugm.name) : "null")
+                    .Append(",\"gx\":").Append(Fmt(GetField(gi, "m_x")))
+                    .Append(",\"gz\":").Append(Fmt(GetField(gi, "m_z")))
+                    .Append(",\"x\":").Append(p.x.ToString("0.0"))
+                    .Append(",\"z\":").Append(p.z.ToString("0.0"));
+                AppendColliderBounds(sb, mb);
+                if (type == "crate")
+                {
+                    sb.Append(",\"ing\":").Append(Jstr(CrateIngredient(mb)));
+                    sb.Append(ChopFields(mb));
+                }
+                sb.Append('}');
+                si++;
+            }
+
+            // 功能站点：盘架/上菜口、洗碗池（按组件类型找，不依赖 StaticGridLocation）
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                string tn = mb.GetType().Name;
+                string type = null;
+                if (tn == "ServerPlateStation") type = "plate_station";
+                else if (tn == "ServerWashingStation") type = "washing";
+                if (type == null) continue;
+                Vector3 p = mb.transform.position;
+                // 功能站没有 GridLocation 组件：grid 归属改用 GridManagerObj
+                // 逐级回退去找（本组件→同对象其它组件→子物体），gx/gz 用该
+                // 网格自己的 origin/cell 反解（GridIndexOn）。找不到网格时
+                // 退回主网格投影（旧行为），避免报 null 导致站都看不见。
+                object stGm = GridManagerObj(mb);
+                string[] gidx = GridIndexOn(stGm, p).Split(',');
+                if (si > 0) sb.Append(',');
+                sb.Append("{\"t\":").Append(Jstr(type))
+                    .Append(",\"n\":").Append(Jstr(mb.name))
+                    .Append(",\"grid\":").Append(
+                        stGm is UnityEngine.Object ugm2 && ugm2 != null ? Jstr(ugm2.name) : "null")
+                    .Append(",\"gx\":").Append(gidx[0])
+                    .Append(",\"gz\":").Append(gidx[1])
+                    .Append(",\"x\":").Append(p.x.ToString("0.0"))
+                    .Append(",\"z\":").Append(p.z.ToString("0.0"));
+                AppendColliderBounds(sb, mb);
+                if (type == "washing")
+                {
+                    // 洗碗进度：m_plateCount（待洗盘数）、m_cleaningTimer（当前块进度）
+                    sb.Append(",\"plate_count\":").Append(Fmt(GetField(mb, "m_plateCount")))
+                        .Append(",\"cleaning_timer\":").Append(Fmt(GetField(mb, "m_cleaningTimer")));
+                }
+                sb.Append('}');
+                si++;
+            }
+
+            // 干净盘子堆：CleanPlateUtensilRespawnBehaviour（每堆一个）
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                string tn = mb.GetType().Name;
+                if (tn != "ServerCleanPlateUtensilRespawnBehaviour" && tn != "CleanPlateUtensilRespawnBehaviour") continue;
+                Vector3 p = mb.transform.position;
+                if (si > 0) sb.Append(',');
+                sb.Append("{\"t\":\"plate_stack\",\"n\":").Append(Jstr(mb.name))
+                    .Append(",\"x\":").Append(p.x.ToString("0.0"))
+                    .Append(",\"z\":").Append(p.z.ToString("0.0"));
+                AppendColliderBounds(sb, mb);
+                sb.Append('}');
+                si++;
+            }
+
+            // 墙体/障碍碰撞体：nodeMap 外围一圈误标可走，需按真实 collider 挡掉
+            AppendWallStations(sb, ref si);
+        }
+
+        // ---------- 静态: 配方 ----------
         void BuildStatic()
         {
             try
             {
-                StringBuilder stations = new StringBuilder();
                 StringBuilder recipes = new StringBuilder();
 
-                int si = 0;
-                foreach (MonoBehaviour mb in _all)
-                {
-                    if (mb == null) continue;
-                    string tn = mb.GetType().Name;
-                    if (tn != "StaticGridLocation" && tn != "DynamicGridLocation") continue;
-                    string type = ClassifyStation(mb, mb.name);
-                    if (type == null) continue;
-                    object gi = GetField(mb, "m_gridIndex");
-                    Vector3 p = mb.transform.position;
-                    if (si > 0) stations.Append(',');
-                    stations.Append("{\"t\":").Append(Jstr(type))
-                        .Append(",\"n\":").Append(Jstr(mb.name))
-                        .Append(",\"gx\":").Append(Fmt(GetField(gi, "m_x")))
-                        .Append(",\"gz\":").Append(Fmt(GetField(gi, "m_z")))
-                        .Append(",\"x\":").Append(p.x.ToString("0.0"))
-                        .Append(",\"z\":").Append(p.z.ToString("0.0"));
-                    AppendColliderBounds(stations, mb);
-                    if (type == "crate")
-                    {
-                        stations.Append(",\"ing\":").Append(Jstr(CrateIngredient(mb)));
-                        stations.Append(ChopFields(mb));
-                    }
-                    stations.Append('}');
-                    si++;
-                }
-
-                // 功能站点：盘架/上菜口、洗碗池（按组件类型找，不依赖 StaticGridLocation）
-                foreach (MonoBehaviour mb in _all)
-                {
-                    if (mb == null) continue;
-                    string tn = mb.GetType().Name;
-                    string type = null;
-                    if (tn == "ServerPlateStation") type = "plate_station";
-                    else if (tn == "ServerWashingStation") type = "washing";
-                    if (type == null) continue;
-                    Vector3 p = mb.transform.position;
-                    string[] gidx = GridIndex(p).Split(',');
-                    if (si > 0) stations.Append(',');
-                    stations.Append("{\"t\":").Append(Jstr(type))
-                        .Append(",\"n\":").Append(Jstr(mb.name))
-                        .Append(",\"gx\":").Append(gidx[0])
-                        .Append(",\"gz\":").Append(gidx[1])
-                        .Append(",\"x\":").Append(p.x.ToString("0.0"))
-                        .Append(",\"z\":").Append(p.z.ToString("0.0"));
-                    AppendColliderBounds(stations, mb);
-                    if (type == "washing")
-                    {
-                        // 洗碗进度：m_plateCount（待洗盘数）、m_cleaningTimer（当前块进度）
-                        stations.Append(",\"plate_count\":").Append(Fmt(GetField(mb, "m_plateCount")))
-                            .Append(",\"cleaning_timer\":").Append(Fmt(GetField(mb, "m_cleaningTimer")));
-                    }
-                    stations.Append('}');
-                    si++;
-                }
-
-                // 干净盘子堆：CleanPlateUtensilRespawnBehaviour（每堆一个）
-                foreach (MonoBehaviour mb in _all)
-                {
-                    if (mb == null) continue;
-                    string tn = mb.GetType().Name;
-                    if (tn != "ServerCleanPlateUtensilRespawnBehaviour" && tn != "CleanPlateUtensilRespawnBehaviour") continue;
-                    Vector3 p = mb.transform.position;
-                    if (si > 0) stations.Append(',');
-                    stations.Append("{\"t\":\"plate_stack\",\"n\":").Append(Jstr(mb.name))
-                        .Append(",\"x\":").Append(p.x.ToString("0.0"))
-                        .Append(",\"z\":").Append(p.z.ToString("0.0"));
-                    AppendColliderBounds(stations, mb);
-                    stations.Append('}');
-                    si++;
-                }
-
-                // 墙体/障碍碰撞体：nodeMap 外围一圈误标可走，需按真实 collider 挡掉
-                AppendWallStations(stations, ref si);
-
+                // 原实现硬编码 ServerCampaignFlowController / ClientCampaignFlowController /
+                // CampaignFlowController 三个具体类名，只覆盖 Campaign 系列关卡。
+                // Dynamic 系列关卡（如 1_6_Dynamic_Lvl_01_2P）走 ServerDynamicFlowController，
+                // 不在这三个名字里，于是 recipes 永远为空（实机复现：BuildStatic
+                // 整局 1851 次重试一次未成功）。改按接口 IRecipeListCache 查找，
+                // 不管具体是哪个子类——元数据反查确认 m_cachedRecipeList 声明在
+                // 共享基类 ClientKitchenFlowControllerBase 上，GetCachedRecipeList()
+                // 是该接口方法，Campaign/Dynamic 两套框架都实现了它。
                 object list = null;
-                foreach (string nm in new[] { "ServerCampaignFlowController", "ClientCampaignFlowController", "CampaignFlowController" })
+                Type recipeIface = FindType("IRecipeListCache");
+                if (recipeIface != null)
                 {
-                    MonoBehaviour fc = FindMB(nm);
-                    if (fc == null) continue;
-                    object l = GetField(fc, "m_cachedRecipeList");
-                    if (l is IEnumerable && Count(l) > 0) { list = l; break; }
+                    foreach (MonoBehaviour mb in _all)
+                    {
+                        if (mb == null || !recipeIface.IsInstanceOfType(mb)) continue;
+                        object l = CallMethod(mb, "GetCachedRecipeList");
+                        if (l is IEnumerable && Count(l) > 0) { list = l; break; }
+                    }
                 }
                 int ri = 0;
                 if (list is IEnumerable)
@@ -1545,8 +2206,8 @@ namespace Oc2AI
                     return;
                 }
 
-                _staticJson = "\"stations\":[" + stations + "],\"recipes\":[" + recipes + "]";
-                Logger.LogInfo("[STATIC] built stations=" + si + " recipes=" + ri);
+                _staticJson = "\"recipes\":[" + recipes + "]";
+                Logger.LogInfo("[STATIC] built recipes=" + ri);
             }
             catch (Exception e)
             {

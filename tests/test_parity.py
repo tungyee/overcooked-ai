@@ -14,8 +14,8 @@ import pytest
 
 import glob
 
-from ai import predicates as P
-from ai.replay import load_frames
+from ai.query import predicates as P
+from ai.exec.replay import load_frames
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 

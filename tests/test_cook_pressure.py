@@ -4,10 +4,14 @@
 - 米饭熟了也不去拿 → `_time_pressure` 曾是空实现（恒 0），熟料 task 结构性垫底。
 - 反复换灶 → `_gen_cook` 漏了 spec §6.1 第 3 号的"该单需熟料"子句。
 """
-from ai.blackboard import Blackboard, StuckScratch
-from ai import planner, recipe_graph, tasks as T
-from ai.recipes import RecipeBook
-from ai.world import World
+import pytest
+
+from ai.state.blackboard import Blackboard, StuckScratch
+from ai.core import planner
+from ai.query import recipe_graph
+from ai import tasks as T
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 def _world(cookers=None, stations=None, orders=None, recipes=None):
@@ -77,39 +81,39 @@ def test_time_pressure_ramps_up_toward_burning():
     """有连续进度时，压力随「快糊了」上升，帮 TakeCookedToPlate 跨过承诺惯性。
 
     游戏语义：cooked = progress>=time，burning = progress>2*time。
-    ratio = progress/(2*time)：0.5 刚熟、1.0 快糊；压力 1.0 → 2.0。
+    ratio = progress/(2*time)：0.4 刚熟(策略)、1.0 快糊；压力 1.0 → 2.0。
     """
     w = _world(cookers=[{"n": "cooker_01", "x": 1.0, "z": 1.0,
-                         "cooking_progress": 10.0, "cooking_time": 10.0}])
+                         "cooking_progress": 8.0, "cooking_time": 10.0}])
     task = T.TakeCookedToPlate("order1", ("cooker_01", "plate_01"),
                                "BoiledSushiRice")
 
-    assert planner._time_pressure(task, w) == 1.0        # 刚熟 ratio 0.5
+    assert planner._time_pressure(task, w) == 1.0        # 刚熟 ratio 0.4
 
-    w.cookers[0]["cooking_progress"] = 15.0
-    assert planner._time_pressure(task, w) == 1.5        # ratio 0.75
+    w.cookers[0]["cooking_progress"] = 14.0
+    assert planner._time_pressure(task, w) == 1.5        # ratio 0.7
 
     w.cookers[0]["cooking_progress"] = 20.0
     assert planner._time_pressure(task, w) == 2.0        # 快糊 ratio 1.0
 
-    w.cookers[0]["cooking_progress"] = 5.0
-    assert planner._time_pressure(task, w) == 0.0        # 还没熟 ratio 0.25
+    w.cookers[0]["cooking_progress"] = 2.0
+    assert planner._time_pressure(task, w) == 0.0        # 还没到快熟段 ratio 0.1
 
 
 def test_time_pressure_ramps_up_before_cooked():
-    """煮到后半程压力就开始爬：提前端盘去等熟（ratio 0.25→0.5 对应 0→1.0）。"""
+    """煮到约三成（ratio 0.15）压力就开始爬：提前端盘去等熟（0.15→0.4 对应 0→1.0）。"""
     w = _world(cookers=[{"n": "cooker_01", "x": 1.0, "z": 1.0,
-                         "cooking_progress": 6.0, "cooking_time": 12.0}])
+                         "cooking_progress": 3.6, "cooking_time": 12.0}])
     task = T.TakeCookedToPlate("order1", ("cooker_01", "plate_01"),
                                "BoiledSushiRice")
 
-    assert planner._time_pressure(task, w) == 0.0        # ratio 6/24=0.25 刚过半
+    assert planner._time_pressure(task, w) == 0.0        # ratio 0.15 起点
 
-    w.cookers[0]["cooking_progress"] = 9.0               # ratio 0.375 → 0.5
-    assert planner._time_pressure(task, w) == 0.5
+    w.cookers[0]["cooking_progress"] = 6.6               # ratio 0.275 → 0.5
+    assert planner._time_pressure(task, w) == pytest.approx(0.5)
 
-    w.cookers[0]["cooking_progress"] = 12.0              # ratio 0.5 刚熟 → 1.0
-    assert planner._time_pressure(task, w) == 1.0
+    w.cookers[0]["cooking_progress"] = 9.6               # ratio 0.4 刚熟(策略) → 1.0
+    assert planner._time_pressure(task, w) == pytest.approx(1.0)
 
 
 def test_cooked_rice_outranks_fetch_when_scored():
@@ -259,10 +263,10 @@ def test_take_cooked_feasible_when_cooker_cooked_empty_hand():
 
 
 def _ctx_with_pot(w, has_contents, cooked):
-    """手持锅 + items[] 里那口锅的内容状态（插件的 has_contents / cooked）。"""
+    """手持锅：World 已按 held_by 把手持物拆到 held_items（内容 has_contents/cooked）。"""
     ctx = _ctx(w, "utensil_pot_01")
-    w.items = [{"n": "utensil_pot_01", "x": 1.0, "z": 1.0,
-                "has_contents": has_contents, "cooked": cooked}]
+    w.held_items = [{"n": "utensil_pot_01", "x": 1.0, "z": 1.0,
+                     "has_contents": has_contents, "cooked": cooked}]
     return ctx
 
 
@@ -371,10 +375,11 @@ def test_rescue_cooked_feasible_when_no_placed_plate_needs_it():
     assert task.feasible(_ctx(w, None)) is True
 
 
-def test_rescue_cooked_not_feasible_when_placed_plate_lacks_it():
+def test_rescue_cooked_feasible_when_placed_plate_lacks_it():
+    """兜底不排除「有盘要它」：已就位空盘缺饭，RescueCooked 依然可行。"""
     w = _take_world([])                       # 已就位盘是空的，缺饭
     task = T.RescueCooked(resources=("cooker_01",))
-    assert task.feasible(_ctx(w, None)) is False
+    assert task.feasible(_ctx(w, None)) is True
 
 
 def test_rescue_cooked_feasible_while_holding_cooked_pot_even_if_cooker_empty():
@@ -394,16 +399,15 @@ def test_rescue_cooked_feasible_while_holding_cooked_pot_even_if_cooker_empty():
 def test_rescue_cooked_infeasible_while_holding_empty_pot():
     """手持**空锅**不算"锅已在我手上"。
 
-    只看"手持锅具"会坏两处：树首 pickup 的 expect 同款短路（根本没去端熟锅，
-    本 task 却一路"成功"到底，灶上的熟料继续烧糊）；以及 `if holding: return
-    True` 绕过"有盘要它就别救"的检查，和 TakeCookedToPlate 抢执行权。
+    只看"手持锅具"会坏：树首 pickup 的 expect 同款短路——根本没去端熟锅，
+    本 task 却一路"成功"到底，灶上的熟料继续烧糊。
     """
     w = _take_world(["CookedCompositeAssembledNode"])
     task = T.RescueCooked(resources=("cooker_01",))
     w.cookers = [{"n": "cooker_01", "x": 1.0, "z": 1.0, "cooked": None}]
     assert task.feasible(_ctx_with_pot(w, False, "Raw")) is False
 
-    # 有盘要这份熟料时，手持空锅更不能绕过那道检查
+    # 手持空锅 + 灶上无锅，依然不可行（与有没有盘无关）
     w2 = _take_world([])
     w2.cookers = [{"n": "cooker_01", "x": 1.0, "z": 1.0, "cooked": None}]
     assert task.feasible(_ctx_with_pot(w2, False, "Raw")) is False
@@ -466,9 +470,12 @@ def test_loose_cookware_excludes_only_cooker_pots():
     xt, zt = w.to_world(6, 5)          # 台面格
     xf, zf = w.to_world(9, 9)          # 地上
     w.items = [
-        {"n": "utensil_pot_01", "x": xc, "z": zc},   # 灶台上
-        {"n": "utensil_pot_02", "x": xt, "z": zt},   # 台面上
-        {"n": "utensil_pot_03", "x": xf, "z": zf},   # 地上
+        {"n": "utensil_pot_01", "x": xc, "z": zc,
+         "on_station": "cooking:cooker_01"},                    # 灶台上
+        {"n": "utensil_pot_02", "x": xt, "z": zt,
+         "on_station": "attach:c1"},                            # 台面上
+        {"n": "utensil_pot_03", "x": xf, "z": zf,
+         "on_station": None},                                   # 地上
     ]
     ctx = {"w": w, "book": RecipeBook(w.recipes, w.stations)}
     names = [it["n"] for it in loose_cookware(ctx)]
@@ -490,10 +497,13 @@ def test_loose_cookware_excludes_cooked_pot_on_counter():
     xc, zc = w.to_world(5, 5)          # 灶台格
     xt, zt = w.to_world(6, 5)          # 台面格
     w.items = [
-        {"n": "utensil_pot_01", "x": xc, "z": zc},   # 灶上：在用
-        {"n": "utensil_pot_02", "x": xt, "z": zt,    # 台面熟锅：留待装盘
-         "detail": ["CookedCompositeAssembledNode(Pot){ ing:SushiRice }"]},
-        {"n": "utensil_pot_03", "x": xt, "z": zt},   # 台面空锅：应回收
+        {"n": "utensil_pot_01", "x": xc, "z": zc,
+         "on_station": "cooking:cooker_01"},                    # 灶上：在用
+        {"n": "utensil_pot_02", "x": xt, "z": zt,              # 台面熟锅：留待装盘
+         "detail": ["CookedCompositeAssembledNode(Pot){ ing:SushiRice }"],
+         "on_station": "attach:c1"},
+        {"n": "utensil_pot_03", "x": xt, "z": zt,
+         "on_station": "attach:c1"},                            # 台面空锅：应回收
     ]
     ctx = {"w": w, "book": RecipeBook(w.recipes, w.stations)}
     names = [it["n"] for it in loose_cookware(ctx)]

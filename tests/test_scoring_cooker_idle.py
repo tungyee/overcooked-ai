@@ -6,8 +6,8 @@
 盘不会）。实测 trace-20261014-120406 的 1700~3270 窗口三口灶 59% 空转，
 而同期 planner 一直在摆海苔、切鱼。
 """
-from ai import planner
-from ai.planner import W_COOKER_IDLE, W_DELIVER_BONUS, W_PRESSURE
+from ai.core import planner
+from ai.core.planner import W_COOKER_IDLE, W_DELIVER_BONUS, W_PRESSURE
 
 
 def test_weight_beats_prep_but_loses_to_delivery_and_hot_pot():

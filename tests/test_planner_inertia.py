@@ -9,15 +9,15 @@
 """
 import pytest
 
-from ai.blackboard import Blackboard, Commitment
-from ai.planner import (
+from ai.state.blackboard import Blackboard, Commitment
+from ai.core.planner import (
     COMMITMENT_MARGIN,
     INFEASIBLE_THRESHOLD,
     PROGRESS_BONUS_PER_STEP,
     _apply_commitment_inertia,
 )
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 from ai import tasks as T
 
 

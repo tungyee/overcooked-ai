@@ -3,16 +3,17 @@
 
 整局重放发现 WashPlate 的选中次数从 15 降到 0。逐帧核对后确认**不是** bug：
   - 本局干净空盘数分布是 1 盘 31 拍、2 盘 155、3 盘 12、4 盘 23，从未见底；
-  - clean==2 时 WashPlate.feasible 本就为假（PLATE_BUFFER=2），占了大多数；
+  - WashPlate.feasible 现在要求「干净盘 + 装配盘 = 0」，有干净盘时本就不洗；
   - 仅 1840~1920 这 5 个采样点 clean==1，WashPlate 得 4.00 分、以 0.44 分之差
     输给 FetchToCooker（4.44）——此时手里还有一张盘，不至于卡死。
 
 但「一张盘都没有」是会把拼装彻底卡死的局面，必须保证那时洗盘压得过一切备菜。
 本模块钉住这条下限，防止后续继续加权时把它挤掉。
 """
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
 from tests.test_fill_cooker_priority import STATIONS, _cooker, _world
 
 
@@ -40,7 +41,7 @@ def test_wash_outranks_everything_when_no_clean_plate():
     **若分层被移除**，必须把本断言恢复成按分数比较，并重标 `W_PLATE_PRESSURE`
     使 0 盘档压过 `W_COOKER_IDLE`。
     """
-    from ai import planner_layers as PL
+    from ai.core import planner_layers as PL
 
     w = _world([_cooker("c1"), _cooker("c2")], plates=[])
     wash = PL.layer_of_task(T.WashPlate(resources=("sink",)), w)

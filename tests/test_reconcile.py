@@ -1,5 +1,5 @@
-from ai.blackboard import Blackboard
-from ai.reconcile import ResourceView, reconcile_claims
+from ai.state.blackboard import Blackboard
+from ai.state.reconcile import ResourceView, reconcile_claims
 
 
 def test_claim_survives_when_resource_present():

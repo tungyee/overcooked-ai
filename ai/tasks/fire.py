@@ -7,9 +7,9 @@
 """
 from typing import Dict, Optional
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai.bt import Condition, Guard, Node, RepeatUntil, Selector, Sequence
+from ai.exec.bt import Condition, Guard, Node, RepeatUntil, Selector, Sequence
 from ai.tasks.base import Task, _register, cooker_station
 
 # 灭火喷射最长时长（拍）。喷射与切菜同键，但灭火器几秒就该扑灭一灶火，
@@ -26,14 +26,15 @@ FIREFIGHT_TIMEOUT_TICKS = 800
 
 def _available_extinguisher(ctx):
     # type: (Dict) -> Optional[Dict]
-    """找没被任何人拿着的灭火器（就近取第一个可用的）。"""
+    """找可用的灭火器（就近取第一个）。
+
+    World 已把手持灭火器拆到 held_extinguishers，这里只遍历非手持的
+    extinguishers（挂墙/地上），不会去追别人手里的。
+    """
     w = ctx["w"]
     best = None
     cx, cz = ctx["chef"].get("x"), ctx["chef"].get("z")
     for e in w.extinguishers:
-        held = str(e.get("held") or "").lower()
-        if held not in ("", "player 2"):
-            continue
         if best is None:
             best = e
             continue

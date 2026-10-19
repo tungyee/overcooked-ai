@@ -1,6 +1,6 @@
 import pytest
 
-from ai.blackboard import (
+from ai.state.blackboard import (
     DEFAULT_TTL,
     Blackboard,
     FireScratch,
@@ -151,5 +151,13 @@ def test_blackboard_fresh_has_empty_state():
 
     assert bb.claims == {}
     assert bb.commitment.active_task is None
-    assert bb.intents.collab_mode == "relay"
     assert bb.scratch is None
+
+
+def test_stuck_scratch_has_bad_pairs():
+    """(资源,格) 二元拉黑：格对别的目标可能是好的，资源对别的格也是。"""
+    from ai.state.blackboard import StuckScratch
+    s = StuckScratch()
+    assert s.bad_pairs == {}
+    s.bad_pairs[(("GridManager", "counter_01"), (1, -4))] = 300
+    assert len(s.bad_pairs) == 1

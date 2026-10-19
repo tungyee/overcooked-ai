@@ -12,9 +12,9 @@ import os
 
 import pytest
 
-from ai import stations as S
-from ai import world as W
-from ai.replay import load_frames
+from ai.query import stations as S
+from ai.state import world as W
+from ai.exec.replay import load_frames
 
 LEGACY_DIR = os.environ.get("OC2_LEGACY_DIR", "")
 LEGACY_WORLD = os.path.join(LEGACY_DIR, "world.py")
@@ -135,25 +135,6 @@ def test_station_blocked_matches_legacy(legacy_world_mod, frames):
         # 空集合两边也会"相等"——占用为空说明 AABB 解析整体失效
         assert new.station_blocked, "frame %d 占用格为空，比对是空过的" % i
 
-
-@_needs_legacy
-def test_bounds_match_legacy(legacy_world_mod, frames):
-    """可玩边界相同。
-
-    注意新实现统一用 `.get() is not None` 判站点 gx/gz，旧实现在这里
-    用 `"gx" in s`。实测两者在全部 1102 帧上结果一致（缺 gx 键的 10
-    个站点其值也不是 None），所以这条能过——它钉住的是"统一判法没有
-    改变现有关卡的行为"。
-    """
-    for i, frame in enumerate(frames):
-        new = W.World(frame)
-        old = legacy_world_mod.World(frame)
-        want = (old.min_gx, old.max_gx, old.min_gz, old.max_gz)
-        # 先防空过：两边都算不出边界时 None == (None,)*4 为假会红，但
-        # 若旧实现也退化成 None，`==` 会绿而什么都没钉住。
-        assert new.bounds is not None, "frame %d 边界为 None，比对是空过的" % i
-        assert new.bounds == want, (
-            "frame %d：新=%r 旧=%r" % (i, new.bounds, want))
 
 
 @_needs_legacy

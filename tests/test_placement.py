@@ -4,8 +4,8 @@
 贴出餐口会被误上菜、贴拼装台会挡盘。这些断言就是那三条。
 """
 import pytest
-from ai import placement
-from ai.navigation import distance_field
+from ai.query import placement
+from ai.space.navigation import distance_field
 
 
 class FakeWorld(object):
@@ -124,6 +124,25 @@ def test_find_drop_station_honors_extra_forbidden():
         w, field, extra_forbidden={(1, 0)}) is None
 
 
+def test_find_drop_station_uses_world_coords_not_local_gx_gz():
+    """篮子台面的本地 gx/gz 不能拿来算主网格距离（多网格坐标 bug）。
+
+    篮子台面本地 (1,0) 看似离 P2 (0,0) 只 1 格，但世界坐标 (10,0) 投影到
+    主网格是 (8,0)（远）。旧实现用本地 gx/gz 会误选篮子台面（交互位 (0,0)
+    代价 0），用世界坐标投影应选主台面（代价 2）。
+    """
+    sts = [
+        {"t": "counter", "n": "basket_counter", "gx": 1, "gz": 0,
+         "x": 10.0, "z": 0.0, "grid": "Balloon Basket"},
+        {"t": "counter", "n": "main_counter", "gx": 3, "gz": 0,
+         "x": 3.6, "z": 0.0, "grid": "GridManager"},
+    ]
+    w = FakeWorld(stations=sts, walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 8)
+    field = distance_field((0, 0), w.walkable, {})
+    got = placement.find_drop_station(w, field)
+    assert got is not None and got["n"] == "main_counter"
+
+
 def test_find_drop_cell_floor_fallback():
     """没有合法空台面时退到地板格。"""
     w = FakeWorld(walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 3)
@@ -207,7 +226,7 @@ def test_find_drop_on_real_frame(level_frame):
     若两者都 None，说明禁区规则把整张图筛空了——那 EnsureHandsFree
     会永远 FAILURE，所有中断 task 都起不来。
     """
-    from ai.world import World
+    from ai.state.world import World
     w = World(level_frame)
     chef = None
     for c in w.chefs:

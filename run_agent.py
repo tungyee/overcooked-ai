@@ -38,7 +38,7 @@ def main(argv=None):
     ctrl = None
     if not args.dry_run:
         try:
-            from ai.controller import Controller
+            from ai.output.controller import Controller
             ctrl = Controller()
         except Exception as exc:               # noqa: BLE001
             print("[run] 初始化 CGEvent controller 失败: %s" % exc,

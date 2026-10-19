@@ -9,11 +9,11 @@
 import pytest
 
 from ai import tasks as T
-from ai import planner
-from ai.blackboard import Blackboard, Claim
-from ai.planner import generate_candidates
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.core import planner
+from ai.state.blackboard import Blackboard, Claim
+from ai.core.planner import generate_candidates
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 def _make_world(orders=None, stations=None, recipes=None, chefs=None,
@@ -120,9 +120,11 @@ def test_claim_granularity_enables_relay():
     # 断言：TakeCookedToPlate(cooker_01) 候选被生成（认领检查通过）
     # 注意：它可能因其他前置条件（holding_cooked）不满足而在后续过滤中被排除
     # 但在候选生成阶段，fetch_to 被占不应阻止 take_cooked 的候选生成
+    # cooker_id 现在是 (grid, name) 元组（§5.2）；本场景的灶没有 grid
+    # 字段，P.resource_id 把缺失 grid 归一化为空字符串。
     take_cooked_tasks = [c.task for c in candidates
                          if c.task.TYPE == "TakeCookedToPlate"
-                         and c.task.cooker_id == "cooker_01"]
+                         and c.task.cooker_id == ("", "cooker_01")]
 
     # 直接测试认领检查：验证 take_cooked 未被 P1 的 fetch_to 阻塞
     assert not bb.is_claimed_by_other("cooker_01", "take_cooked", "P2", bb.tick), \
@@ -173,7 +175,7 @@ def test_waiters_queue_aging_priority():
 
 def test_wait_timeout_releases_own_claims():
     """等待超时 → 放弃 task 并释放自己的认领（打断 hold-and-wait）。"""
-    from ai.blackboard import WAIT_GIVEUP_TICKS
+    from ai.state.blackboard import WAIT_GIVEUP_TICKS
 
     bb = Blackboard()
     bb.tick = 10
@@ -233,7 +235,7 @@ def test_commitment_interleave_when_running_long_task():
     候选: FetchToBoard (order#2), 分数 +5.0
     期望: 穿插执行 FetchToBoard, FetchToCooker → paused_task
     """
-    from ai.planner import select_task, COMMITMENT_MARGIN, INTERLEAVE_THRESHOLD, INTERLEAVE_PENALTY
+    from ai.core.planner import select_task, COMMITMENT_MARGIN, INTERLEAVE_THRESHOLD, INTERLEAVE_PENALTY
 
     # 构造场景
     recipes = [
@@ -289,7 +291,7 @@ def test_interleave_resume_after_completion():
     初始状态: paused_task 存在, 当前 task 已完成
     期望: 下一拍恢复 paused_task（如果它仍可行）
     """
-    from ai.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_CHOP
+    from ai.core.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_CHOP
 
     recipes = [
         {"dish": "CucumberSushi", "composition": ["Plate", "Cucumber"]}
@@ -346,7 +348,7 @@ def test_interleave_resume_when_commitment_is_none():
     （而非测试里模拟的 active_task=None）。旧代码直接 .steps_done 会崩：
     AttributeError: 'NoneType' object has no attribute 'steps_done'（实机复现）。
     """
-    from ai.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_CHOP
+    from ai.core.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_CHOP
 
     recipes = [
         {"dish": "CucumberSushi", "composition": ["Plate", "Cucumber"]}
@@ -394,7 +396,7 @@ def test_no_interleave_when_remaining_steps_low():
     候选: FetchToBoard, 分数 +8.0
     期望: 继续 DeliverPlate（不穿插）
     """
-    from ai.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_SERVE, EST_FETCH
+    from ai.core.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_SERVE, EST_FETCH
 
     recipes = [
         {"dish": "CucumberSushi", "composition": ["Plate", "Cucumber"]},
@@ -451,7 +453,7 @@ def test_no_interleave_firefighting():
     候选: FetchToBoard, 分数 +10.0
     期望: 继续 Discard（不穿插）
     """
-    from ai.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_FETCH
+    from ai.core.planner import _apply_commitment_inertia, _score_tasks, Candidate, EST_FETCH
     from ai.tasks import Discard
 
     recipes = [

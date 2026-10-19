@@ -6,16 +6,16 @@
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import cook_supply as CS
-from ai import predicates as P
+from ai.revenue import cook_supply as CS
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Condition, Node, Selector, Sequence
-from ai.plate_tokens import parse_plate_detail, parse_pot_contents
+from ai.query import stations as S
+from ai.exec.bt import Condition, Node, Selector, Sequence
+from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
-                           loose_count, plate_by_id, placed_plates)
+                           loose_count, plate_by_id)
 
 # 端盘在锅前等熟的最长拍数（15s）。煮一锅饭实测约 11s，取盘+走到锅前再
 # 留足余量；超时交还 Planner，避免无限等一个可能永远不成立的状态。
@@ -25,14 +25,29 @@ WAIT_COOKED_TIMEOUT_TICKS = 300
 # task 长，超时上限单独放宽（20s，比默认 TASK_TIMEOUT_TICKS=200 的 10s 翻倍）。
 TAKE_COOKED_TIMEOUT_TICKS = 400
 
+# 下料是**两趟**差事（空手走到料箱、拿着料走回灶），和灭火同构，默认 200
+# 拍压根不够：实机 trace-20261015-165358 九次 FillCooker 里四次撞线
+# （t=149 用 199 拍只差一拍；t=699/941/2719 整 200 拍 FAILURE）。
+# 一趟实测约 95 拍（t=941 那次：去米箱 94 拍、回灶 94 拍，米已在手、人已
+# 站到灶前一格 (4,2)，差最后一个 Tap 被砍），两趟 190 已吃掉 95% 的预算。
+# 失败后的重试只用 40/25 拍就成功——活儿没白干，只是记账判了失败、重建树
+# 重走一遍判定，三次白费 600 拍 = 30 秒，而同期三口灶全空。
+#
+# 400 拍（20s）＝两趟 190 + 取放两次交互的 observe 等待（每个精确步 ≈8 拍，
+# 见 AGENTS.md §10.1）+ 余量。**内层 build() 的 Timeout 必须同步**：
+# Executor 外层读 TIMEOUT_TICKS，内层若还是 200 则以内层为准，等于没改
+# （tests/test_fill_cooker_timeout.py::test_fill_cooker_inner_timeout_matches_declared）。
+FETCH_TO_COOKER_TIMEOUT_TICKS = 400
+
+# 散锅回收多一趟来回（捡散锅→上灶），在 FETCH_TO_COOKER_TIMEOUT_TICKS 之外
+# 额外放宽。与 TIMEOUT_TICKS property / build() 内层 Timeout 保持同一表达式，
+# 否则外层放宽会被内层更紧的 Timeout 静默吃掉（见 property 注释的实机踩坑）。
+RECOVER_COOKER_TICKS = 200
+
 # Python 主循环拍率（AGENTS.md §2：主循环 20 Hz，「拍」=50ms）。
 TICKS_PER_SECOND = 20
 
-# 「来不及端盘来盛」的判定阈值（拍）。实测一趟 TakeCookedToPlate（走到盘
-# 堆/晾干架取盘 → 端回锅前 → 盛饭）约 120~145 拍（trace-20261014-011202
-# 的 t=654→776、1919→2056 两次成功样本），这里取 150 拍（7.5s）含安全余量：
-# 烧糊剩余时间短于它就别指望端盘来救，直接端锅离灶停计时。
-RESCUE_DEADLINE_TICKS = 150
+
 
 
 @_register
@@ -48,6 +63,24 @@ class FetchToCooker(Task):
     TYPE = "FetchToCooker"
 
     @property
+    def TIMEOUT_TICKS(self):
+        # type: () -> int
+        """两趟差事，默认 200 拍不够（见 FETCH_TO_COOKER_TIMEOUT_TICKS 的实测）。
+
+        多料同锅是「每样料各自一趟来回」，预算必须按料数摊开，否则料越多
+        越必然超时。做成 property 而不是类常数，是为了让 Executor 外层那道
+        兜底（`getattr(task, "TIMEOUT_TICKS", MAX_TASK_TICKS)`）与 build()
+        里的内层 Timeout 永远相等——两者不等时以更紧的那个为准，于是放宽
+        会被静默吃掉（实机那四次撞线就是内层 200 压着外层）。
+        FillCooker 继承本属性：它走同一棵树、同样两趟；回收散锅再额外加
+        RECOVER_COOKER_TICKS（多一趟来回）。
+        """
+        base = FETCH_TO_COOKER_TIMEOUT_TICKS * max(len(self.raws), 1)
+        if self.loose_pot:
+            base += RECOVER_COOKER_TICKS
+        return base
+
+    @property
     def cooker_id(self):
         return self._resources[0]
 
@@ -58,8 +91,20 @@ class FetchToCooker(Task):
             return tuple(self._resources[1])
         return ()
 
+    @property
+    def loose_pot(self):
+        # type: () -> Optional[str]
+        """散锅（空/生）的 item 名；回收散锅上灶时非 None，否则 None。"""
+        if len(self._resources) > 2 and self._resources[2]:
+            return str(self._resources[2])
+        return None
+
     def claims(self):
-        return ((self.cooker_id, "fetch_to"),)
+        claims = [(self.cooker_id, "fetch_to")]
+        lp = self.loose_pot
+        if lp:
+            claims.append((lp, "recover"))
+        return tuple(claims)
 
     def _raws(self, ctx):
         # type: (Dict) -> Tuple[str, ...]
@@ -83,22 +128,75 @@ class FetchToCooker(Task):
     def feasible(self, ctx):
         # type: (Dict) -> bool
         c = cooker_state(ctx, self.cooker_id)
-        if c is None or not P.cooker_has_pot(c):
-            return False       # cooked=None → 灶上没锅，没法下料
-        if P.cooker_started(c):
-            return False       # 已在煮/已熟
-        if P.cooker_burning(c):
-            return False       # 着火/烧糊的锅不放料（spec §5.3）
+        if c is None or P.cooker_burning(c):
+            return False       # 没这口灶 / 着火糊锅不放料
         raws = self._raws(ctx)
         if not raws:
             return False
+        lp = self.loose_pot
+        if not P.cooker_has_pot(c):
+            # 空灶 → 回收散锅路径：必须绑散锅且散锅在场可捡
+            if not lp:
+                return False
+            pot = self._loose_pot_item(ctx)
+            if pot is None:
+                return False
+            # 散锅已有生料 → 上灶即煮，不用再 fetch；空锅 → 料要拿得到
+            if parse_pot_contents(pot.get("detail") or []):
+                return True
+            return all(ingredient_available(ctx, ctx["book"].cook_input_form(r))
+                       for r in raws)
+        # 灶上有锅：只在没开煮时下料
+        if P.cooker_started(c):
+            return False
         return all(ingredient_available(ctx, ctx["book"].cook_input_form(r))
                    for r in raws)
+
+    def _loose_pot_item(self, ctx):
+        # type: (Dict) -> Optional[Dict]
+        """按绑定的散锅名在 items 里找这条（散锅回收路径用）。"""
+        lp = self.loose_pot
+        if not lp:
+            return None
+        for it in ctx["w"].items:
+            if str(it.get("n") or "").lower() == str(lp).lower():
+                return it
+        return None
 
     def build(self):
         # type: () -> Node
         cooker_id, cooked = self.cooker_id, self.item
         raws = self.raws
+        lp = self.loose_pot
+
+        # 散锅回收（空灶 + 散锅）：拿起散锅 → 放到空灶。只在绑了散锅时挂。
+        def pot_target(c):
+            if not lp:
+                return None
+            for it in c["w"].items:
+                if str(it.get("n") or "").lower() == str(lp).lower():
+                    return it
+            return None
+
+        def holding_pot(c):
+            return bool(lp) and P.held_matches(c["chef"], lp)
+
+        def pot_placed(c):
+            cc = cooker_state(c, cooker_id)
+            return cc is not None and P.cooker_has_pot(cc)
+
+        recover = None
+        if lp:
+            recover = Sequence([
+                PR.InteractWith(pot_target, "pickup", holding_pot, face=False),
+                PR.InteractWith(
+                    lambda c: cooker_station(c, cooker_id), "placement",
+                    pot_placed),
+            ])
+
+        timeout = FETCH_TO_COOKER_TIMEOUT_TICKS * max(len(raws), 1)
+        if lp:
+            timeout += RECOVER_COOKER_TICKS
 
         # 单料：散落优先——地上有散落米就直接拿散落米下锅（find_ingredient
         # 的 loose 优先），散落不够才从箱子批量投米兜底。
@@ -128,19 +226,18 @@ class FetchToCooker(Task):
                     cc.get("pot_contents") or [])
 
             def pickup():
-                # 散落料（投掷落地）没有 m_gridLocation 朝向信号——实机：
-                # interactions.gx/gz 指向别处，Face 永远转不到位，只会反复
-                # 短按方向键把角色一点点挪走、米饭捡不起来。face=False 直接
-                # 走到 Tap（pickup 句柄在相邻格已就绪）。
+                # ingredient_source 对「挂站点上的散落料」返回站点（有朝向），
+                # face=True 让 Face 转身；裸散落料 Face 内部直接 SUCCESS 跳过，
+                # 行为与旧 face=False 等价。
                 return PR.InteractWith(
                     lambda x: ingredient_source(x, form(x)), "pickup", holding,
-                    face=False)
+                    face=True)
 
             def drop():
                 return PR.InteractWith(
                     lambda x: cooker_station(x, cooker_id), "placement", placed)
 
-            return PR.Timeout(Selector([
+            fill = Selector([
                 # 分支1：地上有散落米 → 直接拿散落米下锅（最便宜的一路，
                 # 不管米是上一轮剩的还是谁投过去的）
                 Sequence([
@@ -170,34 +267,52 @@ class FetchToCooker(Task):
                     PR.InteractWith(crate, "pickup", holding),
                     drop(),
                 ]),
-            ]), TASK_TIMEOUT_TICKS)
+            ])
 
         # 多料：逐料下锅（原有逻辑）
-        def raw_src(c, r):
-            return ingredient_source(c, c["book"].cook_input_form(r))
+        else:
+            def raw_src(c, r):
+                return ingredient_source(c, c["book"].cook_input_form(r))
 
-        def holding(c, r):
-            return P.held_matches(c["chef"], c["book"].cook_input_form(r))
+            def holding(c, r):
+                return P.held_matches(c["chef"], c["book"].cook_input_form(r))
 
-        def placed(c, r):
-            cc = cooker_state(c, cooker_id)
-            if cc is None:
-                return False
-            if P.cooker_started(cc):
-                return True
-            form = c["book"].cook_input_form(r)
-            return str(form).lower() in parse_pot_contents(
-                cc.get("pot_contents") or [])
+            def placed(c, r):
+                cc = cooker_state(c, cooker_id)
+                if cc is None:
+                    return False
+                if P.cooker_started(cc):
+                    return True
+                form = c["book"].cook_input_form(r)
+                return str(form).lower() in parse_pot_contents(
+                    cc.get("pot_contents") or [])
 
-        steps = [PR.EnsureHandsFree(keep=lambda c: holding(c, raws[0]))]
-        for r in raws:
-            steps.append(PR.InteractWith(
-                lambda c, r=r: raw_src(c, r), "pickup",
-                lambda c, r=r: holding(c, r)))
-            steps.append(PR.InteractWith(
-                lambda c: cooker_station(c, cooker_id), "placement",
-                lambda c, r=r: placed(c, r)))
-        return PR.Timeout(Sequence(steps), TASK_TIMEOUT_TICKS)
+            steps = [PR.EnsureHandsFree(keep=lambda c: holding(c, raws[0]))]
+            for r in raws:
+                steps.append(PR.InteractWith(
+                    lambda c, r=r: raw_src(c, r), "pickup",
+                    lambda c, r=r: holding(c, r)))
+                steps.append(PR.InteractWith(
+                    lambda c: cooker_station(c, cooker_id), "placement",
+                    lambda c, r=r: placed(c, r)))
+            # 多料逐料下锅：每样料各自一趟来回，预算按料数摊开。单料路径（上面
+            # 那支）用常数本身，所以 len(raws)==1 时两支一致。
+            fill = Sequence(steps)
+
+        if recover is None:
+            return PR.Timeout(fill, timeout)
+
+        # 有散锅回收：先回收，再「锅还空才填」。
+        # done() 判「已开煮 或 生料已全在锅」——散锅带生料上灶后自动开煮，
+        # 这里短路跳过 fill，不白跑一趟 fetch。
+        return PR.Timeout(
+            Sequence([
+                PR.EnsureHandsFree(keep=holding_pot),
+                recover,
+                Sequence([Condition(lambda c: not self.done(c)), fill]),
+            ]),
+            timeout,
+        )
 
 
 @_register
@@ -245,14 +360,31 @@ class FillCooker(FetchToCooker):
         # type: (Dict) -> bool
         w, book = ctx["w"], ctx["book"]
         c = cooker_state(ctx, self.cooker_id)
-        if c is None or not P.cooker_has_pot(c):
+        if c is None or P.cooker_burning(c):
             return False
-        if P.cooker_started(c) or P.cooker_burning(c):
+        if CS.cooked_shortfall(w, book, self.item) <= 0:
+            return False       # 供给已覆盖需求，再下/回收都是浪费
+        lp = self.loose_pot
+        if not P.cooker_has_pot(c):
+            # 空灶 → 回收散锅路径：必须绑散锅且散锅在场
+            if not lp:
+                return False
+            pot = self._loose_pot_item(ctx)
+            if pot is None:
+                return False
+            # 散锅已有生料 → 上灶即煮，不用 fetch；空锅 → 料要拿得到
+            if parse_pot_contents(pot.get("detail") or []):
+                return True
+            raws = self._raws(ctx)
+            if not raws:
+                return False
+            return all(ingredient_available(ctx, book.cook_input_form(r))
+                       for r in raws)
+        # 灶上有空锅
+        if P.cooker_started(c):
             return False
         if parse_pot_contents(c.get("pot_contents") or []):
             return False       # 锅里已有料，等它煮完
-        if CS.cooked_shortfall(w, book, self.item) <= 0:
-            return False       # 供给已覆盖需求，再下就是浪费灶
         raws = self._raws(ctx)
         if not raws:
             return False
@@ -274,6 +406,7 @@ class TakeCookedToPlate(Task):
 
     TYPE = "TakeCookedToPlate"
     HANDS = "empty"       # 要空手去端盘；手不空时打分加腾手代价（spec §6.1(b)）
+    NO_ABANDON = True     # 盛饭是停烧糊的必经之路；拉黑期(200拍)比烧糊倒计时还长 → 必着火
 
     @property
     def cooker_id(self):
@@ -419,60 +552,11 @@ def _holding_cooked(ctx):
 
     只判"手持锅具"不够：空锅也满足，会让 pickup 步骤永远短路。
     """
-    return (P.held_cookware_state(ctx["chef"], ctx["w"].items, ctx["w"].recipes)
+    return (P.held_cookware_state(ctx["chef"], P.held_items(ctx["w"]), ctx["w"].recipes)
             == P.COOKWARE_COOKED)
 
 
-def _about_to_burn(c):
-    # type: (Optional[Dict]) -> bool
-    """已经糊/着火，或**来不及**端盘来盛了 → 立刻端锅离灶止损。
 
-    判据从「已过烧糊点」改成带余量的预测。旧版要求
-    `progress >= 2*ctime`——那一刻锅**已经着火**了，RescueCooked 这个
-    兜底等于永远晚一步：实机 trace-20261014-011202 t=2056~2184，灶 (2)
-    的饭 progress 16.9 就已熟，P2 取盘再走回来约 130 拍，而锅 140 拍后
-    着火；planner 一路让它端着盘跑，直到 t=2184（progress 24、burning
-    已置位）才选中 RescueCooked，下一拍 Arbiter 就切进 Firefighting。
-
-    现在改为：烧糊剩余时间 < 端盘那一趟的预计耗时 + 安全余量就算"来不及"。
-    端锅只是止损（料留着、停计时），比烧糊着火便宜得多；但也不能太激进，
-    否则刚熟的锅全被端走、TakeCookedToPlate 永远轮不到——所以余量按
-    「取盘往返」这个具体动作估，不是拍一个大常数。
-
-    烧糊剩余时间的口径与 planner._burn_eta_ticks 一致（读
-    cooking_progress，糊点 = 2*cooking_time）。
-    """
-    if c is None:
-        return False
-    if c.get("burning") or c.get("onFire"):
-        return True
-    eta = _burn_eta_ticks(c)
-    return eta is not None and eta < RESCUE_DEADLINE_TICKS
-
-
-def _burn_eta_ticks(c):
-    # type: (Optional[Dict]) -> Optional[float]
-    """这口灶还有多少拍烧糊；没在煮则 None。
-
-    与 planner._burn_eta_ticks 同一口径（见那边的字段语义注释）。这里单独
-    实现是为了保持 tasks 层不依赖 planner（planner 依赖 tasks，反向会成环）。
-    """
-    if c is None:
-        return None
-    if c.get("burning") or c.get("onFire"):
-        return 0.0
-    prog = c.get("cooking_progress")
-    ctime = c.get("cooking_time")
-    if prog is None or ctime is None:
-        return None
-    try:
-        prog = float(prog)
-        burn_at = 2.0 * float(ctime)
-    except (TypeError, ValueError):
-        return None
-    if burn_at <= 0 or prog <= 0:
-        return None            # 空灶 / 刚放料还没点火
-    return max(0.0, (burn_at - prog) * TICKS_PER_SECOND)
 
 
 @_register
@@ -509,7 +593,7 @@ class ReturnPot(Task):
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
-        state = P.held_cookware_state(ctx["chef"], ctx["w"].items,
+        state = P.held_cookware_state(ctx["chef"], P.held_items(ctx["w"]),
                                       ctx["w"].recipes)
         if state is None:
             return False               # 手空 / 手里不是锅
@@ -534,7 +618,7 @@ class ReturnPot(Task):
 
 @_register
 class RescueCooked(Task):
-    """第 6 号：熟了但没盘要它 → 端锅离灶，停止烧糊计时。
+    """第 6 号（兜底）：熟了 → 端锅离灶，停止烧糊计时。
 
     spec §6.1 原话："熟料在锅里同时是**资产**（现成食材，寿司关复用率
     极高）和**负债**（cooked→burning→onFire 计时在跑）。已确认的游戏
@@ -545,6 +629,7 @@ class RescueCooked(Task):
     """
 
     TYPE = "RescueCooked"
+    NO_ABANDON = True     # 端锅离灶是停烧糊的兜底：拉黑它就等于判这口锅死刑
 
     @property
     def cooker_id(self):
@@ -569,54 +654,21 @@ class RescueCooked(Task):
           - **执行看手**：本 task 第一步就是把锅端离灶台，灶随即变
             `cooked=None`。若绑死在"灶 cooked"，它一动手就把自己判成不可行
             → 被承诺惯性抛弃 → ReturnPot 把锅放回 → 死循环（实机复现
-            `RescueCooked ↔ ReturnPot`）。故"锅已在我手上"也算可行，且
-            此时**不再因"有盘要它"翻脸**——这一步是收尾，不该被中途打断。
+            `RescueCooked ↔ ReturnPot`）。故"锅已在我手上"也算可行。
 
-        第二段的"在我手上"必须是**端着带料的那口锅**，不能只判"手持锅具"，
-        空锅也满足后者，两处都会坏：
-          1. 树首 pickup 的 expect 同款短路（`InteractWith` 见 expect 成立
-             就 SUCCESS）→ 根本没去把熟锅端下来，本 task 却一路"成功"到底，
-             `done()`（该灶没锅）仍是 False，灶上的熟料继续烧糊；
-          2. `if holding: return True` 会**绕过**下面"有盘要它就别救"的检查，
-             让手持空锅时本 task 与 TakeCookedToPlate 抢执行权。
-        判据与树里 pickup 的 expect 共用同一个 `_holding_cooked`。
+        RescueCooked 是**兜底**：只回答「有无熟锅要离灶停计时」，不做
+        「有没有盘要它」的排除——那类取舍交给 Planner 的分层/打分（有盘时
+        TakeCookedToPlate 自然在此竞争）。
+
+        第二段的"在我手上"必须是**端着带料的那口锅**，不能只判"手持锅具"：
+        空锅也满足后者，会让树首 pickup 的 expect 短路（`InteractWith` 见
+        expect 成立就 SUCCESS）→ 根本没去把熟锅端下来，`done()`（该灶没锅）
+        仍是 False，灶上的熟料继续烧糊。判据与树里 pickup 的 expect 共用
+        同一个 `_holding_cooked`。
         """
         c = cooker_state(ctx, self.cooker_id)
         holding = _holding_cooked(ctx)
-        if not P.cooker_cooked(c) and not holding:
-            return False
-        if holding:
-            return True          # 执行中：正在把熟料端离灶台，别中途翻脸
-        # 快糊/已糊的锅要立刻端离灶台止损，哪怕有盘要这料：它已经是负债
-        # （要着火了）。若 TakeCookedToPlate 因没盘匹配而没发射，只有
-        # RescueCooked 能兜底，否则活活烧糊（实机复现：多煮出来的锅没人端）。
-        if _about_to_burn(c):
-            return True
-        # 有**已就位**的盘要这料 → 该走 TakeCookedToPlate，别浪费一趟。
-        # 用 placed_plates 而不是 plates_lacking：后者遍历所有盘（含盘堆里的
-        # 空盘），会永远非空 → RescueCooked 永远不可行 → 没人要的熟料只能
-        # 干烧糊（实机：多煮出来的那两口锅没人端）。
-        cooked_items = self._cooked_candidates(ctx)
-        for item in cooked_items:
-            for p in placed_plates(ctx):
-                if ctx["book"].plate_lacks(p, item):
-                    return False
-        return True
-
-    def _cooked_candidates(self, ctx):
-        # type: (Dict) -> List[str]
-        """这锅里可能是什么熟料。
-
-        快照不报锅内容，只报 cooked 布尔。所以按本关配方里所有需烹饪的
-        熟料名去问"有没有盘缺它"——保守但正确：只要还有盘可能要这锅东西
-        就不救，宁可多等一拍走 TakeCookedToPlate。
-        """
-        out = []
-        for order in ctx["w"].orders:
-            for ing in ctx["book"].requirements(order):
-                if ctx["book"].needs_cooking(ing):
-                    out.append(ing)
-        return out
+        return P.cooker_cooked(c) or holding
 
     def build(self):
         # type: () -> Node

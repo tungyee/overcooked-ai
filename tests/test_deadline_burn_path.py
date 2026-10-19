@@ -7,8 +7,8 @@
 """
 import pytest
 
-from ai import planner
-from ai.blackboard import Blackboard
+from ai.core import planner
+from ai.state.blackboard import Blackboard
 
 
 def test_blackboard_has_no_cooker_assignments():

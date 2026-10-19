@@ -15,10 +15,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 
 import tree_viz as V        # noqa: E402
 
-from ai import primitives as PR   # noqa: E402
-from ai import tasks as T   # noqa: E402
-from ai.bt import Sequence, Status   # noqa: E402
-from ai.world import World  # noqa: E402
+from ai import primitives as PR  # noqa: E402
+from ai import tasks as T  # noqa: E402
+from ai.exec.bt import Sequence, Status   # noqa: E402
+from ai.state.world import World  # noqa: E402
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
                        "real_frame_sushi_1_4.json")

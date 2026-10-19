@@ -5,8 +5,8 @@ TapWhileHolding：按住同时单击——传送带顶位专用（spec §7.2）�
 """
 from typing import Any, Callable, Dict, Optional
 
-from ai import predicates as P
-from ai.bt import Status
+from ai.query import predicates as P
+from ai.exec.bt import Status
 from ai.primitives.base import Primitive, resolve
 
 

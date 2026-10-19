@@ -13,10 +13,11 @@ from unittest.mock import patch
 import pytest
 
 from ai.agent import Agent
-from ai.blackboard import Blackboard
-from ai import planner, trace
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard
+from ai.core import planner
+from ai.output import trace
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
                        "real_frame_sushi_1_4.json")

@@ -10,8 +10,8 @@ trace-20261014-120406 的 1700~3270 窗口（正是 order#3/4/5 三单过期的�
 要让「填灶」成为订单无关的世界谓词，先得能回答两个纯计数问题：
 这种熟料还缺几份（demand）、已经有几份在路上（supply）。
 """
-from ai import cook_supply as CS
-from ai.recipes import RecipeBook
+from ai.revenue import cook_supply as CS
+from ai.query.recipes import RecipeBook
 
 
 RECIPES = [
@@ -49,13 +49,14 @@ def plate(n, detail=()):
 class W(object):
     """只读世界替身：供需计数是纯谓词，不该依赖真 World。"""
 
-    def __init__(self, orders=(), cookers=(), plates=(), chefs=(), items=()):
+    def __init__(self, orders=(), cookers=(), plates=(), chefs=(), items=(),
+                 recipes=None):
         self.orders = list(orders)
         self.cookers = list(cookers)
         self.plates = list(plates)
         self.chefs = list(chefs)
         self.items = list(items)
-        self.recipes = RECIPES
+        self.recipes = recipes if recipes is not None else RECIPES
 
 
 # ---------- 需求 ----------
@@ -201,3 +202,67 @@ def test_idle_cookers_excludes_burning():
     c = cooker("c1")
     c["onFire"] = True
     assert CS.idle_cookers(W(cookers=[c])) == []
+
+
+# ---------- 散锅回收（空灶 + 散锅） ----------
+
+def pot_item(n, detail=(), on_station=None, cooked="Raw"):
+    return {"n": n, "x": 1.0, "z": 1.0, "has_contents": bool(detail),
+            "cooked": cooked, "detail": list(detail), "on_station": on_station}
+
+
+def test_recoverable_cookers_pairs_empty_cooker_with_loose_pots():
+    """空灶 + 空/生散锅 → 各发一个回收候选；在煮的灶不参与。"""
+    w = W(orders=[order("1", "Sushi_Fish"), order("2", "Sushi_Cucumber")],
+          cookers=[cooker("c1", pot=False),
+                   cooker("c2", cooking=True, contents=["ing:SushiRice"])],
+          items=[pot_item("utensil_pot_01", detail=[]),
+                 pot_item("utensil_pot_02", detail=["ing:SushiRice"])])
+    got = {(c["n"], pn, item, raws)
+           for c, pn, item, raws in CS.recoverable_cookers(w, book())}
+    assert ("c1", "utensil_pot_01", "BoiledSushiRice", ("SushiRice",)) in got
+    assert ("c1", "utensil_pot_02", "BoiledSushiRice", ("SushiRice",)) in got
+    assert all(c["n"] == "c1" for c, _p, _i, _r in CS.recoverable_cookers(w, book()))
+
+
+def test_recoverable_cookers_excludes_cooked_and_burnt_pots():
+    """散熟锅（留待装盘）与散糊锅（要倒掉）都不该被当散锅回收上灶。"""
+    w = W(orders=[order("1", "Sushi_Fish")],
+          cookers=[cooker("c1", pot=False)],
+          items=[pot_item("utensil_pot_01", cooked="Cooked",
+                          detail=["CookedCompositeAssembledNode(Pot){ ing:SushiRice }"]),
+                 pot_item("utensil_pot_02", cooked="Burnt",
+                          detail=["ing:SushiRice"])])
+    assert CS.recoverable_cookers(w, book()) == []
+
+
+def test_recoverable_cookers_excludes_on_cooker_pot():
+    """on_station 是 cooking 的锅是灶上在用的，不是散锅。"""
+    w = W(orders=[order("1", "Sushi_Fish")],
+          cookers=[cooker("c1", pot=False)],
+          items=[pot_item("utensil_pot_01", detail=["ing:SushiRice"],
+                          on_station="cooking:c1")])
+    assert CS.recoverable_cookers(w, book()) == []
+
+
+def test_recoverable_cookers_matches_cookware_type():
+    """空炖锅只配煮的料，不配煎的料（炊具类型过滤）。"""
+    recipes = [
+        {"name": "BoiledSushiRice", "comp": ["SushiRice"], "cook": "Pot"},
+        {"name": "FriedMushrooms", "comp": ["Mushroom"], "cook": "FryingPan"},
+        {"name": "SushiRice"},
+        {"name": "Mushroom"},
+    ]
+    bk = RecipeBook(recipes, [])
+    w = W(orders=[{"id": "1", "dish": "Sushi_Fish",
+                   "composition": ["BoiledSushiRice"],
+                   "remaining": 100, "lifetime": 130},
+                  {"id": "2", "dish": "FriedMushrooms",
+                   "composition": ["FriedMushrooms"],
+                   "remaining": 100, "lifetime": 130}],
+          cookers=[cooker("c1", pot=False)],
+          items=[pot_item("utensil_pot_01", detail=[])],
+          recipes=recipes)
+    got = {(pn, item) for c, pn, item, raws in CS.recoverable_cookers(w, bk)}
+    assert ("utensil_pot_01", "BoiledSushiRice") in got
+    assert ("utensil_pot_01", "FriedMushrooms") not in got

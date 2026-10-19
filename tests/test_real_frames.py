@@ -5,10 +5,10 @@
 """
 import pytest
 
-from ai import predicates as P
-from ai import world as W
-from ai.geometry import GridMapping
-from ai.navigation import distance_field, interact_cells
+from ai.query import predicates as P
+from ai.state import world as W
+from ai.space.geometry import GridMapping
+from ai.space.navigation import distance_field, interact_cells
 
 # Import fixture_files from conftest to check if sample frames exist
 import sys
@@ -111,3 +111,26 @@ def test_distance_field_reaches_stations_from_chef(level_frame):
             reachable += 1
 
     assert reachable > 0, "没有任何站点可达，距离场或可走判定有问题"
+
+
+def _load_gz_frames(name):
+    import gzip
+    import json
+
+    path = os.path.join(os.path.dirname(__file__), "fixtures", name)
+    if not os.path.exists(path):
+        pytest.skip("缺 %s，这份 fixture 由 Task 9 在实机录制阶段产出" % name)
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def test_world_belts_from_travelator_not_hardcoded_table_real_frame():
+    """§5.3/§5.4：belt_cells 改用 parse_belts 读 belts[]，不再查
+    occupancy.BELTS 关卡硬编码表。要等 Task 9/18 用新插件录制
+    sushi_1_4_belts.ndjson.gz 之后才能真正跑通，暂时 SKIP。
+    """
+    frames = _load_gz_frames("sushi_1_4_belts.ndjson.gz")
+    frame = next((f for f in frames if f.get("belts")), None)
+    assert frame is not None, "样本没有带 belts 字段的帧"
+    w = W.World(frame)
+    assert len(w.belt_cells) == 18   # §4.5：与手标表数量一致

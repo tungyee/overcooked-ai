@@ -7,9 +7,9 @@
 import pytest
 
 from ai import tasks as T
-from ai.blackboard import Blackboard
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.state.blackboard import Blackboard
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 
 def _make_world(orders=None, stations=None, recipes=None, cookers=None,

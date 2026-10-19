@@ -12,7 +12,7 @@
 """
 import pytest
 
-from ai import planner
+from ai.core import planner
 
 
 def test_order_deadline_no_longer_penalized_twice():

@@ -3,8 +3,8 @@ import os
 
 import pytest
 
-from ai import stations as S
-from ai import world as W
+from ai.query import stations as S
+from ai.state import world as W
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -168,14 +168,6 @@ def test_find_plate_stack_dedupes_by_position():
     assert S.find_plate_stack(w) is not None
 
 
-def test_find_plate_stack_falls_back_to_hardcoded_cells():
-    """stations[] 里没有任何盘堆时，用 PLATE_STACKS 的实测坐标兜底。"""
-    w = W.World({"level": "Sushi_1_4_2P", "stations": [], "plates": []})
-    got = S.find_plate_stack(w)
-    assert got is not None
-    assert got["t"] == "plate_stack"
-
-
 def test_find_plate_stack_unknown_level_falls_back_to_plate_station():
     """换关卡且无盘堆：退到出餐口，仍不返回 None 就崩。"""
     w = W.World({
@@ -206,3 +198,52 @@ def test_find_plate_stack_real_frame():
     clean = set((round(p["x"], 2), round(p["z"], 2)) for p in w.plates
                 if (p.get("count") or 0) == 0)
     assert (round(got["x"], 2), round(got["z"], 2)) in clean
+
+
+def _grid13():
+    """Sushi_1_3 主网格映射：origin (6.0, 7.2), cell 1.2。"""
+    from ai.space.geometry import GridMapping
+    m = GridMapping(cell=1.2, off_x=8, off_z=6, origin_x=6.0, origin_z=7.2)
+    return m.to_grid
+
+
+def test_sink_place_cells_merges_adjacent_drying_rack():
+    """放脏盘占地 = 洗碗池 + 相邻晾干架（合并 1×2）。
+
+    washing 的 gz 字段故意报错（2，实为 -4）：占地必须从 x/z 投影，不能信
+    gx/gz（实机 WashingPart 的 gz 是局部网格坐标，与主网格不一致）。
+    """
+    to_grid = _grid13()
+    st = {"t": "washing", "n": "WashingPart", "gx": 4, "gz": 2,
+          "x": 10.8, "z": 2.4}
+    stations = [
+        st,
+        {"t": "plate_return", "n": "DryingPart", "gx": 3, "gz": -4,
+         "x": 9.6, "z": 2.4},
+        {"t": "plate_return", "n": "workstation_plate_return", "gx": 5,
+         "gz": -4, "x": 12.0, "z": 2.4},
+    ]
+    assert S.sink_place_cells(st, stations, to_grid) == {(4, -4), (3, -4)}
+
+
+def test_sink_place_cells_ignores_dirty_return_and_non_adjacent():
+    """只合并相邻的晾干架（drying）；脏盘回收口、不相邻的 drying 不并。"""
+    to_grid = _grid13()
+    st = {"t": "washing", "n": "WashingPart", "x": 10.8, "z": 2.4}
+    stations = [
+        st,
+        {"t": "plate_return", "n": "workstation_plate_return",
+         "x": 12.0, "z": 2.4},
+        {"t": "plate_return", "n": "DryingPart", "x": 22.8, "z": 2.4},  # 不相邻
+    ]
+    assert S.sink_place_cells(st, stations, to_grid) == {(4, -4)}
+
+
+def test_sink_place_cells_no_world_pos_returns_empty():
+    to_grid = _grid13()
+    st = {"t": "washing", "n": "WashingPart", "gx": 4, "gz": -4}
+    assert S.sink_place_cells(st, [], to_grid) == set()
+
+
+def test_sink_place_cells_non_dict_returns_empty():
+    assert S.sink_place_cells(None, [], None) == set()

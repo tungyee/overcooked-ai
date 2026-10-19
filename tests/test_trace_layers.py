@@ -5,7 +5,7 @@
 可行但层不够高（ok=True + in_top_layer=False）。这是分层最大的可观测性
 收益，所以单独钉住。
 """
-from ai import trace
+from ai.output import trace
 
 
 class _Task(object):

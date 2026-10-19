@@ -6,21 +6,17 @@
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import predicates as P
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Node, Sequence
+from ai.query import stations as S
+from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
-                           plate_cell, station_at_cell)
+                           plate_cell, placed_plates, station_at_cell)
 
-# 洗盘按住交互键的上限（拍）。旧实现用 confirm_wait >= 20 做兜底，
-# spec §3.4 指出 20 Hz 下那是约 1 秒而非 4 秒。洗一摞盘实测要数秒，
-# 故给 120 拍（6 秒）。HoldUntil 的 timeout 无默认值、必须显式传。
-WASH_TIMEOUT_TICKS = 120
-
-# 干净盘缓冲阈值：场上干净空盘数低于该值就允许洗盘（提前补，不等到用光）。
-# 洗盘慢，是补位动作，不是主线；但也不能卡到 0 块才洗——那时拼装被卡死。
-PLATE_BUFFER = 2
+# 洗盘按住交互键的上限（拍）。done() 现在是「一池子全洗完」（见 WashPlate.done），
+# 每块实测约 2.8 秒（~56 拍），一整摞 3~4 块要 168~224 拍，故给 240 拍（12 秒）。
+# 这只是兜底：正常由 done()（池子清空）提前 SUCCESS，超时才 FAILURE 交还 Planner。
+WASH_TIMEOUT_TICKS = 240
 
 # ---------- 盘相关谓词（仅本组用） ----------
 
@@ -55,13 +51,68 @@ def clean_plate_exists(ctx):
     return False
 
 
-def dirty_plate_exists(ctx):
+def sink_station(ctx, sink_id=None):
+    # type: (Dict, Any) -> Optional[Dict]
+    """取洗碗池站点；sink_id 给定时优先精确匹配（多池关卡），否则取第一个。"""
+    washing = [s for s in ctx["w"].stations
+               if isinstance(s, dict) and s.get("t") == "washing"]
+    if not washing:
+        return None
+    if sink_id is not None:
+        for s in washing:
+            if str(s.get("n")) == str(sink_id):
+                return s
+    return washing[0]
+
+
+def sink_plate_count(ctx, sink_id=None):
+    # type: (Dict, Any) -> int
+    """洗碗池里待洗的盘数（插件 washing 站点的 plate_count；缺失/异常按 0）。"""
+    st = sink_station(ctx, sink_id)
+    if st is None:
+        return 0
+    try:
+        return int(st.get("plate_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def clean_plate_at_source(ctx):
     # type: (Dict) -> bool
-    """脏盘摞（items 里的 DirtyPlateStack）。"""
+    """干净空盘是否已出现在取盘位（晾干架 / 盘堆）。
+
+    这是旧 WashPlate.done 的判据；现在被 done() 复用，但要叠加
+    「池子已清空」这一条件，见 WashPlate.done。
+    """
+    src_cells = set()
+    for st in ctx["w"].stations:
+        if not S._is_plate_source(st):
+            continue
+        gx, gz = st.get("gx"), st.get("gz")
+        if gx is not None and gz is not None:
+            src_cells.add((gx, gz))
+    if not src_cells:
+        return False
+    for p in ctx["w"].plates:
+        if P.plate_count(p) != 0:
+            continue
+        if plate_cell(ctx, p) in src_cells:
+            return True
+    return False
+
+
+def dirty_plate_exists(ctx, sink_id=None):
+    # type: (Dict, Any) -> bool
+    """有要洗的盘：场上的 DirtyPlateStack，或洗碗池里待洗的盘（plate_count>0）。
+
+    后者是「盘已放进池子、正在洗」的进行态：盘一入池就离开 items[]，
+    若只认 items[]，feasible 会在入池那一拍翻脸，承诺惯性 3 拍后把正在
+    洗的树抢走（实机 trace-20261017-182700 t=1678~1680）。
+    """
     for it in ctx["w"].items:
         if "dirtyplate" in str(it.get("n") or "").lower():
             return True
-    return False
+    return sink_plate_count(ctx, sink_id) > 0
 
 
 @_register
@@ -88,9 +139,15 @@ class PlaceCleanPlate(Task):
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        """认领盘的格 == 拼装格（spec §6.1）。**绑定具体盘**求值。"""
+        """认领盘的格 == 拼装格，且手已空（spec §6.1）。**绑定具体盘**求值。
+
+        只查盘格不够：盘被端在手里、恰好路过拼装格时，其世界坐标也会落在
+        目标格，于是 done 误判"已放好"（实机：端着盘在拼装格旁左右横跳）。
+        手空是"真的放下去了"的必要信号——盘还攥在手里就绝不能算完成。
+        """
         p = plate_by_id(ctx, self.plate_id)
-        return plate_cell(ctx, p) == tuple(self.counter_cell)
+        return (plate_cell(ctx, p) == tuple(self.counter_cell)
+                and P.hands_free(ctx["chef"]))
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
@@ -113,20 +170,23 @@ class PlaceCleanPlate(Task):
                 lambda c: P.held_is_plate(c["chef"])),
             PR.InteractWith(
                 lambda c: station_at_cell(c, cell), "placement",
-                lambda c: plate_cell(
-                    c, plate_by_id(c, plate_id)) == tuple(cell)),
+                lambda c: (plate_cell(
+                    c, plate_by_id(c, plate_id)) == tuple(cell)
+                    and P.hands_free(c["chef"]))),
         ]), TASK_TIMEOUT_TICKS)
 
 
 @_register
 class WashPlate(Task):
-    """第 2 号：洗一块脏盘。
+    """第 2 号：洗脏盘。
 
-    完成判定是"干净盘出现在**晾干架**或盘堆"——spec §6.1 第 2 号注：
-    "洗完的盘从晾干架出来，不是盘堆……初版完成判定只写'出现可用干净盘'
-    没说去哪取，实施时会漏。"Plan 1.5 的 stations._is_plate_source 已
-    把 t=="plate_return" 且名含 drying 的站点算作可取盘位（实测帧确有
-    {'t':'plate_return','n':'DryingPart'}）。
+    完成判定改成「一次性洗完」：洗碗池里待洗的盘清零（plate_count==0），
+    且干净盘已出现在晾干架/盘堆。旧判定只等第一块干净盘，于是端一摞只洗
+    一块就走，剩下的盘永远留在池子里没人管。
+
+    spec §6.1 第 2 号注：洗完的盘从晾干架出来，不是盘堆。Plan 1.5 的
+    stations._is_plate_source 已把 t=="plate_return" 且名含 drying 的
+    站点算作可取盘位（实测帧确有 {'t':'plate_return','n':'DryingPart'}）。
     """
 
     TYPE = "WashPlate"
@@ -140,39 +200,41 @@ class WashPlate(Task):
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        src_cells = set()
-        for st in ctx["w"].stations:
-            if not S._is_plate_source(st):
-                continue
-            gx, gz = st.get("gx"), st.get("gz")
-            if gx is not None and gz is not None:
-                src_cells.add((gx, gz))
-        if not src_cells:
+        # 一次性洗完：池子里还有待洗的盘就不算完（plate_count>0）。
+        # 不能只判「池子空了」——任务一开始（还没放盘进去）池子就是空的，
+        # 那样 done 恒真、feasible 恒假，WashPlate 永远启动不了。所以必须
+        # 叠加「已经洗出干净盘在取盘位」。
+        if sink_plate_count(ctx, self.sink_id) > 0:
             return False
-        for p in ctx["w"].plates:
-            if P.plate_count(p) != 0:
-                continue
-            if plate_cell(ctx, p) in src_cells:
-                return True
-        return False
+        return clean_plate_at_source(ctx)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
         # done 已成立就不可行（上下游咬合，同 PlaceCleanPlate / Chop）。
         # 漏掉这一句的后果不是「多洗一趟」而是**彻底空转**：晾干架上已躺着
         # 干净盘时 done 恒真，树一建起来 `HoldUntil` 的谓词当拍就成立 → 整个
-        # Sequence 直接 SUCCESS，一次洗盘键都不按；而 feasible 仍为真（clean=1
-        # < PLATE_BUFFER 且脏盘摞还在），于是它以 4.00 分反复被选中，把该去
-        # 「把那块干净盘摆上拼装格」的拍全吃掉。
-        # 实机 trace-20261014-221306：t=6117~6193 与 7228~7370 共 220 拍选
-        # WashPlate、0 拍按键；同期 PlaceCleanPlate 可行 1101 拍、选中 0 次。
+        # Sequence 直接 SUCCESS，一次洗盘键都不按。实机 trace-20261014-221306：
+        # t=6117~6193 与 7228~7370 共 220 拍选 WashPlate、0 拍按键。
         if self.done(ctx):
             return False
-        # 提前补盘：干净盘数 < PLATE_BUFFER 就允许洗，别等到 0 块拼装被卡死。
-        # 洗盘慢是补位动作，不给无限洗：干净盘够缓冲就不洗（交给打分按稀缺度提权）。
-        if P.clean_plate_count(ctx["w"].plates) >= PLATE_BUFFER:
+        # 当前承诺就是洗这个池子 → 继续洗完，别中断。这里必须看「承诺」而
+        # 不是只看「池子里有盘」：池子里有盘也可能是 P1 刚放进去的脏盘，那时
+        # 场上还有干净盘/装配盘的话就不该去洗。只有 P2 自己已承诺在洗（含
+        # 捡起脏盘往池子走的阶段）才放行续洗。
+        bb = ctx.get("bb")
+        commitment = getattr(bb, "commitment", None)
+        active = getattr(commitment, "active_task", None) \
+            if commitment is not None else None
+        if active is not None and active == self:
+            return True
+        # 不在续洗态 → 按「要不要开始洗」判断：场上还有「干净空盘」或「已就位
+        # 的装配盘」就别洗——前者还能拿去摆盘、后者说明装配链正在/可以继续，
+        # 洗盘会抢走本可装配的工时。只有两者都为 0（拼装彻底卡死）才启动洗盘。
+        # 实机复现：盘已摆在拼装格上（装配盘=1），却因旧规则 clean < PLATE_BUFFER
+        # 而跑去洗盘——明明 FetchToPlate 还能往上倒料。
+        if P.clean_plate_count(ctx["w"].plates) > 0 or placed_plates(ctx):
             return False
-        return dirty_plate_exists(ctx)
+        return dirty_plate_exists(ctx, self.sink_id)
 
     def build(self):
         # type: () -> Node
@@ -180,8 +242,10 @@ class WashPlate(Task):
         done = self.done
 
         def sink(c):
-            return S.find_station(c["w"].stations, "washing") or \
-                station_at_cell(c, None)
+            return sink_station(c, sink_id)
+
+        def sink_has_plates(c):
+            return sink_plate_count(c, sink_id) > 0
 
         def dirty(c):
             """脏盘摞的取用目标：优先 stations 里的回盘台（有 gx/gz）。
@@ -215,15 +279,26 @@ class WashPlate(Task):
             return stack
 
         return PR.Timeout(Sequence([
-            # face=True：脏盘摞是**固定站点**，站对位置但朝向不对时
-            # `interactions.pickup` 为 null，不转身就永远按不到（实机
-            # trace-20261014-004742：WashPlate 11 次全部 failure，每次都
-            # 横穿整张地图到 (-1,-4) 再立刻失败。对比 t=3753 yaw=117 句柄
-            # 就绪 vs t=8421 yaw=270 句柄全 null）。
-            PR.InteractWith(dirty, "pickup",
-                            lambda c: not P.hands_free(c["chef"])),
-            PR.InteractWith(sink, "placement",
-                            lambda c: P.hands_free(c["chef"])),
+            Selector([
+                Sequence([
+                    # face=True：脏盘摞是**固定站点**，站对位置但朝向不对时
+                    # `interactions.pickup` 为 null，不转身就永远按不到（实机
+                    # trace-20261014-004742：WashPlate 11 次全部 failure，每次都
+                    # 横穿整张地图到 (-1,-4) 再立刻失败。对比 t=3753 yaw=117 句柄
+                    # 就绪 vs t=8421 yaw=270 句柄全 null）。
+                    PR.InteractWith(dirty, "pickup",
+                                    lambda c: not P.hands_free(c["chef"])),
+                    PR.InteractWith(sink, "placement",
+                                    lambda c: P.hands_free(c["chef"])),
+                ]),
+                # 起点 B：盘已经在池子里（没有可捡的脏盘摞）→ 走到池子并
+                # 朝向它，不捡不放，直接开洗。
+                Sequence([
+                    Condition(sink_has_plates),
+                    PR.Approach(sink, None),
+                    PR.Face(sink),
+                ]),
+            ]),
             # target 让 HoldUntil 每拍校验还在水池前：被推走时松键 FAILURE，
             # Sequence 重置重新 Approach，而不是空按 wash 卡死（同 Chop）。
             PR.HoldUntil("chop", done, timeout=WASH_TIMEOUT_TICKS, target=sink),

@@ -9,11 +9,11 @@ Sushi_1_3_2P 由 Planner 生成并加分，其他关卡零变化。可投掷食�
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai import placement
-from ai import predicates as P
+from ai.query import placement
+from ai.query import predicates as P
 from ai import primitives as PR
-from ai import stations as S
-from ai.bt import Node, Sequence
+from ai.query import stations as S
+from ai.exec.bt import Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            plate_by_id, plate_cell)
 

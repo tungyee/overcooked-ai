@@ -7,8 +7,8 @@ import os
 
 import pytest
 
-from ai import trace
-from ai.replay import load_frames
+from ai.output import trace
+from ai.exec.replay import load_frames
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 

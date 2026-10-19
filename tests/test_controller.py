@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("Quartz", reason="CGEvent controller 需要 pyobjc（仅 macOS）")
 
-from ai import controller
+from ai.output import controller
 
 
 def test_key_table_covers_primitive_keys():

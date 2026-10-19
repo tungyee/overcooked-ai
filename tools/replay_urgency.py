@@ -18,10 +18,10 @@ import json
 import re
 import sys
 
-from ai import planner
-from ai.bb_factory import make_bb
-from ai.recipes import RecipeBook
-from ai.world import World
+from ai.core import planner
+from ai.state.bb_factory import make_bb
+from ai.query.recipes import RecipeBook
+from ai.state.world import World
 
 TASK_RE = re.compile(r"(\w+)\((.*)order#(\d+)\)")
 

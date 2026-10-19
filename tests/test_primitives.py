@@ -5,11 +5,11 @@
 import pytest
 
 from ai import primitives as PR
-from ai.bt import Status
-from ai.hands import Hands
-from ai.navigation import distance_field
-from ai.recipes import RecipeBook
-from ai.blackboard import Blackboard
+from ai.exec.bt import Status
+from ai.output.hands import Hands
+from ai.space.navigation import distance_field
+from ai.query.recipes import RecipeBook
+from ai.state.blackboard import Blackboard
 
 
 class FakeCtrl(object):
@@ -237,6 +237,38 @@ def test_approach_station_underfoot_still_uses_neighbor():
     assert ctx["hands"].move_dir == "right"
 
 
+def test_approach_station_underfoot_with_interaction_is_success():
+    """角色滑到固定站点自己的格上、但游戏已报出可交互句柄 → 直接 SUCCESS。
+
+    半格惯性滑动会让 round 把「站在箱子正前方」算进箱子自己那格
+    （trace-20261018-104804 t=194~220 取意面），cur != goal，旧逻辑会
+    反向纠正 + Face 回正，白白转身。游戏既已说「能交互」，就不到四邻去了。
+    """
+    w = FakeWorld(walkable=lambda gx, gz: gz == 0 and -2 <= gx <= 8 and gx != 5)
+    chef = {"name": "Player 2", "x": 5 * 1.2, "z": 0.0, "held": None,
+            "interactions": _inter(pickup_gx=2, pickup_gz=-1)}
+    ctx, ctrl = make_ctx(w=w, chef=chef, start=(5, 0))
+    node = PR.Approach({"n": "crate", "gx": 2, "gz": -1,
+                        "x": 5 * 1.2, "z": 0.0}, "pickup")
+    assert node.tick(ctx) == Status.SUCCESS
+    assert ctx["hands"].move_dir is None
+    assert ("press", "left") not in ctrl.calls
+    assert ("press", "right") not in ctrl.calls
+
+
+def test_approach_station_underfoot_without_interaction_still_uses_neighbor():
+    """同样站在站点格上，但游戏没报出可交互句柄 → 不能短路，仍走四邻。
+
+    interact_ready 是这条短路的门槛：没面向目标（或目标不可交互）时
+    绝不 SUCCESS，防止「站进站点格」被误当成到位。
+    """
+    w = FakeWorld(walkable=lambda gx, gz: gz == 0 and -2 <= gx <= 8 and gx != 5)
+    ctx, _ = make_ctx(w=w, start=(5, 0))
+    node = PR.Approach({"n": "crate", "gx": 5, "gz": 0}, "pickup")
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir in ("left", "right")
+
+
 def test_approach_presses_belt_counter_key():
     """站在传送带上横穿时同时顶住反向键，否则被推走（spec §7.2）。"""
     w = FakeWorld(walkable=lambda gx, gz: -2 <= gx <= 8 and -1 <= gz <= 4,
@@ -259,7 +291,7 @@ def test_approach_halt_releases_movement():
 
 def test_approach_respects_blocked_cells_from_scratch():
     """脱困拉黑的格子要绕开（MarkBlocked 写 scratch，Approach 读它）。"""
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     w = FakeWorld(walkable=lambda gx, gz: -1 <= gz <= 1 and 0 <= gx <= 4)
     bb = Blackboard()
     bb.scratch = StuckScratch(bad_cells={(1, 0): 999})
@@ -299,6 +331,32 @@ def test_face_succeeds_once_interaction_grid_matches():
     assert ctx["hands"].move_dir is None
 
 
+def test_face_succeeds_on_cross_grid_station_using_raw_gx_gz():
+    """Task 19 实机回归修正：篮子等附属网格站点，游戏上报的
+    interactions.gx/gz 是站点自身网格的局部坐标，跟 target_cell 为
+    Approach/寻路而做的世界坐标投影不是同一基准。Face 的到位判据必须走
+    interact_ready（内部按 gx/gz 优先比对，与游戏上报的基准一致），不能
+    直接拿 facing_cell 跟 target_cell 的投影结果比——否则站在正确交互位
+    也会永远判不到位（trace-20261016-122733 实测：篮子料箱前转向
+    max_ticks 超时 FAILURE，Tap 发不出去）。
+
+    target 同时带 gx=5,gz=5（站点自身网格局部坐标，不是 FakeWorld 主网格
+    坐标）与 x/z（世界坐标，FakeWorld.to_grid 投影后是另一个格，这里用
+    x=1.2,z=0.0 投影到 (1,0)，故意跟 gx/gz 不一致，模拟附属网格站点）。
+    游戏上报 interactions.gx/gz=(5,5)——跟站点自带的局部 gx/gz 一致（这是
+    游戏的基准）。若 Face 错误地拿 target_cell 的投影结果 (1,0) 去比，
+    (5,5) != (1,0)，永远判不到位；按 interact_ready 的 gx/gz 优先逻辑，
+    两边都是 (5,5)，应该立刻 SUCCESS。
+    """
+    ctx, _ = make_ctx(start=(0, 0))
+    target = {"n": "DispenserCrate 3 (1)", "gx": 5, "gz": 5,
+              "x": 1.2, "z": 0.0}
+    node = PR.Face(target)
+    ctx["chef"]["interactions"] = _inter(gx=5, gz=5)
+    assert node.tick(ctx) == Status.SUCCESS
+    assert ctx["hands"].move_dir is None
+
+
 def test_face_succeeds_on_name_only_interaction():
     """出餐口只报句柄名、不给 gx/gz 朝向信号：用 interact_ready 名字兜底。
 
@@ -326,6 +384,47 @@ def test_face_timeout_is_failure():
     for _ in range(3):
         assert node.tick(ctx) == Status.RUNNING
     assert node.tick(ctx) == Status.FAILURE
+
+
+def test_face_noop_for_bare_target_without_facing_signal():
+    """裸散落料（无 grid 且无 gx/gz）没有朝向信号，Face 直接 SUCCESS 跳过、
+    不压方向键——否则会反复短按把角色一点点挪走（实机 trace-20261016-122733，
+    米饭捡不起来）。"""
+    ctx, ctrl = make_ctx(start=(0, 0))
+    node = PR.Face({"n": "PastaTomato", "x": 1.2, "z": 0.0})
+    assert node.tick(ctx) == Status.SUCCESS
+    assert ctrl.calls == []
+
+
+# ---------- target_grid_callbacks（多网格本地坐标）----------
+
+def test_target_grid_callbacks_uses_local_grid_for_station():
+    """目标带 grid 时，返回该网格的本地 to_grid/to_world（篮子网格原点
+    19.6，不是主网格 9.6）。"""
+    from ai.space.geometry import GridSet
+    w = FakeWorld()
+    w.grids = GridSet.from_frame([
+        {"id": "Balloon Basket", "ox": 19.6, "oz": -4.0, "cell": 1.2},
+        {"id": "GridManager", "ox": 9.6, "oz": -2.4, "cell": 1.2},
+    ])
+    to_grid, to_world, cell = PR.target_grid_callbacks(
+        w, {"n": "crate", "grid": "Balloon Basket"})
+    assert to_world(1, 1) == (20.8, -2.8)
+    assert to_grid(20.8, -2.8) == (1, 1)
+    assert cell == 1.2
+
+
+def test_target_grid_callbacks_falls_back_to_main_grid():
+    """目标无 grid（裸散落料/旧 fixture）→ 退回主网格回调，不抛。"""
+    from ai.space.geometry import GridSet
+    w = FakeWorld()
+    w.grids = GridSet.from_frame([
+        {"id": "GridManager", "ox": 9.6, "oz": -2.4, "cell": 1.2},
+    ])
+    to_grid, to_world, cell = PR.target_grid_callbacks(
+        w, {"n": "loose", "x": 1.2, "z": 0.0})
+    assert to_world(1, 0) == (1.2, 0.0)
+    assert cell == 1.2
 
 
 # ---------- Tap（Review Focus 1）----------
@@ -465,7 +564,7 @@ def test_confirm_double_condition_catches_dropped_item():
     ctx, _ = make_ctx(w=w, chef=chef)
 
     def placed_in_plate(c):
-        from ai import predicates as Pr
+        from ai.query import predicates as Pr
         return (Pr.hands_free(c["chef"])
                 and "cucumber" in Pr.plate_contents(plate))
 
@@ -1086,7 +1185,7 @@ def test_interact_with_does_not_double_tap_across_ticks():
 
 def test_mark_blocked_writes_scratch():
     """L1：把卡住的格拉黑，下次 Approach 的距离场绕开它。"""
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     bb = Blackboard()
     bb.scratch = StuckScratch()
     ctx, _ = make_ctx(bb=bb, tick=100)
@@ -1104,7 +1203,7 @@ def test_mark_blocked_creates_scratch_if_missing():
 
 
 def test_mark_blocked_accepts_callable_cell():
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     bb = Blackboard()
     bb.scratch = StuckScratch()
     ctx, _ = make_ctx(bb=bb, tick=5)
@@ -1154,7 +1253,7 @@ def test_abandon_target_writes_scratch_not_commitment():
     steps_done / retries 的写权。Planner 在可行性过滤时读 scratch.abandoned
     （Plan 3 接），这是守住写入规则的唯一做法。
     """
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     bb = Blackboard()
     bb.scratch = StuckScratch()
     before = bb.commitment.active_task
@@ -1167,7 +1266,7 @@ def test_abandon_target_writes_scratch_not_commitment():
 
 def test_abandon_target_accepts_station_dict():
     """传站点 dict 时按实例名 n 拉黑（资源 id 规则，spec §4.4）。"""
-    from ai.blackboard import StuckScratch
+    from ai.state.blackboard import StuckScratch
     bb = Blackboard()
     bb.scratch = StuckScratch()
     ctx, _ = make_ctx(bb=bb, tick=0)
@@ -1346,3 +1445,255 @@ def test_ensure_hands_free_strict_no_fallback_to_floor():
     ctx, _ = make_ctx(w=w, chef=chef)
     # 无 counter 站点：默认 pick 找不到空台面。非 strict 会退地板，strict 必须 FAILURE。
     assert PR.EnsureHandsFree(strict=True).tick(ctx) == Status.FAILURE
+
+
+# ---------- Approach：按身份而非坐标 reset（Task 13）----------
+
+def test_approach_does_not_reset_motion_when_only_coordinates_move():
+    """§5.4/§7：平台移动时站点坐标变化，但身份不变——不应清空巡航进度。"""
+    calls = []
+
+    class TrackingWorld(FakeWorld):
+        def walkable(self, gx, gz):
+            return True
+
+    w = TrackingWorld(walkable=lambda gx, gz: True)
+    target_pos = {"x": 0.0, "z": 0.0}
+
+    def target(ctx):
+        # 同一个站点（相同 n），坐标每拍变化——模拟平台移动
+        return {"n": "crate_01", "grid": "Balloon Basket",
+                "x": target_pos["x"], "z": target_pos["z"]}
+
+    ctx, ctrl = make_ctx(w=w, start=(0, 0))
+    node = PR.Approach(target)
+    node.tick(ctx)
+    motion_before = node._motion   # 内部 MotionControl 实例
+
+    # 下一拍：平台把目标推移了 1.2（一格）
+    target_pos["x"] = 1.2
+    node.tick(ctx)
+    motion_after = node._motion
+
+    assert motion_before is motion_after, (
+        "坐标变化但身份不变时，MotionControl 不应被 reset() 替换成新实例")
+
+
+def test_approach_resets_motion_when_identity_changes():
+    """对照：目标换成另一个站点（身份真的变了），必须 reset。"""
+    w = FakeWorld(walkable=lambda gx, gz: True)
+    targets = iter([
+        {"n": "crate_01", "grid": "GridManager", "x": 0.0, "z": 0.0},
+        {"n": "crate_02", "grid": "GridManager", "x": 1.2, "z": 0.0},
+    ])
+
+    def target(ctx):
+        return next(targets, {"n": "crate_02", "grid": "GridManager", "x": 1.2, "z": 0.0})
+
+    ctx, ctrl = make_ctx(w=w, start=(0, 0))
+    node = PR.Approach(target)
+    node.tick(ctx)
+    motion_before = node._motion
+    node.tick(ctx)
+    motion_after = node._motion
+
+    assert motion_before is not motion_after, "换了不同站点必须 reset"
+
+
+# ---------- target_cell 坐标优先级（spec §7，Task 19） ----------
+
+def test_target_cell_prefers_world_projection_over_raw_gx_gz():
+    """§7 的发现：篮子站点的局部 gx/gz 不是主网格坐标，必须按 x/z 投影，
+    不能直接信任站点自带的 gx/gz（那是它所在网格的局部索引）。"""
+    class ProjectingWorld(object):
+        def to_grid(self, x, z):
+            # 模拟主网格换算：假设主网格 origin (9.6, -2.4)，cell 1.2
+            return (int(round((x - 9.6) / 1.2)), int(round((z + 2.4) / 1.2)))
+
+    ctx = {"w": ProjectingWorld()}
+    # 站点物理世界坐标 (22.0, -3.6)（即篮子局部 (2,-1) 的真实位置），
+    # 但插件同时发了局部 gx=2, gz=-1（这是篮子网格的局部索引，不是主网格的）
+    target = {"gx": 2, "gz": -1, "x": 22.0, "z": -3.6}
+    got = PR.target_cell(target, ctx)
+    # 必须按世界坐标投影到主网格坐标系，不能原样返回局部 (2, -1)
+    assert got == ctx["w"].to_grid(22.0, -3.6)
+    assert got != (2, -1)
+
+
+def test_target_cell_falls_back_to_raw_gx_gz_when_no_world_coords():
+    """x/z 缺失（旧 fixture/合成测试数据）时，仍退回 gx/gz，不崩不变 None。"""
+    class ProjectingWorld(object):
+        def to_grid(self, x, z):
+            return (0, 0)
+
+    ctx = {"w": ProjectingWorld()}
+    target = {"gx": 5, "gz": 7}
+    assert PR.target_cell(target, ctx) == (5, 7)
+
+
+# ---------- AlignToCell ----------
+
+def test_align_success_when_handle_already_matches():
+    """句柄已指向目标 → 直接 SUCCESS，不按任何键。"""
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "pot",
+            "interactions": _inter(placement_gx=1, placement_gz=0)}
+    ctx, ctrl = make_ctx(chef=chef)
+    node = PR.AlignToCell({"n": "c", "gx": 1, "gz": 0}, "placement")
+    assert node.tick(ctx) == Status.SUCCESS
+    assert ctrl.calls == []
+
+
+def test_align_presses_toward_cell_center_when_handle_mismatches():
+    """句柄被别的物体抢走、且偏离格心 → 朝格心短按，RUNNING。
+
+    实机 trace-20261016-220409 t=9523：P2 偏离格心 0.3 格，placement 句柄
+    被出餐口抢走，而格心处全朝向可用（spec §2.3）。
+    """
+    # 格 (1,0) 的中心是 (1.2, 0.0)；放在 (0.7, 0.0) 即 0.5 偏离。
+    # 不取 0.9：那恰好是 0.3 偏离 == align_epsilon(1.2)，落在容差边界上，
+    # 测的就变成了 <= 还是 < 的 tie-break，而那个 tie-break 不是本用例的主题。
+    chef = {"name": "Player 2", "x": 0.7, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, _ = make_ctx(chef=chef, start=(1, 0))
+    node = PR.AlignToCell({"n": "c", "gx": 2, "gz": 0}, "placement")
+    assert node.tick(ctx) == Status.RUNNING
+    assert ctx["hands"].move_dir == "right", "格心在 +x 方向"
+
+
+def test_align_failure_when_centered_but_handle_still_mismatches():
+    """已在格心容差内仍不符 → FAILURE 交还 Planner（不无限收紧）。"""
+    chef = {"name": "Player 2", "x": 1.2, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, _ = make_ctx(chef=chef, start=(1, 0))
+    node = PR.AlignToCell({"n": "c", "gx": 2, "gz": 0}, "placement")
+    assert node.tick(ctx) == Status.FAILURE
+
+
+def test_align_target_gone_is_failure():
+    """收紧途中目标消失（P1 端走）→ FAILURE，不 NPE 不死等（Review Focus 1）。"""
+    ctx, _ = make_ctx()
+    node = PR.AlignToCell(lambda c: None, "placement")
+    assert node.tick(ctx) == Status.FAILURE
+
+
+def test_align_target_underfoot_no_direction():
+    """目标就在脚下格 → 无方向可按，FAILURE 交还 Planner（Review Focus 3）。"""
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "pot",
+            "interactions": _inter(placement_gx=9, placement_gz=9)}
+    ctx, _ = make_ctx(chef=chef, start=(0, 0))
+    node = PR.AlignToCell({"n": "loose", "gx": 0, "gz": 0}, "placement")
+    assert node.tick(ctx) == Status.FAILURE
+
+
+def test_align_on_belt_does_not_loop_forever():
+    """传送带上外力持续，永远到不了格心 → max_ticks 兜底 FAILURE（Review Focus 4）。"""
+    w = FakeWorld(walkable=lambda gx, gz: True, belt_cells={(1, 0)})
+    chef = {"name": "Player 2", "x": 0.7, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, _ = make_ctx(w=w, chef=chef, start=(1, 0))
+    node = PR.AlignToCell({"n": "c", "gx": 2, "gz": 0}, "placement", max_ticks=3)
+    seen = [node.tick(ctx) for _ in range(5)]
+    assert Status.FAILURE in seen, "max_ticks 没兜住，会无限 RUNNING"
+
+
+def test_align_halt_releases_movement():
+    chef = {"name": "Player 2", "x": 0.7, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, _ = make_ctx(chef=chef, start=(1, 0))
+    node = PR.AlignToCell({"n": "c", "gx": 2, "gz": 0}, "placement")
+    node.tick(ctx)
+    node.halt()
+    assert ctx["hands"].move_dir is None
+
+
+def test_blocked_cells_ignores_pairs_without_resource_id():
+    """不传 resource_id 时行为不变（向后兼容既有调用点）。"""
+    from ai.state.blackboard import StuckScratch
+    bb = Blackboard()
+    bb.scratch = StuckScratch(bad_cells={(1, 0): 999},
+                              bad_pairs={("res_a", (2, 0)): 999})
+    ctx, _ = make_ctx(bb=bb)
+    assert PR._blocked_cells(ctx) == {(1, 0)}
+
+
+def test_blocked_cells_includes_pairs_for_matching_resource():
+    from ai.state.blackboard import StuckScratch
+    bb = Blackboard()
+    bb.scratch = StuckScratch(bad_cells={(1, 0): 999},
+                              bad_pairs={("res_a", (2, 0)): 999,
+                                         ("res_b", (3, 0)): 999})
+    ctx, _ = make_ctx(bb=bb)
+    assert PR._blocked_cells(ctx, "res_a") == {(1, 0), (2, 0)}
+    assert PR._blocked_cells(ctx, "res_b") == {(1, 0), (3, 0)}
+
+
+def test_blocked_pair_expires_after_ttl():
+    """TTL 过期后要能重试，否则一次偶发失败永久废掉一个组合（Review Focus 5）。"""
+    from ai.state.blackboard import StuckScratch
+    bb = Blackboard()
+    bb.scratch = StuckScratch(bad_pairs={("res_a", (2, 0)): 100})
+    ctx, _ = make_ctx(bb=bb, tick=100)
+    assert PR._blocked_cells(ctx, "res_a") == set(), "expire <= tick 即失效"
+
+
+def test_interact_with_aligns_before_tapping():
+    """句柄被别的物体抢走时，InteractWith 先收紧站位而不是整体 FAILURE。
+
+    实机 trace-20261016-220409：EnsureHandsFree 在这种局面直接 FAILURE，
+    树塌 → 重建 → 同样位置再塌，P2 钉住 287 拍到收盘（spec §1）。
+    """
+    chef = {"name": "Player 2", "x": 0.7, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, ctrl = make_ctx(chef=chef, start=(1, 0))
+    node = PR.InteractWith({"n": "c", "gx": 2, "gz": 0}, "placement",
+                           lambda c: False)
+    got = [node.tick(ctx) for _ in range(4)]
+    assert Status.FAILURE not in got, "不该直接失败，应先收紧站位"
+    assert ("tap", "pickup") not in ctrl.calls, "句柄不对时不许瞎按"
+
+
+def test_ensure_hands_free_aligns_before_tapping():
+    """EnsureHandsFree 同理——它是每棵树的树首，塌了整个 task 都没了。"""
+    station = {"t": "counter", "n": "c", "gx": 2, "gz": 0, "x": 2.4, "z": 0.0}
+    w = FakeWorld(stations=[station],
+                  walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 4)
+    chef = {"name": "Player 2", "x": 0.7, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, ctrl = make_ctx(w=w, chef=chef, start=(1, 0))
+    node = PR.EnsureHandsFree()
+    got = [node.tick(ctx) for _ in range(4)]
+    assert Status.FAILURE not in got
+    assert ("tap", "pickup") not in ctrl.calls
+
+
+def test_align_failure_blacklists_resource_cell_pair():
+    """收紧到位仍不符 → 记 (资源,格)，让 Approach 下次换格。"""
+    from ai.state.blackboard import StuckScratch
+    from ai.query import predicates as P
+    bb = Blackboard()
+    bb.scratch = StuckScratch()
+    chef = {"name": "Player 2", "x": 1.2, "z": 0.0, "held": "pot",
+            "interactions": _inter(gx=2, gz=0, placement_gx=0, placement_gz=-1)}
+    ctx, _ = make_ctx(chef=chef, start=(1, 0), bb=bb, tick=50)
+    station = {"t": "counter", "n": "c", "grid": "GridManager", "gx": 2, "gz": 0}
+    node = PR.AlignToCell(station, "placement")
+    assert node.tick(ctx) == Status.FAILURE
+    key = (P.resource_id(station), (1, 0))
+    assert bb.scratch.bad_pairs.get(key) == 50 + PR.ALIGN_PAIR_TTL_TICKS
+
+
+def test_approach_avoids_pair_blacklisted_interact_cell():
+    """(资源,格) 被拉黑 → Approach 换别的交互位，不再撞同一格。"""
+    from ai.state.blackboard import StuckScratch
+    from ai.query import predicates as P
+    station = {"t": "counter", "n": "c", "grid": "GridManager", "gx": 2, "gz": 0}
+    w = FakeWorld(stations=[station],
+                  walkable=lambda gx, gz: -1 <= gz <= 1 and 0 <= gx <= 4)
+    bb = Blackboard()
+    bb.scratch = StuckScratch(
+        bad_pairs={(P.resource_id(station), (1, 0)): 999})
+    ctx, _ = make_ctx(w=w, start=(0, 0), bb=bb)
+    node = PR.Approach(station, "placement")
+    for _ in range(3):
+        node.tick(ctx)
+    assert node._goal != (1, 0), "被拉黑的交互位不该再被选为目标"

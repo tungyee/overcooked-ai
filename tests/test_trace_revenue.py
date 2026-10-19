@@ -9,7 +9,7 @@ lifetime 才是过期（唯一信号），翻 4577 行才能看出来。本模�
 import os
 import pytest
 
-from ai import trace
+from ai.output import trace
 
 
 @pytest.fixture(autouse=True)

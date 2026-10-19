@@ -15,8 +15,8 @@ W_DEADLINE_LOOKAHEAD = 10.0 定义后从未被引用：_score_candidate ⑩ 直�
 正是它们自己 docstring 引用的 `cf2fc64` 同款失效：断言的是「样子对不对」而不是
 「算出来的值对不对」。改成走 `_score_candidate` 实算。
 """
-from ai import planner
-from ai.blackboard import Blackboard
+from ai.core import planner
+from ai.state.blackboard import Blackboard
 
 
 def test_deadline_term_is_scaled_by_its_weight_when_scored():

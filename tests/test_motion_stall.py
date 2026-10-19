@@ -9,7 +9,7 @@ trace-20261014-120406 里 2326/4577 拍（51%）按着方向键但格子没变�
 MotionControl 内部早有 `_progress_since/_progress_pos`（用于 no_progress
 失败判定），这里只是把它暴露进 `ctx["motion"]`，让 trace 逐拍可读。
 """
-from ai.bt import Status
+from ai.exec.bt import Status
 from ai.primitives.motion import MotionControl, PROGRESS_MAX_SECONDS
 from tests.test_motion_control import observe
 from tests.test_primitives import FakeWorld, make_ctx

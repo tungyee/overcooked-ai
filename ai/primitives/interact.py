@@ -5,9 +5,10 @@ InteractWith：= Approach + (Face) + TapWhileHolding + Confirm（前置 + 后置
 """
 from typing import Any, Callable, Dict, Optional
 
-from ai import placement
-from ai import predicates as P
-from ai.bt import Status
+from ai.query import placement
+from ai.query import predicates as P
+from ai.exec.bt import Status
+from ai.primitives.align import AlignToCell
 from ai.primitives.base import Primitive, resolve
 from ai.primitives.hold import TapWhileHolding
 from ai.primitives.move import Approach, Face
@@ -18,7 +19,7 @@ from ai.primitives.tap import Tap, Confirm
 PUT_DOWN_RETRIES = 5
 
 # EnsureHandsFree 的四个阶段（形态对齐 InteractWith）。
-_P_APPROACH, _P_FACE, _P_TAP, _P_CONFIRM = 0, 1, 2, 3
+_P_APPROACH, _P_FACE, _P_ALIGN, _P_TAP, _P_CONFIRM = 0, 1, 2, 3, 4
 
 
 def _belt_hold_key(ctx):
@@ -97,6 +98,9 @@ class EnsureHandsFree(Primitive):
         # 地板格没有句柄可复核——插件对裸地板格不给 placement/facing 信号，
         # 传来传来的 None 会被 Tap 当成"目标消失"直接 FAILURE，所以那一路
         # 用一个无 target 的 Tap 盲按。
+        # 台面落点才对齐：裸地板格插件不给 placement 信号，interact_ready
+        # 恒 False，收紧会一路白走到 max_ticks（见 align.py 模块注释）。
+        self._align_station = AlignToCell(lambda c: self._tgt, "placement")
         self._tap_station = TapWhileHolding(
             "pickup", _belt_hold_key, lambda c: self._tgt, "placement")
         self._tap_floor = Tap("pickup")
@@ -104,7 +108,8 @@ class EnsureHandsFree(Primitive):
                                 PUT_DOWN_RETRIES)
 
     def _nodes(self):
-        return (self._approach, self._floor_approach, self._face, self._tap_station,
+        return (self._approach, self._floor_approach, self._face,
+                self._align_station, self._tap_station,
                 self._tap_floor, self._confirm)
 
     def reset(self):
@@ -162,6 +167,11 @@ class EnsureHandsFree(Primitive):
             s = self._face.tick(ctx)
             if s != Status.SUCCESS:
                 return s
+            self._phase = _P_ALIGN
+        if self._phase == _P_ALIGN:
+            s = self._align_station.tick(ctx)
+            if s != Status.SUCCESS:
+                return s
             self._phase = _P_TAP
         if self._phase == _P_TAP:
             s = (self._tap_station.tick(ctx) if self._on_station
@@ -193,7 +203,7 @@ class EnsureHandsFree(Primitive):
         锅只能去台面/地板）。
         """
         w = ctx["w"]
-        state = P.held_cookware_state(ctx["chef"], w.items, w.recipes)
+        state = P.held_cookware_state(ctx["chef"], P.held_items(w), w.recipes)
         if self._home_cooker and state in (P.COOKWARE_EMPTY, P.COOKWARE_RAW):
             st = placement.find_empty_cooker(w, ctx["field"])
             if st is not None:
@@ -244,17 +254,26 @@ class InteractWith(Primitive):
         self.expect = expect
         self._approach = Approach(target, kind)
         self._face = Face(target) if face else None
+        self._align = AlignToCell(target, kind)
         self._tap = TapWhileHolding("pickup", _belt_hold_key, target, kind)
         self._confirm = Confirm(expect, retries)
         self._phase = 0
 
     def _children(self):
         # type: () -> list
-        """返回子节点序列（用于迭代和 reset/halt）。"""
+        """返回子节点序列（用于迭代和 reset/halt）。
+
+        AlignToCell 夹在 Face 与 Tap 之间：Face 的到位判据读通用 gx/gz，
+        Tap 的前置校验读 placement_gx/gz，两者来自游戏的两次独立扫描，
+        Face SUCCESS 不蕴含 Tap 能按（见 primitives/align.py 模块注释）。
+
+        `face=False` 的路径（拾取散落物）同样要带它：句柄抢占按距离发生，
+        与朝向无关。
+        """
         out = [self._approach]
         if self._face is not None:
             out.append(self._face)
-        out.extend([self._tap, self._confirm])
+        out.extend([self._align, self._tap, self._confirm])
         return out
 
     def reset(self):

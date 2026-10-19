@@ -6,8 +6,8 @@
      "复用同一棵树（进度自然保留）"）。
   2. halt 沿 RUNNING 链向下传播（按键释放依赖它）。
 """
-from ai import bt
-from ai.bt import Status
+from ai.exec import bt
+from ai.exec.bt import Status
 
 
 class Rec(bt.Node):

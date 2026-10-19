@@ -3,7 +3,7 @@ import pathlib
 
 import pytest
 
-from ai.geometry import GridMapping, parse_vec
+from ai.space.geometry import GridMapping, GridSet, parse_vec
 
 
 def test_parse_vec_parses_triple():
@@ -188,3 +188,40 @@ def test_real_frame_all_stations_round_trip():
         checked += 1
 
     assert checked == 61
+
+
+# ---------- GridSet（多网格坐标模型）----------
+BALLOON_GRIDS = [
+    {"id": "GridManager", "ox": 9.6, "oz": -2.4, "cell": 1.2},
+    {"id": "Balloon Basket", "ox": 19.6, "oz": -2.4, "cell": 1.2},
+]
+
+
+def test_gridset_from_frame_builds_both_grids():
+    gs = GridSet.from_frame(BALLOON_GRIDS)
+    assert set(gs.ids()) == {"GridManager", "Balloon Basket"}
+
+
+def test_gridset_to_world_uses_correct_origin_per_grid():
+    gs = GridSet.from_frame(BALLOON_GRIDS)
+    # 料箱 DispenserCrate 3 (1) 局部 g(2,-1) -> 世界 (22.0, -3.6)（§4.2 实测）
+    assert gs.to_world("Balloon Basket", 2, -1) == pytest.approx((22.0, -3.6))
+    # 同样的局部坐标在主网格是另一个世界点——证明两网格不共享坐标
+    assert gs.to_world("GridManager", 2, -1) == pytest.approx((12.0, -3.6))
+
+
+def test_gridset_to_grid_is_inverse_per_grid():
+    gs = GridSet.from_frame(BALLOON_GRIDS)
+    x, z = gs.to_world("Balloon Basket", 2, -1)
+    assert gs.to_grid("Balloon Basket", x, z) == (2, -1)
+
+
+def test_gridset_unknown_grid_returns_none():
+    gs = GridSet.from_frame(BALLOON_GRIDS)
+    assert gs.to_world("NoSuchGrid", 0, 0) is None
+    assert gs.to_grid("NoSuchGrid", 0.0, 0.0) is None
+
+
+def test_gridset_from_empty_frame_is_empty():
+    gs = GridSet.from_frame(None)
+    assert gs.ids() == []

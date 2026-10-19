@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from ai import recipes as R
+from ai.query import recipes as R
 
 # 实测帧的真实数据（tests/fixtures/real_frame_sushi_1_4.json）
 RECIPES = [
@@ -161,7 +161,7 @@ def real_frames():
     与 tests/test_real_frames.py 的 frames 夹具同源但不共享（那个是
     module-scope，跨文件不可见），所以这里自己加载一份。
     """
-    from ai.replay import load_frames
+    from ai.exec.replay import load_frames
     path = os.path.join(os.path.dirname(__file__), "fixtures",
                         "full_level.ndjson.gz")
     if not os.path.exists(path):

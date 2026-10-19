@@ -2,7 +2,7 @@
 
 全程假 controller，零真实按键注入——Plan 2 的交付标准之一。
 """
-from ai.hands import Hands, DIR2D, OPPOSITE, TAP_COOLDOWN_TICKS
+from ai.output.hands import Hands, DIR2D, OPPOSITE, TAP_COOLDOWN_TICKS
 
 
 class FakeCtrl(object):

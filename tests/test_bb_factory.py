@@ -1,4 +1,4 @@
-from ai.bb_factory import live_order_ids, make_bb, make_resource_view
+from ai.state.bb_factory import live_order_ids, make_bb, make_resource_view
 
 
 def test_make_bb_returns_fresh_blackboard():
@@ -6,13 +6,6 @@ def test_make_bb_returns_fresh_blackboard():
 
     assert bb.tick == 7
     assert bb.claims == {}
-    assert bb.intents.collab_mode == "relay"
-
-
-def test_make_bb_honors_collab_mode():
-    bb = make_bb(collab_mode="split")
-
-    assert bb.intents.collab_mode == "split"
 
 
 def test_make_bb_instances_are_independent():

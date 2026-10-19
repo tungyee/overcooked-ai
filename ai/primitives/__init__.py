@@ -8,7 +8,13 @@ from ai.primitives.base import (
     resolve,
     _blocked_cells,
     target_cell,
+    target_grid_callbacks,
     _dir_towards,
+)
+from ai.primitives.align import (
+    AlignToCell,
+    ALIGN_MAX_TICKS,
+    ALIGN_PAIR_TTL_TICKS,
 )
 from ai.primitives.move import Approach, Face
 from ai.primitives.tap import Tap, Confirm, Settle
@@ -25,8 +31,12 @@ from ai.primitives.stuck import (
 __all__ = [
     "Primitive",
     "resolve",
+    "target_grid_callbacks",
     "Approach",
     "Face",
+    "AlignToCell",
+    "ALIGN_MAX_TICKS",
+    "ALIGN_PAIR_TTL_TICKS",
     "Tap",
     "Confirm",
     "Settle",

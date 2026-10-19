@@ -7,9 +7,10 @@
 """
 import pytest
 
-from ai import planner, tasks as T
-from ai.blackboard import Blackboard, StuckScratch
-from ai.recipes import RecipeBook
+from ai.core import planner
+from ai import tasks as T
+from ai.state.blackboard import Blackboard, StuckScratch
+from ai.query.recipes import RecipeBook
 from tests.test_eta import RECIPES, STATIONS, order, plate, world
 
 
@@ -70,16 +71,18 @@ def test_prep_allowed_before_the_clock_starts():
 
 # ---------- 终局否决 ----------
 
-def test_prep_vetoed_when_no_time_to_finish():
-    """剩 8 秒还去取料：这一单无论如何变不成送达。"""
-    w = _w(orders=[order("1", "Sushi_Cucumber", 100.0)], plates=[plate("p1")],
-           time_left=8)
-    bb, book = _bb(), RecipeBook(w.recipes, w.stations)
-    cand = planner.Candidate(T.FetchToPlate("1", ("p1",), "Seaweed"), [], 10)
-    ok, veto = planner._feasibility_of(cand, planner._make_context(w, bb, book),
-                                       bb, time_left=planner._time_left_ticks(w))
-    assert ok is False
-    assert veto == "endgame"
+# 终局否决已临时禁用（见 ai/planner.py `_feasibility_of`），恢复时把下面这个
+# 用例一起取消注释。
+# def test_prep_vetoed_when_no_time_to_finish():
+#     """剩 8 秒还去取料：这一单无论如何变不成送达。"""
+#     w = _w(orders=[order("1", "Sushi_Cucumber", 100.0)], plates=[plate("p1")],
+#            time_left=8)
+#     bb, book = _bb(), RecipeBook(w.recipes, w.stations)
+#     cand = planner.Candidate(T.FetchToPlate("1", ("p1",), "Seaweed"), [], 10)
+#     ok, veto = planner._feasibility_of(cand, planner._make_context(w, bb, book),
+#                                        bb, time_left=planner._time_left_ticks(w))
+#     assert ok is False
+#     assert veto == "endgame"
 
 
 def test_delivery_still_allowed_at_endgame():
@@ -122,7 +125,7 @@ def test_firefighting_is_never_endgame_vetoed():
     否决对它天然不生效。这条断言把这个性质钉住——真实帧 108 个着火采样点
     全部仍能发出 Extinguish。
     """
-    from ai.world import World
+    from ai.state.world import World
     st = {
         "orders": [], "stations": list(STATIONS), "recipes": list(RECIPES),
         "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
@@ -141,18 +144,20 @@ def test_firefighting_is_never_endgame_vetoed():
     assert "endgame" not in vetoes
 
 
-def test_housekeeping_vetoed_at_endgame():
-    """洗盘/填灶这类纯投资在终局也该停——它们的产出来不及兑现。"""
-    w = _w(orders=[order("1", "Sushi_Cucumber", 100.0)], plates=[], time_left=6)
-    bb, book = _bb(), RecipeBook(w.recipes, w.stations)
-    for task in (T.WashPlate(resources=("sink",)),
-                 T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice"),
-                 T.Prefetch(item="Seaweed")):
-        cand = planner.Candidate(task, [], 10)
-        ok, veto = planner._feasibility_of(
-            cand, planner._make_context(w, bb, book), bb,
-            time_left=planner._time_left_ticks(w))
-        assert veto == "endgame", (task.TYPE, veto)
+# 终局否决已临时禁用（见 ai/planner.py `_feasibility_of`），恢复时把下面这个
+# 用例一起取消注释。
+# def test_housekeeping_vetoed_at_endgame():
+#     """洗盘/填灶这类纯投资在终局也该停——它们的产出来不及兑现。"""
+#     w = _w(orders=[order("1", "Sushi_Cucumber", 100.0)], plates=[], time_left=6)
+#     bb, book = _bb(), RecipeBook(w.recipes, w.stations)
+#     for task in (T.WashPlate(resources=("sink",)),
+#                  T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice"),
+#                  T.Prefetch(item="Seaweed")):
+#         cand = planner.Candidate(task, [], 10)
+#         ok, veto = planner._feasibility_of(
+#             cand, planner._make_context(w, bb, book), bb,
+#             time_left=planner._time_left_ticks(w))
+#         assert veto == "endgame", (task.TYPE, veto)
 
 
 # ---------- Prefetch 的 slack 约束（4.2）----------

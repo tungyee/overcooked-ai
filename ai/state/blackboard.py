@@ -12,6 +12,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ai.dialog.schema import DialogState, Preference
+
 DEFAULT_TTL = 100          # 拍。20 Hz 下约 5 秒
 WAIT_GIVEUP_TICKS = 60     # 等待超时让出（spec §4.3 规则 2）
 
@@ -119,6 +121,16 @@ class Blackboard:
     # 200 拍是不对称的，一次抖动就能把候选打翻（见 planner 的常数注释）。
     doom_streak: Dict[Any, int] = field(default_factory=dict)
 
+    # ---------- 对话层（spec §4.5–4.7）----------
+    # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。
+    preferences: List[Preference] = field(default_factory=list)
+    # 玩家「别管这单」：order id → 失效拍号（spec §4.6）。
+    abandoned_orders: Dict[Any, int] = field(default_factory=dict)
+    # 对话跨回合状态（最近回合、待播报事件等，spec §6.2）。
+    dialog: DialogState = field(default_factory=DialogState)
+    # 截止闸上一次抢单后的冷却结束拍（spec §4.6）。
+    rescue_cooldown_until: int = 0
+
     # ---------- 认领 ----------
     def claim(self, resource_id, action, owner, order_id, tick,
               ttl=DEFAULT_TTL, contents_expected=None, item=None):
@@ -198,3 +210,18 @@ class Blackboard:
             if oid == order_id:
                 return tick - since
         return None
+
+
+def prune_expired_preferences(bb, current_tick):
+    # type: (Blackboard, int) -> int
+    """删除已到期的偏好，返回删除数（spec §4.7：每拍扫一遍）。
+
+    `expires_tick == 0` 表示永久（角色分工活到关卡结束）；非零时
+    `current_tick >= expires_tick` 即失效，与 planner 的过期判断同界。
+    原列表原地修改，调用方已持有的引用不会失效。
+    """
+    kept = [p for p in bb.preferences
+            if not p.expires_tick or p.expires_tick > current_tick]
+    removed = len(bb.preferences) - len(kept)
+    bb.preferences[:] = kept
+    return removed

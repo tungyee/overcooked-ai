@@ -188,6 +188,13 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         # 「振荡」就是这个——候选里的 chosen 在跳，实际一直跑同一棵树，
         # 不记这一项复盘必读反。
         "chosen": record.get("chosen"),
+        # 对话分支（spec §6.4）：{task key: 生料名}。认领复盘的第一步；
+        # `rescue_override` 是截止闸抢回的订单 id（没抢单时缺省）。
+        "branches": record.get("branches") or {},
+        "rescue_override": record.get("rescue_override"),
+        # 对话层本拍做的事：命令/ack、事件、偏好条数（spec §6.3 第 5 条）。
+        # 没有对话 worker 时是空 dict，复盘能直接看出语音是否接入。
+        "dialog": record.get("dialog") or {},
         "commit": _format_commitment(commit),
         "exec": exec_state,
         "keys": keys,

@@ -87,12 +87,19 @@ def _recipe(r):
     """配方只留排查会用到的字段（配方本身是静态大表，全量太吵）。"""
     if not isinstance(r, dict):
         return {}
-    return {
+    out = {
         "name": r.get("name"),
         "comp": r.get("comp"),
         "cook": r.get("cook"),
         "plate": r.get("plate"),
     }
+    # 切配跟着食材走（插件 0.19+ 随配方下发）：回放从 trace 重建 RecipeBook
+    # 时少了它，传送带供料、无箱子的食材会被当成不用切。旧帧没有就不写，
+    # 让 RecipeBook 照旧退回箱子。
+    for key in ("chop", "chop_stages"):
+        if key in r:
+            out[key] = r.get(key)
+    return out
 
 
 def _raw_grid(world):

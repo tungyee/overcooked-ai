@@ -5,7 +5,7 @@
 ## 1. 技术栈与运行架构
 
 - **语言/运行时**：Python 3.9.6（macOS 系统 Python）。无打包、无构建步骤，`ai/` 是纯库，通过 `pytest.ini` 的 `pythonpath = .` 直接 import。
-- **依赖**：运行时除标准库外只有 **`Quartz`（pyobjc）**，且仅在 `ai/output/controller.py`（真实按键注入）用到；决策逻辑完全不依赖第三方库。开发依赖仅 `pytest==7.4.4`（见 `requirements-dev.txt`）。没有 `pyproject.toml` / `setup.py` / `package.json`。
+- **依赖**：运行时除标准库外只有 **`Quartz`（pyobjc）**，且仅在 `ai/output/controller.py`（真实按键注入）用到；决策逻辑完全不依赖第三方库。开发依赖仅 `pytest==7.4.4`（见 `requirements-dev.txt`）。语音对话为可选链路，额外依赖见 `requirements-voice.txt`（`sounddevice` / `numpy` / `websockets` / `requests`），只在启用语音时延迟加载。没有 `pyproject.toml` / `setup.py` / `package.json`。
 - **数据链路**：C# BepInEx 插件（`plugin/Oc2AIPlugin.cs`）5 Hz 推 NDJSON → `ai/state/world.py` 的 `StateClient` 按 `\n` 分帧 → `World` 解析快照。
 - **控制链路**：`ai/output/hands.py`（按键状态层）→ 注入的 controller。正式运行时是 `ai/output/controller.py`（CGEvent，需 macOS「辅助功能」权限）；测试/离线时用 `NullController`（`ai/agent.py` 内定义）或测试里注入的假 controller。
 - **频率约定（关键，容易混淆）**：插件推送 **5 Hz**；Python 主循环 **20 Hz**（`TICK_INTERVAL = 0.05`）。代码里「拍」（tick）统一指 **Python 循环拍 = 50 ms**，所有按拍计的阈值都按 20 Hz 理解。实现上主循环用 `StateClient.read_latest()` **非阻塞读**、中间 4 拍复用最新帧重 tick——不能用阻塞的 `read()`，否则会被 5 Hz 推帧拖成 5 Hz（曾踩坑）。
@@ -26,6 +26,7 @@
 | `revenue/` 收益 | `economy.py` 小费/连击 · `eta.py` 订单 ETA/slack/必死 · `cook_supply.py` 熟料供需（见下） |
 | `output/` 输出 | `hands.py` 按键唯一出口 · `key_scheduler.py` 按键定时松开 · `controller.py` CGEvent 注入（仅实机）· `trace.py` 决策日志 · `state_dump.py` 快照压成可序列化 dict |
 | `exec/` 执行/回放 | `bt.py` 行为树引擎（有记忆的 Sequence/Selector + RepeatUntil/Guard）· `record.py`/`replay.py` 录帧回放 |
+| `dialog/` 对话（可选） | `schema.py` 偏好/命令/`VoiceConfig`/LLM JSON 校验 · `policy.py` 主动开口/限频/紧急模板 · `worker.py` 后台 daemon：PTT/VAD→ASR→LLM→TTS · `audio.py` 采集/播放/RMS VAD · `ptt.py` 全局按键 PTT（Quartz event tap）· `asr.py`/`tts.py`/`llm.py` 云客户端 · `env.py` `.env` 加载 |
 
 ## 3. 核心架构
 
@@ -63,3 +64,12 @@ World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
 2. combo 递增 ⟺ 被记账的那单是「`id` 数值最小」者（57/0；对比假设「remaining 最小」只有 43/14 —— 两者分歧是因为订单过期后 id 会被复用）。
 
 **推论：AI 的杠杆是「选哪种菜」，不是「选哪一单」。** `DeliverPlate(order#X)` 里的 X 对 combo 毫无影响，所以送餐的紧迫度/新鲜度/完成度统一按 `_credited_order_id` 求值。又因为实机「料齐的盘」几乎从不同时有两张（本局 0 盘 4279 拍、1 盘 298 拍），送餐那一刻没有分叉，combo 偏好必须传导到**备菜**才有用（`COMBO_PREP_DISCOUNT`）。
+
+### 3.2 对话层线程边界（spec §6.2）
+
+- 主循环固定 **20 Hz**，仍是唯一碰 `World` / `Blackboard` 的地方；每 10 拍（**2 Hz**）把压缩后的上下文 `publish_context()` 给 worker，新快照覆盖旧快照。
+- `DialogWorker` 跑独立 **daemon 线程**（内部可用 asyncio），只消费 context / 事件、产出 `DialogCommand` + ack；**不读 World、不写 Blackboard**。
+- 输入切句支持两种模式：默认 RMS VAD（自适应噪声底）；设置 `OC2_VOICE_PTT_KEY` 后改用全局按键 PTT（`ai/dialog/ptt.py` 的 Quartz listen-only event tap），按住录音、松开发送，一次按住只触发一轮对话。PTT 监听失败会记录 `worker_error where=ptt` 并退回 VAD。
+- 命令回到主循环做权威校验后才写 `bb.preferences` / 硬否决；worker 等到 ack 再决定播不播 LLM 的回复（`rejected` 静默）。
+- 主循环用非阻塞队列与服务衔接，语音网络抖动或播放阻塞不会把 20 Hz 拖慢；关闭顺序是 Agent → worker → 游戏。
+- 语音整个链路可缺席：缺 key（无 `--voice`）时 `voice=None`，主循环没有 worker，行为与纯按键版一致。

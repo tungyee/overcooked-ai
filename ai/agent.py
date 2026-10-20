@@ -5,10 +5,17 @@
 与 oc/ai/agent.py 的差异：旧实现 1180 行 God Object，新实现 ~180 行装配层。
 Spec: §8.1 主循环
 """
+import logging
+import queue
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from ai import tasks as T
 from ai.core import arbiter, executor, planner
+from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
+                              node_key, tool_schemas)
+from ai.dialog.schema import DialogState, preference_matches_task
+from ai.revenue import eta as ETA
 from ai.space import navigation, reachability
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
@@ -18,8 +25,11 @@ from ai.output.hands import Hands
 from ai.primitives.stuck import ABANDON_TTL_TICKS, note_motion_failure
 from ai.core.recovery import FailureHistory, abandon_actions, waiting_reason
 from ai.primitives.motion import FRAME_MAX_AGE
+from ai.query import recipe_graph
 from ai.query.recipes import RecipeBook
 from ai.state.world import StateClient, World
+
+log = logging.getLogger(__name__)
 
 # 主循环周期（秒）= 50 ms，即 20 Hz。全项目代码里的"拍"（tick）统一指
 # **本循环拍**：所有按拍计的阈值（task 超时、按键冷却、卡住判定等）都按
@@ -29,7 +39,6 @@ TICK_INTERVAL = 0.05
 # L3 兜底：同一物理操作在 TTL 内失败满 N 次，对其认领动作短暂退避。
 # 按操作独立累计，切换任务/订单不能清零；不同动作不会互相拉黑。
 ABANDON_FAIL_STREAK = 3
-
 
 def _timer_expired(timer):
     # type: (Any) -> bool
@@ -61,6 +70,20 @@ def _p1_record(p1_model):
     }
 
 
+def _seconds(ticks):
+    # type: (Any) -> Optional[float]
+    """拍 → 秒（20 Hz），保留 1 位小数；None/非数值保持 None。
+
+    对话上下文统一用秒，避免 LLM 把 ETA/slack 的拍数当成秒（差 20 倍）。
+    """
+    if ticks is None:
+        return None
+    try:
+        return round(float(ticks) / planner.TICKS_PER_SECOND, 1)
+    except (TypeError, ValueError):
+        return None
+
+
 def _claims_binding(bb):
     # type: (Any) -> Dict
     """认领绑定：{资源:动作} → 归属者 / 订单 / 已持有拍数，供 trace 排查。"""
@@ -75,6 +98,139 @@ def _claims_binding(bb):
     return out
 
 
+def _task_desc(task_type):
+    # type: (str) -> str
+    """task 类型 → 一句话说明（task 类的 DESC）；未注册返回空串。"""
+    return getattr(T.TASK_TYPES.get(task_type), "DESC", "") or ""
+
+
+def _build_task_meta():
+    # type: () -> Dict[str, TaskMeta]
+    """从 `T.TASK_TYPES` 汇总账本用的 task 元数据；救援类口径取 planner 的。"""
+    out = {}
+    for name, cls in T.TASK_TYPES.items():
+        out[name] = TaskMeta(
+            desc=getattr(cls, "DESC", "") or "",
+            label=getattr(cls, "LABEL", "") or "",
+            process=getattr(cls, "PROCESS", "") or "",
+            shared=bool(getattr(cls, "SHARED", False)),
+            station=getattr(cls, "STATION", None),
+            rescue=planner._is_rescue_action(cls),
+        )
+    return out
+
+
+_TASK_META = _build_task_meta()
+
+
+def _task_text(task, with_order=True):
+    # type: (Any, bool) -> Optional[str]
+    """task → DAG 节点 key（`Chop:Cucumber` / `WashPlate`），给 LLM 看。"""
+    if task is None:
+        return None
+    task_type = getattr(task, "TYPE", None)
+    item = getattr(task, "item", None)
+    if getattr(T.TASK_TYPES.get(task_type), "SHARED", False) or not item:
+        text = str(task_type)
+    else:
+        text = node_key(task_type, item)
+    order_id = getattr(task, "order_id", None)
+    if not with_order or order_id is None:
+        return text
+    return text + "（订单 #%s）" % (order_id,)
+
+
+def _token_text(token):
+    # type: (str) -> str
+    """盘内 token（plate_tokens 口径）→ 可读名：`cooked:sushirice:pot` → `SushiRice(煮熟)`。"""
+    if token.startswith("cooked:"):
+        parts = token.split(":")
+        raw = parts[1] if len(parts) > 1 else "?"
+        return "%s(熟)" % (raw,)
+    return token
+
+
+def _cooker_text(index, cooker):
+    # type: (int, Dict) -> Dict
+    """灶的一行描述：锅里有什么、煮到哪、是否快糊。灶按出现顺序编号。"""
+    contents = [str(c) for c in cooker.get("pot_contents") or ()]
+    if cooker.get("onFire"):
+        state = "着火了"
+    elif cooker.get("burning"):
+        state = "快糊了"
+    elif cooker.get("cooked"):
+        state = "已熟"
+    elif cooker.get("isCooking"):
+        prog, total = cooker.get("cooking_progress"), cooker.get("cooking_time")
+        try:
+            state = "在煮，%d%%" % (int(100 * float(prog) / float(total)),)
+        except (TypeError, ValueError, ZeroDivisionError):
+            state = "在煮"
+    elif contents:
+        state = "有料未开火"
+    else:
+        state = "空"
+    text = state
+    if contents:
+        text = "%s；锅里 %s" % (state, "、".join(contents))
+    return {"name": "%d 号灶" % (index,), "text": text}
+
+
+def _plates_text(world, book):
+    # type: (World, Any) -> str
+    """盘子概况：空盘数、装了料的盘各装了什么（token 归一后可读）。"""
+    empty, filled = 0, []
+    for plate in getattr(world, "plates", None) or ():
+        try:
+            tokens = sorted(book.plate_tokens(plate)) if book is not None \
+                else [str(c).lower() for c in plate.get("contents") or ()]
+        except Exception:                       # noqa: BLE001
+            tokens = []
+        if tokens:
+            filled.append("[" + "、".join(_token_text(t) for t in tokens) + "]")
+        else:
+            empty += 1
+    parts = ["空盘 %d 个" % (empty,)]
+    if filled:
+        parts.append("装了料的盘 " + " ".join(filled))
+    return "；".join(parts)
+
+
+def _duty_tools(kitchen, ledger):
+    # type: (Kitchen, Ledger) -> List[dict]
+    return tool_schemas(kitchen.targets(), ledger.ids())
+
+
+def _option_text(task):
+    # type: (Any) -> str
+    """「接下来可做的」一项：节点 + 一句话说明。"""
+    text = _task_text(task)
+    desc = _task_desc(getattr(task, "TYPE", None))
+    return "%s（%s）" % (text, desc) if desc else text
+
+
+def _ranked_tasks(plan_record):
+    # type: (Dict) -> List[Any]
+    """decision_record → 可行候选按分数降序的 task 列表。"""
+    rows = []
+    for row in (plan_record or {}).get("candidates") or ():
+        try:
+            task, score, ok = row[0], row[1], row[3]
+        except (TypeError, IndexError):
+            continue
+        if ok and score is not None:
+            rows.append((score, task))
+    rows.sort(key=lambda r: -float(r[0]))
+    out, seen = [], set()
+    for _score, task in rows:
+        text = _task_text(task)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(task)
+    return out
+
+
 class NullController:
     """默认 controller（仅用于测试）。"""
     def tap(self, name, hold=0.12): pass
@@ -86,8 +242,8 @@ class NullController:
 class Agent:
     """AI 主循环：13 步装配。"""
 
-    def __init__(self, ctrl=None):
-        # type: (Optional[Any]) -> None
+    def __init__(self, ctrl=None, voice=None, dialog_worker=None):
+        # type: (Optional[Any], Optional[Any], Optional[Any]) -> None
         self.client = StateClient()
         self.bb = Blackboard()
         self.executor_inst = executor.Executor()
@@ -108,11 +264,42 @@ class Agent:
         self._balloon_moving = False
         self._balloon_frame_seq = None
 
+        # ---------- 对话层（spec §6.2–6.4）----------
+        # dialog_worker 注入优先（测试）；否则有 voice 时自己建队列与 worker。
+        self.dialog_worker = dialog_worker
+        self.cmd_q = getattr(dialog_worker, "cmd_q", None)
+        self.ack_q = getattr(dialog_worker, "ack_q", None)
+        self.ctx_q = getattr(dialog_worker, "ctx_q", None)
+        self.event_q = getattr(dialog_worker, "event_q", None)
+        if dialog_worker is None and voice is not None:
+            self.cmd_q = queue.Queue()
+            self.ack_q = queue.Queue()
+            self.ctx_q = queue.Queue(maxsize=1)
+            self.event_q = queue.Queue(maxsize=1)
+            # 延迟导入：离线运行不加载音频/网络客户端。
+            from ai.dialog.worker import DialogWorker
+            self.dialog_worker = DialogWorker(
+                voice, self.cmd_q, self.ack_q, self.ctx_q, self.event_q)
+        elif dialog_worker is not None:
+            # 注入的 worker 若没暴露队列，补一套空队列，保证 service 不炸。
+            self.cmd_q = self.cmd_q or queue.Queue()
+            self.ack_q = self.ack_q or queue.Queue()
+            self.ctx_q = self.ctx_q or queue.Queue(maxsize=1)
+            self.event_q = self.event_q or queue.Queue(maxsize=1)
+
+        self._dialog_level = None      # 上一次观察到的关卡名；换关清账本
+        self._seen_orders = {}         # 本关见过的菜 → 首张订单（新菜只说一次）
+        self._last_ranked = []         # 上一拍 planner 打分前几名（给 LLM 看）
+        # 分工账本：`bb.preferences` 只由它编译（ai/dialog/duties.py）。
+        self.ledger = Ledger()
+
     def run(self, max_seconds=None, stop_requested=None):
         """主循环入口（20 Hz）。插件 5 Hz 推帧，中间 4 拍复用最新帧重 tick。"""
         latest = None  # type: Optional[Any]
         end_at = time.monotonic() + max_seconds if max_seconds is not None else None
         try:
+            if self.dialog_worker is not None:
+                self.dialog_worker.start()
             while (end_at is None or time.monotonic() < end_at) and not (stop_requested and stop_requested()):
                 started = time.monotonic()
                 self.hands.service(started)
@@ -134,11 +321,302 @@ class Agent:
         finally:
             # 断线、读帧错误与意外异常均要释放持续方向键。
             self.hands.release_all()
+            if self.dialog_worker is not None:
+                self.dialog_worker.stop()
+
+    # ------------------------------------------------------------ 分工账本
+
+    def _kitchen(self, world):
+        # type: (World) -> Kitchen
+        """本关配方 DAG。
+
+        菜按**本关首次出现的顺序**编（`_seen_orders` 是有序 dict），再补上
+        当前订单里还没记账的菜：订单轮换不改变 DAG 文本，头部 system 消息
+        稳定，方舟上下文缓存才能命中。
+        """
+        book = self.book or RecipeBook(world.recipes, world.stations)
+        orders = list(self._seen_orders.values())
+        known = {o.get("dish") for o in orders}
+        orders += [o for o in world.orders or () if o.get("dish") not in known]
+        return Kitchen.from_orders(
+            book, orders, recipe_graph._compile_node, _TASK_META,
+            {st.get("t") for st in world.stations or () if st.get("t")})
+
+    def _apply_duty_batch(self, world, batch):
+        # type: (World, Any) -> List[Dict]
+        """一轮 LLM 工具调用 → 逐条落账本，返回给 LLM 的结果。"""
+        kitchen = self._kitchen(world)
+        tick = self.bb.tick or 0
+        results = []  # type: List[Dict]
+        for name, args in getattr(batch, "calls", None) or ():
+            if args is None:
+                results.append({"ok": False, "reason": "参数不是合法 JSON"})
+                continue
+            if name == "update_duties":
+                result = self.ledger.apply(args, kitchen, tick,
+                                           source=getattr(batch, "source", ""))
+            else:
+                result = {"ok": False, "reason": "未知工具：%s" % (name,)}
+            results.append(result)
+        self._sync_duty_preferences()
+        return results
+
+    def _sync_duty_preferences(self):
+        # type: () -> None
+        """账本是唯一事实来源：重编 `bb.preferences`，并让新约定立刻作用到承诺。
+
+        新的 leave_to_p1 / stop 命中 P2 当前承诺 → 清承诺（救援动作豁免，
+        与 planner `_clear_claimed_commitment` 同口径）。
+        """
+        prefs = self.ledger.preferences()
+        self.bb.preferences[:] = prefs
+        commitment = self.bb.commitment
+        active = getattr(commitment, "active_task", None) if commitment else None
+        # 救援动作不清承诺：与 planner `_clear_claimed_commitment` 同一口径。
+        if active is None or planner._is_rescue_action(active):
+            return
+        if planner._rescue_hold_live(self.bb, active):
+            return
+        for pref in prefs:
+            if pref.kind in ("claim", "stop") and \
+                    preference_matches_task(pref, active):
+                commitment.active_task = None
+                commitment.infeasible_streak = 0
+                return
+
+    def _dialog_matches(self, world, book):
+        # type: (World, RecipeBook) -> Tuple[list, Dict, Dict]
+        """与 planner.plan 同口径的盘/灶 1:1 匹配（spec §6.4）。"""
+        live_orders = planner._dialog_live_orders(world, self.bb)
+        plate_match = planner._match_plates_to_orders(
+            world, self.bb, book, orders=live_orders)
+        cooker_match = planner._match_cookers_to_orders(
+            world, self.bb, book, plate_match, orders=live_orders)
+        return live_orders, plate_match, cooker_match
+
+    def _maybe_reset_dialog_level(self, world):
+        # type: (World) -> None
+        """换关卡时清空账本与对话历史（spec §4.7 / §6.3）。
+
+        只看关卡名：暂停/菜单不清，玩家暂停一下回来，分工和聊天记录都还在。
+        首次观察只记账，不重置——启动晚于玩家进入关卡时不该把已说的话抹掉。
+        """
+        level = getattr(world, "level", None)
+        if level is None:
+            return
+        if self._dialog_level is None:
+            self._dialog_level = level
+            self._log_dialog_level_start(level)
+            return
+        if level == self._dialog_level:
+            return
+        self._dialog_level = level
+        self._log_dialog_level_start(level)
+        self.ledger.clear()
+        self.bb.preferences[:] = []
+        self.bb.dialog = DialogState()
+        self.bb.abandoned_orders = {}
+        self.bb.rescue_cooldown_until = 0
+        self._seen_orders = {}
+        # 上一关遗留的批次和 ack 必须丢掉：它们代表旧 World 上的决定。
+        self._drain_dialog_queues()
+        reset = getattr(self.dialog_worker, "reset_state", None)
+        if callable(reset):
+            reset()
+
+    def _log_dialog_level_start(self, level):
+        # type: (Any) -> None
+        """把关卡开始时间写进对话日志，供 since_level_ms 打点。"""
+        log_event = getattr(self.dialog_worker, "log_event", None)
+        if not callable(log_event):
+            return
+        try:
+            log_event("level_start", level=level)
+        except Exception:                       # noqa: BLE001
+            # 打点失败不能影响主循环。
+            log.debug("写 level_start 打点失败", exc_info=True)
+
+    def _drain_dialog_queues(self):
+        # type: () -> None
+        """丢弃命令/ack 队列里的旧世代消息（主循环线程调用）。"""
+        for q in (self.cmd_q, self.ack_q):
+            if q is None:
+                continue
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _service_dialog(self, world):
+        # type: (World) -> Dict
+        """每拍对话服务：工具批次落地、到期、事件、上下文（spec §6.3）。
+
+        必须在 `self.book` 重建、`bb.tick` 推进之后、arbiter/planner 之前
+        调用：账本先编成偏好，本拍规划才能看见。返回本拍的 trace 摘要。
+        """
+        record = {"batches": [], "event": None, "duties": []}
+        if self.dialog_worker is None:
+            return record
+
+        self._maybe_reset_dialog_level(world)
+        events = []  # type: list
+        tick = self.bb.tick or 0
+
+        # ② drain 工具批次 → 账本落地 → 逐条结果回 worker
+        while True:
+            try:
+                batch = self.cmd_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                results = self._apply_duty_batch(world, batch)
+            except Exception as exc:            # noqa: BLE001
+                # 单个坏批次不能打断 20 Hz 主循环。
+                log.exception("落地工具批次失败")
+                results = [{"ok": False, "reason": "主循环出错：%s" % (exc,)}
+                           for _ in getattr(batch, "calls", None) or ()]
+            record["batches"].append({
+                "id": getattr(batch, "batch_id", None),
+                "calls": getattr(batch, "calls", None), "results": results})
+            self._put_ack({
+                "batch_id": getattr(batch, "batch_id", None),
+                "results": results,
+                "duties": self._duty_rows(world, None, tick),
+            })
+
+        # ③ 到期：stop 30 秒解除；放弃订单 60 秒恢复。
+        if self.ledger.prune(tick):
+            self._sync_duty_preferences()
+        self.bb.abandoned_orders = {
+            oid: expiry for oid, expiry in self.bb.abandoned_orders.items()
+            if expiry > tick
+        }
+
+        # ④ 新菜谱事件：每种菜一局只说一次（开局第一批也算，spec §5.1）。
+        new_ids = []
+        for order in world.orders:
+            order_id, dish = order.get("id"), order.get("dish")
+            if order_id is None or not dish:
+                continue
+            if dish not in self._seen_orders:
+                self._seen_orders[dish] = dict(order)
+                new_ids.append(order_id)
+        if new_ids:
+            event = ("new_order", new_ids)
+            self._put_event(event)
+            events.append(event)
+
+        # ⑥ 2 Hz 上下文（20 Hz 主循环 / 10 拍）；有事件时立刻发一份，
+        # 让 worker 处理事件时看到的是本拍状态。
+        if self.tick % 10 == 0 or events or record["batches"]:
+            publish = getattr(self.dialog_worker, "publish_context", None)
+            if callable(publish):
+                try:
+                    publish(self._build_dialog_context(world))
+                except Exception:               # noqa: BLE001
+                    # 上下文是增强信息；构造失败不该打断主循环，但必须留痕。
+                    log.exception("构造对话上下文失败")
+
+        if events:
+            record["event"] = events[-1] if len(events) == 1 else events
+        record["duties"] = self.ledger.snapshot(tick)
+        return record
+
+    def _put_ack(self, ack):
+        # type: (Any) -> None
+        if self.ack_q is None:
+            return
+        try:
+            self.ack_q.put_nowait(ack)
+        except queue.Full:
+            pass
+
+    def _put_event(self, event):
+        # type: (Any) -> None
+        put = getattr(self.dialog_worker, "put_event", None)
+        if callable(put):
+            put(event)
+            return
+        if self.event_q is None:
+            return
+        try:
+            self.event_q.put_nowait(event)
+        except queue.Full:
+            try:
+                self.event_q.get_nowait()
+                self.event_q.put_nowait(event)
+            except queue.Empty:
+                pass
+
+    def _build_dialog_context(self, world):
+        # type: (World) -> Dict
+        """给 LLM 的只读快照：事实，不是建议（时间一律秒）。"""
+        tick = self.bb.tick or 0
+        book = self.book or RecipeBook(world.recipes, world.stations)
+        kitchen = self._kitchen(world)
+        active = (self.bb.commitment.active_task
+                  if self.bb.commitment else None)
+        p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
+
+        live_orders = planner._dialog_live_orders(world, self.bb)
+        plate_match, cooker_match = {}, {}
+        try:
+            live_orders, plate_match, cooker_match = self._dialog_matches(
+                world, book)
+        except Exception:                       # noqa: BLE001
+            log.exception("对话上下文：盘/灶匹配失败")
+        rows = {}
+        try:
+            rows = {row.order_id: row for row in ETA.order_queue(
+                world, book, plate_match, cooker_match, orders=live_orders)}
+        except Exception:                       # noqa: BLE001
+            log.exception("对话上下文：ETA 计算失败")
+        orders = [{
+            "id": order.get("id"),
+            "dish": order.get("dish"),
+            "remaining": order.get("remaining"),
+            "eta": _seconds(getattr(rows.get(order.get("id")), "eta", None)),
+        } for order in live_orders]
+        # P2 接下来可做的：planner 最近一拍的打分前几名（节点 + 说明）。
+        options = [_option_text(task) for task in self._last_ranked[:6]]
+
+        tools = _duty_tools(kitchen, self.ledger)
+        return {
+            "level": getattr(world, "level", None),
+            "tick": tick,
+            "time_left": _seconds(planner._time_left_ticks(world)),
+            "score": ((getattr(world, "raw", None) or {}).get("score") or {}
+                      ).get("base"),
+            "orders": orders,
+            "cookers": [_cooker_text(i, c) for i, c
+                        in enumerate(world.cookers or (), 1)],
+            "plates": _plates_text(world, book),
+            "p1": {"holding": P.held_name(p1_chef) or None},
+            "p2": {
+                "doing": _task_text(active) if active is not None else None,
+            },
+            "p2_options": options,
+            "duties": self._duty_rows(world, kitchen, tick),
+            "dag": kitchen.render(),
+            "dish_dags": {dish: kitchen.render([dish], shared=False)
+                          for dish in kitchen.dags},
+            "tools": tools,
+        }
+
+    def _duty_rows(self, world, kitchen, tick):
+        # type: (World, Optional[Kitchen], int) -> List[Dict]
+        """账本快照，供 LLM 看到当前分工。"""
+        return self.ledger.snapshot(tick)
 
     def _tick_once(self, world):
         # type: (World) -> None
         """执行一拍的 13 步主循环。"""
         self._observe_scene(world)
+        # 关卡/阶段切换要在生命周期守卫之前观察：暂停/菜单也是新世代，
+        # 必须清掉上一局的对话状态与排队命令（spec §4.7 / §6.3）。
+        if self.dialog_worker is not None:
+            self._maybe_reset_dialog_level(world)
         # 生命周期守卫（spec §8.1）：暂停 / 非关卡 → 松键、不做任何决策。
         stale = (self._frame_received_at is not None and
                  time.monotonic() - self._frame_received_at > FRAME_MAX_AGE)
@@ -178,6 +656,9 @@ class Agent:
         # 污染整局：若那帧 crate 的 chop 还没带上，needs_chopping 恒为
         # False，AI 会以为"鱼/黄瓜不用切"，拿生料直接去装盘（实机复现过）。
         self.book = RecipeBook(world.recipes, world.stations)
+
+        # 对话服务：命令先落偏好/硬否决，本拍规划立刻可见（spec §6.3）。
+        dialog_record = self._service_dialog(world)
 
         # 拍号推进：Tap 冷却按拍计（hands 内部状态）
         self.hands.tick()
@@ -253,10 +734,14 @@ class Agent:
             claims_new = {}
             plan_record = {"candidates": []}
 
+        # 给 LLM 看的「接下来可做的」：本拍可行候选按分数排序。
+        self._last_ranked = _ranked_tasks(plan_record)
+
         record = {
             "mode_reason": mode_reason,
             "p1": _p1_record(self.bb.p1_model),
             "candidates": plan_record.get("candidates", []),
+            "dialog": dialog_record,
             "bindings": {
                 "plate_order": plan_record.get("plate_match", {}),
                 "cooker_order": plan_record.get("cooker_match", {}),
@@ -267,6 +752,10 @@ class Agent:
             # trace.emit 读到的恒为 None —— 实机 trace-20261015-165358 的
             # 3637 行里 top_layer 全是 null，只能靠逐候选 layer 反推 min()。
             "top_layer": plan_record.get("top_layer"),
+            # 对话分支与截止闸抢单（spec §6.4）：分支是认领复盘的第一步，
+            # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
+            "branches": plan_record.get("branches") or {},
+            "rescue_override": plan_record.get("rescue_override"),
             "chosen": str(planner_choice) if planner_choice is not None else None,
         }
 
@@ -366,6 +855,9 @@ class Agent:
             self.executor_inst.halt_and_discard()
             self.hands.release_all()
             self.bb = Blackboard()
+            # 黑板整体换新：账本是 bb.preferences 的唯一来源，必须一起清，
+            # 否则下一次同步会把上一局的约定编回新黑板。
+            self.ledger.clear()
             self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)
             self.book = None
             self._prev_balloon_box = None

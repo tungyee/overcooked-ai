@@ -1,10 +1,12 @@
 import pytest
 
+from ai.dialog.schema import Preference
 from ai.state.blackboard import (
     DEFAULT_TTL,
     Blackboard,
     FireScratch,
     StuckScratch,
+    prune_expired_preferences,
 )
 
 
@@ -161,3 +163,61 @@ def test_stuck_scratch_has_bad_pairs():
     assert s.bad_pairs == {}
     s.bad_pairs[(("GridManager", "counter_01"), (1, -4))] = 300
     assert len(s.bad_pairs) == 1
+
+
+# ---------- 对话层字段与偏好清理（spec §4.5–4.7）----------
+
+def test_blackboard_dialog_defaults():
+    bb = Blackboard()
+
+    assert bb.preferences == []
+    assert bb.abandoned_orders == {}
+    assert bb.dialog is not None
+    assert bb.rescue_cooldown_until == 0
+
+
+def test_blackboard_dialog_defaults_are_not_shared_between_instances():
+    a = Blackboard()
+    b = Blackboard()
+    a.preferences.append(Preference(kind="claim", scope=frozenset()))
+    a.abandoned_orders[1] = 120
+    a.dialog.history.append({"role": "user", "content": "x"})
+
+    assert b.preferences == []
+    assert b.abandoned_orders == {}
+    assert b.dialog.history == []
+
+
+def test_prune_expired_preferences():
+    bb = Blackboard()
+    bb.preferences = [
+        Preference(kind="claim", scope=frozenset(), expires_tick=80),
+        Preference(kind="claim", scope=frozenset(), expires_tick=120),
+    ]
+
+    assert prune_expired_preferences(bb, 110) == 1
+    assert [p.expires_tick for p in bb.preferences] == [120]
+
+
+def test_prune_expired_preferences_keeps_zero_and_boundary():
+    """expires_tick==0 表示永久；正好到期（tick == expires）即失效。"""
+    bb = Blackboard()
+    kept_zero = Preference(kind="claim", scope=frozenset(), expires_tick=0)
+    at_tick = Preference(kind="claim", scope=frozenset(), expires_tick=110)
+    before = Preference(kind="claim", scope=frozenset(), expires_tick=111)
+    earlier = Preference(kind="claim", scope=frozenset(), expires_tick=80)
+    bb.preferences = [kept_zero, at_tick, before, earlier]
+
+    removed = prune_expired_preferences(bb, 110)
+
+    assert removed == 2
+    assert bb.preferences == [kept_zero, before]
+
+
+def test_prune_expired_preferences_noop_when_none_expired():
+    bb = Blackboard()
+    keep = Preference(kind="claim", scope=frozenset(), expires_tick=0)
+    bb.preferences = [keep]
+
+    assert prune_expired_preferences(bb, 10**6) == 0
+    assert bb.preferences == [keep]

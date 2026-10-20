@@ -104,6 +104,9 @@ class FetchToPlate(Task):
     """
 
     TYPE = "FetchToPlate"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把这种料（需要切的取切好的）放进盘里"
+    LABEL = "装盘"
     HANDS = "empty"       # 要空手去拿料；手里有东西时打分加腾手代价（spec §6.1(b)）
 
     @property
@@ -190,6 +193,11 @@ class DeliverPlate(Task):
     """
 
     TYPE = "DeliverPlate"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把配齐的盘送到出餐口"
+    LABEL = "送餐"
+    # 不分菜的共享节点（ai/dialog/duties.py）。
+    SHARED = True
     HANDS = "empty"       # 要空手去端盘；手里有东西时打分加腾手代价（spec §6.1(b)）
 
     @property

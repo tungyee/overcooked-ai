@@ -136,3 +136,19 @@ def test_snapshot_map_includes_terrain_and_occupancy():
     assert snap["map"]["occupancy"] == [
         {"grid": "GridManager", "cells": [[0, 0], [1, 0]]},
     ]
+
+
+def test_snapshot_keeps_recipe_chop_fields():
+    """配方自带的切配信息要进 trace：回放从 trace 重建 RecipeBook 时，传送带
+    供料、无箱子的食材（1-6 的鱼）才不会被当成不用切。旧帧没有就不写。"""
+    from ai.output import state_dump
+    from ai.state.world import World
+    world = World({"phase": "level", "recipes": [
+        {"name": "SushiFish", "comp": [], "cook": "null",
+         "chop": "ChoppedSushiFish", "chop_stages": 8},
+        {"name": "Seaweed", "comp": [], "cook": "null"},
+    ]})
+    recipes = state_dump.snapshot(world)["recipes"]
+    assert recipes[0]["chop"] == "ChoppedSushiFish"
+    assert recipes[0]["chop_stages"] == 8
+    assert "chop" not in recipes[1]

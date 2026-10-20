@@ -25,6 +25,11 @@ namespace Oc2AI
         string _level;
         int _staticTries;
         int _droppedStates;
+        // chop 索引的单调缓存（食材名小写 → [切成什么, 几刀]）。Dynamic 关卡里
+        // 鱼/米/海苔开局后才刷出，一次性 BuildStatic 会漏掉；每帧把新扫到的
+        // 食材合并进来，一旦出现新键就让 recipes 重建。只增不减：食材类型一旦
+        // 见过就保留，不因实例被切掉/用掉而消失。
+        Dictionary<string, string[]> _chopIndexCache = new Dictionary<string, string[]>();
 
         // P2 的 WorkstationInteract(chop/投掷) 键按住时长监控：用于实测
         // 「按住是否影响投掷距离」。-1 = 未按住；>=0 = 当前按住起始的 unscaledTime。
@@ -916,6 +921,20 @@ namespace Oc2AI
         string BuildState()
         {
             if (_staticJson == null && IsInLevel()) BuildStatic();
+
+            // Dynamic 关卡食材开局后才刷出：每帧重扫 chop 索引，出现新食材就让
+            // 下一拍重建 recipes（_staticJson=null 触发）。缓存只增不减，见字段注释。
+            if (_staticJson != null && IsInLevel())
+            {
+                int before = _chopIndexCache.Count;
+                MergeChopIndex(_chopIndexCache, BuildChopIndex());
+                if (_chopIndexCache.Count > before)
+                {
+                    Logger.LogInfo("[CHOPIDX] new ingredients, rebuild recipes (cache="
+                        + _chopIndexCache.Count + ")");
+                    _staticJson = null;
+                }
+            }
 
             StringBuilder sb = new StringBuilder("{");
             sb.Append("\"plugin_version\":\"0.19.0\",\"protocol_version\":4,\"session_id\":").Append(Jstr(_sessionId))
@@ -2180,13 +2199,31 @@ namespace Oc2AI
                         if (l is IEnumerable && Count(l) > 0) { list = l; break; }
                     }
                 }
+                // 「要不要切」跟着食材走，不跟着箱子走（1-6 鱼只走传送带、无箱子）。
+                // 扫一遍全场景的食材 prefab，建 食材名(小写) → [切成什么, 几刀]，
+                // 导出配方时把 chop/chop_stages 写进叶子节点。索引用单调缓存：
+                // Dynamic 关卡食材开局后才刷出，每帧合并新料，这里读的是累计结果。
+                MergeChopIndex(_chopIndexCache, BuildChopIndex());
+                Dictionary<string, string[]> chopIndex = _chopIndexCache;
                 int ri = 0;
                 if (list is IEnumerable)
                 {
                     foreach (object node in (IEnumerable)list)
                     {
                         if (ri > 0) recipes.Append(',');
-                        recipes.Append("{\"name\":").Append(Jstr(ShortVal(node)))
+                        string nm = ShortVal(node);
+                        string chop = "null";
+                        string stages = "null";
+                        if (nm != null)
+                        {
+                            string[] ci;
+                            if (chopIndex.TryGetValue(nm.ToLowerInvariant(), out ci))
+                            {
+                                chop = ci[0];
+                                stages = ci[1];
+                            }
+                        }
+                        recipes.Append("{\"name\":").Append(Jstr(nm))
                             .Append(",\"t\":").Append(Jstr(node.GetType().Name))
                             .Append(",\"step\":").Append(Jstr(ShortVal(GetField(node, "m_platingStep"))))
                             .Append(",\"progress\":").Append(Jstr(ShortVal(GetField(node, "m_progress"))))
@@ -2194,6 +2231,8 @@ namespace Oc2AI
                             .Append(",\"cook\":").Append(Jstr(ShortVal(GetField(node, "m_cookingStep"))))
                             .Append(",\"plate\":").Append(Jstr(ShortVal(GetField(node, "m_platingPrefab"))))
                             .Append(",\"ing\":").Append(Jstr(ShortVal(GetField(node, "m_ingriedientOrderNode"))))
+                            .Append(",\"chop\":").Append(Jstr(chop))
+                            .Append(",\"chop_stages\":").Append(Jstr(stages))
                             .Append('}');
                         ri++;
                         if (ri >= 200) break;
@@ -2216,6 +2255,105 @@ namespace Oc2AI
             {
                 _staticJson = null;
                 Logger.LogWarning("[STATIC] error: " + e.Message);
+            }
+        }
+
+        // 食材名(小写) → [切成什么, 几刀]。
+        //
+        // 「要不要切」是食材 prefab 上 WorkableItem 的属性，跟箱子无关。旧实现只在
+        // 箱子(DispenserCrate)上读它，于是「只走传送带、没有箱子」的食材（1-6 的鱼）
+        // 会被当成不用切的料，planner 直接发 FetchToPlate。这里改成从三个来源收集，
+        // 与食材从哪来解耦：
+        //   ① PickupItemSpawner.m_itemPrefab —— 通用刷出器，传送带供料点也是它；
+        //   ② ServerIngredientContainer/IngredientContainer.m_contents —— 容器里的料；
+        //   ③ CarryableItem/TeleportableItem —— 场上散落/手持/传送带上的料。
+        // ①② 的 prefab 名干净，先扫；③ 的实例名可能带场景后缀，留作兜底补漏。
+        Dictionary<string, string[]> BuildChopIndex()
+        {
+            var index = new Dictionary<string, string[]>();
+            try
+            {
+                Type wt = FindType("WorkableItem");
+                if (wt == null) return index;
+                foreach (MonoBehaviour mb in _all)
+                {
+                    if (mb == null) continue;
+                    string tn = mb.GetType().Name;
+                    if (tn == "PickupItemSpawner")
+                    {
+                        AddChopFrom(index, wt, GetField(mb, "m_itemPrefab"));
+                    }
+                    else if (tn == "ServerIngredientContainer" || tn == "IngredientContainer")
+                    {
+                        object contents = GetField(mb, "m_contents");
+                        if (contents is IEnumerable)
+                        {
+                            foreach (object e in (IEnumerable)contents)
+                                AddChopFrom(index, wt, e);
+                        }
+                    }
+                }
+                foreach (MonoBehaviour mb in _all)
+                {
+                    if (mb == null) continue;
+                    string tn = mb.GetType().Name;
+                    if (tn.IndexOf("CarryableItem") >= 0 || tn.IndexOf("TeleportableItem") >= 0)
+                        AddChopFrom(index, wt, mb.gameObject);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[CHOPIDX] build error: " + e.Message);
+            }
+            return index;
+        }
+
+        // 把 fresh 里 cache 没有的键合并进去（只增不减）。见 _chopIndexCache 字段注释。
+        void MergeChopIndex(Dictionary<string, string[]> cache, Dictionary<string, string[]> fresh)
+        {
+            foreach (var kv in fresh)
+                if (!cache.ContainsKey(kv.Key)) cache[kv.Key] = kv.Value;
+        }
+
+        // 从一个食材 prefab/实例读 WorkableItem，把 name → [chop, stages] 记进 index。
+        // 已存在的键跳过（第一遍刷出器/容器的干净名优先）。chop 与 stages 都为 null
+        // 表示不可切，不记——查表 miss 走 null，效果相同。
+        void AddChopFrom(Dictionary<string, string[]> index, Type wt, object obj)
+        {
+            try
+            {
+                if (obj == null) return;
+                GameObject go = null;
+                if (obj is GameObject g) go = g;
+                else if (obj is Component c) go = c.gameObject;
+                if (go == null) return;
+                string name = go.name;
+                if (string.IsNullOrEmpty(name)) return;
+                string key = name.ToLowerInvariant();
+                if (index.ContainsKey(key)) return;
+                Component w = go.GetComponent(wt);
+                if (w == null)
+                {
+                    // 散落/传送带上的食材实例可能只挂 ServerWorkableItem（运行时切配状态），
+                    // 真正的切配数据 WorkableItem 由其 m_workable 字段引用。箱子那条路读
+                    // 的是 prefab(m_itemPrefab)/容器内容，直接有 WorkableItem，走不到这里。
+                    Type swt = FindType("ServerWorkableItem");
+                    if (swt == null) return;
+                    Component sw = go.GetComponent(swt);
+                    if (sw == null) return;
+                    w = GetField(sw, "m_workable") as Component;
+                    if (w == null) return;
+                }
+                object next = GetField(w, "m_nextPrefab");
+                object stages = GetField(w, "m_stages");
+                string chop = (next is UnityEngine.Object uo && uo != null) ? uo.name : "null";
+                string st = (stages == null ? "null" : stages.ToString());
+                if (chop == "null" && st == "null") return;
+                index[key] = new string[] { chop, st };
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[CHOPIDX] error on " + (obj != null ? obj.GetType().Name : "null") + ": " + e.Message);
             }
         }
 

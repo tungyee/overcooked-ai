@@ -161,17 +161,21 @@ TERM_WHITELIST = {
     L_FIRE: frozenset(),
     # L1/L2 只看锅：越接近糊越先救。只留一项 → 退化成纯词典序，最可预测。
     # 不含 completion_ratio——锅的时钟不管盘满不满（spec §7 定过）。
-    L_IRREVERSIBLE: frozenset(["pressure"]),
-    L_RESCUE: frozenset(["pressure"]),
+    # pref 是对话偏好（spec §4.5）。L1/L2 只给**正分**开口：负分在
+    # planner._matching_preferences 里已被免疫规则跳过，所以「我来煮」的
+    # 负 claim 不会把「饭要糊了」压下去，而「你去煮」的 direct 仍能生效。
+    L_IRREVERSIBLE: frozenset(["pressure", "pref"]),
+    L_RESCUE: frozenset(["pressure", "pref"]),
     # L3 兑现：送哪种菜。combo 是这层的主角（它只能选菜、不能选单，
     # 见 planner._credited_order_id 的 55/0 实测）。
-    L_REDEEM: frozenset(["freshness", "combo_head", "combo_break", "urgency"]),
+    L_REDEEM: frozenset(["freshness", "combo_head", "combo_break", "urgency",
+                         "pref"]),
     # L4 解卡：0 盘 > 无盘就位 > 1 盘
-    L_UNBLOCK: frozenset(["plate_pressure", "no_plate_placed"]),
+    L_UNBLOCK: frozenset(["plate_pressure", "no_plate_placed", "pref"]),
     # L5 空层（见 L_CAPACITY 常量处）。白名单保留原内容：层里没有候选，
     # 它永远不会被 filter_terms 用到；留着是为了「将来往这层放东西」时
     # 不必同时想起登记白名单（未登记的层会 raise）。
-    L_CAPACITY: frozenset(["cooker_idle", "eta"]),
+    L_CAPACITY: frozenset(["cooker_idle", "eta", "pref"]),
     # L6 备菜：现有大部分项都在这层。deadline_lookahead 是「锅烧糊前瞻」
     # （订单到期前瞻那支已删，见 AGENTS.md §10.1/§10.2 的双计算说明）。
     # pressure 只对 TakeCookedToPlate 非零（快熟阶段 pressure < 1.0 时它落
@@ -181,6 +185,9 @@ TERM_WHITELIST = {
         "urgency", "completion_ratio", "async_resource", "ingredient_reuse",
         "combo_head", "combo_break", "deadline_lookahead", "hands",
         "move_penalty", "eta", "relay_1_3_bonus",
+        # 对话偏好（spec §4.5）在备菜层与既有项直接相加：direct 的 +4
+        # 改同层先后，claim 的 -8 在层内被截止闸兜底（spec §4.6）。
+        "pref",
         # cooker_idle 随 FillCooker 一起从 L5 迁来。**少了它填灶在本层净分
         # 只剩 eta 的负数**，会从「永远赢」直接翻到「永远输」、灶又全空 ——
         # 正是 FillCooker 当初被造出来要解决的问题（AGENTS.md §4 产能：
@@ -188,8 +195,8 @@ TERM_WHITELIST = {
         # 按单发射的 FetchToCooker 走 async_resource，不重复给。
         "cooker_idle",
     ]),
-    # L7 清理：就近
-    L_CLEANUP: frozenset(["eta", "hands"]),
+    # L7 清理：就近。pref 让「去洗碗」这类账本约定在清理层也生效。
+    L_CLEANUP: frozenset(["eta", "hands", "pref"]),
 }
 
 

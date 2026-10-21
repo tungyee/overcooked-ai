@@ -2,6 +2,10 @@
 
 给合作烹饪游戏 [Overcooked! 2](https://store.steampowered.com/app/728880/Overcooked_2/) 写的 **AI 陪玩（P2 自动玩家）**：游戏里由 BepInEx 插件把整局状态以 NDJSON 快照推到本机，Python 进程读快照、做决策，再通过插件 exec 通道（27412）发命令驱动虚拟手柄控制分屏的 2P，与人类玩家（1P）协作做菜、出餐。运行行为树不需要模型 API。
 
+## 演示视频
+
+[Level 1–6 关卡演示（约 4 分半）](media/Level-1-6-demo.mp4)
+
 ## 工作原理（一句话）
 
 ```

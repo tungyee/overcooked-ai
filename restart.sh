@@ -15,7 +15,7 @@ G="${GAME_DIR:-$HOME/Library/Application Support/Steam/steamapps/common/Overcook
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 if [ ! -x "$PYTHON" ]; then
-    echo "[restart] 找不到 Python: $PYTHON；先 python3 -m venv .venv，或设置 PYTHON 的绝对路径" >&2
+    echo "[restart] 找不到 Python: ${PYTHON}；先 python3 -m venv .venv，或设置 PYTHON 的绝对路径" >&2
     exit 1
 fi
 PORT=27411

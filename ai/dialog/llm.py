@@ -218,8 +218,9 @@ _EVENT_TEXT = {
     "checkin": ("按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。"),
     "last_seconds": ("事件：本关只剩最后几秒了。用一两句话提醒或鼓励 P1（如「最后十秒，稳住」），"
                      "也可以说下现在该干嘛。不调用工具。"),
-    "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费）、送达数、连击，"
-                      "用一两句话总结这局，可以鼓励、也可以吐槽，语气自然。不调用工具。"),
+    "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费-漏单扣分）、"
+                      "送达数、漏单扣分、连击，用一两句话总结这局，可以鼓励、也可以吐槽，"
+                      "语气自然。不调用工具。"),
 }
 
 
@@ -248,6 +249,9 @@ def render_state(context):
     tips = ctx.get("tips")
     if tips is not None:
         lines.append("小费 %s。" % (tips,))
+    deductions = ctx.get("deductions")
+    if deductions:
+        lines.append("漏单扣 %s 分。" % (abs(deductions),))
     orders = ctx.get("orders") or []
     if orders:
         lines.append("订单：")

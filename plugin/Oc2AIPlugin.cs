@@ -1122,7 +1122,8 @@ namespace Oc2AI
             AppendK(sb, "base", GetField(score, "TotalBaseScore"), false);
             AppendK(sb, "tips", GetField(score, "TotalTipsScore"), false);
             AppendK(sb, "combo", GetField(score, "TotalCombo"), false);
-            AppendK(sb, "multiplier", GetField(score, "TotalMultiplier"), true);
+            AppendK(sb, "multiplier", GetField(score, "TotalMultiplier"), false);
+            AppendK(sb, "deductions", GetField(score, "TotalTimeExpireDeductions"), true);
             sb.Append('}');
         }
 

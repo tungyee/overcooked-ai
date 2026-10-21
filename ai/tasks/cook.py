@@ -15,7 +15,8 @@ from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
-                           loose_count, loose_on_station, plate_by_id)
+                           loose_count, loose_on_station, plate_by_id,
+                           plate_matches_order)
 
 # 端盘在锅前等熟的最长拍数（15s）。煮一锅饭实测约 11s，取盘+走到锅前再
 # 留足余量；超时交还 Planner，避免无限等一个可能永远不成立的状态。
@@ -488,6 +489,8 @@ class TakeCookedToPlate(Task):
             return False                       # 目标盘被端走
         if not ctx["book"].plate_lacks(p, self.item):
             return False                       # 盘里已有这份熟料（done 边界）
+        if not plate_matches_order(ctx, p, self.order_id):
+            return False                       # 盘内容与该单不再兼容（P1 放错料）
         if _holding_plate(ctx, self.plate_id):
             return True                        # 执行中：目标盘已在手上
         return self._source(ctx) is not None

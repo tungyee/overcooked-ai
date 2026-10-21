@@ -183,6 +183,32 @@ def test_add_compiles_modes_to_preferences(kitchen):
     assert (by_id["a2"].kind, by_id["a2"].weight) == ("direct", 4.0)
 
 
+def test_deliver_plate_accepts_only_now_and_do(kitchen):
+    """送餐只开放 now/do：不能「交给 P1」，也不能「先别做」。"""
+    ledger = Ledger()
+    assert _add(ledger, kitchen, "now", "DeliverPlate")["ok"] is True
+    assert _add(ledger, kitchen, "do", "DeliverPlate")["ok"] is True
+    r1 = _add(ledger, kitchen, "leave_to_p1", "DeliverPlate")
+    assert r1["ok"] is False and "DeliverPlate" in r1["reason"]
+    r2 = _add(ledger, kitchen, "stop", "DeliverPlate")
+    assert r2["ok"] is False and "DeliverPlate" in r2["reason"]
+    # 被拒的调用不新增约定：仍只有 do 一条，且不产生 claim/stop
+    assert [d.mode for d in ledger.duties] == ["do"]
+    assert {p.kind for p in ledger.preferences()} == {"direct"}
+
+
+def test_other_shared_actions_keep_all_modes(kitchen):
+    """限制只针对送餐：洗盘 / 摆盘仍可交给 P1 或叫停。"""
+    ledger = Ledger()
+    assert _add(ledger, kitchen, "leave_to_p1", "WashPlate")["ok"] is True
+    assert _add(ledger, kitchen, "stop", "PlaceCleanPlate")["ok"] is True
+
+
+def test_render_marks_deliver_mode_restriction(kitchen):
+    text = kitchen.render()
+    assert "DeliverPlate（送餐）（只接受：P2 马上去、P2 优先做）" in text
+
+
 def test_add_now_and_stop_compile_to_preferences(kitchen):
     ledger = Ledger()
     assert _add(ledger, kitchen, "now", "Cucumber")["id"] == "a1"
@@ -312,17 +338,31 @@ def test_material_claim_hits_its_chain_not_others(world, book, kitchen):
 
 
 def test_ledger_changes_planner_choice(world, book, kitchen):
-    """账本必须真的改变 P2 的选择：基线送餐 → 「黄瓜你来、送餐我来」后取黄瓜。"""
+    """账本必须真的改变 P2 的选择：基线送餐 → 「黄瓜马上去」后取黄瓜。"""
     before, _ = planner.plan(world, Blackboard(), None, book)
     assert before.TYPE == "DeliverPlate"
 
     bb = Blackboard()
     ledger = Ledger()
-    _add(ledger, kitchen, "do", "Cucumber")
-    _add(ledger, kitchen, "leave_to_p1", "DeliverPlate")
+    _add(ledger, kitchen, "now", "Cucumber")
     bb.preferences[:] = ledger.preferences()
     after, _ = planner.plan(world, bb, None, book)
     assert (after.TYPE, after.item) == ("FetchToBoard", "Cucumber")
+
+
+def test_deliver_cannot_be_claimed_away(world, book, kitchen):
+    """「送餐我来」被拒（送餐只接受 now/do）：不产生认领偏好，P2 仍可选送餐。"""
+    before, _ = planner.plan(world, Blackboard(), None, book)
+    assert before.TYPE == "DeliverPlate"
+
+    ledger = Ledger()
+    assert _add(ledger, kitchen, "leave_to_p1", "DeliverPlate")["ok"] is False
+    assert ledger.preferences() == []
+
+    bb = Blackboard()
+    bb.preferences[:] = ledger.preferences()
+    after, _ = planner.plan(world, bb, None, book)
+    assert after.TYPE == "DeliverPlate"
 
 
 def test_order_less_claim_can_still_be_rescued():

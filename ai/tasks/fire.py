@@ -63,12 +63,19 @@ class Extinguish(Task):
       RepeatUntil(没有着火的灶了, Selector[
         带锅 → 清手 → 端锅 → 放锅（home_cooker=False 不回灶台）,
         有火 → 清手(keep 灭火器) → 取灭火器 → 走近 → 转向
-               → Guard(没有新锅, HoldUntil(chop, 火全灭, target=下一灶)),
+               → Guard(没有新锅, HoldUntil(chop, 这口灭了, target=下一灶)),
       ])
 
-    喷射与切菜同键（P2 分屏 WorkstationInteract）。换下一灶由 HoldUntil 的
-    target 重解析触发：当前灶一灭，target 指向下一灶、interact_ready 变假
-    → 松键 FAILURE → 树重建 → 从 Selector 重新评估，去喷下一灶。
+    喷射与切菜同键（P2 分屏 WorkstationInteract），但 `kind="spray"`：端着
+    灭火器时游戏的 use 句柄（m_interactable）是灭火器自己、不是灶，所以插件
+    HoldCommand 的 UseMatches 门恒不中、按不出键；spray 改走朝向句柄
+    （m_gridLocation，HandleMatches(kind=null)），正对灶才按键。
+
+    换下一灶由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定最近
+    那口灶的名字，`spray_done` 判「这口灶还在不在燃烧列表里」。这口一灭 →
+    提前 SUCCESS（不再等「全灭」）→ RepeatUntil 重新评估 Selector，走到
+    下一口着火灶。否则 pred 若仍是「not any_fire」，多口火时会一直喷已经
+    灭掉的那口、不换目标（实机 trace 里火反复蔓延、灭火器喷半天灭不完）。
     """
 
     TYPE = "Extinguish"
@@ -132,9 +139,38 @@ class Extinguish(Task):
             cc = with_pot(c)
             return cooker_station(c, cc[0]["n"]) if cc else None
 
+        # 「当前正在喷哪口灶」的可变标记（build 闭包共享）。喷完一口后
+        # spray_done 用它判「这口灭了没」，让 HoldUntil 提前 SUCCESS、
+        # RepeatUntil 重新评估去喷下一口。否则 pred 只能等「全灭」（not
+        # any_fire），多口火时会一直喷已经灭掉的那口、不换目标（实机复现）。
+        spray = {"n": None}
+
         def fire_station(c):
+            # 供 Approach 走位用：解析最近的着火灶。顺便把上一口的喷标记
+            # 清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
+            # 从零开始，否则 spray_done 会拿上一口的旧名提前判 True。
             cc = burning(c)
+            spray["n"] = None
             return cooker_station(c, cc[0]["n"]) if cc else None
+
+        def spray_target(c):
+            # 供 HoldUntil 喷用：锁定当前最近的着火灶，并记下它的名字。
+            cc = burning(c)
+            if not cc:
+                spray["n"] = None
+                return None
+            spray["n"] = cc[0]["n"]
+            return cooker_station(c, cc[0]["n"])
+
+        def spray_done(c):
+            # 当前锁定的这口灶灭了（或全灭）→ 本轮喷完，交 RepeatUntil 换下一口。
+            cc = burning(c)
+            if not cc:
+                return True
+            n = spray["n"]
+            if n is None:
+                return False
+            return not any(cc0.get("n") == n for cc0 in cc)
 
         def ext(c):
             return _available_extinguisher(c)
@@ -164,8 +200,9 @@ class Extinguish(Task):
                 PR.Approach(fire_station),
                 PR.Face(fire_station),
                 Guard(lambda c: not any_pot(c),
-                      PR.HoldUntil("chop", lambda c: not any_fire(c),
+                      PR.HoldUntil("chop", spray_done,
                                    timeout=EXTINGUISH_TIMEOUT_TICKS,
-                                   target=fire_station)),
+                                   kind="spray",
+                                   target=spray_target)),
             ]),
         ])), FIREFIGHT_TIMEOUT_TICKS)

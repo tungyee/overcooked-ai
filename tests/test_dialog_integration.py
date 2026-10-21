@@ -133,8 +133,8 @@ def _row(record, task):
 
 # --------------------------------------------------------- 场景 1：送餐
 
-def test_player_claims_delivery_p2_drops_to_lower_layer(monkeypatch):
-    """玩家说「我来送」：P2 本拍不再选 DeliverPlate，改选低层候选。"""
+def test_player_claiming_delivery_is_rejected(monkeypatch):
+    """「我来送」被拒：送餐只接受 now/do，P2 仍把送餐当可选。"""
     frame = _find_frame(_has_complete_plate, "料齐的盘 / DeliverPlate 候选")
     world = World(frame)
     agent = _make_agent(monkeypatch, world)
@@ -145,18 +145,10 @@ def test_player_claims_delivery_p2_drops_to_lower_layer(monkeypatch):
 
     result = _apply(agent, world, op="add", mode="leave_to_p1",
                     target="DeliverPlate")
-    assert result["ok"], result
+    assert result["ok"] is False and "DeliverPlate" in result["reason"]
 
     after, record = planner.plan(world, agent.bb, None, agent.book)
-
-    assert after is None or after.TYPE != "DeliverPlate"
-    # 低层候选仍存在（送餐被认领后逐层向下掉，而不是停摆）。
-    assert after is not None
-    assert record["top_layer"] > PL.L_REDEEM
-    deliver_rows = [row for row in record["candidates"]
-                    if row[0].TYPE == "DeliverPlate"]
-    assert deliver_rows
-    assert all(row[7] is False for row in deliver_rows)  # 未进本拍打分
+    assert after is not None and after.TYPE == "DeliverPlate"
 
 
 # --------------------------------------------------------- 场景 2：米饭链
@@ -277,57 +269,6 @@ def test_l2_take_cooked_not_blocked_by_cook_claim(monkeypatch):
     assert row[2].get("pref", 0.0) == 0.0  # 认领负分被 L1/L2 免疫
 
 
-# --------------------------------------------------------- 场景 5：截止闸
-
-def _make_expiring_world():
-    """料齐的盘 + 只剩 3.5 秒的订单 → cushion < margin。
-
-    与 `tests/test_rescue_gate.py` 同一套真实 World/配方/ETA：不 mock 闸。
-    """
-    return World({
-        "orders": [{"id": "o1", "dish": "Sushi_A",
-                    "composition": ["Seaweed"], "remaining": 3.5,
-                    "lifetime": 130.0}],
-        "stations": [
-            {"t": "washing", "n": "sink_01", "gx": 7, "gz": 1},
-            {"t": "plate_return", "n": "DryingPart", "gx": 8, "gz": 1},
-            {"t": "serving", "n": "hatch", "gx": 9, "gz": 1},
-        ],
-        "recipes": [
-            {"name": "Sushi_A", "comp": ["Seaweed"]},
-            {"name": "Seaweed"},
-        ],
-        "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
-        "plates": [{"n": "plate_a", "x": 0.0, "z": 0.0,
-                    "contents": ["seaweed"]}],
-        "workstations": [],
-        "cookers": [],
-        "items": [{"n": "DirtyPlateStack", "x": 3.0, "z": 0.0}],
-        "extinguishers": [],
-        "grid": {"nodeMap": None},
-    })
-
-
-def test_rescue_gate_override_with_claim_and_pending_event(monkeypatch):
-    """最后窗口内认领送餐：闸开、抢回并写 rescue_override（不再语音播报）。"""
-    world = _make_expiring_world()
-    worker = _RecordingWorker()
-    agent = _make_agent(monkeypatch, world, worker)
-
-    result = _apply(agent, world, op="add", mode="leave_to_p1",
-                    target="DeliverPlate")
-    assert result["ok"], result
-
-    chosen, record = planner.plan(world, agent.bb, None, agent.book)
-
-    assert chosen is not None
-    assert chosen.TYPE == "DeliverPlate"
-    assert record["top_layer"] == PL.L_REDEEM       # 没有 fallthrough
-    assert record["rescue_override"] == "o1"
-    assert agent.bb.dialog.pending_event == ("rescue", "o1")
-    assert agent.bb.rescue_cooldown_until == agent.bb.tick + 100
-
-
 # --------------------------------------------------------- 场景 6/7：worker
 
 class _AgentWorkerBridge(object):
@@ -385,33 +326,28 @@ def _run_worker_turn(agent, worker, bundle, world, text):
 
 
 def test_spoken_division_reaches_planner_end_to_end():
-    """「你切黄瓜，送餐我来」：两条工具调用都落地，P2 的选择随之改变。"""
+    """「马上去切黄瓜」：now 硬指令落地，P2 的选择随之改变。"""
     frame = _find_frame(_has_complete_plate, "料齐的盘 / DeliverPlate 候选")
     world = World(frame)
     llm = FakeLLM(reply("",
-                        duty(op="add", mode="do", target="Cucumber"),
-                        duty(op="add", mode="leave_to_p1",
-                             target="DeliverPlate")),
-                  reply("好，黄瓜我切，送餐交给你。"))
+                        duty(op="add", mode="now", target="Cucumber")),
+                  reply("好，这就去切黄瓜。"))
     worker, bundle = make_worker(llm=llm)
     agent = _make_dialog_agent(world, bundle)
 
     before, _ = planner.plan(world, agent.bb, None, agent.book)
     assert before.TYPE == "DeliverPlate"
 
-    record = _run_worker_turn(agent, worker, bundle, world, "你切黄瓜，送餐我来")
+    record = _run_worker_turn(agent, worker, bundle, world, "马上去切黄瓜")
 
-    assert [r["ok"] for r in record["batches"][0]["results"]] == [True, True]
-    assert bundle.tts.spoken == ["好，黄瓜我切，送餐交给你。"]
+    assert [r["ok"] for r in record["batches"][0]["results"]] == [True]
+    assert bundle.tts.spoken == ["好，这就去切黄瓜。"]
     # 工具结果写回历史，下一轮模型能看到 id
     assert [m["role"] for m in worker.state.history] == [
-        "user", "assistant", "tool", "tool", "assistant"]
+        "user", "assistant", "tool", "assistant"]
 
     after, _ = planner.plan(world, agent.bb, None, agent.book)
-    assert after.TYPE != "DeliverPlate"
-    assert (after.TYPE, after.item) in (("FetchToBoard", "Cucumber"),
-                                        ("Prefetch", "Cucumber"),
-                                        ("Chop", "Cucumber"))
+    assert (after.TYPE, after.item) == ("FetchToBoard", "Cucumber")
 
 
 def test_rejected_call_is_reported_back_and_rest_applies():

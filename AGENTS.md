@@ -1,9 +1,5 @@
 # AGENTS.md — Overcooked! 2 AI 陪玩（oc2）
 
-## 最近改动
-
-详细的变更/修复记录见 `docs/notes/changelog.md`（按日期倒序，含每轮的验证结论与备份路径）。
-
 面向 AI 编码代理的项目速览。**详细内容在 `docs/agent/` 下**：架构细节见 `architecture.md`，task/原语/认领见 `tasks-primitives.md`，技术债务与待办见 `status-backlog.md`。代码注释里大量引用「spec §N」，所指是 `docs/superpowers/specs/2026-10-04-ai-behavior-architecture-design.md`。
 
 ## 1. 项目概览
@@ -11,7 +7,7 @@
 给合作烹饪游戏 **Overcooked! 2** 写的 **AI 陪玩（控制分屏 2P）**：C# BepInEx 插件把整局状态以 NDJSON 全量快照推到 `127.0.0.1:27411`（5 Hz），Python 进程读快照做决策，再通过插件 exec 通道（`127.0.0.1:27412`）发命令驱动虚拟手柄控制 P2，与人类 P1 协作做菜、出餐。
 
 - C# 插件源码 `plugin/Oc2AIPlugin.cs`，NDJSON 字段是两侧共用的契约，改字段要同步。
-- 主关卡 `Sushi_1_4_2P`，部分关卡数据仍对该关硬编码。
+- 主关卡 `Sushi_1_4_2P`。
 
 ## 2. 关键约定（务必遵守）
 
@@ -33,6 +29,12 @@ G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
 # 可选前置：改了 plugin/*.cs 时编译并部署（之后必须重启游戏才生效）
 ./plugin/build.sh && cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/"
 
+# 一键启动（推荐）：停旧 → 编译部署 → 起游戏 → 等端口 → 起 Agent
+./restart.sh                  # 有 key 自动开语音
+./restart.sh --skip-build     # 只改 Python 侧时跳过编译
+./restart.sh --voice          # 显式开语音；--no-voice 强制关
+
+# 也可以分步手动（下面 ①~③）：
 # ① 起游戏（必须用 run_game.sh，Steam 直接启动不加载插件）
 "$G/run_game.sh"
 # ② 标题画面按 A/空格进 P1、到主菜单（虚拟手柄只在主菜单能 engage 成 P2）
@@ -62,7 +64,6 @@ python3 -m pytest tests/                # 全部测试
 python3 -m pytest tests/test_eta.py -q  # 单文件 / 单用例（::test_xxx）
 python3 tools/tree_viz.py <帧文件>      # 离线冒烟：建全部 task 树、走分支、不按键
 python3 tools/record_frames.py          # 录制实时帧到 NDJSON
-python3 tools/dll_probe.py <dll> <TypeName>...  # .NET 元数据探针
 ```
 
 ## 4. 安全
@@ -78,7 +79,7 @@ python3 tools/dll_probe.py <dll> <TypeName>...  # .NET 元数据探针
 - `docs/agent/tasks-primitives.md` —— task 契约与类型表、执行原语表、资源 id/认领、代码风格。
 - `docs/agent/status-backlog.md` —— 已知限制/技术债务、当前状态、待办、改权重前必读。
 - `docs/dialog_system.md` —— 语音对话：依赖、环境变量、`--voice` 用法、排障（VAD/TTS 回声/延迟/音频设备）。
-- `docs/map/` —— 各关卡网格/站点/配方数据；`docs/notes/` —— 一次性调试/修复/复盘记录（历史存档）。
+- `docs/map/` —— 各关卡网格/站点/配方数据。
 - `docs/superpowers/specs/2026-10-04-ai-behavior-architecture-design.md` —— 架构设计（「spec §N」出处）。
 - `docs/superpowers/specs/2026-10-18-voice-dialog-interaction-design.md` —— 语音对话设计（对话层 spec §N 出处）。
 - `docs/superpowers/specs/2026-10-06-e2e-testing-design.md` —— 端到端测试框架设计。

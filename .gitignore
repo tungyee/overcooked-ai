@@ -25,4 +25,16 @@ tests/fixtures/*.ndjson
 # macOS
 .DS_Store
 .worktrees/
-.worktrees/
+
+# AI 编码工作流 / 本地缓存（内部产物，不入库）
+.claude/
+.superpowers/
+.pytest_cache/
+
+# 开发工具：反编译/元数据探针（仅本地，不公开）
+tools/decompile.py
+tools/dll_probe.py
+
+# 内部文档：调试笔记 / 实施计划（仅本地，不公开）
+docs/notes/
+docs/plans/

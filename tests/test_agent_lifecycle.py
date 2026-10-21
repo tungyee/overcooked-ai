@@ -18,28 +18,10 @@ from ai.query.recipes import RecipeBook
 from ai.state.world import World
 
 
-class RecordingCtrl(object):
-    """记录所有按键调用，不碰 Quartz。"""
-
-    def __init__(self):
-        self.calls = []
-
-    def tap(self, name, hold=0.12):
-        self.calls.append(("tap", name))
-
-    def press(self, name):
-        self.calls.append(("press", name))
-
-    def release(self, name):
-        self.calls.append(("release", name))
-
-    def release_all(self):
-        self.calls.append(("release_all",))
-
-
-def _agent(ctrl):
-    with patch("ai.agent.StateClient", return_value=object()):
-        return Agent(ctrl=ctrl)
+def _agent():
+    with patch("ai.agent.StateClient", return_value=object()), \
+         patch("ai.agent.ExecClient") as _mock_exec:
+        return Agent()
 
 
 def _snapshot(phase="level", paused=False):
@@ -60,24 +42,21 @@ def _snapshot(phase="level", paused=False):
     }
 
 
-def test_paused_releases_keys_and_skips_decision():
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+def test_paused_skips_decision():
+    agent = _agent()
 
     agent._tick_once(World(_snapshot(paused=True)))
 
-    assert ("release_all",) in ctrl.calls, "暂停时应松键"
     assert agent.bb.commitment.active_task is None, "暂停时不应登记承诺"
     assert agent.bb.claims == {}, "暂停时不应写认领"
 
 
-def test_non_level_phase_releases_keys():
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+def test_non_level_phase_skips_decision():
+    agent = _agent()
 
     agent._tick_once(World(_snapshot(phase="menu")))
 
-    assert ("release_all",) in ctrl.calls, "非关卡应松键"
+    assert agent.bb.commitment.active_task is None, "非关卡不应登记承诺"
 
 
 @pytest.fixture
@@ -90,8 +69,7 @@ def trace_file(tmp_path, monkeypatch):
 
 def test_paused_logs_one_heartbeat_not_every_tick(trace_file):
     """暂停期间只写一条 trace：区分"agent 没起来"和"AI 没决策"。"""
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+    agent = _agent()
 
     for _ in range(5):
         agent._tick_once(World(_snapshot(paused=True)))
@@ -107,8 +85,7 @@ def test_paused_logs_one_heartbeat_not_every_tick(trace_file):
 
 def test_idle_heartbeat_resets_when_back_in_level(trace_file):
     """回到关卡内正常记拍；再次暂停时重新记一条。"""
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+    agent = _agent()
 
     agent._tick_once(World(_snapshot(paused=True)))
     agent.tick += 1
@@ -131,8 +108,7 @@ def test_idle_heartbeat_resets_when_back_in_level(trace_file):
 
 def test_non_level_phase_logs_one_heartbeat(trace_file):
     """非关卡（菜单/结算）同样留一条，mode_reason 带上是哪个阶段。"""
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+    agent = _agent()
 
     for _ in range(3):
         agent._tick_once(World(_snapshot(phase="menu")))
@@ -144,23 +120,19 @@ def test_non_level_phase_logs_one_heartbeat(trace_file):
     assert logs[0]["exec"]["status"] == "skipped"
 
 
-def test_run_releases_keys_on_disconnect():
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+def test_run_returns_on_disconnect():
+    agent = _agent()
 
     class EofClient(object):
         def read_latest(self):
             raise EOFError("socket closed")
 
     agent.client = EofClient()
-    agent.run()          # 应立即返回，不阻塞
-
-    assert ("release_all",) in ctrl.calls, "断线应松键"
+    agent.run()          # 应立即返回，不阻塞（finally 里 halt 在途命令）
 
 
 def test_run_frame_sequence_advances_only_on_received_snapshots(monkeypatch):
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+    agent = _agent()
     snapshots = iter([_snapshot(), None, None, _snapshot()])
 
     class Client:
@@ -178,16 +150,13 @@ def test_run_frame_sequence_advances_only_on_received_snapshots(monkeypatch):
     assert seen == [1, 1, 1, 2]
 
 
-def test_stale_stream_stops_keys_and_resumes_on_fresh_snapshot(monkeypatch, trace_file):
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+def test_stale_stream_skips_and_resumes_on_fresh_snapshot(monkeypatch, trace_file):
+    agent = _agent()
     agent._frame_seq, agent._frame_received_at = 1, 0.0
-    agent.hands.set_move("right")
     monkeypatch.setattr("ai.agent.time.monotonic", lambda: 1.0)
     with patch("ai.agent.planner.plan") as plan:
         agent._tick_once(World(_snapshot()))
         plan.assert_not_called()
-    assert agent.hands.move_dir is None
     assert trace.read_log()[-1]["mode_reason"] == "stale_frame"
     agent._frame_seq, agent._frame_received_at = 2, 1.0
     agent._tick_once(World(_snapshot()))
@@ -195,19 +164,16 @@ def test_stale_stream_stops_keys_and_resumes_on_fresh_snapshot(monkeypatch, trac
     assert agent._exec_context(World(_snapshot()))["frame_seq"] == 2
 
 
-def test_run_releases_keys_on_unexpected_read_error():
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+def test_run_raises_on_unexpected_read_error():
+    agent = _agent()
 
     class Client:
         def read_latest(self):
             raise OSError("read failed")
 
     agent.client = Client()
-    agent.hands.set_move("right")
     with pytest.raises(OSError):
         agent.run()
-    assert agent.hands.move_dir is None
 
 
 def test_firefighting_task_is_never_abandoned():
@@ -218,7 +184,7 @@ def test_firefighting_task_is_never_abandoned():
     """
     from ai import tasks as T
 
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
 
     fire = T.Extinguish()
     for _ in range(5):
@@ -242,7 +208,7 @@ def test_cooked_pot_tasks_are_never_abandoned():
     from ai import tasks as T
     from ai.core.planner import _is_abandoned
 
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
 
     rescue = T.RescueCooked(resources=("cooker_01",))
     take = T.TakeCookedToPlate("order1", ("cooker_01", "plate_01"),
@@ -277,7 +243,7 @@ def test_motion_obstruction_is_shared_across_order_ids():
     from ai import tasks as T
     from ai.core.planner import _is_abandoned
 
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     first = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
     second = T.FetchToCooker("2", ("cooker", ("SushiRice",)), "BoiledSushiRice")
     agent._note_motion_failure(first, {"motion_failure": {
@@ -295,7 +261,7 @@ def test_motion_failure_in_wind_does_not_blacklist_resource():
     from ai import tasks as T
     from ai.core.planner import _is_abandoned
 
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     task = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
 
     class WindyWorld(object):
@@ -317,7 +283,7 @@ def test_motion_failure_outside_wind_still_blacklists():
     from ai import tasks as T
     from ai.core.planner import _is_abandoned
 
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     task = T.FetchToCooker("1", ("cooker", ("SushiRice",)), "BoiledSushiRice")
 
     class CalmWorld(object):
@@ -337,8 +303,7 @@ def test_recipe_book_rebuilt_each_frame():
     真实事故：进关卡第一帧 crate 的 chop 还没带上 → 整局以为"鱼不用切"，
     AI 拿生鱼直接去装盘、从不使用砧板。
     """
-    ctrl = RecordingCtrl()
-    agent = _agent(ctrl)
+    agent = _agent()
 
     f1 = _snapshot()
     f1["recipes"] = [{"name": "SushiFish", "comp": []}]

@@ -11,8 +11,8 @@ import pytest
 from ai import tasks as T
 from ai.agent import _TASK_META
 from ai.core import planner
-from ai.dialog.duties import (STOP_TTL_S, STOP_TTL_TICKS, Kitchen, Ledger,
-                              render_ledger, tool_schemas)
+from ai.dialog.duties import (STOP_TTL_S, STOP_TTL_TICKS, WEIGHT_NOW, Kitchen,
+                              Ledger, render_ledger, tool_schemas)
 from ai.dialog.schema import preference_matches_task
 from ai.query.recipe_graph import _compile_node
 from ai.query.recipes import RecipeBook
@@ -183,6 +183,17 @@ def test_add_compiles_modes_to_preferences(kitchen):
     assert (by_id["a2"].kind, by_id["a2"].weight) == ("direct", 4.0)
 
 
+def test_add_now_and_stop_compile_to_preferences(kitchen):
+    ledger = Ledger()
+    assert _add(ledger, kitchen, "now", "Cucumber")["id"] == "a1"
+    assert _add(ledger, kitchen, "stop", "SushiFish")["id"] == "a2"
+    by_id = {p.duty_id: p for p in ledger.preferences()}
+    assert (by_id["a1"].kind, by_id["a1"].owner, by_id["a1"].weight) == \
+        ("now", "P2", WEIGHT_NOW)
+    assert (by_id["a2"].kind, by_id["a2"].owner, by_id["a2"].weight) == \
+        ("stop", "P2", 0.0)
+
+
 def test_add_on_same_target_rewrites_it(kitchen):
     ledger = Ledger()
     _add(ledger, kitchen, "leave_to_p1", "Cucumber")
@@ -256,6 +267,38 @@ def test_newer_duty_wins_on_shared_items():
     assert _kinds(ledger, "FetchToPlate", "Salad") == ["claim"]
 
 
+# ------------------------------------------------------------ now 一次性消费
+
+def test_consume_now_downgrades_matching_now_to_do(kitchen):
+    """「马上去」落实一次就降级成 do：命中的 now 不再长期存在。"""
+    ledger = Ledger()
+    _add(ledger, kitchen, "now", "Cucumber")
+    assert ledger.get("a1").mode == "now"
+
+    assert ledger.consume_now(_task("Chop", "Cucumber")) is True
+    assert ledger.get("a1").mode == "do"
+
+
+def test_consume_now_keeps_non_matching_now(kitchen):
+    """只降级命中的 now，没命中的 now 保留。"""
+    ledger = Ledger()
+    _add(ledger, kitchen, "now", "Cucumber")
+    _add(ledger, kitchen, "now", "Seaweed")
+
+    assert ledger.consume_now(_task("Chop", "Cucumber")) is True
+    assert ledger.get("a1").mode == "do"       # Cucumber 命中 → 降级
+    assert ledger.get("a2").mode == "now"      # Seaweed 未命中 → 保留
+
+
+def test_consume_now_ignores_non_now_and_none(kitchen):
+    """do 不受影响；task 为 None 直接不改。"""
+    ledger = Ledger()
+    _add(ledger, kitchen, "do", "Cucumber")
+    assert ledger.consume_now(_task("Chop", "Cucumber")) is False
+    assert ledger.consume_now(None) is False
+    assert ledger.get("a1").mode == "do"
+
+
 # ------------------------------------------------------------ planner
 
 
@@ -314,9 +357,10 @@ def test_tool_schemas_use_targets_from_level(kitchen):
     props = tools[0]["function"]["parameters"]["properties"]
     assert props["target"]["enum"] == kitchen.targets()
     assert props["id"]["enum"] == ["a1"]
-    assert props["mode"]["enum"] == ["do", "leave_to_p1"]
+    assert props["mode"]["enum"] == ["do", "leave_to_p1", "now", "stop"]
     assert "node" not in props and "upstream" not in props
-    assert "stop" not in props["mode"]["description"]
+    assert "now" in props["mode"]["description"]
+    assert "stop" in props["mode"]["description"]
 
 
 def test_tool_schemas_without_duties(kitchen):

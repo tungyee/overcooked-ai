@@ -504,6 +504,23 @@ def test_walkable_blocks_wall_layers():
     assert is_walkable(0, 0) is False
 
 
+def test_walkable_blocks_wall_within_chef_radius():
+    """阻挡 box 距格心 < CHEF_RADIUS(0.4) 时，即使格心点在 box 外也应判不可走。
+
+    厨师胶囊体半径 0.4；绿植/柜台 collider 常往邻格溢出 0.2~0.3，格心点判
+    会漏掉，Dijkstra 引角色往「点判可走、身体却过不去」的格走（实机 1-3：
+    绿植 (-3,-4) 的 collider 溢出到 (-3,-5)，角色卡在边界）。外扩 0.4 后
+    (-3,-5) 会被正确判不可走、绕开。
+    """
+    terrain = {
+        9: [(-100.0, 100.0, -100.0, 100.0)],
+        10: [(9.9, 11.0, -3.0, -1.8)],   # minx=9.9，格心 x=9.6，相距 0.3 < 0.4
+    }
+    is_walkable = O.make_walkable_from_terrain(terrain, [], set(), MAPPING)
+    assert is_walkable(0, 0) is False   # 格心 (9.6,-2.4) 距 box 0.3，被外扩挡住
+    assert is_walkable(-1, 0) is True   # 格心 (8.4,-2.4) 距 box 1.5，可走
+
+
 def test_walkable_blocks_wall_edge_touching_cell_center():
     """格中心恰好落在墙 AABB 边界上时，浮点误差不能把整行漏判成可走。
 

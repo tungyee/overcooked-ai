@@ -141,7 +141,7 @@ def _types_of(world, book):
     # type: (World, RecipeBook) -> set
     from ai.agent import Agent
     with patch("ai.agent.StateClient", lambda *a, **k: MagicMock()):
-        agent = Agent(ctrl=MagicMock(), voice=None)
+        agent = Agent(voice=None)
     agent.book = book
     _live, pm, cm = agent._dialog_matches(world, book)
     cands = planner.generate_candidates(world, agent.bb, None, book,
@@ -367,7 +367,7 @@ def _make_pair(frame, llm):
     bridge = _Bridge(cmd_q, ack_q)
     with patch("ai.agent.StateClient", lambda *a, **k: MagicMock()):
         from ai.agent import Agent
-        agent = Agent(ctrl=MagicMock(), dialog_worker=bridge)
+        agent = Agent(dialog_worker=bridge)
     mute = _Mute()
     config = VoiceConfig(asr_key="", asr_resource_id="", tts_key="",
                          tts_voice="", tts_resource_id="", ark_key="",

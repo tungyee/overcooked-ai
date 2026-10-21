@@ -9,15 +9,13 @@
 这是 Plan 2 的交付验证（spec §11.2 阶段 3）："打印树、假状态走分支、
 **不注入按键**"。
 
-与 oc/ai/tree_viz.py 的差异：旧版靠**猴补丁**绕开真实 controller
-（import agent as A; A.Controller = NoopCtrl; A.StateClient = DummyClient）。
-新版不需要——Hands 构造时注入 controller（见 ai/hands.py 的设计理由），
-NullController 是正常参数。旧版还依赖 ag._build_tree(w, order) 这个
+与 oc/ai/tree_viz.py 的差异：旧版靠**猴补丁**绕开真实 controller。
+新版不需要——ctx 注入 NullExec（见 ai/exec/client.py），叶子原语发
+exec 命令但不真正连 27412。旧版还依赖 ag._build_tree(w, order) 这个
 Agent 方法，而新架构里树由每个 task 自己 build()。
 
 放 tools/ 而非 ai/：这是开发工具不是运行时模块，与 tools/record_frames.py
-同列。spec §8.2 把 tree_viz.py 列在 ai/ 旁边，但那张表记的是职责归属
-而非目录——ai/ 下不该有 __main__ 脚本。
+同列。
 """
 import argparse
 import json
@@ -31,36 +29,11 @@ from ai import primitives as PR  # noqa: E402
 from ai import tasks as T  # noqa: E402
 from ai.state.blackboard import Blackboard       # noqa: E402
 from ai.exec.bt import Node, Status             # noqa: E402
-from ai.output.hands import Hands                 # noqa: E402
+from ai.exec.client import NullExec             # noqa: E402
 from ai.space.navigation import distance_field   # noqa: E402
 from ai.query.predicates import P2_NAME, chef_by_name   # noqa: E402
 from ai.query.recipes import RecipeBook          # noqa: E402
 from ai.state.world import World                 # noqa: E402
-
-
-class NullController(object):
-    """记录调用但不碰键盘。
-
-    注意它**不是** oc/ai/tree_viz.py 的 NoopCtrl：那个是为了猴补丁
-    Agent.Controller 而存在的空壳，这个是 Hands 的正常注入参数，并且
-    记下调用序列供断言。
-    """
-
-    def __init__(self):
-        # type: () -> None
-        self.calls = []
-
-    def tap(self, name, hold=0.12):
-        self.calls.append(("tap", name))
-
-    def press(self, name):
-        self.calls.append(("press", name))
-
-    def release(self, name):
-        self.calls.append(("release", name))
-
-    def release_all(self):
-        self.calls.append(("release_all",))
 
 
 # ---------- 渲染 ----------
@@ -88,8 +61,6 @@ def label(node):
         return "Approach(%s)" % (node.kind or "-")
     if isinstance(node, PR.Settle):
         return "Settle(%d)" % node.ticks
-    if isinstance(node, PR.Nudge):
-        return "Nudge(%s, %d)" % (node.direction, node.ticks)
     return cls
 
 
@@ -114,12 +85,11 @@ def render(node, prefix="", is_last=True, lines=None):
 
 # ---------- 装配 ----------
 
-def make_ctx(world, chef=None, tick=0, with_controller=False):
+def make_ctx(world, chef=None, tick=0, with_exec=False):
     # type: (World, dict, int, bool) -> object
-    """从真实 World 装配原语要的 ctx（契约见 ai/primitives.py 头注释）。
+    """从真实 World 装配原语要的 ctx（契约见 ai/primitives/base.py 头注释）。
 
-    控制的是 P2——认错厨师就是控制错对象（spec §11.2.1 已知缝隙表把
-    "chefs[].slot 全为 null"记为 Plan 3 接入时要验的项，这里按 name 取）。
+    控制的是 P2——认错厨师就是控制错对象，这里按 name 取。
     """
     if chef is None:
         chef = chef_by_name(world.chefs, P2_NAME)
@@ -133,20 +103,20 @@ def make_ctx(world, chef=None, tick=0, with_controller=False):
         chef = {"name": P2_NAME, "x": 0.0, "z": 0.0, "held": None,
                 "interactions": {}}
 
-    ctrl = NullController()
+    ex = NullExec()
     start = world.to_grid(chef.get("x") or 0.0, chef.get("z") or 0.0)
     ctx = {
         "w": world,
         "chef": chef,
-        "hands": Hands(ctrl),
         "bb": Blackboard(),
         "field": distance_field(start, world.walkable, world.belt_dir,
                                 edge_blocked=getattr(world, "edge_blocked", None)),
         "book": RecipeBook(world.recipes, world.stations),
         "tick": tick,
+        "exec": ex,
     }
-    if with_controller:
-        return ctx, ctrl
+    if with_exec:
+        return ctx, ex
     return ctx
 
 
@@ -275,7 +245,7 @@ def main(argv=None):
         return 2
 
     world = World(load_frame(args.frame, args.frame_index))
-    ctx, ctrl = make_ctx(world, with_controller=True)
+    ctx, ex = make_ctx(world, with_exec=True)
 
     print("关卡 %s  phase=%s  订单 %r"
           % (world.level, world.phase,
@@ -295,18 +265,13 @@ def main(argv=None):
             tree = t.build()
             for _ in range(args.tick):
                 tree.tick(ctx)
-                ctx["hands"].tick()
             tree.halt()
         print("")
 
     print("共 %d 个 task，可行 %d 个"
           % (len(tasks), sum(1 for t in tasks if t.feasible(ctx))))
-    print("按键注入：%d 次调用，全部落在 NullController（零真实按键）"
-          % len(ctrl.calls))
-    if ctx["hands"].held_keys or ctx["hands"].move_dir:
-        sys.stderr.write("⚠️ 有残留按键状态：held=%r move=%r\n"
-                         % (ctx["hands"].held_keys, ctx["hands"].move_dir))
-        return 1
+    print("exec 命令：%d 条，全部落在 NullExec（零真实按键）"
+          % len(ex.issued))
     return 0
 
 

@@ -108,18 +108,6 @@ class Blackboard:
     balloon_moving: bool = False
     blacklisted_resources: Dict[Any, int] = field(default_factory=dict)  # 拉黑资源 → 失效拍号
     paused_task: Optional[Dict] = None  # 暂停的任务 {"task_id": str, "steps_done": int}
-    # 来不及做完的订单 id → 失效拍号（第 2 组 2.3）。值是拍号而非布尔，因为
-    # slack 在 0 附近每拍抖动，判死必须有 TTL 迟滞、否则候选集会 flap。
-    #
-    # 放在 Blackboard 而**不是** StuckScratch：scratch 是「模式进入时构造、
-    # 退出即丢弃」的局部状态，每次进出灭火/脱困都会被整体替换（arbiter.py
-    # 两处、agent.py 一处、primitives/stuck.py 一处都会 new 一个）。判死必须
-    # 跨模式存活——灭个火回来发现所有单又都"有救"了，这道闸就等于没有。
-    doomed_orders: Dict[Any, int] = field(default_factory=dict)
-    # 判死的**入口**确认计数：order id → 连续算出必死的拍数。攒够
-    # planner.DOOM_CONFIRM_TICKS 才真的写进 doomed_orders。入口无迟滞而出口
-    # 200 拍是不对称的，一次抖动就能把候选打翻（见 planner 的常数注释）。
-    doom_streak: Dict[Any, int] = field(default_factory=dict)
 
     # ---------- 对话层（spec §4.5–4.7）----------
     # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。

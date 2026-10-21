@@ -80,7 +80,7 @@
   - `Preference(kind, branch=None, family=None, task_type=None, candidate_key=None, owner="P1", weight=0.0, expires_tick=0, base_ttl=0)`
   - `DialogCommand(type, branch=None, family=None, task_type=None, candidate_key=None, order_id=None, owner=None, ttl_s=None, command_id="")`
   - `LLMTurn(addressed, reply, commands, confidence)`
-  - `DialogState(last_speech_tick=0, last_order_tick=0, last_rescue_tick=0, last_help_tick=0, recent_turns=None, pending_reply=None, pending_event=None, event_seq=0)`
+  - `DialogState(last_speech_tick=0, last_order_tick=0, last_rescue_tick=0, last_help_tick=0, recent_turns=None, pending_reply=None, event_seq=0)`
   - `VoiceConfig(asr_key, asr_resource_id, tts_key, tts_voice, tts_resource_id, ark_key, ark_base_url, ark_model, name="小厨", rate=1.05, volume=0.7, log_path=None, debug=False)`
   - `FAMILY_OF_TYPE: Dict[str, str]`, `RESCUE_TYPES: set`, `NO_BRANCH_TYPES: set`
   - `task_key_str(task) -> str`, `preference_matches_task(pref, task, branch) -> bool`, `parse_llm_turn(text) -> LLMTurn`
@@ -446,7 +446,7 @@ Expected: FAIL.
 
 - [ ] **Step 4: Implement `_select_layer` and use it in `plan()`**
 
-Compute `slack_map = ETA.solo_slack_by_order(world, book, plate_match, cooker_match)` **before** calling `_select_layer` (the current `plan()` computes it after `layer_filter`; move it up). Group `feasible` by `layer_map[c.task.key]`; iterate layers ascending. For each layer, build `eligible = [c for c in layer_cands if _claim_assign_penalty(c, bb, layer) >= 0 or _rescue_gate_open(c, cushion(c), bb)]`. If `eligible` is non-empty, return `(layer, eligible)`. If not, continue to the next layer. `cushion(c)` uses the candidate's effective order id (for `DeliverPlate`, use the same `_credited_order_id` as scoring) and `slack_map`. When a gate-open candidate is chosen, set `bb.rescue_cooldown_until = bb.tick + 100`, record `rescue_override` in `decision_record`, and set `bb.dialog.pending_event = ("rescue", order_id)` with `bb.dialog.event_seq += 1` so Agent can forward it to the worker.
+Group `feasible` by `layer_map[c.task.key]`; iterate layers ascending. For each layer, build `eligible = [c for c in layer_cands if _claim_assign_penalty(c, bb, layer) >= 0 or _rescue_gate_open(c, cushion(c), bb)]`. If `eligible` is non-empty, return `(layer, eligible)`. If not, continue to the next layer. `cushion(c)` uses the candidate's effective order id (for `DeliverPlate`, use the same `_credited_order_id` as scoring) and `slack_map`. When a gate-open candidate is chosen, set `bb.rescue_cooldown_until = bb.tick + 100`, record `rescue_override` in `decision_record`, and set `bb.dialog.pending_event = ("rescue", order_id)` with `bb.dialog.event_seq += 1` so Agent can forward it to the worker.
 
 - [ ] **Step 5: Replace the current `layer_filter` + `in_layer` selection**
 
@@ -836,7 +836,7 @@ Expected: FAIL with missing methods.
 
 - [ ] **Step 4: Implement `_service_dialog`**
 
-Drain `cmd_q`; for each command call `_apply_dialog_command`; put `(command_id, outcome, reason)` on `ack_q`. Prune expired preferences and abandoned orders. Every 10 ticks publish `_build_dialog_context`. Compare the active order **dish set** against per-level seen dishes to detect new recipes (each dish triggers at most once per level; duplicate orders and reappearing dishes do not trigger) and put a `new_order` event. Drain `bb.dialog.pending_event` to the event queue. Track `chosen_task is None` for 40 ticks + P1 `hands_free` to put a `help` event. Trace `dialog` events.
+Drain `cmd_q`; for each command call `_apply_dialog_command`; put `(command_id, outcome, reason)` on `ack_q`. Prune expired preferences and abandoned orders. Every 10 ticks publish `_build_dialog_context`. Detect new order ids vs `_known_order_ids` and put a `new_order` event. Drain `bb.dialog.pending_event` to the event queue. Track `chosen_task is None` for 40 ticks + P1 `hands_free` to put a `help` event. Trace `dialog` events.
 
 - [ ] **Step 5: Implement command application**
 

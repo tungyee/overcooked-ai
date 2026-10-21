@@ -181,15 +181,17 @@ P1 说的话经语音识别转成文字给你（可能有错别字，按发音�
 - 只用中文口语，一两句、30 字以内；菜名和食材说中文，不要念英文名。
 - 可以闲聊、开玩笑、回答问题；被吐槽时先认个错再说正事。
 - 状态问题（「你在干嘛」「饭好了没」）只按最新的【世界状态】如实回答，不知道就说不知道，不要编。
-- 你下一步具体做什么由系统决定；分工约定只是让系统偏向/避开某些活。不要承诺「马上」「这就去」。
+- 你下一步具体做什么由系统决定；分工约定只是让系统偏向/避开某些活。只有 now 命令可以说「这就去」，do 说「有空就做」，其余不承诺。
 - 调用过工具后，按工具返回的结果说话：成功就确认，被拒或带提醒就如实说明。
 - 分工谈好了就用大白话确认（「那我来煮饭，你来切黄瓜」），不要念内部名词。
 
 ## 分工约定（update_duties）
-P1 话里的「我」指 P1，「你」指你（P2）：「X 我来负责」= P1 做 = leave_to_p1，「X 你来」= do。
-这些约定每条只描述你（P2）自己：
-- do：你优先做（「你去X」「X 你来」）
-- leave_to_p1：P1 在做，你避开（「我来X」「X 我来」「X 交给我」）
+P1 话里的「我」指 P1，「你」指你（P2）。这些约定每条只描述你（P2）自己，分四档：
+- now：马上去（「去X」「马上X」「先X」「现在X」「帮我X」）
+- do：有空优先做（「你负责X」「X归你」「X你来管」「X你包了」）
+- leave_to_p1：P1 在做，你避开（「我来X」「X交给我」「X我来」）
+- stop：先别做（「先别X」「别做X」），30 秒后自动解除
+拿不准用哪档就一律用 now。
 target 是一种**物料**（代表这种料的整条链：取料、切、下锅、盛盘、装盘都算）或一个**共享动作**。\
 「煮饭」「切黄瓜」「鱼你包了」都是指那种物料整条链；一种物料只归一个人，不要拆开。
 「我负责煮的」「切菜我来」这类按加工方式说的，就对目录里标了「要煮」「要切」的每种物料各调用一次。
@@ -211,7 +213,13 @@ target 是一种**物料**（代表这种料的整条链：取料、切、下锅
 _EVENT_TEXT = {
     "new_order": ("事件：新菜出现了。先看这道新菜里哪些物料还没有归属，只对这些新物料调用 "
                   "update_duties（哪些你做、哪些请 P1 做）；已经约定好的物料（世界状态「分工」栏里已有的）"
-                  "不要重复、不要改。再用一两句话告诉 P1 新分工，P1 之后可以改口。"),
+                  "不要重复、不要改。然后直接说谁负责新物料（如「黄瓜我来切，番茄归你」），"
+                  "不要报菜名、别说「新菜来了」「新单子是」这类开场白，一句话说清分工，P1 之后可以改口。"),
+    "checkin": ("按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。"),
+    "last_seconds": ("事件：本关只剩最后几秒了。用一两句话提醒或鼓励 P1（如「最后十秒，稳住」），"
+                     "也可以说下现在该干嘛。不调用工具。"),
+    "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费）、送达数、连击，"
+                      "用一两句话总结这局，可以鼓励、也可以吐槽，语气自然。不调用工具。"),
 }
 
 
@@ -230,8 +238,16 @@ def render_state(context):
     ctx = context or {}
     lines = ["【世界状态】"]
     if ctx.get("time_left") is not None:
-        lines.append("本关剩余 %s 秒；得分 %s。" % (ctx.get("time_left"),
-                                               ctx.get("score", "?")))
+        lines.append("本关剩余 %s 秒。" % (ctx.get("time_left"),))
+    total = ctx.get("total")
+    if total is not None:
+        lines.append("总分 %s。" % (total,))
+    deliveries = ctx.get("deliveries")
+    if deliveries is not None:
+        lines.append("已送 %s 单。" % (deliveries,))
+    tips = ctx.get("tips")
+    if tips is not None:
+        lines.append("小费 %s。" % (tips,))
     orders = ctx.get("orders") or []
     if orders:
         lines.append("订单：")
@@ -247,6 +263,21 @@ def render_state(context):
     plates = ctx.get("plates")
     if plates:
         lines.append("盘子：%s" % (plates,))
+    boards = ctx.get("boards") or []
+    if boards:
+        lines.append("切菜板：%s" % ("；".join(boards),))
+    idle = ctx.get("idle_cookers")
+    if idle:
+        lines.append("空闲灶 %s 个" % (idle,))
+    combo = ctx.get("combo")
+    if combo:
+        lines.append("连击 %s" % (combo,))
+    expiring = ctx.get("expiring_orders") or []
+    if expiring:
+        lines.append("快过期的订单：")
+        for o in expiring:
+            lines.append("- #%s %s（剩 %s 秒）" % (
+                o.get("id"), o.get("dish"), o.get("remaining")))
     p1 = ctx.get("p1") or {}
     lines.append("P1：手持 %s" % (p1.get("holding") or "空",))
     p2 = ctx.get("p2") or {}

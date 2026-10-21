@@ -65,22 +65,13 @@ def loose_cookware(ctx):
 
 def item_wanted_by_orders(ctx, item):
     # type: (Dict, Optional[str]) -> int
-    """该料被几张**还有救的**现存订单需要（按订单成分名比较）。
-
-    判死的单不计入（第 4 组 4.2）：给来不及做完的单提前备料是纯损失，取回来
-    的料没人要。判死表由 planner.mark_doomed_orders 每拍写入 bb.doomed_orders。
-    """
+    """该料被几张现存订单需要（按订单成分名比较）。"""
     if not item:
         return 0
     want = str(item).lower()
     book = ctx["book"]
-    bb = ctx.get("bb")
-    doomed = getattr(bb, "doomed_orders", None) or {}
-    tick = getattr(bb, "tick", 0) if bb is not None else 0
     n = 0
     for order in ctx["w"].orders:
-        if doomed.get(order.get("id"), 0) > tick:
-            continue
         for ing in book.requirements(order):
             if str(ing).lower() == want:
                 n += 1
@@ -98,6 +89,43 @@ def loose_item_named(ctx, item):
         if str(it.get("n") or "").lower() == want:
             return it
     return None
+
+
+def _has_free_chopping_board(world):
+    # type: (Any) -> bool
+    """是否存在 item 为空的砧板（手持需切的生料能否放上去）。"""
+    for st in world.stations or ():
+        if not isinstance(st, dict) or st.get("t") != "chopping":
+            continue
+        name = str(st.get("n") or "")
+        if name and P.board_item(world.workstations, name) == "":
+            return True
+    return False
+
+
+def _chopped_form_available(world, book, raw):
+    # type: (Any, Any, Optional[str]) -> bool
+    """该生料的切好形态是否已可用（砧板 / 手上 / 散落）。
+
+    与 ai.query.recipe_graph._chopped_available 同源：recipe_graph 用它判
+    Chop 链 done、不再发 FetchToBoard/Chop 候选，这里用它判「手里这份生料
+    是否已经多余」。两者口径必须一致，否则手持生料 + 场上已有切好料时，
+    一边说不用切、一边说不放下，死锁（1-6 trace-20261021-125032 t=8559）。
+    """
+    form = book.chop_target(raw)
+    if not form:
+        return False
+    low = str(form).lower()
+    for ws in world.workstations or ():
+        if str(ws.get("item") or "").lower() == low:
+            return True
+    for c in world.chefs or ():
+        if P.held_name(c) == low:
+            return True
+    for it in world.items or ():
+        if str(it.get("n") or "").lower() == low:
+            return True
+    return False
 
 
 @_register
@@ -316,8 +344,16 @@ class StashHeld(Task):
                 if not P.cooker_has_pot(c) and not c.get("isCooking"):
                     return False  # 有空灶，别 stash，让 FetchToCooker 接手
 
-        # 手里的东西还有单要 → 别放下，去装盘
-        return item_wanted_by_orders(ctx, held) == 0
+        # 手里的东西还有单要 → 别放下，去装盘。但两条例外要 stash：
+        #  1) 需切的生料没有空砧板可放 → FetchToBoard 接不了手；
+        #  2) 需切的生料其切好形态已可用 → 这份生料多余了（别再切一份）。
+        if item_wanted_by_orders(ctx, held) > 0:
+            if book.needs_chopping(held) and (
+                    not _has_free_chopping_board(ctx["w"])
+                    or _chopped_form_available(ctx["w"], book, held)):
+                return True
+            return False
+        return True
 
     def build(self):
         # type: () -> Node

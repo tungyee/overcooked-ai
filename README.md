@@ -1,6 +1,6 @@
 # Overcooked! 2 AI 陪玩（oc2）
 
-给合作烹饪游戏 [Overcooked! 2](https://store.steampowered.com/app/728880/Overcooked_2/) 写的 **AI 陪玩（P2 自动玩家）**：游戏里由 BepInEx 插件把整局状态以 NDJSON 快照推到本机，Python 进程读快照、做决策，再用 macOS / Windows 键盘注入控制分屏的 2P，与人类玩家（1P）协作做菜、出餐。运行行为树不需要模型 API。
+给合作烹饪游戏 [Overcooked! 2](https://store.steampowered.com/app/728880/Overcooked_2/) 写的 **AI 陪玩（P2 自动玩家）**：游戏里由 BepInEx 插件把整局状态以 NDJSON 快照推到本机，Python 进程读快照、做决策，再通过插件 exec 通道（27412）发命令驱动虚拟手柄控制分屏的 2P，与人类玩家（1P）协作做菜、出餐。运行行为树不需要模型 API。
 
 ## 工作原理（一句话）
 
@@ -9,34 +9,25 @@
         ↓
 Python 主循环（20 Hz 收帧 → 对账 → 推断 P1 → 仲裁 → 规划 → 执行 → 日志）
         ↓
-macOS CGEvent / Windows SendInput 键盘注入（控制 P2）
+插件 exec 通道 + InControl 虚拟手柄（控制 P2）
 ```
 
-决策采用「三层 + 黑板」架构：`World` 快照 → `Arbiter` 选模式 → `Planner` 选任务 → `Executor` 用行为树产出按键。详细设计见 `docs/superpowers/specs/`。
+决策采用「三层 + 黑板」架构：`World` 快照 → `Arbiter` 选模式 → `Planner` 选任务 → `Executor` 用行为树产出 exec 命令。详细设计见 `docs/superpowers/specs/`。
 
 ## 前置条件
 
-- **macOS**（CGEvent 注入，需终端获得「辅助功能」权限）或 **Windows**（SendInput，启动器自动检查与游戏的权限级别）
+- **macOS**（插件驱动虚拟手柄，无需「辅助功能」权限）
 - Steam 版 **Overcooked! 2**，且已装 **BepInEx**（插件宿主，游戏目录下有 `BepInEx/`）
-- **Python 3.9+**（运行仅依赖标准库 + `Quartz`/pyobjc，用于按键注入）
+- **Python 3.9+**（运行仅依赖标准库）
 - **.NET SDK**（仅编译插件时需要，见下文环境变量）
 
-## Windows 快速开始
+## Windows
 
-先安装 Python，并在游戏目录安装 **BepInEx 5 x86**。在仓库根目录执行；首次部署必须退出游戏，编译脚本会按需下载 Roslyn 编译器：
-
-```powershell
-.\setup_windows.ps1 -GameDir 'D:\steam\steamapps\common\Overcooked! 2' -Deploy
-.\start_windows.ps1 -Background -Seconds 150
-```
-
-已部署时只需运行 start_windows.ps1。游戏使用分割键盘并加入两名玩家；人类使用 WASD 的 1P，AI 使用方向键的 2P，右 Shift 拾放、右 Ctrl 工作。Windows 不发送右 Alt 冲刺。按需允许 UAC，并保持游戏在前台。
-
-省略 `-Seconds 150` 可持续运行；停止用 `./stop_windows.ps1`。失焦、暂停、断流和倒计时归零会松键并暂停决策。
-
-本分支配套插件 **0.19.0 / protocol 4**；旧插件不能与新版 Python 混用。测试结果为 1316 passed / 85 skipped；1-4 追加修复已通过真实帧重放，尚未重新实机验证。详见 [1-4 修复报告](docs/notes/sushi14-stall-2026-10-19.md) 和 [Windows 实测报告](docs/notes/windows-live-validation-2026-10-19.md)。
+键盘注入（SendInput）后端已移除；Windows 与 macOS 一样走插件 exec 通道 + 虚拟手柄（InControl），编译部署插件后启动游戏与 `run_agent.py` 即可。本分支配套插件 **0.19.0 / protocol 4**；旧插件不能与新版 Python 混用。
 
 ## macOS 快速开始
+
+> 新机器首次搭建（装 BepInEx/doorstop、建 `run_game.sh`）见 [`docs/setup.md`](docs/setup.md)。
 
 ### 1. 编译并部署插件（仅改插件源码时需要）
 
@@ -56,11 +47,11 @@ cp plugin/build/Oc2AIPlugin.dll "$GAME_DIR/BepInEx/plugins/Oc2AIPlugin.dll"
 ### 3. 启动 AI
 
 ```bash
-python3 run_agent.py            # 正式：连游戏 + 注入 P2 按键
-python3 run_agent.py --dry-run  # 只读：不注入按键，只看决策
+python3 run_agent.py            # 正式：连游戏 + 插件 exec（虚拟手柄）
+python3 run_agent.py --dry-run  # 只读：不连 exec（NullExec），只看决策
 ```
 
-退出顺序：先 `Ctrl-C` 停 Agent（会自动松开所有按键），再退出游戏。
+退出顺序：先 `Ctrl-C` 停 Agent（会关闭 exec 通道），再退出游戏。
 
 ## 测试
 

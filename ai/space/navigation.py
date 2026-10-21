@@ -4,13 +4,14 @@
 （`bfs_to_station`），候选 task 一多就是 O(候选数 × 图)。这里改为每拍
 从厨师位置 flood-fill 一次得到全图距离，ETA 查表 O(1)（spec §6.4）。
 
-代价模型与原 `_step_cost` 保持一致：逆传送带方向走要长按，代价 8。
-所以这是 Dijkstra，不是均匀代价 BFS——若用 BFS 会把逆带路径算便宜。
+代价模型：逆传送带方向走当前**不加惩罚**（BELT_REVERSE_COST=1，与普通步同价），
+寻路按几何最短走；逆带要 dash+长按顶住这层由 move 原语处理。留这个常数供实机
+调参——若逆行实测偏慢，把它调回 >1 即可重新启用惩罚，调用方与测试都不用改。
 """
 import heapq
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-BELT_REVERSE_COST = 8
+BELT_REVERSE_COST = 1
 
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
@@ -167,6 +168,54 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
     if include_belts:
         return list(fallback)
     return list(preferred) if preferred else list(fallback)
+
+
+def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None):
+    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set]) -> List[Tuple[int, int]]
+    """出餐口（嵌墙）交互位：只取厨房内侧（前侧），排除墙后死路一侧。
+
+    出餐口是嵌在外墙里的一段墙，只有朝厨房的一面能送餐；墙后那一面是
+    贴墙的死路（0~1 格），站过去既送不了餐、也常被柜台/墙卡住。前/后按
+    「沿墙法向连续可走多少格」的深度区分：深度大的一面是厨房（前侧）。
+    两面深度相等（出餐口不在墙边，罕见）时退回全部四邻，不做过滤。
+
+    水平墙（占地 gz 相同、gx >= 2）比南北，垂直墙（占地 gx 相同、gz >= 2）
+    比东西；1×1 或方向不明确的占地退化为 interact_cells_multi。
+    """
+    xs = sorted({c[0] for c in footprint})
+    zs = sorted({c[1] for c in footprint})
+
+    if len(zs) == 1 and len(xs) >= 2:
+        gz = zs[0]
+        mid_gx = xs[len(xs) // 2]
+        north = _walkable_depth(mid_gx, gz, 0, 1, is_walkable)
+        south = _walkable_depth(mid_gx, gz, 0, -1, is_walkable)
+        if north > south:
+            return [(gx, gz + 1) for gx in xs if is_walkable(gx, gz + 1)]
+        if south > north:
+            return [(gx, gz - 1) for gx in xs if is_walkable(gx, gz - 1)]
+    elif len(xs) == 1 and len(zs) >= 2:
+        gx = xs[0]
+        mid_gz = zs[len(zs) // 2]
+        east = _walkable_depth(gx, mid_gz, 1, 0, is_walkable)
+        west = _walkable_depth(gx, mid_gz, -1, 0, is_walkable)
+        if east > west:
+            return [(gx + 1, gz) for gz in zs if is_walkable(gx + 1, gz)]
+        if west > east:
+            return [(gx - 1, gz) for gz in zs if is_walkable(gx - 1, gz)]
+    return interact_cells_multi(footprint, is_walkable, belt_cells)
+
+
+def _walkable_depth(gx, gz, dx, dz, is_walkable, limit=8):
+    # type: (int, int, int, int, Callable[[int, int], bool], int) -> int
+    """从 (gx,gz) 沿 (dx,dz) 连续可走多少格（不含起点，含沿途格）。"""
+    depth = 0
+    x, z = gx + dx, gz + dz
+    while depth < limit and is_walkable(x, z):
+        depth += 1
+        x += dx
+        z += dz
+    return depth
 
 
 def nearest_cost(field, cells):

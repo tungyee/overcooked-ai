@@ -6,9 +6,12 @@ Settle：等状态刷新（spec §7.5）。
 """
 from typing import Any, Callable, Dict, Optional
 
-from ai.query import predicates as P
 from ai.exec.bt import Status
-from ai.primitives.base import Primitive, resolve
+from ai.exec.commands import build_command
+from ai.primitives.base import Primitive, resolve, handle_desc, target_world, target_grid_callbacks
+
+# tap 命令超时（毫秒）。
+TAP_TIMEOUT_MS = 3000
 
 
 class Tap(Primitive):
@@ -42,35 +45,33 @@ class Tap(Primitive):
 
     def reset(self):
         # type: () -> None
-        if self._hands is not None and self._fired:
-            self._hands.cancel_tap(self.key)
         Primitive.reset(self)
         self._fired = False
 
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
-        hands = ctx["hands"]
-        if self._fired:
-            return Status.RUNNING if hands.tap_active(self.key) else Status.SUCCESS
+        return self._tick_delegated(ctx, ctx["exec"])
 
-        if self.target is not None:
-            st = resolve(self.target, ctx)
-            if st is None:
+    def _tick_delegated(self, ctx, ex):
+        # type: (Dict, Any) -> str
+        if self._pending_cmd is None:
+            st = resolve(self.target, ctx) if self.target is not None else None
+            if self.target is not None and st is None:
                 return Status.FAILURE
-            if not P.interact_ready(ctx["chef"], st, self.kind,
-                                    ctx["w"].to_grid):
-                return Status.FAILURE
-
-        # 先停移动：边滑边按会落空或串位（旧 _grab_burst 同样先停）
-        hands.set_move(None)
-        if not hands.tap(self.key):
-            # 冷却未到（另一个节点刚按过同键）。返回 RUNNING 而不是
-            # SUCCESS——谎称按成功会让 Sequence 直接走到 Confirm，
-            # 然后校验失败，多绕一圈且日志误导。
-            return Status.RUNNING
-        self._fired = True
-        return Status.RUNNING if hands.tap_active(self.key) else Status.SUCCESS
+            cmd = build_command(
+                "tap",
+                target=handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
+                kind=self.kind,
+                hold_dir=None,
+                target_world=target_world(st),
+                timeout_ms=TAP_TIMEOUT_MS,
+            )
+            s = self._begin_exec(ctx, ex, cmd)
+            if s == Status.RUNNING:
+                self._fired = True   # 已发出按键命令，之后手部变化是预期的
+            return s
+        return self._poll_exec(ctx, ex)
 
 
 class Confirm(Primitive):
@@ -148,7 +149,6 @@ class Settle(Primitive):
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
-        ctx["hands"].set_move(None)
         if self._left <= 0:
             self.reset()
             return Status.SUCCESS

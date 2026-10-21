@@ -320,6 +320,21 @@ def test_tts_sends_text_and_yields_audio_chunks():
     assert ws.closed
 
 
+def test_tts_sends_rate_when_configured():
+    ws = FakeWS(_tts_frames())
+    client = tts.TTSClient(
+        "key", "seed-tts-2.0", "voice", rate=1.3, ws_factory=FakeConnect(ws)
+    )
+
+    list(client.synthesize("行，我洗。"))
+
+    sent = [P.decode_tts_message(raw) for raw in ws.sent]
+    start = json.loads(sent[1].payload)
+    task = json.loads(sent[2].payload)
+    assert start["req_params"]["rate"] == pytest.approx(1.3)
+    assert task["req_params"]["rate"] == pytest.approx(1.3)
+
+
 def test_tts_control_bodies_carry_event_field():
     ws = FakeWS(_tts_frames())
     client = tts.TTSClient("key", "seed-tts-2.0", "voice", ws_factory=FakeConnect(ws))

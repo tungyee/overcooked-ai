@@ -8,13 +8,12 @@
 这里对应地提供一个根级入口。
 
 先决条件：
-  1. 游戏（Overcooked! 2）已用 BepInEx（run_game.sh，见 AGENTS.md §5.1）启动并进入关卡
-     Sushi_1_4_2P；插件把状态推到 127.0.0.1:27411。
-  2. 本进程在 macOS 上运行，且终端已获「辅助功能」权限（CGEvent 注入）。
+  1. 游戏（Overcooked! 2）已用 BepInEx（run_game.sh，见 AGENTS.md）启动并进入关卡
+     Sushi_1_4_2P；插件把状态推到 127.0.0.1:27411，并监听 27412 exec 通道。
 
 用法：
-    python3 run_agent.py             # 正式：连游戏 + 注入按键；有 key 时默认开语音
-    python3 run_agent.py --dry-run   # 不注入按键（NullController），只看决策
+    python3 run_agent.py             # 正式：连游戏 + 插件 exec（虚拟手柄）；有 key 时默认开语音
+    python3 run_agent.py --dry-run   # 不连 exec（NullExec），只看决策
     python3 run_agent.py --no-voice  # 关闭语音对话
     python3 run_agent.py --voice --voice-debug  # 显式开语音并打印对话调试信息
 
@@ -22,7 +21,7 @@
 启动时默认自动读取仓库根 `.env`（已有环境变量优先）；可用 `--env-file PATH`
 指定其它文件，或 `--no-env-file` 关闭。
 
-Ctrl-C / SIGTERM 退出时会松开所有按键。
+Ctrl-C / SIGTERM 退出时会关闭 exec 通道。
 """
 import argparse
 import math
@@ -33,6 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 from ai.agent import Agent
+from ai.exec.client import NullExec
 from ai.dialog.env import load_env_file
 from ai.dialog.schema import VoiceConfig
 
@@ -68,11 +68,9 @@ class VoiceConfigError(RuntimeError):
 def _parse_args(argv):
     ap = argparse.ArgumentParser(description="Overcooked! 2 AI 陪玩")
     ap.add_argument("--dry-run", action="store_true",
-                    help="不注入按键（用 NullController），只跑决策")
-    ap.add_argument('--seconds', type=float, help='限时运行后自动松键退出')
+                    help="不连 exec（用 NullExec），只跑决策")
+    ap.add_argument('--seconds', type=float, help='限时运行后自动退出')
     ap.add_argument('--stop-file', type=Path)
-    ap.add_argument('--pickup-key', default='right_shift', choices=('right_shift','right_ctrl','slash'))
-    ap.add_argument('--chop-key', default='right_ctrl', choices=('right_shift','right_ctrl','slash'))
     # default=None 用来区分「没给 flag」与显式关闭；--no-voice 恒优先。
     ap.add_argument("--voice", dest="voice", action="store_true", default=None,
                     help="显式启用语音；缺必需环境变量时报错退出（退出码 2）")
@@ -238,43 +236,30 @@ def main(argv=None):
         print("[run] %s" % exc, file=sys.stderr)
         return 2
 
-    # 先解析语音配置：--voice 缺 key 要在连游戏、要辅助功能权限之前就失败。
+    # 先解析语音配置：--voice 缺 key 要在连游戏之前就失败。
     try:
         voice = _build_voice_config(args, os.environ)
     except VoiceConfigError as exc:
         print("[run] %s" % exc, file=sys.stderr)
         return 2
 
-    ctrl = None
-    if not args.dry_run:
-        try:
-            from ai.output.controller import Controller
-            ctrl = Controller(bindings={'pickup': args.pickup_key, 'chop': args.chop_key})
-        except Exception as exc:               # noqa: BLE001
-            print("[run] 初始化输入 controller 失败: %s" % exc,
-                  file=sys.stderr)
-            print("[run] Windows 请使用启动器匹配游戏权限；macOS 需要 pyobjc/辅助功能；"
-                  "或先用 --dry-run 只跑决策。", file=sys.stderr)
-            return 2
-
+    # 唯一执行后端是插件 exec（虚拟手柄）；--dry-run 注入 NullExec 只决策不连 27412。
+    exec_client = NullExec() if args.dry_run else None
     try:
-        agent = Agent(ctrl=ctrl, voice=voice)
+        agent = Agent(voice=voice, exec_client=exec_client)
     except OSError as exc:
-        if ctrl is not None:
-            ctrl.release_all()
         print("[run] 连接游戏失败（插件没起？127.0.0.1:27411）: %s" % exc,
               file=sys.stderr)
         return 1
 
     def _stop(signum, frame):
-        agent.hands.release_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
     agent.require_live_protocol = True
-    print("[run] 已连接；等待新版地形协议、双人关卡和游戏前台后开始决策",
+    print("[run] 已连接 exec 通道；等待新版地形协议、双人关卡后开始决策",
           file=sys.stderr)
     if voice is not None:
         print("[run] 语音已启用：音色=%s 日志=%s"
@@ -284,7 +269,7 @@ def main(argv=None):
         agent.run(max_seconds=args.seconds,
                   stop_requested=args.stop_file.exists if args.stop_file else None)
     finally:
-        agent.hands.release_all()
+        agent.exec_client.close()
         agent.client.close()
     return 0
 

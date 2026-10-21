@@ -99,22 +99,21 @@ class OrderETA(object):
     """一个订单的完工预测。`eta` 是**队列累计后**的完工拍数（含前面单的占用）。"""
 
     __slots__ = ("order_id", "remaining", "lifetime", "hand_ticks",
-                 "solo_eta", "eta", "slack", "doomed", "solo_slack", "rank")
+                 "solo_eta", "eta", "slack", "solo_slack", "rank")
 
     def __init__(self, order_id, remaining, lifetime, hand_ticks,
-                 solo_eta, eta, slack, doomed, solo_slack=None, rank=0):
-        # type: (Any, float, Any, int, int, int, float, bool, Optional[float], int) -> None
+                 solo_eta, eta, slack, solo_slack=None, rank=0):
+        # type: (Any, float, Any, int, int, int, float, Optional[float], int) -> None
         self.order_id = order_id
         self.remaining = remaining
         self.lifetime = lifetime
         self.hand_ticks = hand_ticks
         self.solo_eta = solo_eta
         self.eta = eta
-        # 队列累计 slack：含前面各单的手上工时占用。**只用于判死**，不要拿它
+        # 队列累计 slack：含前面各单的手上工时占用。只作诊断展示，不要拿它
         # 当优先级——队尾单背着全队工时，slack 必然最小，用它打分会得出
         # 「排得越后越紧急」的倒挂结论（见 solo_slack）。
         self.slack = slack
-        self.doomed = doomed
         # 独立 slack：只看这一单自己的关键路径，不含别单占用。打分的 urgency
         # 读它——同款菜下它对 remaining 单调，队首自然最紧迫。
         self.solo_slack = (remaining * TICKS_PER_SECOND - solo_eta
@@ -122,9 +121,8 @@ class OrderETA(object):
         self.rank = rank            # EDF 队列位次（0 = 队首）
 
     def __repr__(self):
-        return ("OrderETA(#%s rem=%.1fs eta=%d slack=%.0f%s)"
-                % (self.order_id, self.remaining, self.eta, self.slack,
-                   " DOOMED" if self.doomed else ""))
+        return ("OrderETA(#%s rem=%.1fs eta=%d slack=%.0f)"
+                % (self.order_id, self.remaining, self.eta, self.slack))
 
 
 def _plate_for(world, plate_match, order_id):
@@ -251,38 +249,6 @@ def _remaining_of(order):
         return 999.0
 
 
-# 判死的新鲜度下限：`remaining/lifetime` 高于这个比例的单一律不判死。
-#
-# 为什么必须有这条闸：队列累计下，只要同时有 4 单以上，队尾单**定义上**
-# slack < 0 —— 判死就退化成了「排位歧视」而非可完成性判断。实机
-# trace-20261014-204822：order#4 在 t=530 出现、t=549 判死，当时
-# remaining=129.0/130s（寿命剩 99%）；#5 同样 19 拍就被拉黑。三个鱼单
-# （#3/#4/#5）一单未送，而鱼单只比黄瓜单多一道同工时的切配 —— 它们被判死
-# 纯因为到得晚。
-#
-# 判死还是自我实现的：判死 → 不投入 → 真做不完 → 过期，预测永不被证伪。
-# 而队列会因为前面的单送出而松动（本局 t=3352 order#3 正是这样解禁，只是
-# 已经太晚）。给新单留出观察期，让它等到队列真的腾不出位置再判。
-#
-# 取 0.75：本关寿命 130s，即「前 32 秒不判死」。一份寿司手上工时约 37 秒，
-# 所以这段窗口内队首最多送出一单 —— 既给了松动的机会，又不至于让真必死的
-# 单白吃掉一整份工时。
-DOOM_FRESHNESS_FLOOR = 0.75
-
-
-def _too_fresh_to_doom(order):
-    # type: (Dict) -> bool
-    """这单是否「太新，还不该判死」（见 DOOM_FRESHNESS_FLOOR）。"""
-    try:
-        lifetime = float(order.get("lifetime"))
-        remaining = float(order.get("remaining"))
-    except (TypeError, ValueError):
-        return False                # 缺字段 → 不豁免，按原规则判
-    if lifetime <= 0:
-        return False
-    return remaining / lifetime > DOOM_FRESHNESS_FLOOR
-
-
 def order_queue(world, book, plate_match=None, cooker_match=None, orders=None):
     # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> List[OrderETA]
     """按最早截止（EDF）排队后，算每单的累计完工时刻与 slack。
@@ -312,40 +278,10 @@ def order_queue(world, book, plate_match=None, cooker_match=None, orders=None):
         eta = max(solo, busy + hands)
         remaining_ticks = _remaining_of(o) * TICKS_PER_SECOND
         slack = remaining_ticks - eta
-        doomed = slack < 0 and not _too_fresh_to_doom(o)
-        # **判死的单不占队列容量**：既然决定放弃它，它的工时就该让给后面的
-        # 单。少了这一步，判死会沿队列雪崩——真实帧 t=1800 原本把 #4~#7 全
-        # 判死，而实况是 #3/#4/#5 过期、#6/#7 送达成功。放开容量后结论变成
-        # 「#3 可救、#4/#5 必死、#6/#7 可救」，与实况逐条吻合（#3 当时确实
-        # 还有 +320 拍余量，它最后丢掉是执行浪费，不是排不进去）。
-        if not doomed:
-            busy += hands
+        busy += hands
         rows.append(OrderETA(o.get("id"), _remaining_of(o), o.get("lifetime"),
-                             hands, solo, eta, slack, doomed, rank=rank))
+                             hands, solo, eta, slack, rank=rank))
     return rows
-
-
-def doomed_order_ids(world, book, plate_match=None, cooker_match=None,
-                     orders=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> List[Any]
-    """来不及做完的订单 id。可行性层据此停止投入（别再给它备料）。"""
-    return [r.order_id
-            for r in order_queue(world, book, plate_match, cooker_match,
-                                 orders=orders)
-            if r.doomed]
-
-
-def slack_by_order(world, book, plate_match=None, cooker_match=None,
-                   orders=None):
-    # type: (Any, Any, Optional[Dict], Optional[Dict], Optional[List]) -> Dict[Any, float]
-    """{order_id: 队列累计 slack（拍）}。**判死口径**。
-
-    打分不要用它：队尾单背着全队工时，slack 必然最小，拿它当紧迫度会得出
-    「排得越后越紧急」（实机 94% 的候选组倒挂）。打分走 solo_slack_by_order。
-    """
-    return {r.order_id: r.slack
-            for r in order_queue(world, book, plate_match, cooker_match,
-                                 orders=orders)}
 
 
 def solo_slack_by_order(world, book, plate_match=None, cooker_match=None,

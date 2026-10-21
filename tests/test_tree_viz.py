@@ -3,7 +3,7 @@
 Plan 2 的交付标准是"打印树、假状态走分支、不注入按键"（spec §11.2
 阶段 3），所以这里最重要的两条断言是：
   1. 整个调用链不导入 Quartz（真键盘注入库）；
-  2. 走完全部 task 的树后，NullController 记下了调用但没有真实按键。
+  2. 走完全部 task 的树后，NullExec 记下了命令但没有连真实 27412。
 """
 import os
 import subprocess
@@ -52,14 +52,12 @@ def test_module_does_not_import_quartz():
         pytest.skip("Quartz 已被其他测试加载到 sys.modules，跳过此检查")
 
 
-def test_null_controller_records_without_pressing():
-    c = V.NullController()
-    c.press("left")
-    c.tap("pickup")
-    c.release("left")
-    c.release_all()
-    assert c.calls == [("press", "left"), ("tap", "pickup"),
-                       ("release", "left"), ("release_all",)]
+def test_null_exec_records_without_connecting():
+    ex = V.NullExec()
+    ex.issue({"cmd": "tap"})
+    assert ex.issued[-1]["cmd"] == "tap"
+    r = ex.poll()
+    assert r["ok"] is True
 
 
 # ---------- 渲染 ----------
@@ -103,7 +101,7 @@ def test_render_timeout_shows_child():
 def test_make_ctx_from_real_frame(frame):
     w = World(frame)
     ctx = V.make_ctx(w)
-    for key in ("w", "chef", "hands", "bb", "field", "book", "tick"):
+    for key in ("w", "chef", "exec", "bb", "field", "book", "tick"):
         assert key in ctx, "ctx 缺 %s（原语的契约，见 primitives 头注释）" % key
     assert ctx["field"], "距离场为空，ETA 查表会全失效"
 
@@ -161,24 +159,16 @@ def test_predicates_evaluate_without_error(frame):
 # ---------- 走分支不按键 ----------
 
 def test_ticking_trees_presses_no_real_keys(frame):
-    """假状态走分支：tick 每棵树若干拍，断言只碰了 NullController。
-
-    这是 spec §11.2 阶段 3 验收标准"不注入按键"的落点。
-    """
+    """假状态走分支：tick 每棵树若干拍，断言只碰了 NullExec（不连真实 27412）。"""
     w = World(frame)
-    ctx, ctrl = V.make_ctx(w, with_controller=True)
+    ctx, ex = V.make_ctx(w, with_exec=True)
     for t in V.enumerate_tasks(ctx):
         tree = t.build()
         for _ in range(3):
             status = tree.tick(ctx)
             assert status in (Status.SUCCESS, Status.FAILURE, Status.RUNNING)
-            ctx["hands"].tick()
         tree.halt()
-    # 走完必须零残留按键（spec §11.5 的浸泡测试硬标准，这里离线先验一次）
-    assert ctx["hands"].held_keys == set()
-    assert ctx["hands"].move_dir is None
-    # 断言 NullController 记录了调用（证明 Hands 确实在工作，只是没真按键）
-    assert len(ctrl.calls) > 0, "应该有按键调用被 NullController 记录"
+    assert len(ex.issued) > 0, "应该有 exec 命令被 NullExec 记录"
 
 
 def test_cli_runs_on_fixture_and_exits_zero():

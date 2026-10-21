@@ -5,9 +5,9 @@
 ## 1. 技术栈与运行架构
 
 - **语言/运行时**：Python 3.9.6（macOS 系统 Python）。无打包、无构建步骤，`ai/` 是纯库，通过 `pytest.ini` 的 `pythonpath = .` 直接 import。
-- **依赖**：运行时除标准库外只有 **`Quartz`（pyobjc）**，且仅在 `ai/output/controller.py`（真实按键注入）用到；决策逻辑完全不依赖第三方库。开发依赖仅 `pytest==7.4.4`（见 `requirements-dev.txt`）。语音对话为可选链路，额外依赖见 `requirements-voice.txt`（`sounddevice` / `numpy` / `websockets` / `requests`），只在启用语音时延迟加载。没有 `pyproject.toml` / `setup.py` / `package.json`。
+- **依赖**：运行时除标准库外无第三方依赖（决策与执行都是纯 Python + 本地 socket）。开发依赖仅 `pytest==7.4.4`（见 `requirements-dev.txt`）。语音对话为可选链路，额外依赖见 `requirements-voice.txt`（`sounddevice` / `numpy` / `websockets` / `requests`），只在启用语音时延迟加载。没有 `pyproject.toml` / `setup.py` / `package.json`。
 - **数据链路**：C# BepInEx 插件（`plugin/Oc2AIPlugin.cs`）5 Hz 推 NDJSON → `ai/state/world.py` 的 `StateClient` 按 `\n` 分帧 → `World` 解析快照。
-- **控制链路**：`ai/output/hands.py`（按键状态层）→ 注入的 controller。正式运行时是 `ai/output/controller.py`（CGEvent，需 macOS「辅助功能」权限）；测试/离线时用 `NullController`（`ai/agent.py` 内定义）或测试里注入的假 controller。
+- **控制链路**：叶子原语经 `ctx["exec"]` 发命令（`ai/exec/commands.py` 的 move/tap/hold/throw/halt）→ `ExecClient`（`ai/exec/client.py`）写 27412 → C# 插件逐帧驱动 InControl 虚拟手柄控制 P2（无需 macOS「辅助功能」权限）。离线/测试用 `NullExec`（同文件，命令即时回 ok 不连 27412）。
 - **频率约定（关键，容易混淆）**：插件推送 **5 Hz**；Python 主循环 **20 Hz**（`TICK_INTERVAL = 0.05`）。代码里「拍」（tick）统一指 **Python 循环拍 = 50 ms**，所有按拍计的阈值都按 20 Hz 理解。实现上主循环用 `StateClient.read_latest()` **非阻塞读**、中间 4 拍复用最新帧重 tick——不能用阻塞的 `read()`，否则会被 5 Hz 推帧拖成 5 Hz（曾踩坑）。
 
 ## 2. 目录结构
@@ -24,8 +24,8 @@
 | `query/` 查询 | `predicates.py` 纯谓词（无副作用、不依赖 World 类）· `recipes.py` RecipeBook 配方语义 · `recipe_graph.py` 配方 DAG 编译 + 候选发射 · `plate_tokens.py` 盘/锅内容 token 解析 · `stations.py` 站点检索 · `placement.py` 落点约束 |
 | `space/` 空间 | `navigation.py` Dijkstra 距离场 · `occupancy.py` 可走性 + 实体去重 · `geometry.py` 网格↔世界坐标 |
 | `revenue/` 收益 | `economy.py` 小费/连击 · `eta.py` 订单 ETA/slack/必死 · `cook_supply.py` 熟料供需（见下） |
-| `output/` 输出 | `hands.py` 按键唯一出口 · `key_scheduler.py` 按键定时松开 · `controller.py` CGEvent 注入（仅实机）· `trace.py` 决策日志 · `state_dump.py` 快照压成可序列化 dict |
-| `exec/` 执行/回放 | `bt.py` 行为树引擎（有记忆的 Sequence/Selector + RepeatUntil/Guard）· `record.py`/`replay.py` 录帧回放 |
+| `output/` 输出 | `trace.py` 决策日志 · `state_dump.py` 快照压成可序列化 dict |
+| `exec/` 执行/回放 | `client.py` ExecClient/NullExec · `commands.py` 命令 schema · `bt.py` 行为树引擎（有记忆的 Sequence/Selector + RepeatUntil/Guard）· `record.py`/`replay.py` 录帧回放 |
 | `dialog/` 对话（可选） | `schema.py` 偏好/命令/`VoiceConfig`/LLM JSON 校验 · `policy.py` 主动开口/限频/紧急模板 · `worker.py` 后台 daemon：PTT/VAD→ASR→LLM→TTS · `audio.py` 采集/播放/RMS VAD · `ptt.py` 全局按键 PTT（Quartz event tap）· `asr.py`/`tts.py`/`llm.py` 云客户端 · `env.py` `.env` 加载 |
 
 ## 3. 核心架构

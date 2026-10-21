@@ -1,7 +1,6 @@
 """task 身份 / 可行性 / 完成判定 / 树结构单测。
 
-ctx 的装配复用 tests/test_primitives.py 的做法（假 World + 假 controller），
-零按键注入。
+ctx 的装配用假 World + NullExec（exec 命令不真正连 27412），零按键注入。
 """
 import pytest
 
@@ -9,26 +8,9 @@ from ai import primitives as PR
 from ai import tasks as T
 from ai.exec.bt import Condition, Guard, RepeatUntil, Selector, Sequence, Status
 from ai.state.blackboard import Blackboard
-from ai.output.hands import Hands
+from ai.exec.client import NullExec
 from ai.space.navigation import distance_field
 from ai.query.recipes import RecipeBook
-
-
-class FakeCtrl(object):
-    def __init__(self):
-        self.calls = []
-
-    def tap(self, name, hold=0.12):
-        self.calls.append(("tap", name))
-
-    def press(self, name):
-        self.calls.append(("press", name))
-
-    def release(self, name):
-        self.calls.append(("release", name))
-
-    def release_all(self):
-        self.calls.append(("release_all",))
 
 
 class FakeWorld(object):
@@ -72,17 +54,17 @@ def make_ctx(w, chef=None, bb=None, tick=0, start=(0, 0)):
     chef = chef if chef is not None else {
         "name": "Player 2", "x": start[0] * 1.2, "z": start[1] * 1.2,
         "held": None, "interactions": inter()}
-    ctrl = FakeCtrl()
+    ex = NullExec()
     cur = w.to_grid(chef["x"], chef["z"])
     return {
         "w": w,
         "chef": chef,
-        "hands": Hands(ctrl),
+        "exec": ex,
         "bb": bb if bb is not None else Blackboard(),
         "field": distance_field(cur, w.walkable, w.belt_dir),
         "book": RecipeBook(w.recipes, w.stations),
         "tick": tick,
-    }, ctrl
+    }, ex
 
 
 # ---------- 身份（spec §6.0 / Review Focus 3）----------
@@ -366,41 +348,43 @@ def test_wash_plate_feasible_when_dirty_exists_and_no_clean():
     assert T.WashPlate(resources=("sink1",)).feasible(ctx) is True
 
 
-def test_wash_plate_infeasible_when_clean_plate_available():
-    """场上还有干净空盘（盘堆里）就别洗——先拿去摆盘/装配，不是洗盘。
+def test_wash_plate_feasible_when_clean_plate_available():
+    """场上还有干净空盘也不再拦 feasible——「要不要洗」已拆进 L4 层谓词。
 
-    旧规则是「干净盘 < PLATE_BUFFER(2) 才洗」，于是只剩 1 块干净盘时也会去
-    洗盘；现在改成「干净盘 + 装配盘 = 0 才洗」，有干净盘就交给摆盘。
+    旧规则是「干净盘 + 装配盘 = 0 才洗」，于是有干净盘时 feasible 判不可行；
+    现在这条软闸是层的事（Task 3，spec §A.3），feasible 只保留物理约束——
+    `now 洗盘` 硬指令在有干净盘时也能选到。干净盘放在 (2,0)（非取盘位、
+    非拼装格），确保 done 与 placed 都不成立，拦它的只有「有干净盘」这一条。
     """
     w = FakeWorld(stations=[SINK, DRYING, STACK], recipes=RECIPES,
                   orders=[ORDER],
                   items=[{"n": "DirtyPlateStack", "x": 0.0, "z": -12.0}],
-                  plates=[plate("p1", -1, 0)])
+                  plates=[plate("p1", 2, 0)])
     ctx, _ = make_ctx(w)
-    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is False
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is True
 
 
-def test_wash_plate_infeasible_when_plate_on_counter():
-    """盘已摆在拼装格上（无论空盘还是已装料）就别洗——装配链还在进行。
+def test_wash_plate_feasible_when_plate_on_counter():
+    """盘已摆在拼装格上（无论空盘还是已装料）也不再拦 feasible。
 
-    实机复现：场上唯一一块盘已就位、FetchToPlate 还能继续倒料，AI 却因
-    clean < PLATE_BUFFER 跑去洗盘。
+    「装配盘在台上就别洗」是 L4 层谓词的事（spec §A.3）：它让 WashPlate 掉出
+    解卡层、优先做装配，但不再让 feasible 直接否决——`now 洗盘` 仍能选到。
     """
-    # 空盘已就位：clean=1 且 placed=1（干净盘分支拦下）
+    # 空盘已就位：clean=1 且 placed=1
     w = FakeWorld(stations=[SINK, DRYING, STACK, COUNTER], recipes=RECIPES,
                   orders=[ORDER],
                   items=[{"n": "DirtyPlateStack", "x": 0.0, "z": -12.0}],
                   plates=[plate("p1", 7, 0)])
     ctx, _ = make_ctx(w)
-    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is False
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is True
 
-    # 已装料的盘在拼装格上：clean=0 但 placed=1（装配盘分支拦下）
+    # 已装料的盘在拼装格上：clean=0 但 placed=1
     w2 = FakeWorld(stations=[SINK, DRYING, STACK, COUNTER], recipes=RECIPES,
                    orders=[ORDER],
                    items=[{"n": "DirtyPlateStack", "x": 0.0, "z": -12.0}],
                    plates=[plate("p2", 7, 0, contents=["Seaweed"])])
     ctx2, _ = make_ctx(w2)
-    assert T.WashPlate(resources=("sink1",)).feasible(ctx2) is False
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx2) is True
 
 
 def test_wash_plate_infeasible_without_dirty_plates():
@@ -494,18 +478,19 @@ def test_wash_plate_feasible_continues_mid_wash_with_clean_plate_out():
     assert task.feasible(ctx) is True
 
 
-def test_wash_plate_infeasible_when_p1_plates_in_sink_but_clean_exists():
-    """P1 刚把脏盘放进池子、P2 并未在洗这池 → 场上还有干净盘就别去洗。
+def test_wash_plate_feasible_when_p1_plates_in_sink_and_clean_exists():
+    """P1 刚把脏盘放进池子、P2 并未在洗这池 → 现在 feasible 仍 True。
 
-    这是续洗判据必须看「承诺」而非「池子里有盘」的原因：只看 sink_plate_count>0
-    会把 P1 放进去的脏盘当成"我们正在洗"，结果场上有干净盘也跑去帮 P1 洗盘。
+    续洗判据看「承诺」而非「池子里有盘」的意义不变（P1 放的盘不算续洗）；但
+    那条「场上还有干净盘就别洗」的软闸已经拆进层（spec §A.3），feasible 不再
+    因为「有干净盘」否决。
     """
     w = FakeWorld(stations=[dict(SINK, plate_count=3), DRYING, STACK],
                   recipes=RECIPES, orders=[ORDER],
                   items=[],
                   plates=[plate("p1", -1, 0)])   # 盘堆里还有一块干净盘
     ctx, _ = make_ctx(w)   # 没有承诺（P2 没在洗）
-    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is False
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is True
 
 
 def test_wash_plate_tree_supports_plates_already_in_sink():
@@ -1422,13 +1407,11 @@ def test_chop_early_stops_when_done_before_timeout():
                   workstations=[board("board_01", "Cucumber")])
     chef = {"name": "Player 2", "x": 1.2, "z": 2 * 1.2, "held": None,
             "interactions": inter(gx=1, gz=3)}
-    ctx, ctrl = make_ctx(w, chef=chef)
+    ctx, _ = make_ctx(w, chef=chef)
     tree = T.Chop("9", ("board_01",), "Cucumber").build()
-    assert tree.tick(ctx) == Status.RUNNING        # 正在按住切
-    assert "chop" in ctx["hands"].held_keys
+    assert tree.tick(ctx) == Status.RUNNING        # 正在执行（先走位后切）
     w.workstations = [board("board_01", "ChoppedCucumber")]
-    assert tree.tick(ctx) == Status.SUCCESS
-    assert ctx["hands"].held_keys == set(), "切完必须松键"
+    assert tree.tick(ctx) == Status.SUCCESS        # pred 成立 → 语义早停
 
 
 def test_chop_tasks_are_registered():
@@ -1523,6 +1506,34 @@ def test_ingredient_source_keeps_bare_loose_item_when_no_station():
     w = FakeWorld(stations=[], items=[item])
     ctx, _ = make_ctx(w)
     assert T.ingredient_source(ctx, "PastaTomato") is item
+
+
+def test_ingredient_source_resolves_conveyor_item_to_static_segment():
+    """传送带上的料（on_station=ConveyorStation）→ 返回静态段而非移动裸 item。
+
+    段有 gx/gz 与方向，Approach 目标从「每帧漂的料 x/z」变成「固定段格」，
+    角色才有稳定目标可追（1-6 米/鱼/海苔只走这条带）。
+    """
+    seg = {"t": "conveyor", "n": "ConveyorStation (6)",
+           "grid": "GridManager", "gx": -6, "gz": -2,
+           "x": 12.0, "z": -2.4, "vx": 0.5, "vz": 0.0}
+    item = {"n": "SushiRice", "x": 12.0, "z": -2.4,
+            "on_station": "attach:ConveyorStation (6)"}
+    w = FakeWorld(stations=[seg], items=[item])
+    ctx, _ = make_ctx(w)
+    assert T.ingredient_source(ctx, "SushiRice") is seg
+
+
+def test_ingredient_source_conveyor_falls_back_to_position_match():
+    """on_station 名与段名对不上时，按世界坐标就近匹配传送带段。"""
+    seg = {"t": "conveyor", "n": "ConveyorStation",
+           "grid": "GridManager", "gx": -6, "gz": -2,
+           "x": 12.0, "z": -2.4, "vx": 0.5, "vz": 0.0}
+    item = {"n": "SushiRice", "x": 12.1, "z": -2.3,
+            "on_station": "attach:ConveyorStation (6)"}
+    w = FakeWorld(stations=[seg], items=[item])
+    ctx, _ = make_ctx(w)
+    assert T.ingredient_source(ctx, "SushiRice") is seg
 
 
 def test_targets_moving_platform_vetoes_non_primary_resource():
@@ -1963,6 +1974,47 @@ def test_stash_held_infeasible_when_holding_needed_item():
             "interactions": inter()}
     ctx, _ = make_ctx(w, chef=chef)
     assert T.StashHeld().feasible(ctx) is False
+
+
+def test_stash_held_feasible_when_holding_needed_choppable_and_no_free_board():
+    """手持需切的料、单还等着它，但砧板全满 → FetchToBoard 接不了手，
+    StashHeld 必须兜底把手清空（搁台面变散落料，板空后 FetchToBoard 再捡）。"""
+    w = FakeWorld(stations=[BOARD, BOARD2, CUKE_CRATE], recipes=RECIPES,
+                  orders=[ORDER],
+                  workstations=[board("board_01", "SushiFish"),
+                                board("board_01 (2)", "SushiFish")])
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Cucumber",
+            "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    assert T.StashHeld().feasible(ctx) is True
+
+
+def test_stash_held_infeasible_when_holding_needed_choppable_and_board_free():
+    """手持需切的料、单还等着它，且有空砧板 → 别 stash，交给 FetchToBoard。"""
+    w = FakeWorld(stations=[BOARD, BOARD2, CUKE_CRATE], recipes=RECIPES,
+                  orders=[ORDER],
+                  workstations=[board("board_01", "SushiFish"),
+                                board("board_01 (2)")])
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Cucumber",
+            "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    assert T.StashHeld().feasible(ctx) is False
+
+
+def test_stash_held_feasible_when_holding_choppable_and_chopped_form_available():
+    """手持需切的生料、也有空砧板，但切好形态已散落在场 → 这份生料多余了。
+
+    否则手持生料 + 场上已有切好料会一起把两条路堵死：recipe_graph 因切好料
+    判该链 done、不再发 FetchToBoard/Chop，StashHeld 又因订单还写着料名不放下。
+    """
+    w = FakeWorld(stations=[BOARD, CUKE_CRATE], recipes=RECIPES,
+                  orders=[ORDER],
+                  workstations=[board("board_01")],
+                  items=[{"n": "ChoppedCucumber", "x": 2.4, "z": 0.0}])
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Cucumber",
+            "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    assert T.StashHeld().feasible(ctx) is True
 
 
 def test_stash_held_infeasible_when_holding_cookware():

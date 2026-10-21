@@ -86,7 +86,7 @@ def _has_cooked_rice(frame):
 
 def _make_agent(monkeypatch, world, worker=None):
     monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
-    agent = Agent(ctrl=MagicMock(), voice=None, dialog_worker=worker)
+    agent = Agent(voice=None, dialog_worker=worker)
     agent.bb.tick = 100
     agent.book = RecipeBook(world.recipes, world.stations)
     return agent
@@ -280,13 +280,13 @@ def test_l2_take_cooked_not_blocked_by_cook_claim(monkeypatch):
 # --------------------------------------------------------- 场景 5：截止闸
 
 def _make_expiring_world():
-    """料齐的盘 + 只剩 5.5 秒的订单 → cushion < margin。
+    """料齐的盘 + 只剩 3.5 秒的订单 → cushion < margin。
 
     与 `tests/test_rescue_gate.py` 同一套真实 World/配方/ETA：不 mock 闸。
     """
     return World({
         "orders": [{"id": "o1", "dish": "Sushi_A",
-                    "composition": ["Seaweed"], "remaining": 5.5,
+                    "composition": ["Seaweed"], "remaining": 3.5,
                     "lifetime": 130.0}],
         "stations": [
             {"t": "washing", "n": "sink_01", "gx": 7, "gz": 1},
@@ -364,7 +364,7 @@ class _AgentWorkerBridge(object):
 def _make_dialog_agent(world, bundle):
     bridge = _AgentWorkerBridge(bundle)
     with patch("ai.agent.StateClient", lambda *a, **k: MagicMock()):
-        agent = Agent(ctrl=MagicMock(), dialog_worker=bridge)
+        agent = Agent(dialog_worker=bridge)
     agent.bb.tick = 100
     agent.book = RecipeBook(world.recipes, world.stations)
     return agent

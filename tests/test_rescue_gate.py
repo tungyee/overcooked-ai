@@ -4,7 +4,7 @@
 规则回顾：
 
 - `cushion = solo_slack`（剩余拍 − 该单完整 solo ETA），**不是**剩余时间；
-- `margin = max(5 秒, min(0.3 × D, 10 秒))`，`D` = 这个动作 + 送餐的耗时；
+- `margin = max(2.5 秒, min(0.15 × D, 5 秒))`，`D` = 这个动作 + 送餐的耗时；
 - `0 <= cushion < margin` 且不在抢单冷却期 → 开闸，允许无视 claim/assign 负分；
 - 本层全被认领且无闸 → 逐层向下掉，不是只掉一层。
 
@@ -92,18 +92,26 @@ def _world(orders, stations=None):
 
 # ---------- margin / gate ----------
 
-def test_margin_starts_at_five_seconds_for_short_actions():
-    """短动作的 D 撑不满 0.3 的占比，5 秒起步兜底。"""
-    assert planner._rescue_margin_ticks("FetchToCooker") == 100   # D=170 拍
-    assert planner._rescue_margin_ticks("DeliverPlate") == 100    # D=50 拍
+def test_margin_starts_at_two_and_a_half_seconds_for_short_actions():
+    """短动作的 D 撑不满 0.15 的占比，2.5 秒（50 拍）起步兜底。"""
+    assert planner._rescue_margin_ticks("FetchToCooker") == 50   # D=170 拍
+    assert planner._rescue_margin_ticks("DeliverPlate") == 50    # D=50 拍
+
+
+def test_margin_narrowed_below_old_value():
+    """收窄后的余量窗口恒小于旧值：Chop 从 100 拍收到 50 拍。"""
+    d = ETA.task_cost_ticks("Chop") + ETA.COST_DELIVER   # 30 + 50 = 80 拍
+    new = planner._rescue_margin_ticks("Chop")
+    assert new == max(50, min(int(0.15 * d), 100))       # 50
+    assert new < max(100, min(int(0.3 * d), 200))        # 旧值 100，更大
 
 
 def test_gate_opens_with_cushion_inside_margin(bb):
-    """solo_eta=17s、remaining=21s → cushion=4s=80 拍 < margin 5s。"""
+    """cushion=2s=40 拍 < margin 2.5s（50 拍）→ 开闸。"""
     task = T.FetchToCooker(order_id=1, resources=("cooker_1",),
                            item="BoiledSushiRice")
     bb.tick = 1000
-    assert planner._rescue_gate_open(_cand(task), cushion=80, bb=bb) is True
+    assert planner._rescue_gate_open(_cand(task), cushion=40, bb=bb) is True
 
 
 def test_gate_closed_when_cushion_is_comfortable(bb):
@@ -114,7 +122,7 @@ def test_gate_closed_when_cushion_is_comfortable(bb):
     assert planner._rescue_gate_open(_cand(task), cushion=180, bb=bb) is False
 
 
-def test_gate_closed_when_already_doomed(bb):
+def test_gate_closed_when_cushion_negative(bb):
     """cushion < 0 已经来不及，不为了它抢。"""
     task = T.FetchToCooker(order_id=1, resources=("cooker_1",),
                            item="BoiledSushiRice")
@@ -136,12 +144,12 @@ def test_cooldown_blocks_the_gate(bb):
     cand = _cand(task)
     bb.tick = 1000
     bb.rescue_cooldown_until = 1050
-    assert planner._rescue_gate_open(cand, cushion=80, bb=bb) is False
+    assert planner._rescue_gate_open(cand, cushion=40, bb=bb) is False
     # 冷却到期那一拍仍算冷却内（严格大于才算过）
     bb.tick = 1050
-    assert planner._rescue_gate_open(cand, cushion=80, bb=bb) is False
+    assert planner._rescue_gate_open(cand, cushion=40, bb=bb) is False
     bb.tick = 1051
-    assert planner._rescue_gate_open(cand, cushion=80, bb=bb) is True
+    assert planner._rescue_gate_open(cand, cushion=40, bb=bb) is True
 
 
 # ---------- 救援类免疫 / L2 仍可选 ----------
@@ -226,8 +234,8 @@ def test_fallthrough_is_iterative_not_one_layer(bb):
 
 def test_gate_open_claimed_delivery_is_selected_and_announced(bb):
     """最后窗口：允许无视认领抢送餐，并写冷却 + 对话事件。"""
-    # plate 已料齐 → solo_eta = 送餐 50 拍；remaining=5.5s=110 拍 → cushion=60
-    w = _world([_order("o1", remaining=5.5)])
+    # plate 已料齐 → solo_eta = 送餐 50 拍；remaining=3.5s=70 拍 → cushion=20
+    w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -249,7 +257,7 @@ def test_gate_open_claimed_delivery_is_selected_and_announced(bb):
 
 def test_cooldown_blocks_a_second_gate_open(bb):
     """第一拍抢过之后，同一单在冷却期内不再开闸，层照常向下掉。"""
-    w = _world([_order("o1", remaining=5.5)])
+    w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -275,7 +283,7 @@ def test_rescue_hold_keeps_claimed_delivery_on_next_tick(bb):
     `_clear_claimed_commitment` 又被同一条 claim 命中 → active_task 被清空，
     Executor 重建树，"抢回"只维持一拍。保护期要挡住这条清理路径。
     """
-    w = _world([_order("o1", remaining=5.5)])
+    w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -300,8 +308,8 @@ def test_rescue_hold_keeps_claimed_delivery_on_next_tick(bb):
 
 def test_hold_release_lets_the_other_order_rescue(bb):
     """抢回的单做完后保护期释放；冷却期内不换单，冷却过后另一单正常开闸。"""
-    w = _world([_order("o1", remaining=5.5),
-                _order("o2", dish="Sushi_B", remaining=6.5)])
+    w = _world([_order("o1", remaining=3.5),
+                _order("o2", dish="Sushi_B", remaining=4.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -338,7 +346,7 @@ def test_hold_release_lets_the_other_order_rescue(bb):
 
 def test_hold_expiry_releases_the_rescue_task(bb):
     """保护期到期后认领重新生效：任务被清、层向下掉。"""
-    w = _world([_order("o1", remaining=5.5)])
+    w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -361,8 +369,8 @@ def test_hold_expiry_releases_the_rescue_task(bb):
 
 def test_two_expiring_orders_select_a_stable_order(bb):
     """两单都在最后窗口时，选择要稳定（顺序 + 结果都不抖）。"""
-    w = _world([_order("o1", remaining=5.5),
-                _order("o2", dish="Sushi_B", remaining=6.5)])
+    w = _world([_order("o1", remaining=3.5),
+                _order("o2", dish="Sushi_B", remaining=4.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
                                      scope=_type("DeliverPlate"))]
@@ -370,7 +378,7 @@ def test_two_expiring_orders_select_a_stable_order(bb):
     plate_match = planner._match_plates_to_orders(w, bb, book)
     cooker_match = planner._match_cookers_to_orders(w, bb, book, plate_match)
     slack = ETA.solo_slack_by_order(w, book, plate_match, cooker_match)
-    assert slack == {"o1": 60.0, "o2": 80.0}
+    assert slack == {"o1": 20.0, "o2": 40.0}
 
     cands = [
         _cand(T.DeliverPlate(order_id="o2", resources=("plate_b",)), book),

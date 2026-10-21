@@ -230,6 +230,22 @@ class World(object):
         self.wind_zones = occupancy.parse_wind_zones(state.get("wind_zones"))
         hazard_boxes = occupancy.hazard_boxes(self.hazards, cell=self.mapping.cell)
         occ_cells = self._occupancy_cells(state.get("occupancy"))
+        # 写死（1-6）：出餐口（plate_station）grid=None，碰撞 footprint 没进
+        # occupancy；且碰撞盒北缘（maxz≈3.6）伸进北邻那排，角色半径过不去 →
+        # 把出餐口北邻一排标成不可走，避免寻路北上钻墙后死路（1-6 实机两处卡死）。
+        if str(self.level or "").startswith("1_6_Dynamic"):
+            for st in self.stations:
+                if not isinstance(st, dict) or st.get("t") != "plate_station":
+                    continue
+                x, z = st.get("x"), st.get("z")
+                if x is None or z is None:
+                    continue
+                cell = self.to_grid(x, z)
+                if cell is None:
+                    continue
+                for dx in (0, 1):      # 出餐口约 2 格宽
+                    for dz in (1,):    # 只挡北邻一排（墙后死路）
+                        occ_cells.add((cell[0] + dx, cell[1] + dz))
         self.belt_cells, self.belt_dir = occupancy.parse_belts(state.get("belts"))
 
         # belt_cells 必须在 walkable 之前解析好：传送带格要从运行时占用里

@@ -15,7 +15,7 @@ from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
-                           loose_count, plate_by_id)
+                           loose_count, loose_on_station, plate_by_id)
 
 # 端盘在锅前等熟的最长拍数（15s）。煮一锅饭实测约 11s，取盘+走到锅前再
 # 留足余量；超时交还 Planner，避免无限等一个可能永远不成立的状态。
@@ -24,6 +24,11 @@ WAIT_COOKED_TIMEOUT_TICKS = 300
 # TakeCookedToPlate 现在跨「取盘 + 走到锅前 + 等熟 + 盛饭」四段，比普通
 # task 长，超时上限单独放宽（20s，比默认 TASK_TIMEOUT_TICKS=200 的 10s 翻倍）。
 TAKE_COOKED_TIMEOUT_TICKS = 400
+
+# 传送带拦截等料的最长拍数（15s）。米/鱼/海苔在传送带上循环移动，走到锁定
+# 段旁等它经过；一轮循环实测约 30~40 秒但场上同时有多份料，等到下一份的
+# 间隔远短于此。超时交还 Planner，而不是无限等一份可能永远不来的料。
+CONVEYOR_WAIT_TICKS = 300
 
 # 下料是**两趟**差事（空手走到料箱、拿着料走回灶），和灭火同构，默认 200
 # 拍压根不够：实机 trace-20261015-165358 九次 FillCooker 里四次撞线
@@ -233,9 +238,31 @@ class FetchToCooker(Task):
                 # ingredient_source 对「挂站点上的散落料」返回站点（有朝向），
                 # face=True 让 Face 转身；裸散落料 Face 内部直接 SUCCESS 跳过，
                 # 行为与旧 face=False 等价。
+                #
+                # 传送带上的料（1-6 的米/鱼/海苔）在持续移动：ingredient_source
+                # 每拍把料解析成它当前所在的传送带段，段随料跨段移动而变，角色
+                # 追着移动的料跑永远追不上（trace-20261021-131529 全程 0 帧拿到
+                # 米、灶从没开煮）。这里把取料目标**锁死在第一次解析出的站点**，
+                # 再 WaitUntil 等料经过这一段才 tap——拦截等料，不追移动目标。
+                locked = {}
+
+                def target(c):
+                    st = locked.get("st")
+                    if st is None:
+                        st = ingredient_source(c, form(c))
+                        if st is not None:
+                            locked["st"] = st
+                    return st
+
+                def arrived(c):
+                    st = locked.get("st")
+                    if not isinstance(st, dict) or st.get("t") != "conveyor":
+                        return True       # 箱子/板/散落不是传送带，不需等
+                    return loose_on_station(c["w"], form(c), st)
+
                 return PR.InteractWith(
-                    lambda x: ingredient_source(x, form(x)), "pickup", holding,
-                    face=True)
+                    target, "pickup", holding, face=True,
+                    wait_pred=arrived, wait_timeout=CONVEYOR_WAIT_TICKS)
 
             def drop():
                 return PR.InteractWith(
@@ -525,19 +552,19 @@ class TakeCookedToPlate(Task):
             p = plate_by_id(c, plate_id)
             return p is not None and c["book"].plate_has(p, cooked)
 
-        # ⚠️ 盛饭的交互句柄 kind 与 FetchToCooker 把料放进锅对称，先用
-        # "placement"；实机若 trace 里 Tap 反复 FAILURE（interact_ready 命中
-        # 不到锅），说明端盘面对锅时插件报的是 pickup 句柄，改成 "pickup"
-        # 或去掉 kind 走通用交互格再验证。
+        # 盛饭的交互句柄用 kind=None（通用朝向句柄）：端盘面对锅时，游戏的
+        # placement 句柄为 null、pickup 句柄会被地上的散料抢走（实机：脚边有
+        # 散米时 pickup=SushiRice 而非锅），只有 m_gridLocation（面朝的那格）
+        # 稳定指向锅。改回 "placement" 会因句柄 null 而 re-aim 空转。
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding_plate),
             PR.InteractWith(plate_target, "pickup", holding_plate),
             # 提前站到锅前等熟：端盘盛饭前置了取盘动作，必须趁煮的时候就
             # 把盘端到锅边、熟了立刻盛（等熟了才去拿盘会来不及，实机烧糊）。
-            PR.Approach(source_target, "placement"),
+            PR.Approach(source_target, None),
             PR.Face(source_target),
             PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),
-            PR.InteractWith(source_target, "placement", poured),
+            PR.InteractWith(source_target, None, poured),
             # 树尾不许挂等待节点（与旧实现同款原因）：盘里一有料本 task 就
             # 不可行 → planner 下一拍换 task → executor halt 这棵树；若树尾有
             # 等待节点，成功记账（释放认领）会被静默吞掉，下一拍又去取熟料

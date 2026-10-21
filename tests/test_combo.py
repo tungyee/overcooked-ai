@@ -60,6 +60,58 @@ def test_queue_head_tolerates_non_numeric_ids():
     assert planner._combo_head_id(odd) is not None
 
 
+# ---------- 送餐 combo 闸 ----------
+
+class _BreaksComboWorld(object):
+    def __init__(self, orders):
+        self.orders = orders
+
+
+def _breaks_combo_orders():
+    return [{"id": "3", "dish": "Sushi_Cucumber", "remaining": 50.0, "lifetime": 130},
+            {"id": "4", "dish": "Sushi_Fish", "remaining": 60.0, "lifetime": 130}]
+
+
+def test_breaks_combo_vetoes_non_head_delivery_when_head_alive():
+    from ai import tasks as T
+    w = _BreaksComboWorld(_breaks_combo_orders())
+    # 送 #4（鱼，非队首菜）→ 打断 combo，队首存在 → 否决
+    assert planner._breaks_combo(T.DeliverPlate("4", ("p1",)), w) is True
+
+
+def test_breaks_combo_vetoes_non_head_even_when_head_hopeless():
+    from ai import tasks as T
+    w = _BreaksComboWorld(_breaks_combo_orders())
+    # 严格保顺序：不做 solo_slack 跳单 escape（多人协作下 solo_slack 不准），
+    # 队首看似没救也仍拦非队首送餐。
+    assert planner._breaks_combo(T.DeliverPlate("4", ("p1",)), w) is True
+
+
+def test_breaks_combo_allows_head_dish_and_non_deliver():
+    from ai import tasks as T
+    w = _BreaksComboWorld(_breaks_combo_orders())
+    # 送队首菜 #3 → combo 接得上，不拦
+    assert planner._breaks_combo(T.DeliverPlate("3", ("p1",)), w) is False
+    # 非送餐 task → 不拦
+    assert planner._breaks_combo(
+        T.FetchToPlate("4", ("p1",), "Seaweed"), w) is False
+
+
+def test_urgency_only_applies_to_head_dish():
+    """urgency 只对队首（dish 会记到队首）生效，非队首备菜不给时间压力。"""
+    from ai import tasks as T
+    orders = _mixed(("3", 50.0, "Sushi_Cucumber"), ("5", 50.0, "Sushi_Fish"))
+    w = FakeWorld(orders)
+    bb = Blackboard()
+    slack_map = {"3": 10.0, "5": 10.0}   # 两单都紧，但只有队首吃 urgency
+    head_cand = planner.Candidate(T.FetchToPlate("3", ("p1",), "Seaweed"), [], 5)
+    tail_cand = planner.Candidate(T.FetchToPlate("5", ("p1",), "SushiFish"), [], 5)
+    _, head_terms = planner._score_candidate(w, bb, head_cand, slack_map=slack_map)
+    _, tail_terms = planner._score_candidate(w, bb, tail_cand, slack_map=slack_map)
+    assert head_terms["urgency"] > 0
+    assert tail_terms["urgency"] == 0
+
+
 # ---------- 打分：队首加分 ----------
 
 def _score_deliver(world, bb, order_id, book=None):
@@ -143,16 +195,6 @@ def test_order_id_of_the_task_does_not_change_combo():
     _, as6 = _score_deliver(w, bb, "6")
     assert as3["combo_head"] == as6["combo_head"]
     assert as3["combo_break"] == as6["combo_break"]
-
-
-def test_no_break_penalty_when_head_is_doomed():
-    """队首已判死（救不回来）时，跳过它不该再罚——combo 注定要断。"""
-    w = FakeWorld(_orders(("3", 51.5), ("4", 61.5)))
-    bb = Blackboard()
-    bb.tick = 0
-    bb.doomed_orders["3"] = 100
-    _, tail = _score_deliver(w, bb, "4")
-    assert tail["combo_break"] == 0
 
 
 def test_combo_bonus_grows_with_current_combo():

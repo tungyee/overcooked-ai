@@ -12,7 +12,6 @@ TTL 单位从秒改为拍：旧实现用 time.monotonic() + BAD_CELL_TTL=4.0
 from typing import Any, Callable, Dict, Optional
 
 from ai.exec.bt import Node, Status
-from ai.output.hands import DIR2D
 from ai.primitives.base import Primitive
 
 # 脱困 TTL，单位**拍**。旧实现用 time.monotonic() + 秒数
@@ -90,38 +89,6 @@ class MarkBlocked(Primitive):
         scratch = _ensure_stuck_scratch(ctx)
         scratch.bad_cells[tuple(cell)] = (ctx.get("tick") or 0) + self.ttl
         return Status.SUCCESS
-
-
-class Nudge(Primitive):
-    """L2：侧向微移 ticks 拍，脱离贴墙 / 离格（spec §7.2）。"""
-
-    def __init__(self, direction, ticks=3):
-        # type: (Any, int) -> None
-        Primitive.__init__(self)
-        self.direction = direction
-        self.ticks = ticks
-        self._left = ticks
-
-    def reset(self):
-        # type: () -> None
-        Primitive.reset(self)
-        self._left = self.ticks
-
-    def tick(self, ctx):
-        # type: (Dict) -> str
-        self._enter(ctx)
-        hands = ctx["hands"]
-        if self._left <= 0:
-            hands.set_move(None)
-            self.reset()
-            return Status.SUCCESS
-        d = _resolve_value(self.direction, ctx)
-        if not d or d not in DIR2D:
-            hands.set_move(None)
-            return Status.FAILURE
-        hands.set_move(d)
-        self._left -= 1
-        return Status.RUNNING
 
 
 class AbandonTarget(Primitive):

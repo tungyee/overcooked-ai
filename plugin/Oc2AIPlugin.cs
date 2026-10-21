@@ -31,6 +31,15 @@ namespace Oc2AI
         // 见过就保留，不因实例被切掉/用掉而消失。
         Dictionary<string, string[]> _chopIndexCache = new Dictionary<string, string[]>();
 
+        // chop 索引低频重扫的收敛计数：连续 3 次无新键就停止（见 RescanChopIndex）。
+        int _chopNoNew = 0;
+
+        // 站点名 → grid 名的缓存（关卡静态数据）。BuildStationGridMap 每帧被
+        // plates/items 各调一次，每次对 _all 全组件做 GridName（内含
+        // GetComponentsInChildren 递归），Balloon 关 2410 组件上拖到 290ms×2。
+        // 缓存后在 RefreshLevel 切关时失效重建。
+        Dictionary<string, string> _stationGridCache;
+
         // P2 的 WorkstationInteract(chop/投掷) 键按住时长监控：用于实测
         // 「按住是否影响投掷距离」。-1 = 未按住；>=0 = 当前按住起始的 unscaledTime。
         float _chopDownSince = -1f;
@@ -54,12 +63,30 @@ namespace Oc2AI
         readonly List<TcpClient> _clients = new List<TcpClient>();
         readonly Queue<string> _out = new Queue<string>();
 
+        // exec 执行通道（27412）：入站命令 + 结果回写 + 逐帧执行循环（见 Oc2ExecServer.cs）。
+        ExecServer _execServer;
+
         void Awake()
         {
             Logger.LogInfo("[OC2AI v0.19.0 Windows upstream] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             StartSocket();
+            _execServer = new ExecServer();
+            _execServer.Start();
             Invoke("Snapshot", 3f);   // 之后由 Snapshot 自己按关卡内外决定下次间隔
+            Invoke("RescanChopIndex", 2f);   // 延迟刷出食材的低频重扫（收敛后自动停止）
+        }
+
+        void Update()
+        {
+            // 帧耗时统计（LocalRuntime 拆出来的性能监控，rebase 合并回主 Update）。
+            double ms = Time.unscaledDeltaTime * 1000.0;
+            _frameCount++; _frameSum += ms; _frameMax = Math.Max(_frameMax, ms);
+            if (ms > 33.34) _slowFrames++;
+            // exec 执行通道：每帧 attach/engage（只在主菜单成功，进入关卡后 self-guard
+            // 直接返回）+ tick 活跃命令（move/tap/... 逐帧状态机）。
+            PadEngagement.TryEngage();
+            _execServer.Tick();
         }
 
         void Snapshot()
@@ -214,6 +241,10 @@ namespace Oc2AI
                 _level = cur;
                 _flowId = flowId; _sceneEpoch++;
                 _staticJson = null;       // 下一拍 BuildState() 会重建 stations/recipes
+                // 切关重启延迟刷出食材的低频重扫（上一关可能已收敛停止）。
+                _chopNoNew = 0;
+                CancelInvoke("RescanChopIndex");
+                Invoke("RescanChopIndex", 2f);
                 // 网格校准也要重来：_originX/Z 是从上一关的 StaticGridLocation
                 // 反解出来的，切关后仍沿用会让功能站（出餐口/洗碗池）的 gx/gz
                 // 全错（实机：1-4 切到 1-3，出餐口被算成 -13,8 而非 -6,-4）。
@@ -221,6 +252,7 @@ namespace Oc2AI
                 _originX = 0f;
                 _originZ = 0f;
                 _mainGrid = null;
+                _stationGridCache = null;   // 站点→grid 缓存随关卡失效
             }
         }
 
@@ -922,19 +954,9 @@ namespace Oc2AI
         {
             if (_staticJson == null && IsInLevel()) BuildStatic();
 
-            // Dynamic 关卡食材开局后才刷出：每帧重扫 chop 索引，出现新食材就让
-            // 下一拍重建 recipes（_staticJson=null 触发）。缓存只增不减，见字段注释。
-            if (_staticJson != null && IsInLevel())
-            {
-                int before = _chopIndexCache.Count;
-                MergeChopIndex(_chopIndexCache, BuildChopIndex());
-                if (_chopIndexCache.Count > before)
-                {
-                    Logger.LogInfo("[CHOPIDX] new ingredients, rebuild recipes (cache="
-                        + _chopIndexCache.Count + ")");
-                    _staticJson = null;
-                }
-            }
+            // 分段计时：定位序列化大头（实机 snapshot_ms 665ms，结果见帧里 segments 字段）。
+            var segW = System.Diagnostics.Stopwatch.StartNew();
+            var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
             sb.Append("\"plugin_version\":\"0.19.0\",\"protocol_version\":4,\"session_id\":").Append(Jstr(_sessionId))
@@ -942,78 +964,100 @@ namespace Oc2AI
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))
               .Append(",\"paused\":").Append(IsPaused() ? "true" : "false");
+            seg.Append("meta=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"score\":");
             AppendScore(sb);
+            seg.Append("score=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"timer\":{");
             AppendTimer(sb, FindClientFlowController(), "client");
             sb.Append(',');
             AppendTimer(sb, FindServerFlowController(), "server");
             sb.Append("}");
+            seg.Append("timer=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"orders\":[");
             AppendOrders(sb);
             sb.Append("]");
+            seg.Append("orders=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"chefs\":[");
             int chefCount = AppendChefs(sb);
             sb.Append("],\"chefCount\":").Append(chefCount);
             AppendChopMonitor(sb);
+            seg.Append("chefs=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             // 手持物 -> 持有者名，本帧只算一次，plates/items/extinguishers 共用。
             Dictionary<GameObject, string> heldBy = BuildHeldByMap();
+            seg.Append("heldBy=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"plates\":[");
             AppendPlates(sb, heldBy);
             sb.Append("]");
+            seg.Append("plates=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"workstations\":[");
             AppendWorkstations(sb);
             sb.Append("]");
+            seg.Append("workstations=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"cookers\":[");
             AppendCookers(sb);
             sb.Append("]");
+            seg.Append("cookers=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"extinguishers\":[");
             AppendExtinguishers(sb, heldBy);
             sb.Append("]");
+            seg.Append("extinguishers=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"items\":[");
             AppendItems(sb, heldBy);
             sb.Append("]");
+            seg.Append("items=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"grid\":");
             AppendGrid(sb);
+            seg.Append("grid=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"grids\":");
             AppendGrids(sb);
+            seg.Append("grids=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"terrain\":");
             AppendTerrain(sb);
+            seg.Append("terrain=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"level_bounds\":");
             AppendLevelBounds(sb);
+            seg.Append("level_bounds=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"occupancy\":");
             AppendOccupancy(sb);
+            seg.Append("occupancy=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"belts\":");
             AppendBelts(sb);
+            seg.Append("belts=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"hazards\":");
             AppendHazards(sb);
+            seg.Append("hazards=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"wind_zones\":");
             AppendWindZones(sb);
+            seg.Append("wind_zones=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"stations\":[");
             AppendStations(sb);
             sb.Append(']');
+            seg.Append("stations=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             if (_staticJson != null) sb.Append(',').Append(_staticJson);
+            seg.Append("staticJson=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
+            sb.Append(",\"segments\":\"").Append(seg.ToString()).Append('"');
             sb.Append(",\"diagnostics\":").Append(_performanceJson);
             sb.Append('}');
             return sb.ToString();
@@ -1320,6 +1364,8 @@ namespace Oc2AI
         void AppendPlates(StringBuilder sb, Dictionary<GameObject, string> heldBy)
         {
             int i = 0;
+            Dictionary<GameObject, string> stationMap = BuildStationMap();
+            Dictionary<string, string> stationGrid = BuildStationGridMap();
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null) continue;
@@ -1334,6 +1380,7 @@ namespace Oc2AI
                   .Append(",\"count\":").Append(ContentsCount(ingr))
                   .Append(",\"contents\":").Append(ListContents(ingr))
                   .Append(",\"detail\":").Append(ListContentsDetail(ingr))
+                  .Append(",\"grid\":").Append(Jstr(GridOfItem(mb.gameObject, stationMap, stationGrid)))
                   .Append(",\"held_by\":").Append(
                       Jstr(heldBy.TryGetValue(mb.gameObject, out string hb) ? hb : null))
                   .Append('}');
@@ -1658,6 +1705,34 @@ namespace Oc2AI
             return map;
         }
 
+        // 站点名 -> grid 名。散料/盘没有 grid 引用，靠 on_station 的站点反查。
+        Dictionary<string, string> BuildStationGridMap()
+        {
+            if (_stationGridCache != null) return _stationGridCache;
+            var map = new Dictionary<string, string>();
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null) continue;
+                string g = GridName(mb);
+                if (string.IsNullOrEmpty(g)) continue;
+                if (!map.ContainsKey(mb.name)) map[mb.name] = g;
+            }
+            _stationGridCache = map;
+            return map;
+        }
+
+        // 物件 -> grid 名：先查它所在的站点（on_station），再查该站点的 grid。
+        string GridOfItem(GameObject go, Dictionary<GameObject, string> stationMap,
+                          Dictionary<string, string> stationGrid)
+        {
+            if (go == null || stationMap == null || stationGrid == null) return null;
+            if (!stationMap.TryGetValue(go, out string os) || string.IsNullOrEmpty(os)) return null;
+            string stName = os;
+            if (stName.StartsWith("attach:")) stName = stName.Substring(7);
+            else if (stName.StartsWith("cooking:")) stName = stName.Substring(8);
+            return stationGrid.TryGetValue(stName, out string g) ? g : null;
+        }
+
         // 每帧一次：手持物 -> 持有者名（"Player 1" / "Player 2"）。AppendItems
         // 用它给 items[] 打 held_by 标记——Python 侧据此把手持物与散落物分开。
         // 手持物坐标跟着厨师走，散落语义的取料谓词不能把它当散落料（否则
@@ -1687,13 +1762,19 @@ namespace Oc2AI
         {
             // 可携带物（地面/柜台/传送带上的原料、鱼片、盘子等；手持物也在此，
             // 靠 held_by 与散落物区分——手持锅的内容状态要在这里读）。
+            // 按 GameObject 去重：同一个物件上挂着多个 Carryable/Teleportable 组件，
+            // 按组件枚举会重复报 N 次；按物件报一次即可，Python 侧 dedupe_items
+            // 仍按 (名字,位置) 兜底。
             int i = 0;
+            HashSet<GameObject> seen = new HashSet<GameObject>();
             Dictionary<GameObject, string> stationMap = BuildStationMap();
+            Dictionary<string, string> stationGrid = BuildStationGridMap();
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null) continue;
                 string tn = mb.GetType().Name;
                 if (tn.IndexOf("CarryableItem") < 0 && tn.IndexOf("TeleportableItem") < 0) continue;
+                if (!seen.Add(mb.gameObject)) continue;
                 Vector3 p = mb.transform.position;
                 if (i > 0) sb.Append(',');
                 string ci = CookInfo(mb);
@@ -1707,13 +1788,13 @@ namespace Oc2AI
                   .Append(",\"cooked\":").Append(cooked == "null" ? "null" : Jstr(cooked))
                   .Append(",\"detail\":").Append(PotContents(mb))
                   .Append(",\"throwable\":").Append(IsThrowable(mb) ? "true" : "false")
+                  .Append(",\"grid\":").Append(Jstr(GridOfItem(mb.gameObject, stationMap, stationGrid)))
                   .Append(",\"on_station\":").Append(
                       Jstr(stationMap.TryGetValue(mb.gameObject, out string os) ? os : null))
                   .Append(",\"held_by\":").Append(
                       Jstr(heldBy.TryGetValue(mb.gameObject, out string hb) ? hb : null))
                   .Append('}');
                 i++;
-                if (i >= 32) break;
             }
         }
 
@@ -1755,11 +1836,15 @@ namespace Oc2AI
 
         // 替代 CalibrateGrid/GridIndex 的单网格假设（§4.1 根因：取第一个
         // QuadGridManager、第一个站点就 return，多网格下必然只拿到一个）。
-        // 直接枚举全部 QuadGridManager 实例，每个的 transform.position 就是
-        // 它的世界原点——m_origin 字段恒为 (0,0,0)，原点在 transform 上，不在
-        // 字段里（§4.1 实测）。
+        // 直接枚举全部 QuadGridManager 实例。
+        //
+        // 注意：主网格的 transform.position **不是**网格原点（有父级偏移，
+        // 实机 Sushi_1_4 transform=12 而 m_gridIndex 实际原点 14.4，差 2.4），
+        // 必须用 CalibrateGrid 反解出的 _originX/Z；非主网格（气球篮）的
+        // transform 才是原点，与 GridIndexOn 的判定保持一致。
         void AppendGrids(StringBuilder sb)
         {
+            if (!_gridReady) CalibrateGrid();
             sb.Append('[');
             int i = 0;
             foreach (MonoBehaviour mb in _all)
@@ -1770,10 +1855,16 @@ namespace Oc2AI
                 float cell = 1.2f;
                 if (size is Vector3 sz && sz.x > 0f) cell = sz.x;
                 Vector3 p = mb.transform.position;
+                float ox = p.x, oz = p.z;
+                if (_gridReady && _mainGrid != null && _mainGrid.name == mb.name)
+                {
+                    ox = _originX;
+                    oz = _originZ;
+                }
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"id\":").Append(Jstr(mb.name))
-                  .Append(",\"ox\":").Append(p.x.ToString("0.####"))
-                  .Append(",\"oz\":").Append(p.z.ToString("0.####"))
+                  .Append(",\"ox\":").Append(ox.ToString("0.####"))
+                  .Append(",\"oz\":").Append(oz.ToString("0.####"))
                   .Append(",\"cell\":").Append(cell.ToString("0.####"))
                   .Append('}');
                 i++;
@@ -2153,6 +2244,35 @@ namespace Oc2AI
                 si++;
             }
 
+            // 台面传送带（ConveyorStation）：物料在上面的传送带，角色走不上去。
+            // 报段位置(gx/gz) + 方向速度(vx/vz)，Python 侧据此去静态段旁拦截，
+            // 而不是追移动物料（1-6 的米/鱼/海苔只走这条带）。
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "ConveyorStation") continue;
+                Vector3 p = mb.transform.position;
+                object stGm = GridManagerObj(mb);
+                string[] gidx = GridIndexOn(stGm, p).Split(',');
+                object dir = GetField(mb, "m_conveyanceDirectionXZ");
+                object spd = GetField(mb, "m_conveySpeed");
+                float speed = spd is float f ? f : 0f;
+                float dx = 0f, dz = 0f;
+                if (dir is Vector2 v2) { dx = v2.x; dz = v2.y; }
+                else if (dir is Vector3 v3) { dx = v3.x; dz = v3.z; }
+                if (si > 0) sb.Append(',');
+                sb.Append("{\"t\":\"conveyor\",\"n\":").Append(Jstr(mb.name))
+                    .Append(",\"grid\":").Append(
+                        stGm is UnityEngine.Object ugm && ugm != null ? Jstr(ugm.name) : "null")
+                    .Append(",\"gx\":").Append(gidx[0])
+                    .Append(",\"gz\":").Append(gidx[1])
+                    .Append(",\"x\":").Append(p.x.ToString("0.0"))
+                    .Append(",\"z\":").Append(p.z.ToString("0.0"))
+                    .Append(",\"vx\":").Append((dx * speed).ToString("0.##"))
+                    .Append(",\"vz\":").Append((dz * speed).ToString("0.##"))
+                    .Append('}');
+                si++;
+            }
+
             // 干净盘子堆：CleanPlateUtensilRespawnBehaviour（每堆一个）
             foreach (MonoBehaviour mb in _all)
             {
@@ -2268,6 +2388,38 @@ namespace Oc2AI
         //   ② ServerIngredientContainer/IngredientContainer.m_contents —— 容器里的料；
         //   ③ CarryableItem/TeleportableItem —— 场上散落/手持/传送带上的料。
         // ①② 的 prefab 名干净，先扫；③ 的实例名可能带场景后缀，留作兜底补漏。
+        // 低频重扫 chop 索引：覆盖 Dynamic 关卡开局后延迟刷出的食材（鱼/米/海苔）。
+        // Invoke 自调度（约每 2 秒一次），连续 3 次无新键即收敛停止——稳定后零开销，
+        // 不再像旧实现那样在每帧 BuildState 里全场景反射（2543 组件拖到 665ms）。
+        // 首次调度在 Awake，切关时在 RefreshLevel 重启。
+        void RescanChopIndex()
+        {
+            if (!IsInLevel())
+            {
+                Invoke("RescanChopIndex", 2f);   // 菜单/加载中：等进关再扫
+                return;
+            }
+            if (_staticJson == null)
+            {
+                Invoke("RescanChopIndex", 1f);   // recipes 还没建好：下一拍 BuildStatic 后再扫
+                return;
+            }
+            int before = _chopIndexCache.Count;
+            MergeChopIndex(_chopIndexCache, BuildChopIndex());
+            if (_chopIndexCache.Count > before)
+            {
+                _chopNoNew = 0;                  // 有新食材，重置收敛计数
+                Logger.LogInfo("[CHOPIDX] new ingredients, rebuild recipes (cache="
+                    + _chopIndexCache.Count + ")");
+                _staticJson = null;              // 下一拍 BuildState 重建 recipes
+                Invoke("RescanChopIndex", 1f);   // 可能还有更多在刷出，快一点再扫
+                return;
+            }
+            _chopNoNew++;
+            if (_chopNoNew < 3) Invoke("RescanChopIndex", 2f);
+            // 收敛（连续 3 次无新键）：不再调度，零开销。
+        }
+
         Dictionary<string, string[]> BuildChopIndex()
         {
             var index = new Dictionary<string, string[]>();

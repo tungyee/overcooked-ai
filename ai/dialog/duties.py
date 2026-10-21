@@ -3,9 +3,10 @@
 LLM 只通过 `update_duties` 工具改账本：`add` / `edit` / `remove` 三种 op，
 每条只描述 **P2 自己**的行为（mode）：
 
-- `do`          —— P2 优先做（玩家说「你去 X」）；
-- `leave_to_p1` —— P1 在做，P2 避开（「我来 X」），截止闸仍可抢回；
-- `stop`        —— P2 先别做（「先别 X」），30 秒后自动解除。
+- `do`          —— P2 优先做（「你负责 X」「X 归你」），有空就做；
+- `now`         —— P2 马上去（「去 X」「马上 X」「先 X」「现在 X」「帮我 X」）；
+- `leave_to_p1` —— P1 在做，P2 避开（「我来 X」「X 交给我」），截止闸仍可抢回；
+- `stop`        —— P2 先别做（「先别 X」「别做 X」），30 秒后自动解除。
 
 「做什么」= `target`，只有两类：
 
@@ -29,9 +30,9 @@ item（`Preference.exclude`）。
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from ai.dialog.schema import Preference
+from ai.dialog.schema import Preference, scope_matches
 
-MODES = ("do", "leave_to_p1")
+MODES = ("do", "leave_to_p1", "now", "stop")
 OPS = ("add", "edit", "remove")
 
 TICKS_PER_SECOND = 20
@@ -44,6 +45,8 @@ BLOCKED_NUDGE_S = 10
 # 编译权重（spec §4.5）：direct +4、claim -8。
 WEIGHT_DO = 4.0
 WEIGHT_CLAIM = -8.0
+# now 权重仅 trace 展示；实际「马上去」的选中由 planner 闸消费（Task 2）。
+WEIGHT_NOW = 20.0
 
 # 作用域元素（与 `schema.scope_matches` 同形）：
 #   (None, item 小写) —— 物料：任意 task 类型、该 item；
@@ -277,7 +280,8 @@ class Duty(object):
     expires_tick: int = 0       # 0 = 长期；只有 stop 有到期
 
 
-_MODE_TEXT = {"do": "P2 优先做", "leave_to_p1": "交给 P1", "stop": "P2 先别做"}
+_MODE_TEXT = {"do": "P2 优先做", "now": "P2 马上去",
+              "leave_to_p1": "交给 P1", "stop": "P2 先别做"}
 
 
 class Ledger(object):
@@ -392,6 +396,26 @@ class Ledger(object):
             self.duties = [d for d in self.duties if d.id not in ids]
         return expired
 
+    def consume_now(self, task):
+        # type: (Any) -> bool
+        """「马上去」是一次性的：P2 已认下这个活（task 命中 now 作用域），
+        就把命中的 now 降级成 do——马上去的「这就去」落实一次，剩下的交给
+        do 的持续优先级，不再每拍触发 planner 硬指令闸（否则同一作用域里
+        FetchToCooker↔FillCooker 逐拍换选、执行树逐拍重建，取料永远做不完）。
+
+        返回是否有改动（True = 调用方需重新编译偏好）。
+        """
+        if task is None:
+            return False
+        changed = False
+        for i, duty in enumerate(self.duties):
+            if duty.mode != "now":
+                continue
+            if scope_matches(duty.scope, task):
+                self.duties[i] = replace(duty, mode="do")
+                changed = True
+        return changed
+
     # ---- 编译 / 渲染
 
     def preferences(self):
@@ -405,6 +429,9 @@ class Ledger(object):
             if duty.mode == "do":
                 out.append(Preference(kind="direct", owner="P2",
                                       weight=WEIGHT_DO, **common))
+            elif duty.mode == "now":
+                out.append(Preference(kind="now", owner="P2",
+                                      weight=WEIGHT_NOW, **common))
             elif duty.mode == "leave_to_p1":
                 out.append(Preference(kind="claim", owner="P1",
                                       weight=WEIGHT_CLAIM, **common))
@@ -454,7 +481,7 @@ def tool_schemas(targets, duty_ids):
                "description": "add 新增（同一 target 已有约定时就是改写它）；edit 改已有条目（必须带 id，只写要改的字段）；remove 删除（必须带 id）"},
         "id": {"type": "string", "description": "约定条目 id，edit/remove 必填"},
         "mode": {"type": "string", "enum": list(MODES),
-                 "description": "do=P2 优先做；leave_to_p1=P1 在做，P2 避开"},
+                 "description": "do=有空优先做；now=马上去；leave_to_p1=交给P1，P2避开；stop=先别做"},
         "target": {"type": "string", "enum": list(targets),
                    "description": "物料名（代表这种料的整条加工链）或共享动作"},
     }

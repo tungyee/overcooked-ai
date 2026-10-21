@@ -2,3 +2,7 @@ sounddevice>=0.4.6
 numpy>=1.21
 websockets>=14,<16
 requests>=2.28
+# macOS PTT 需要 Quartz 全局按键监听（Windows 走 GetAsyncKeyState，无需 pyobjc）
+# 12.x 起不再提供 py3.9 的 wheel，源码编译会被新版 clang 拒绝，故卡在 11.x
+pyobjc-framework-Quartz==11.1; sys_platform == "darwin"
+pyobjc-core==11.1; sys_platform == "darwin"

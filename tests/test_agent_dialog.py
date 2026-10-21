@@ -763,3 +763,24 @@ def test_trace_emit_omits_stuck_when_not_stuck(monkeypatch, tmp_path):
     assert "stuck" not in trace.read_log()[0]
 
 
+def test_build_dialog_context_includes_deductions(dagent, world):
+    world.raw["score"] = {"base": 180, "tips": 14, "deliveries": 3,
+                          "deductions": 60}
+
+    ctx = dagent._build_dialog_context(world)
+
+    assert ctx.get("deductions") == 60
+    assert ctx["total"] == 134        # base 180 + tips 14 - 漏单扣 60
+
+    from ai.dialog.llm import render_state
+    assert "漏单扣 60 分" in render_state(ctx)
+
+
+def test_build_dialog_context_marks_round_finished(dagent, world):
+    world.raw["timer"] = {"server": {"left": 0, "limit": 130}}
+    assert dagent._build_dialog_context(world).get("round_finished") is True
+
+    world.raw["timer"] = {"server": {"left": 30, "limit": 130}}
+    assert dagent._build_dialog_context(world).get("round_finished") is False
+
+

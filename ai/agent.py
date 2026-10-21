@@ -126,6 +126,7 @@ def _build_task_meta():
             shared=bool(getattr(cls, "SHARED", False)),
             station=getattr(cls, "STATION", None),
             rescue=planner._is_rescue_action(cls),
+            allowed_modes=getattr(cls, "DUTY_MODES", None),
         )
     return out
 
@@ -267,11 +268,15 @@ def _combo(world):
 
 def _score_total(world):
     # type: (World) -> Optional[int]
-    """结算总分 = 送餐 base + 小费 tips；取不到 base 返回 None。"""
+    """结算总分 = 送餐 base + 小费 tips - 漏单扣分；取不到 base 返回 None。"""
     base = _score_field(world, "base")
     if base is None:
         return None
-    return base + (_score_field(world, "tips") or 0)
+    total = base + (_score_field(world, "tips") or 0)
+    deductions = _score_field(world, "deductions")
+    if deductions:
+        total -= abs(deductions)
+    return total
 
 
 def _expiring_orders(orders):
@@ -780,6 +785,7 @@ class Agent:
             "level": getattr(world, "level", None),
             "live": bool(getattr(world, "phase", None) == "level"
                          and not getattr(world, "paused", False)),
+            "round_finished": _timer_expired(world.raw.get("timer")),
             "tick": tick,
             "time_left": _seconds(planner._time_left_ticks(world)),
             "score": _score_field(world, "base"),
@@ -794,6 +800,7 @@ class Agent:
             "combo": _combo(world),
             "deliveries": _score_field(world, "deliveries"),
             "tips": _score_field(world, "tips"),
+            "deductions": _score_field(world, "deductions"),
             "expiring_orders": _expiring_orders(live_orders),
             "p1": {"holding": P.held_name(p1_chef) or None},
             "p2": {
@@ -1142,13 +1149,13 @@ class Agent:
                 scratch = self.bb.scratch
                 bad = getattr(scratch, "bad_cells", None) or {}
                 blocked = {c for c, expire in bad.items() if expire > self.tick}
-                # 气球篮移动时避开篮子的格子：角色正站在篮子上则放行（它随
-                # 篮子一起动，仍能在篮子上移动），否则跨网格踩空会掉下去
+                # 气球篮移动时避开篮子的格子（护栏，已按用户要求注释）：
+                # 角色正站在篮子上则放行，否则跨网格踩空会掉下去
                 # （trace-20261017-215633 t=1121 respawn 5s）。
-                if self.bb.balloon_moving:
-                    balloon_cells = world.balloon_cells()
-                    if cell not in balloon_cells:
-                        blocked |= balloon_cells
+                # if self.bb.balloon_moving:
+                #     balloon_cells = world.balloon_cells()
+                #     if cell not in balloon_cells:
+                #         blocked |= balloon_cells
                 soft = p1model.p1_soft_cost_map(world, self.bb.p1_model)
                 field = reachability.field_for(world, self.bb, soft_cost=soft)
                 if field is None:  # 缺地形的历史测试仍使用旧距离场。

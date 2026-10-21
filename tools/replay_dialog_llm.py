@@ -287,10 +287,9 @@ SCENARIOS = [
         Step("可以煮了。", expect=Expect(no_duties=[("stop", "")])),
     ], "叫停与恢复"),
     Scenario("i_deliver", "deliver", [
-        Step("送餐我来。", expect=Expect(
-            duties=[("leave_to_p1", "DeliverPlate")],
-            avoid=("DeliverPlate",))),
-    ], "认领送餐：P2 掉到下一层"),
+        Step("送餐我来。", expect=Expect(tools=False),
+             say_any=("送餐",)),
+    ], "送餐不开放认领：谁在旁边谁送，P2 不避开"),
     Scenario("i_cook", "cook", [
         Step("煮的东西我来负责。", expect=Expect(
             duties=[("leave_to_p1", "FetchToCooker")], tools=True,

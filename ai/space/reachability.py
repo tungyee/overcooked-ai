@@ -18,10 +18,13 @@ def field_for(world, bb=None, name=P.P2_NAME, soft_cost=None):
     tick = getattr(bb, 'tick', 0)
     blocked = {tuple(cell) for cell, until in (getattr(scratch, 'bad_cells', None) or {}).items()
                if until > tick}
-    if getattr(bb, 'balloon_moving', False) and hasattr(world, 'balloon_cells'):
-        platform = world.balloon_cells()
-        if start not in platform:
-            blocked |= platform
+    # 移动篮子护栏（已按用户要求注释）：篮子移动且 P2 不在篮子上时，把篮子
+    # 格子拉黑，避免跨网格踩空掉落（trace-20261017-215633 t=1121 respawn 5s）。
+    # 注释后 planner 不再因篮子移动而把料箱/洗碗池判 unreachable。
+    # if getattr(bb, 'balloon_moving', False) and hasattr(world, 'balloon_cells'):
+    #     platform = world.balloon_cells()
+    #     if start not in platform:
+    #         blocked |= platform
     cache = getattr(world, '_reach_fields', None)
     if cache is None:
         cache = world._reach_fields = {}

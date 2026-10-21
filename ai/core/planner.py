@@ -437,8 +437,9 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     task = cand.task
     if not T.claims_available(task, ctx):
         return False, "claimed"
-    if _targets_moving_platform(task, ctx):
-        return False, "platform_moving"
+    # 方案 B（篮子移动时否决目标在篮子上的候选 task）已禁用。
+    # if _targets_moving_platform(task, ctx):
+    #     return False, "platform_moving"
     if _is_stopped(task, bb):
         return False, "p2_suppressed"
     if not ignore_abandon and _is_abandoned(task, bb):

@@ -1123,3 +1123,59 @@ def test_speak_flushes_only_the_playback_window():
     assert capture.marks == [7]
     assert capture.flushed_since == [7]
     assert capture.flushed == 0
+
+
+def test_first_checkin_defers_until_after_first_new_order():
+    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
+    worker.publish_context({"level": "Sushi_1_4_2P",
+                            "orders": [{"id": 1, "dish": "X"}],
+                            "tick": 100,
+                            "live": True})
+    worker._first_new_order_at = time.monotonic()
+    worker._next_checkin_at = time.monotonic() - 1.0
+    worker._checkins_fired = 0
+
+    worker._maybe_checkin(None, False, False)
+
+    assert worker._checkins_fired == 0
+    assert worker._next_checkin_at >= (
+        worker._first_new_order_at + worker_mod.CHECKIN_MIN_S - 0.01)
+    assert bundle.tts.spoken == []
+
+
+def test_second_checkin_is_not_deferred_by_first_new_order():
+    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
+    worker.publish_context({"level": "Sushi_1_4_2P",
+                            "orders": [{"id": 1, "dish": "X"}],
+                            "tick": 100,
+                            "live": True})
+    worker._first_new_order_at = time.monotonic() - 100.0
+    worker._next_checkin_at = time.monotonic() - 1.0
+    worker._checkins_fired = 1
+
+    worker._maybe_checkin(None, False, False)
+
+    assert worker._checkins_fired == 2
+    assert bundle.tts.spoken == ["局面不错。"]
+
+
+def test_checkin_clears_schedule_when_round_finished():
+    worker, bundle = make_worker(llm=FakeLLM())
+    worker.publish_context({"level": "Sushi_1_4_2P",
+                            "orders": [{"id": 1, "dish": "X"}],
+                            "tick": 100,
+                            "live": True,
+                            "round_finished": True})
+    worker._next_checkin_at = time.monotonic() - 1.0
+
+    worker._maybe_checkin(None, False, False)
+
+    assert worker._next_checkin_at is None
+    assert bundle.tts.spoken == []
+
+
+def test_round_summary_does_not_schedule_next_checkin():
+    worker, _ = make_worker(llm=FakeLLM(reply("这局不错。")))
+    worker._handle_event(("round_summary", None),
+                         {"tick": 1000, "live": False, "round_finished": True})
+    assert worker._next_checkin_at is None

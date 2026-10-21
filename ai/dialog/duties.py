@@ -73,6 +73,8 @@ class TaskMeta(object):
     station: Optional[str] = None
     # 救援类（L1/L2 免疫认领负分）：认领时要在结果里提醒，planner 仍会接手
     rescue: bool = False
+    # 共享动作允许的分工档位（None = 四档都接受）；送餐只放行 now/do。
+    allowed_modes: Optional[Tuple[str, ...]] = None
 
 
 @dataclass
@@ -197,6 +199,14 @@ class Kitchen(object):
             return frozenset({(name, None)}), ""
         return None, "本关没有 %s（可选：%s）" % (name, "、".join(self.targets()))
 
+    def allowed_modes(self, target):
+        # type: (Any) -> Optional[Tuple[str, ...]]
+        """target 是受限共享动作时返回允许的分工档位；否则 None（不限）。"""
+        name = str(target or "").strip()
+        if name in self.shared_keys():
+            return self._meta(name).allowed_modes
+        return None
+
     def rescue_types(self, target):
         # type: (Any) -> List[str]
         """target 的链里属于救援类的 task 类型（认领对它们不起作用）。"""
@@ -252,7 +262,11 @@ class Kitchen(object):
             lines.append("共享动作（不分菜）：")
             for key in self.shared_keys():
                 m = self._meta(key)
-                lines.append("  %s（%s）" % (key, m.label or m.desc))
+                line = "  %s（%s）" % (key, m.label or m.desc)
+                if m.allowed_modes:
+                    line += "（只接受：%s）" % "、".join(
+                        _MODE_TEXT[md] for md in m.allowed_modes)
+                lines.append(line)
             missing = ["%s（%s）" % (self._meta(k).label or k, k)
                        for k in self.unavailable()]
             if missing:
@@ -352,6 +366,13 @@ class Ledger(object):
         scope, reason = kitchen.expand(target)
         if scope is None:
             return {"ok": False, "reason": reason}
+        allowed = kitchen.allowed_modes(target)
+        if allowed is not None and mode not in allowed:
+            return {"ok": False,
+                    "reason": "%s 只接受 %s（不能 %s）" % (
+                        target,
+                        "、".join(_MODE_TEXT[m] for m in allowed),
+                        _MODE_TEXT[mode])}
 
         # 同一 target 只有一条约定：add 到已有 target 上等于改写它
         same = next((d for d in self.duties if d.target == target), None)

@@ -653,6 +653,63 @@ def test_extinguish_target_sticks_to_nearest_not_list_order():
         "该选离 P2 最近的那口着火灶，不是 cookers 列表里的第一个"
 
 
+def test_extinguish_spray_done_when_target_out():
+    """喷火 HoldUntil 的 pred 判「当前这口灭了」就结束，不等全灭。
+
+    多口火时若 pred 还是「not any_fire（全灭）」，最近那口灭了但别处还在烧，
+    厨师会一直喷已经灭掉的那口、不换目标（实机：火反复蔓延、喷半天灭不完）。
+    这里钉住：spray_target 锁定最近那口，它一灭 spray_done 立即 True，交
+    RepeatUntil 换下一口；Approach 的 fire_station 负责在每次走位前把锁定
+    清掉，避免上一口的旧名让下一轮提前判 True。
+    """
+    near = cooker("workstation_cooker_01 (2)", cooked=True,
+                  burning=True, onFire=True)
+    near.update(x=1 * 1.2, z=0.0)          # 紧挨 P2
+    far = cooker("workstation_cooker_01 (3)", cooked=True,
+                 burning=True, onFire=True)
+    far.update(x=9 * 1.2, z=0.0)
+    stations = [
+        {"t": "cooking", "n": "workstation_cooker_01 (2)",
+         "gx": 1, "gz": 0, "x": 1 * 1.2, "z": 0.0},
+        {"t": "cooking", "n": "workstation_cooker_01 (3)",
+         "gx": 9, "gz": 0, "x": 9 * 1.2, "z": 0.0},
+    ]
+    w = FakeWorld(stations=stations, recipes=RECIPES, orders=[ORDER],
+                  cookers=[far, near])
+    ctx, _ = make_ctx(w)
+
+    tree = T.Extinguish().build()
+    spray = tree.child.child.children[1]          # Selector 分支2
+    fire_station = spray.children[3].target       # Approach 走位目标（带重置）
+    hold = spray.children[-1].child               # Guard 里的 HoldUntil
+    spray_target = hold.target
+    spray_done = hold.pred
+
+    # 还没锁定目标 → 不算喷完
+    assert spray_done(ctx) is False
+
+    # 锁定最近那口 (2)，它还在烧 → 没喷完
+    got = spray_target(ctx)
+    assert got["n"] == "workstation_cooker_01 (2)"
+    assert spray_done(ctx) is False
+
+    # (2) 灭了，(3) 还在烧 → 当前这口喷完 → True（不必等全灭）
+    near.update(burning=False, onFire=False)
+    assert spray_done(ctx) is True
+
+    # 模拟下一轮走位：fire_station 清空锁定，回到「还没锁定」状态
+    nxt = fire_station(ctx)
+    assert nxt["n"] == "workstation_cooker_01 (3)"
+    assert spray_done(ctx) is False
+
+    # 锁定 (3) 再喷，全灭后 True
+    got2 = spray_target(ctx)
+    assert got2["n"] == "workstation_cooker_01 (3)"
+    assert spray_done(ctx) is False
+    far.update(burning=False, onFire=False)
+    assert spray_done(ctx) is True
+
+
 def test_fetch_to_cooker_claims_cooker():
     t = T.FetchToCooker("1", ("workstation_cooker_01",), "BoiledSushiRice")
     assert t.claims() == (("workstation_cooker_01", "fetch_to"),)
@@ -748,6 +805,23 @@ def test_take_cooked_feasible_while_cooking():
     t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
                             "BoiledSushiRice")
     assert t.feasible(ctx) is True
+
+
+def test_take_cooked_infeasible_when_plate_has_foreign_ingredient():
+    """P1 往 P2 要盛饭的盘里放了别的料 → 盘不再匹配原单，task 不可行。
+
+    与 FetchToPlate 同根因（实机 trace-20261021-231257）：盘↔订单匹配把盘
+    改绑走，但已承诺的盛饭 task 的 feasible 若不校验盘内容，会继续往装错
+    的盘里盛饭。
+    """
+    w = FakeWorld(stations=[COOKER, COUNTER], recipes=RECIPES,
+                  orders=[ORDER],
+                  cookers=[cooker("workstation_cooker_01", cooked=True)],
+                  plates=[plate("p1", 7, 0, ["SushiPrawn"])])
+    ctx, _ = make_ctx(w)
+    t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
+                            "BoiledSushiRice")
+    assert t.feasible(ctx) is False
 
 
 def test_take_cooked_infeasible_when_burning():
@@ -1062,6 +1136,8 @@ def test_extinguish_tree_loops_pot_then_spray():
     hold = spray_branch.children[-1].child
     assert isinstance(hold, PR.HoldUntil)
     assert hold.key == "chop"
+    assert hold.kind == "spray", \
+        "喷火必须走 kind='spray'（插件按朝向句柄匹配，而非 use 句柄——灭火器是手持物）"
 
 
 def test_extinguish_pot_pickup_expects_holding_pot():
@@ -1464,11 +1540,27 @@ def test_fetch_to_plate_infeasible_when_ingredient_unavailable():
     assert T.FetchToPlate("1", ("p1",), "Seaweed").feasible(ctx) is False
 
 
-def test_ingredient_unavailable_on_moving_platform():
-    """篮子移动时，来源挂在非主网格（篮子）上的生料判不可取（方案 B）。
+def test_fetch_to_plate_infeasible_when_plate_has_foreign_ingredient():
+    """P1 往 P2 正在装料的盘里放了别的料 → 盘不再匹配原单，task 不可行。
 
-    planner 据此跳过「去移动中的篮子取料」的 task，而不是选出来再执行失败
-    （选到 → 必失败 → 重选的死循环）。
+    实机 trace-20261021-231257 t=901：P2 承诺 FetchToPlate(SushiFish→盘A,
+    order#6)，P1 把 SushiPrawn 放进盘 A。盘↔订单匹配把盘 A 改绑给 prawn 单，
+    但已承诺的 FetchToPlate(SushiFish) 的 feasible 仍真 → AI 一直往有虾的盘
+    里倒鱼。feasible 必须校验「盘内容仍是该单需求的子集」。
+    """
+    w = FakeWorld(stations=[COUNTER, SEAWEED_CRATE], recipes=RECIPES,
+                  orders=[ORDER], plates=[plate("p1", 7, 0, ["SushiPrawn"])])
+    ctx, _ = make_ctx(w)
+    assert T.FetchToPlate("1", ("p1",), "Seaweed").feasible(ctx) is False
+
+
+def test_ingredient_available_regardless_of_moving_platform():
+    """移动篮子护栏已禁用：来源在篮子上的生料不再因篮子移动而判不可取。
+
+    方案 B（篮子移动时否决目标在篮子上的 task）已全链路禁用：
+    planner._targets_moving_platform / base._source_on_moving_platform /
+    reachability.field_for 的篮子拉黑都已注释。这里钉住「取料可行性不再读
+    balloon_moving」这一事实，防止有人悄悄恢复护栏却漏改这层。
     """
     crate = dict(SEAWEED_CRATE)
     crate["grid"] = "Balloon Basket"
@@ -1477,8 +1569,7 @@ def test_ingredient_unavailable_on_moving_platform():
     bb = Blackboard()
     bb.balloon_moving = True
     ctx, _ = make_ctx(w, bb=bb)
-    assert T.ingredient_available(ctx, "Seaweed") is False
-    # 篮子停稳后恢复可取自
+    assert T.ingredient_available(ctx, "Seaweed") is True
     bb.balloon_moving = False
     assert T.ingredient_available(ctx, "Seaweed") is True
 

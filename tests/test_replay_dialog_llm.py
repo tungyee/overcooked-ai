@@ -2,7 +2,7 @@
 """历史 trace 回放工具的纯函数：快照还原与离线跑一轮（fake LLM）。"""
 import json
 
-from ai.dialog.llm import LLMReply, ToolCall
+from ai.dialog.llm import LLMReply
 from tools import replay_dialog_llm as R
 
 
@@ -62,11 +62,7 @@ def test_run_scenario_offline_applies_ledger_and_checks(tmp_path, capsys):
     with gzip.open(fixture, "rt") as fh:
         state = [json.loads(line) for line in fh][-1]
     frame = R.Frame(path="fixture", line=1, tick=1, state=state)
-    llm = _ScriptedLLM(LLMReply("", [ToolCall(
-        "c0", "update_duties",
-        json.dumps({"op": "add", "mode": "leave_to_p1",
-                    "target": "DeliverPlate"}))]),
-        LLMReply("好，送餐交给你。"))
+    llm = _ScriptedLLM(LLMReply("送餐不用分，谁在旁边谁送。"), LLMReply(""))
     scenario = [s for s in R.SCENARIOS if s.name == "i_deliver"][0]
     args = type("A", (), {"show_prompt": False,
                           "dry_run": False})()
@@ -75,5 +71,5 @@ def test_run_scenario_offline_applies_ledger_and_checks(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert ok, out
-    assert "a1 leave_to_p1 DeliverPlate" in out
     assert "基线 P2 选择：DeliverPlate" in out
+    assert "送餐不用分" in out

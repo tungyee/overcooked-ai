@@ -247,6 +247,7 @@ namespace Oc2AI
         private const float REAIM_TIME = 0.6f;
 
         private readonly Dictionary<string, object> _target;
+        private readonly string _kind;
         private readonly Vector2 _targetWorld;
         private readonly bool _hasTargetWorld;
         private readonly float _timeout;
@@ -263,6 +264,7 @@ namespace Oc2AI
         public HoldCommand(Dictionary<string, object> cmd)
         {
             _target = Req.Obj(cmd, "target");
+            _kind = Req.Str(cmd, "kind");
             var tw = Req.List(cmd, "target_world");
             if (tw != null && tw.Count >= 2)
             {
@@ -279,9 +281,11 @@ namespace Oc2AI
             if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
             if (!f.Valid) { Finish(false, "no chef"); return; }
             f.RefreshInteraction();
-            // use 句柄没命中（没正对目标）→ 有 target_world 就先 re-aim 转向，
-            // 转正后下一拍 UseMatches 命中再按键；无世界坐标则 drifted 交 Python。
-            if (_target != null && !PadButtons.UseMatches(f, _target))
+            // 句柄没命中（没正对目标）→ 有 target_world 就先 re-aim 转向，
+            // 转正后下一拍命中再按键；无世界坐标则 drifted 交 Python。
+            // spray（灭火器）：use 句柄是手持灭火器本身而非灶，改比朝向句柄
+            // （m_gridLocation，HandleMatches(kind=null)）——正对灶才算命中。
+            if (_target != null && !MatchesTarget(f))
             {
                 if (!_hasTargetWorld)
                 {
@@ -301,6 +305,13 @@ namespace Oc2AI
 
             PadEngagement.Pad.Stop();
             PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+        }
+
+        private bool MatchesTarget(ChefFrame f)
+        {
+            // spray 比朝向句柄（m_gridLocation），其余比 use 句柄（m_interactable）。
+            if (_kind == "spray") return PadButtons.HandleMatches(f, _target, null);
+            return PadButtons.UseMatches(f, _target);
         }
 
         private void Finish(bool ok, string why)

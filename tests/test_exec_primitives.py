@@ -121,6 +121,25 @@ def test_hold_issues_hold():
     assert hold.tick(ctx) == Status.SUCCESS
 
 
+def test_hold_spray_issues_spray_kind():
+    """灭火喷雾的 hold 命令带 kind="spray"：插件据此改比朝向句柄。
+
+    端着灭火器时 use 句柄（m_interactable）是灭火器自己，不是灶；spray 让
+    HoldCommand 改走 HandleMatches(kind=null)（m_gridLocation，正对灶），
+    否则 UseMatches 恒不中、按不出 WorkstationInteract（实机复现）。
+    """
+    ex = FakeExec()
+    ctx = make_ctx(W, CHEF, ex)
+    hold = PR.HoldUntil("chop", lambda c: False, 100,
+                        kind="spray",
+                        target=lambda c: {"gx": 1, "gz": 0, "x": 1.2, "z": 0.0,
+                                          "n": "workstation_cooker_01 (3)"})
+    assert hold.tick(ctx) == Status.RUNNING
+    assert ex.issued[0]["cmd"] == "hold"
+    assert ex.issued[0]["kind"] == "spray"
+    assert ex.issued[0]["target"]["name"] == "workstation_cooker_01 (3)"
+
+
 def test_hold_early_exits_on_pred():
     ex = FakeExec()
     ctx = make_ctx(W, CHEF, ex)

@@ -97,6 +97,9 @@ class Task(object):
     # - STATION：本关要有这类站点（frame stations[].t）才进目录；
     SHARED = False
     STATION = None      # type: Optional[str]
+    # 共享动作允许的分工档位（update_duties 的 mode）。None = 四档都接受；
+    # 例如送餐设 ("now", "do")：不能「交给 P1」也不能「先别做」——谁在旁边谁送。
+    DUTY_MODES = None   # type: Optional[tuple]
     # 手部前置（spec §6.1(b)）：需要什么样的手才能做。"any" / "empty"。
     # "empty" 表示要空手去拿东西；手不空时**不是不可行**，由 Planner 在
     # 打分上加"腾手代价"（见 planner._score_candidate），执行时由树首
@@ -243,6 +246,30 @@ def plate_cell(ctx, p):
     return ctx["w"].to_grid(x, z)
 
 
+def plate_matches_order(ctx, plate, order_id):
+    # type: (Dict, Optional[Dict], Any) -> bool
+    """盘内容是否仍是该订单需求的子集（装盘类 task 的可行性补充）。
+
+    P1 往 P2 正在装料的盘里放了别的料 → 盘↔订单匹配会把盘改绑走
+    （planner._match_plates_to_orders 只认 plate_tokens ⊆ order_want_tokens），
+    但已承诺的 FetchToPlate / TakeCookedToPlate 的 feasible 若不校验这一点，
+    就会继续往这张盘倒不属于该单的料（实机 trace-20261021-231257：
+    往有虾的盘里倒鱼）。
+
+    订单找不到（已送掉/过期）也返回 False：别往一张没主的盘倒料，交给
+    ResetPlate 清盘。order_id 为 None（无订单绑定的防御调用）不拦。
+    """
+    if plate is None:
+        return False
+    if order_id is None:
+        return True
+    book = ctx["book"]
+    for o in ctx["w"].orders:
+        if str(o.get("id")) == str(order_id):
+            return book.plate_tokens(plate) <= book.order_want_tokens(o)
+    return False
+
+
 def placed_plates(ctx):
     # type: (Dict) -> List[Dict]
     """已就位（落在某个 counter 拼装格上）的盘。
@@ -322,13 +349,17 @@ def _source_on_moving_platform(ctx, loc):
 
     共享判据见 P.on_moving_platform；这里只从 find_ingredient 的 loc 里
     取出来源站点的 grid 再委托过去。
+
+    生料来源过滤（方案 B）已禁用：恒返回 False。调用点等价于
+    `reachability.can_interact` 原样判定，不再因来源在移动篮子上而否决。
     """
-    if not loc:
-        return False
-    st = loc.get("st")
-    if not isinstance(st, dict):
-        return False
-    return P.on_moving_platform(st.get("grid"), ctx)
+    return False
+    # if not loc:
+    #     return False
+    # st = loc.get("st")
+    # if not isinstance(st, dict):
+    #     return False
+    # return P.on_moving_platform(st.get("grid"), ctx)
 
 
 def ingredient_available(ctx, raw):

@@ -351,6 +351,10 @@ class DialogWorker(object):
         self._pending_order_at = None
         # 下次定时 check-in 的单调时钟时间点；None 表示尚未排期。
         self._next_checkin_at = None
+        # 首次 new_order 的触发时间与已发起的 check-in 次数：首次 check-in
+        # 必须避开首次 new_order，避免开局连续发言。
+        self._first_new_order_at = None
+        self._checkins_fired = 0
 
     # -------------------------------------------------------------- logging
 
@@ -541,6 +545,8 @@ class DialogWorker(object):
             self._pending_order_at = None
             self._level_started = None
             self._next_checkin_at = None
+            self._first_new_order_at = None
+            self._checkins_fired = 0
 
     # ------------------------------------------------------------- queues
 
@@ -869,9 +875,9 @@ class DialogWorker(object):
         now = time.monotonic()
         context = self._latest_context() or {}
         live = bool(context.get("live"))
-        if not live:
-            # 暂停 / 退出关卡：清掉随机排期，恢复后再由下一轮正常回合重排。
-            # 这样退出后不会再冒出 check-in。
+        if not live or context.get("round_finished"):
+            # 暂停 / 退出关卡 / 本局已结束：清掉随机排期，恢复后再由下一轮
+            # 正常回合重排。这样退出后不会再冒出 check-in。
             self._next_checkin_at = None
             return
         has_orders = bool(context.get("orders"))
@@ -879,9 +885,16 @@ class DialogWorker(object):
         if (not utterance and not vad_active and not ptt_recording
                 and should_checkin(self._next_checkin_at, now,
                                    has_orders, in_level, live)):
+            # 首次 check-in 必须和首次 new_order 保持间距，避免开局连续发言。
+            if self._checkins_fired == 0 and self._first_new_order_at is not None:
+                earliest = self._first_new_order_at + CHECKIN_MIN_S
+                if now < earliest:
+                    self._next_checkin_at = earliest
+                    return
             # 先清排期再开口：正常结束会重排，LLM 失败等早退路径则停在
             # None，下一拍 `should_checkin` 返回 False，不会空转打 LLM。
             self._next_checkin_at = None
+            self._checkins_fired += 1
             self._run_llm(context, "checkin", "",
                           timing=TurnTiming(source="event", event="checkin",
                                             started=now))
@@ -1017,6 +1030,9 @@ class DialogWorker(object):
             trigger, batch = merge_new_orders(ids, self.state, tick)
             if not trigger:
                 return
+            # 首次 new_order 记下时间点，供首次 check-in 避让。
+            if self._first_new_order_at is None:
+                self._first_new_order_at = time.monotonic()
             # 1 秒合并窗口就是 new_order 的限频，不再套全局 4 秒闸。
             self.last_proactive_tick = tick
             timing = TurnTiming(
@@ -1127,8 +1143,10 @@ class DialogWorker(object):
         stream.finish()
         stream.wait()
         # 每轮正常结束后随机排下一次定时 check-in（失败早退不重排，沿用旧排期）。
-        self._next_checkin_at = (time.monotonic()
-                                 + random.uniform(CHECKIN_MIN_S, CHECKIN_MAX_S))
+        # 结束总结是本局最后一句，之后不再排 check-in，避免退出关卡还在说话。
+        if event != "round_summary":
+            self._next_checkin_at = (time.monotonic()
+                                     + random.uniform(CHECKIN_MIN_S, CHECKIN_MAX_S))
         if stream.error is not None:
             outcome = "tts_error"
         elif stream.text_seen.strip():

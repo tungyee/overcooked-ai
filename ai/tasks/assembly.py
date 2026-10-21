@@ -12,7 +12,7 @@ from ai.query import stations as S
 from ai.exec.bt import Guard, Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            ingredient_available, ingredient_source,
-                           plate_by_id)
+                           plate_by_id, plate_matches_order)
 
 
 def _plate_on_serving_hatch(ctx, plate):
@@ -131,6 +131,8 @@ class FetchToPlate(Task):
             return False       # 盘被端走（Review Focus 5）
         if self.done(ctx):
             return False
+        if not plate_matches_order(ctx, p, self.order_id):
+            return False       # 盘内容与该单不再兼容（P1 放错料）
         return ingredient_available(ctx, self._fetch_form(ctx))
 
     def _fetch_form(self, ctx):
@@ -198,6 +200,8 @@ class DeliverPlate(Task):
     LABEL = "送餐"
     # 不分菜的共享节点（ai/dialog/duties.py）。
     SHARED = True
+    # 送餐不开放「交给 P1 / 先别做」：谁在旁边谁送，只能让 P2 马上去或优先做。
+    DUTY_MODES = ("now", "do")
     HANDS = "empty"       # 要空手去端盘；手里有东西时打分加腾手代价（spec §6.1(b)）
 
     @property

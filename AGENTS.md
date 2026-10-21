@@ -23,6 +23,12 @@
 
 Python 侧无构建步骤；C# 插件需单独编译。命令在仓库根执行。
 
+跨平台启动与安装以 `README.md` 为准。Windows：`setup_windows.ps1 -Deploy` 编译部署，`start_windows.ps1 -NoVoice` 在当前控制台运行，Ctrl+C 或 `stop_windows.ps1 -Wait` 停止，`-Restart` 等旧实例退出后再启动；`voice_console.ps1` 提供可见语音控制台与 `oc2` 再启动命令。只读模式仅连接 27411，实控启动器等待 27411/27412。两平台都先在主菜单保留一个人类 P1，让插件虚拟手柄接入 P2，不再加入分割键盘 P2；只重启 Python 且 pad 仍接入时可留在关卡。
+
+Windows 语音 PTT 使用只读 GetAsyncKeyState，建议 `caps_lock`，不依赖 Quartz/UAC、不注入按键；macOS PTT 仍用 Quartz，需要安装 pyobjc 并授权。`.env` 支持 UTF-8 BOM，已有环境变量优先。ASR/TTS 的异步队列读取必须可取消，不把无限期 queue.get 留在 executor 中，否则解释器退出会卡住并占住启动锁。
+
+macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.20.0 / 状态协议 4，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
+
 ```bash
 G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
 
@@ -69,7 +75,7 @@ python3 tools/record_frames.py          # 录制实时帧到 NDJSON
 ## 4. 安全
 
 - 真实运行由插件驱动虚拟手柄（InControl），不注入键盘、无需 macOS「辅助功能」权限。离线验证用 `--dry-run` 或 `tools/tree_viz.py`（NullExec，不连 27412）。
-- 语音 PTT 用 Quartz 全局按键监听（`ai/dialog/ptt.py`），同样需要「辅助功能」权限，部分系统还需要「输入监控」；授权后要重启终端/IDE 进程。
+- macOS 语音 PTT 用 Quartz 全局按键监听（`ai/dialog/ptt.py`），需要「辅助功能」权限，部分系统还需要「输入监控」；授权后要重启终端/IDE。Windows 使用只读按键状态轮询，不需要这些权限。
 - 状态端口仅本机，无凭据/密钥；`.gitignore` 已排除运行时产物（`trace-*.jsonl`、`voice*.jsonl`、`frames-*.jsonl`、未压缩 fixture 帧、`*.log`、`.env`、`__pycache__`、`.venv`）。密钥只从环境变量读，`.env.example` 只放占位符。
 
 ## 5. 参考文档

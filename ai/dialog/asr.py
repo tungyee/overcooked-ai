@@ -18,7 +18,7 @@ import websockets
 
 from ai.dialog import volc_protocol as P
 from ai.dialog._async_bridge import (
-    DEFAULT_WS_TIMEOUT_S, connect as open_ws, iter_async, recv as recv_ws)
+    DEFAULT_WS_TIMEOUT_S, async_queue_get, connect as open_ws, iter_async, recv as recv_ws)
 
 
 ASR_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
@@ -125,7 +125,7 @@ async def _send_audio(ws, pcm_chunks, packet_size):
     # type: (object, object, int) -> None
     seq = 2  # full client request 占用 1
     if isinstance(pcm_chunks, queue.Queue):
-        # 实时麦克风：队列由 worker 线程持续投入；用 executor 等待，
+        # 实时麦克风：队列由 worker 线程持续投入；用可取消的异步轮询，
         # 避免阻塞事件循环导致 ASR 下行帧读不到。
         packets = _pack_queue(pcm_chunks, packet_size)
     else:
@@ -145,13 +145,11 @@ async def _pack_queue(chunks, packet_size):
     # type: (queue.Queue, int) -> object
     """从阻塞队列持续打包；None 表示录音结束。
 
-    队列来自 worker 线程，不能在事件循环里直接 `get()`；交给默认
-    executor 等待，音频包之间仍能正常收 ASR 的下行帧。
+    队列来自 worker 线程，通过非阻塞轮询等待，取消时不遗留 executor 线程。
     """
-    loop = asyncio.get_event_loop()
     buf = bytearray()
     while True:
-        chunk = await loop.run_in_executor(None, chunks.get)
+        chunk = await async_queue_get(chunks)
         if chunk is None:
             break
         if not chunk:

@@ -1,14 +1,15 @@
 """全局按键 PTT（push-to-talk）监听：按住录音、松开发送。
 
-用 Quartz 的 listen-only event tap 监听指定键的 keyDown/keyUp，不拦截
-事件，所以游戏/Steam Input 仍能收到同一个按键。事件只放进线程安全队列，
+macOS 用 Quartz listen-only event tap，Windows 用 GetAsyncKeyState
+只读轮询指定键，不拦截事件，游戏/Steam Input 仍能收到同一个按键。事件只放进线程安全队列，
 由 DialogWorker 在自己的线程里消费；本模块不碰音频。
 
-macOS 需要给启动终端/IDE「辅助功能」权限（与按键注入相同）；如果系统
+macOS 的语音热键监听需要给启动终端/IDE「辅助功能」权限；如果系统
 额外要求「输入监控」，授权后需重启进程。
 """
 import queue
 import threading
+import sys
 
 
 # macOS 虚拟键码（Carbon/HIToolbox）。
@@ -18,34 +19,41 @@ KEYCODES = {
     "f9": 101, "f10": 109, "f11": 103, "f12": 111,
     "right_option": 61, "right_shift": 60, "right_control": 62,
 }
+WINDOWS_KEYCODES = dict(('f%d' % n, 0x6f+n) for n in range(1, 13))
+WINDOWS_KEYCODES.update(right_option=0xa5, right_shift=0xa1, right_control=0xa3)
+WINDOWS_KEYCODES['right_alt'] = 0xa5
+# 本机 PTT 使用普通键，避免 Alt/Ctrl/Shift 与游戏输入组合成系统快捷键。
+WINDOWS_KEYCODES['caps_lock'] = 0x14
 
 
-def keycode_for(name):
-    # type: (str) -> int
-    """把 `f8` / `right_option` / 数字键码转成 macOS keycode。"""
+def keycode_for(name, platform=None):
+    # type: (str, object) -> int
+    """按当前平台解析键名；Windows 使用虚拟键码，macOS 使用 Carbon。"""
+    codes = WINDOWS_KEYCODES if (platform or sys.platform) == 'win32' else KEYCODES
     key = str(name or "").strip().lower()
     if not key:
         raise ValueError("PTT 键名为空")
-    if key in KEYCODES:
-        return KEYCODES[key]
+    if key in codes:
+        return codes[key]
     try:
         return int(key)
     except ValueError:
         raise ValueError(
             "未知 PTT 键 %r；可用：%s 或数字 keycode"
-            % (name, ", ".join(sorted(KEYCODES))))
+            % (name, ", ".join(sorted(codes))))
 
 
 class PushToTalk(object):
     """监听一个全局按键，`poll()` 返回 "down"/"up" 事件。
 
-    `tap_factory` 仅用于测试注入；默认使用 Quartz.CGEventTapCreate。
-    `start()` 建立 event tap 并启动 run loop；失败时抛 RuntimeError，
+    `tap_factory` / `state_reader` 仅用于测试注入。
+    `start()` 启动平台监听线程；失败时抛 RuntimeError，
     调用方应退回 VAD。
     """
 
-    def __init__(self, keycode, tap_factory=None, ready_timeout=3.0):
-        # type: (int, object, float) -> None
+    def __init__(self, keycode, tap_factory=None, ready_timeout=3.0,
+                 platform=None, state_reader=None):
+        # type: (int, object, float, object, object) -> None
         self.keycode = int(keycode)
         self._tap_factory = tap_factory
         self._ready_timeout = float(ready_timeout)
@@ -56,6 +64,9 @@ class PushToTalk(object):
         self._tap = None
         self._error = None
         self._closed = False
+        self._platform = platform or sys.platform
+        self._state_reader = state_reader
+        self._stop_event = threading.Event()
 
     def start(self):
         # type: () -> None
@@ -65,14 +76,18 @@ class PushToTalk(object):
         self._closed = False
         self._error = None
         self._ready.clear()
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run, name="dialog-ptt", daemon=True)
         self._thread.start()
         if not self._ready.wait(self._ready_timeout):
+            self.stop()
             raise RuntimeError(
-                "PTT 按键监听启动超时（检查辅助功能/输入监控权限）")
+                "PTT 按键监听启动超时；macOS 请检查辅助功能/输入监控权限")
         if self._error:
-            raise RuntimeError(self._error)
+            error = self._error
+            self.stop()
+            raise RuntimeError(error)
 
     def poll(self):
         # type: () -> list
@@ -89,6 +104,7 @@ class PushToTalk(object):
         # type: () -> None
         """停止 run loop 并释放 event tap（可重复调用）。"""
         self._closed = True
+        self._stop_event.set()
         loop = self._loop
         tap = self._tap
         if loop is not None:
@@ -112,6 +128,9 @@ class PushToTalk(object):
 
     def _run(self):
         # type: () -> None
+        if self._platform == 'win32':
+            self._run_windows()
+            return
         try:
             import Quartz
         except Exception as exc:                # pragma: no cover - 缺 pyobjc
@@ -168,4 +187,27 @@ class PushToTalk(object):
             Quartz.CFRunLoopRun()
         except Exception as exc:                # noqa: BLE001
             self._error = "PTT 按键监听失败：%s" % (exc,)
+            self._ready.set()
+
+    def _run_windows(self):
+        # type: () -> None
+        """只读按键高位，去除重复 down；不拦截、不注入任何游戏按键。"""
+        try:
+            read = self._state_reader
+            if read is None:
+                import ctypes
+                from ctypes import wintypes
+                read = ctypes.WinDLL('user32', use_last_error=True).GetAsyncKeyState
+                read.argtypes = [wintypes.INT]
+                read.restype = wintypes.SHORT
+            pressed = False
+            while not self._stop_event.is_set():
+                down = bool(read(self.keycode) & 0x8000)
+                if down != pressed:
+                    self._events.put('down' if down else 'up')
+                    pressed = down
+                self._ready.set()
+                self._stop_event.wait(.01)
+        except Exception as exc:
+            self._error = 'PTT Windows 按键监听失败：%s' % exc
             self._ready.set()

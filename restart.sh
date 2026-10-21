@@ -13,6 +13,11 @@ set -u
 
 G="${GAME_DIR:-$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
+if [ ! -x "$PYTHON" ]; then
+    echo "[restart] 找不到 Python: $PYTHON；先 python3 -m venv .venv，或设置 PYTHON 的绝对路径" >&2
+    exit 1
+fi
 PORT=27411
 EXEC_PORT=27412
 SKIP_BUILD=0
@@ -50,7 +55,7 @@ port_open() {
     if command -v nc >/dev/null 2>&1; then
         nc -z 127.0.0.1 "$port" 2>/dev/null
     else
-        python3 -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',$port)); s.close()" 2>/dev/null
+        "$PYTHON" -c "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',$port)); s.close()" 2>/dev/null
     fi
 }
 
@@ -85,9 +90,7 @@ if [ "$READY" -ne 1 ]; then
     exit 1
 fi
 
-# 6. 起 Agent。
+# 6. 前台起 Agent，Ctrl+C 可停；不再把 Agent 留在隐藏的后台。
 echo "[restart] 启动 Agent ..."
-python3 run_agent.py $VOICE_FLAG &
-
-echo "[restart] 完成。下次再跑本脚本会自动先停掉它们。"
 echo "[restart] 提示：虚拟手柄只在主菜单能 engage 成 P2——标题画面按 A/空格进 P1、到主菜单后会自动接入。"
+exec "$PYTHON" run_agent.py $VOICE_FLAG

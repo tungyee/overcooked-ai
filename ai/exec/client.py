@@ -65,6 +65,7 @@ class ExecClient(object):
             with self._lock:
                 self._sock.sendall(line.encode("utf-8"))
         except OSError:
+            self.close()
             return -1
         return cmd_id
 
@@ -73,19 +74,25 @@ class ExecClient(object):
         """非阻塞取一个已完成的结果；无则 None。坏行丢弃并继续读下一条。"""
         if not self._connected or self._sock is None:
             return None
-        try:
-            data = self._sock.recv(4096)
-        except OSError:
-            data = b""
-        if data:
-            self._buf += data
         while True:
             idx = self._buf.find(b"\n")
             if idx < 0:
-                return None
-            line = self._buf[:idx].decode("utf-8")
+                try:
+                    data = self._sock.recv(4096)
+                except BlockingIOError:
+                    return None  # Windows WSAEWOULDBLOCK 只是本拍没有新结果。
+                except OSError:
+                    self.close()
+                    return None
+                if not data:
+                    self.close()  # EOF 必须触发主循环重连，不能永远保持假 connected。
+                    return None
+                self._buf += data
+                continue
+            raw_line = self._buf[:idx]
             self._buf = self._buf[idx + 1:]
             try:
+                line = raw_line.decode("utf-8")
                 return parse_result(line)
             except ValueError:
                 self._dropped += 1
@@ -99,6 +106,7 @@ class ExecClient(object):
                 pass
         self._sock = None
         self._connected = False
+        self._buf = b""
 
 
 class NullExec(object):

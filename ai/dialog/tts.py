@@ -16,7 +16,7 @@ import websockets
 
 from ai.dialog import volc_protocol as P
 from ai.dialog._async_bridge import (
-    DEFAULT_WS_TIMEOUT_S, connect as open_ws, iter_async, recv as recv_ws)
+    DEFAULT_WS_TIMEOUT_S, async_queue_get, connect as open_ws, iter_async, recv as recv_ws)
 
 
 TTS_ENDPOINT = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
@@ -180,11 +180,14 @@ class WarmTTSClient(TTSClient):
         self._jobs = queue.Queue()
         self._thread = None
         self._lock = threading.Lock()
+        self._closed = False
 
     def warmup(self):
         # type: () -> None
         """后台启动事件循环并建连；重复调用无副作用。"""
         with self._lock:
+            if self._closed:
+                raise RuntimeError('TTS 客户端已关闭')
             if self._thread is not None and self._thread.is_alive():
                 return
             self._thread = threading.Thread(
@@ -196,17 +199,25 @@ class WarmTTSClient(TTSClient):
         # type: (str) -> object
         self.warmup()
         result_q = queue.Queue()
-        self._jobs.put(("syn", text, result_q))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('TTS 客户端已关闭')
+            self._jobs.put(("syn", text, result_q))
         return _warm_pcm_iter(result_q)
 
     def close(self):
         # type: () -> None
         """结束后台循环与连接（幂等）。"""
-        self._jobs.put(None)
-        thread = self._thread
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._jobs.put(None)
+            thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
-            self._thread = None
+            with self._lock:
+                if not thread.is_alive() and self._thread is thread:
+                    self._thread = None
 
     def _run_loop(self):
         # type: () -> None
@@ -284,7 +295,7 @@ class WarmTTSClient(TTSClient):
         ws = None
         try:
             while True:
-                job = await asyncio.to_thread(self._jobs.get)
+                job = await async_queue_get(self._jobs)
                 if job is None:
                     break
                 kind = job[0]

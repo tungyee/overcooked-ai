@@ -8,7 +8,8 @@
 
 - Steam 已安装，且已安装 **Overcooked! 2**（macOS 版）。
 - 可用的 `python3`（macOS 默认不带；用 Xcode Command Line Tools 或 Homebrew 装一个）。
-- 首次编译插件需要 Roslyn 编译器：`plugin/build.sh` 会自动探测/下载，或用 `CSC_DLL` / `DOTNET` 环境变量指定（见 `plugin/build.sh`）。
+- 安装 .NET SDK（不是仅有运行时）：`plugin/build.sh` 从 `dotnet --list-sdks` 探测 Roslyn，或用 `CSC_DLL` / `DOTNET` 环境变量指定；脚本不自动下载 SDK。
+- 在仓库根创建 Python 环境：`python3 -m venv .venv`。可选语音依赖见 [README](../README.md#可选语音与大模型)。
 
 ## 1. 安装 BepInEx + doorstop
 
@@ -18,7 +19,8 @@
 2. 解压到游戏根目录：
 
    ```bash
-   G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
+   export GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
+   G="$GAME_DIR"
    # 解压后应能看到：
    #   "$G/BepInEx/"、"$G/libdoorstop.dylib"、"$G/run_bepinex.sh"
    ```
@@ -47,6 +49,7 @@ DYLD_LIBRARY_PATH="$G" \
 
 ```bash
 ./plugin/build.sh
+mkdir -p "$G/BepInEx/plugins"
 cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/Oc2AIPlugin.dll"
 ```
 
@@ -59,17 +62,19 @@ cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/Oc2AIPlugin.dll"
 # 或手动三步：
 "$G/run_game.sh"        # ① 起游戏（到标题画面）
 # ② 标题画面按 A/空格进 P1、到主菜单（虚拟手柄只在主菜单能 engage 成 P2）
-python3 run_agent.py    # ③ 起 Agent（须在游戏主菜单时启动）
+.venv/bin/python run_agent.py --no-voice # ③ 起 Agent；确认插件虚拟手柄已在主菜单加入 P2 后再进关
 ```
 
 ## 5. 配置
 
 - **非默认 Steam 库**：设 `GAME_DIR=/你的游戏目录`（`restart.sh` / `run_game.sh` / `plugin/build.sh` 都认这个环境变量）。
 - **语音（可选）**：仓库根建 `.env`，填 `VOLC_ASR_API_KEY`、`VOLC_TTS_API_KEY`、`ARK_API_KEY`、`ARK_MODEL`（模板见 `.env.example`）。`./restart.sh --voice` 显式开，缺 key 会报错退出。
-- **退出**：先 `pkill -f run_agent.py` 再退游戏；或直接退游戏，Agent 会检测到 27411 断连而自动退出。
+- **退出与继续**：Agent 在终端前台运行（包括 `restart.sh`），Ctrl+C 停止后再退游戏。只重启 Python 用 `.venv/bin/python run_agent.py`，不必重启游戏；`restart.sh` 会重启游戏。
+- **Python 解释器**：`restart.sh` 默认用仓库 `.venv/bin/python`，也可用 `PYTHON=/完整路径/python3` 覆盖。
+- **玩家加入**：只加入一个人类 P1，插件在主菜单自动接入虚拟手柄 P2，不再使用分割键盘 2P。
 
 ## 参考
 
-- 插件协议版本：`0.19.0 / protocol 4`（见 `README.md`）。
+- 插件协议版本：`0.20.0 / protocol 4`，需同时开放本机状态端口 27411 与执行端口 27412（见 `README.md`）。
 - 架构与约定：`docs/agent/architecture.md`、`AGENTS.md`。
 - 语音排障：`docs/dialog_system.md`。

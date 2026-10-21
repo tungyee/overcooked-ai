@@ -24,6 +24,16 @@ _JOIN_TIMEOUT = 2.0
 DEFAULT_WS_TIMEOUT_S = 5.0
 
 
+async def async_queue_get(items):
+    # type: (queue.Queue) -> object
+    """可取消地读取线程队列，避免 executor 的永久 get 阻止解释器退出。"""
+    while True:
+        try:
+            return items.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+
+
 @contextlib.asynccontextmanager
 async def connect(factory, *args, timeout=DEFAULT_WS_TIMEOUT_S, label="WS",
                   **kwargs):

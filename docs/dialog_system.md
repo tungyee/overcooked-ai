@@ -18,12 +18,14 @@
 
 - 代码在 `ai/dialog/`：`audio.py`（采集/播放/VAD）· `ptt.py`（全局按键 PTT）· `asr.py` · `tts.py` · `llm.py` · `policy.py`（主动开口/限频/新单合并）· `worker.py`（后台线程）· `duties.py`（分工账本/物料目录/工具 schema）· `schema.py`（偏好/作用域匹配/`VoiceConfig`）· `env.py`（`.env` 加载）。
 - 主循环仍是 **20 Hz** 的唯一决策者；`DialogWorker` 是独立 daemon 线程，只通过上下文快照（2 Hz）、事件、工具批次、ack 四个队列与主循环通信，**不读 World、不写 Blackboard**。
-- 语音是可选能力：没装依赖或没配 key 时，加上 `--no-voice`（或什么都不加）就退回纯按键模式，决策行为不变。
+- 语音是可选能力：没装依赖或没配 key 时，加上 `--no-voice`（或什么都不加）就退回纯行为树模式，仍由插件虚拟手柄执行，决策行为不变。
 
 ## 2. 先决条件
 
-- **macOS + 麦克风 + 扬声器**。v1 只用系统默认输入/输出设备。
-- 终端需要 **麦克风权限**（系统设置 → 隐私与安全性 → 麦克风），以及原有的**辅助功能**权限（按键注入）。
+- **Windows 或 macOS + 麦克风 + 扬声器/耳机**，使用系统默认输入/输出设备。
+- macOS 终端需要 **麦克风权限**；使用 PTT 时另需安装 `pyobjc-framework-Quartz` 并授权「辅助功能」，部分系统需「输入监控」。游戏控制本身不需要这些热键权限。
+- Windows 需在隐私设置中允许桌面应用访问麦克风；PTT 用 GetAsyncKeyState，只读轮询，不拦截或注入键盘。建议 `.env` 设 `OC2_VOICE_PTT_KEY=caps_lock`，按住录音、松开发送。Alt/Ctrl/Shift 易与游戏快捷键冲突，笔记本 F8 可能是飞行模式。
+- 两平台完整启动命令见 [README](../README.md)。Windows 可用 `powershell.exe -NoProfile -NoExit -ExecutionPolicy Bypass -File .\voice_console.ps1`；Ctrl+C 停止，输入 `oc2` 再启动。
 - 安装语音依赖（未启用语音时不需要）：
 
   ```bash

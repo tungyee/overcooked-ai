@@ -14,7 +14,7 @@ def load_env_file(path):
     已存在的环境变量不会被覆盖——命令行/系统环境优先于 .env。
     """
     added = 0
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         for raw_line in fh:
             line = raw_line.strip()
             if not line or line.startswith("#"):

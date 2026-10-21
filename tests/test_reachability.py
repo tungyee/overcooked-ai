@@ -6,7 +6,32 @@ from ai.core import planner
 from ai.query.recipes import RecipeBook, find_ingredient
 from ai.state.blackboard import Blackboard
 from ai.tasks.base import ingredient_available
-from tests.test_primitives import FakeWorld
+class FakeWorld(object):
+    """只提供原语/规划要用的属性。"""
+
+    def __init__(self, stations=None, plates=None, workstations=None,
+                 cookers=None, items=None, chefs=None, recipes=None,
+                 belt_cells=None, belt_dir=None, walkable=None, cell=1.2):
+        self.stations = stations or []
+        self.plates = plates or []
+        self.workstations = workstations or []
+        self.cookers = cookers or []
+        self.items = items or []
+        self.chefs = chefs or []
+        self.recipes = recipes or []
+        self.belt_cells = set(belt_cells or ())
+        self.belt_dir = belt_dir or {}
+        self._walk = walkable or (lambda gx, gz: True)
+        self._cell = cell
+
+    def walkable(self, gx, gz):
+        return self._walk(gx, gz)
+
+    def to_grid(self, x, z):
+        return (int(round(x / self._cell)), int(round(z / self._cell)))
+
+    def to_world(self, gx, gz):
+        return (gx * self._cell, gz * self._cell)
 
 
 def world(connected=False):
@@ -93,18 +118,6 @@ def test_legacy_without_topology_keeps_offline_compatibility():
     w.terrain = {}
     w.workstations = []
     assert find_ingredient(w, 'Tomato', exclude_plate=True)['kind'] == 'crate'
-
-
-def test_local_approach_replan_keeps_moving_platform_mask():
-    from ai import primitives as PR
-    from ai.exec.bt import Status
-    from tests.test_primitives import make_ctx
-    w = world(True)
-    ctx, ctrl = make_ctx(w=w, chef=w.chefs[0], start=(0,0))
-    ctx['navigation_blocked'] = {(3,0)}
-    result = PR.Approach(dict(n='target', x=7, z=1)).tick(ctx)
-    assert result == Status.FAILURE
-    assert not any(call[0] == 'press' for call in ctrl.calls)
 
 
 def test_discard_resolves_logical_bin_claim_by_type():

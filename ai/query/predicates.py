@@ -577,9 +577,10 @@ def interact_ready(chef, target, kind=None, to_grid=None):
     # type: (Optional[Dict], Optional[Dict], Optional[str], Any) -> bool
     """"现在能跟 target 交互吗"——用游戏自己的交互信号判断。
 
-    kind=None 用通用网格 interactions.gx/gz；kind="pickup"/"placement"
-    优先用对应句柄的网格（pickup_gx/gz、placement_gx/gz），这是
-    AGENTS.md §6 称的"能否交互的最精确信号"。
+    判定顺序：名字优先（句柄名 = 对象身份，FindNearbyObjects 权威结果），
+    坐标兜底（句柄专属网格 pickup_gx/gz / placement_gx/gz，或通用 gx/gz）。
+    名字优先是因为站点的 gx/gz 可能算错（WashingPart 报 gz=2 而非 -4，实机
+    trace-20261020-223413），而句柄报的名字不受坐标系影响、也涵盖篮子本地坐标。
 
     从 oc/ai/agent.py:1092 移植，两处改动：
       1. 不接 World，to_grid 作为可选回调注入 → 纯函数，单测不造 World。
@@ -605,7 +606,21 @@ def interact_ready(chef, target, kind=None, to_grid=None):
         if PLATE_STATION_KEYWORD in pl and PLATE_STATION_KEYWORD not in tn.lower():
             return False
 
-    # 句柄专属网格（最精确）
+    # 名字优先：句柄报的名字就是对象身份（FindNearbyObjects 的权威结果），
+    # 不受坐标系影响——主网格站点 gz 坏值（WashingPart 报 gz=2 而非 -4）与
+    # 篮子本地坐标都成立。按 kind 只比对对应句柄名，避免「面向 A 但放置句柄
+    # 被邻近 B 抢走」时误放行。
+    if tn:
+        if kind in ("pickup", "placement"):
+            hname = str(inter.get(kind) or "").strip()
+            if hname and station_name_matches(hname, tn):
+                return True
+        else:
+            for key in ("grid", "interactable"):
+                if station_name_matches(str(inter.get(key) or "").strip(), tn):
+                    return True
+
+    # 坐标兜底（放错格仍要拦）：句柄专属网格最精确。
     if kind in ("pickup", "placement"):
         hgx = inter.get("%s_gx" % kind)
         hgz = inter.get("%s_gz" % kind)
@@ -617,7 +632,7 @@ def interact_ready(chef, target, kind=None, to_grid=None):
     if None not in (igx, igz, tgx, tgz):
         return int(round(igx)) == tgx and int(round(igz)) == tgz
 
-    # 兜底：名匹配（无网格信号时，如动态物 / 灭火器）
+    # 兜底：名匹配（无网格信号时，如动态物 / 灭火器，句柄名可能报在任一字段）
     if not tn:
         return False
     for key in _HANDLE_KEYS:

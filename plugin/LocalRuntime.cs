@@ -14,13 +14,6 @@ namespace Oc2AI
         int _frameCount, _slowFrames;
         double _frameSum, _frameMax;
 
-        void Update()
-        {
-            double ms = Time.unscaledDeltaTime * 1000.0;
-            _frameCount++; _frameSum += ms; _frameMax = Math.Max(_frameMax, ms);
-            if (ms > 33.34) _slowFrames++;
-        }
-
         void SavePerformance(System.Diagnostics.Stopwatch watch)
         {
             _performanceJson = "{\"sample\":\"previous_snapshot\",\"snapshot_ms\":"

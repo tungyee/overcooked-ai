@@ -1,44 +1,52 @@
 """移动与转向原语。
 
 Approach：走到能跟 target 交互的位置。
-Face：转向 target。
+Face：转向 target（委托后端下为 no-op，转向已并入 move/tap 的重瞄）。
 """
 from typing import Any, Dict, Optional
 
 from ai.space import navigation
 from ai.space import occupancy as O
 from ai.query import predicates as P
+from ai.query import placement
 from ai.exec.bt import Status
+from ai.exec.commands import build_command
 from ai.query.stations import PLATE_STATION, sink_place_cells
-from ai.primitives.base import (Primitive, resolve, target_cell,
-                                _dir_towards, _blocked_cells, target_identity)
-from ai.output.hands import DIR2D, OPPOSITE
-from ai.primitives.motion import MotionControl
+from ai.primitives.base import (Primitive, resolve, target_cell, handle_desc,
+                                _blocked_cells, target_grid_callbacks)
 
-# 转向也走短按 / 观察，预算要覆盖多次 5Hz 新帧；最终仍以交互信号为准。
+# 转向预算（委托后端下 Face 是 no-op，保留该常量仅用于接口兼容）。
 FACE_MAX_TICKS = 40
 
-# 距目标还有几步就松开冲刺（刹车距离）。冲刺速度下 5 Hz 的位置反馈有
-# 200 ms 延迟，倒数第二格才松冲刺时惯性已经把人带过交互格（实机：横穿
-# 传送带去中间柜台反复冲过头）。留 3 步足够把速度降下来，又不牺牲长距离
-# 的巡航时间（3 格 ≈ 0.5 s）。
-DASH_BRAKE_CELLS = 3
+# move 命令超时（毫秒）：委托后端下一趟走位最多 8 秒。
+MOVE_TIMEOUT_MS = 8000
+
+
+def _station_interact_cells(st, cell, w, kind, include_belts=False):
+    # type: (Dict, Tuple[int, int], object, Optional[str], bool) -> List[Tuple[int, int]]
+    """站点交互位：出餐口只取厨房内侧（前侧），其余站点用四邻并集。
+
+    出餐口是嵌在外墙里的一段墙，墙后那一面是死路，站过去送不了餐；
+    见 navigation.serving_hatch_interact_cells 的判据（沿墙法向的深度）。
+    """
+    if st.get("t") == PLATE_STATION:
+        fp = O.station_block_cells(st, w.terrain, w.mapping)
+        return navigation.serving_hatch_interact_cells(
+            fp, w.walkable, w.belt_cells)
+    if st.get("t") == "washing" and kind == "placement":
+        cells = sink_place_cells(st, w.stations, w.to_grid)
+    else:
+        cells = {cell}
+    return navigation.interact_cells_multi(
+        cells, w.walkable, w.belt_cells, include_belts=include_belts)
 
 
 class Approach(Primitive):
-    """走到能跟 target 交互的位置。
+    """走到能跟 target 交互的位置（委托后端：把走位交给插件 move 命令）。
 
-    到位判据是**位置**：`chef_cell ∈ interact_cells(target)`，即站在目标
-    相邻的可交互格（或目标格）并停稳后到位，**不看向**。朝向交给 Face——
-    用朝向敏感的 interact_ready（placement_gx/gz）当到位判据，会在面向
-    相邻目标时反复翻转，导致左右摇摆停不下来（实机：两个灶之间横跳）。
-
-    移动默认按老跑法一路巡航（快）；只在近目标处检测到「反向折返」（越过
-    目标又掉头，即 a—c—b 震荡）时切到短按+停稳，真正落定后恢复巡航。
-    这样既不会默认对最后两格每格等停稳（慢），又能在震荡时兜底收敛。
-
-    **只保证站位，不保证朝向**（spec §7.2）。需要定向交互的地方必须显式
-    带 Face——灭火必须面朝火源才喷得到。
+    本地只负责 goal/path 计算（复用寻路），实际移动由插件逐帧跟随 +
+    连续到达 + stuck 检测完成。到位判据是**位置**：`chef_cell ∈
+    interact_cells(target)`；朝向交给 move/tap 的重瞄，不在原语里处理。
     """
 
     def __init__(self, target, kind=None, allow_target=False):
@@ -47,25 +55,14 @@ class Approach(Primitive):
         self.target = target
         self.kind = kind
         self.allow_target = allow_target
-        self._goal = None
-        self._target_cell = None
-        self._target_identity = None
-        self._motion = MotionControl()
-        self._oscillating = False
-        self._last_dir = None
 
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
-        self._goal = self._target_cell = None
-        self._target_identity = None
-        self._motion = MotionControl()
-        self._oscillating = False
-        self._last_dir = None
 
     def needs_reapproach(self, ctx):
         # type: (Dict) -> bool
-        """按键前若被推离交互区域，交给移动阶段重新接近当前目标。"""
+        """若被推离交互区域，交给移动阶段重新接近当前目标。"""
         w, chef = ctx['w'], ctx['chef']
         st = resolve(self.target, ctx)
         cell = target_cell(st, ctx)
@@ -87,305 +84,90 @@ class Approach(Primitive):
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
-        w, chef, hands = ctx["w"], ctx["chef"], ctx["hands"]
+        return self._tick_delegated(ctx, ctx["exec"])
+
+    def _avoid_occupied(self, st, w, goals):
+        # type: (Dict, object, List[Tuple[int, int]]) -> List[Tuple[int, int]]
+        """站点目标做 pickup/placement 时，避开地上有散落物的交互格。
+
+        散料/盘落在交互格上时，游戏的 pickup/placement 句柄（距离扫描）会指向
+        脚下的散料而非站点，交互必然失败（实机：散米挡灶前，RescueCooked 端锅、
+        TakeCookedToPlate 盛饭都卡）。有干净交互格就优先走干净格，全被占才退回。
+        """
+        if self.kind not in ("pickup", "placement"):
+            return goals
+        if not (isinstance(st, dict) and st.get("t")):
+            return goals          # 目标是散料/盘（无站点类型）→ 不避让
+        occ = placement.occupied_cells(w)
+        unocc = [g for g in goals if g not in occ]
+        return unocc if unocc else goals
+
+    def _tick_delegated(self, ctx, ex):
+        # type: (Dict, Any) -> str
+        """复用本地 goal/path 计算，把走位交给插件 move 命令。"""
+        w, chef = ctx["w"], ctx["chef"]
         st = resolve(self.target, ctx)
         if st is None:
-            hands.set_move(None)
             return Status.FAILURE
-
         cell = target_cell(st, ctx)
         if cell is None:
-            hands.set_move(None)
             return Status.FAILURE
-
-        # 多格站点（出餐口 1×2）的交互位要按占地格算，不是交互格单格：
-        # 游戏接受站在它任一占地格的邻侧送餐（placement 锚点仍报单一交互
-        # 格），只用单格四邻会漏掉另一半占地旁的站位，角色多挪一格。
-        if st.get("t") == PLATE_STATION:
-            interact_cells_src = O.station_block_cells(
-                st, w.terrain, w.mapping)
-        elif st.get("t") == "washing" and self.kind == "placement":
-            # 放脏盘：洗碗池 + 相邻晾干架合并 1×2（洗碗 wash 只能面向洗碗
-            # 池，kind=None 仍走单格分支，不受影响）。
-            interact_cells_src = sink_place_cells(st, w.stations, w.to_grid)
-        else:
-            interact_cells_src = {cell}
-
-        identity = target_identity(st)
-        if identity is not None:
-            # 有稳定身份（站点带 n）：身份不变就不 reset，即使坐标变了
-            # （平台移动场景，§5.4/§7）。
-            if identity != self._target_identity:
-                self.reset()
-                self._target_identity = identity
-                self._target_cell = cell
-            else:
-                self._target_cell = cell   # 坐标仍要更新，供后续距离场计算用
-        elif cell != self._target_cell:
-            # 无稳定身份（拼装格等）：退回旧的按坐标比较。
-            self.reset()
-            self._target_cell = cell
 
         cur = P.chef_cell(chef, w.to_grid)
         if cur is None:
-            hands.set_move(None)
             return Status.FAILURE
-
-        # 每拍重算距离场代价太贵（spec §6.4 要求每拍只 flood-fill 一次），
-        # 但拉黑格是脱困期才有的少量格子——有拉黑时才重算一次。
-        field = ctx["field"]
-        soft = ctx.get("soft_cost")
-        # 传资源 id：除了全局拉黑的格，还要避开「这一格对这个目标用不了」
-        # 的二元拉黑（AlignToCell 写，见 blackboard.StuckScratch.bad_pairs）。
-        unusable_goals = _blocked_cells(ctx, P.resource_id(st))
-        blocked = _blocked_cells(ctx)
-        # 目标局部重寻路也必须保留本拍的移动平台隔离，不能因坏站位重算而
-        # 重新开放正在远离的篮子（主场已排除它，局部场不能反向放开）。
-        blocked |= set(ctx.get('navigation_blocked') or ())
-        unusable_goals |= blocked
-        if blocked:
-            field = navigation.distance_field(
-                cur, w.walkable, w.belt_dir, blocked, soft_cost=soft,
-                edge_blocked=getattr(w, "edge_blocked", None))
-
-        # 目标就在脚下：散落物（投掷落地的料、掉落的灭火器）没有站点语义，
-        # 可能正落在自己站的那一格。此时已经够得着，直接到位——旧逻辑只取
-        # 四邻当 goal，于是先走开一格，距离场下一拍又把人拉回来，表现为
-        # 两格之间来回震荡（实机：灭火器掉脚下，[5,2]↔[6,2] 抖了 700 拍，
-        # 火烧到关卡结束，trace-20261014-004742 t=11000~11580）。
-        # 只对「目标格可走」成立——站点格不可走，仍走四邻。
+        # 目标就在脚下（散料/掉落物落自己站的那格）：无需走。
         if cur == cell and w.walkable(cell[0], cell[1]):
-            hands.set_move(None)
-            ctx["motion"] = {"phase": "arrived", "frame_seq": ctx.get("frame_seq"),
-                             "fresh": True, "direction": None,
-                             "target": list(cell), "goal": list(cell)}
             return Status.SUCCESS
 
-        # 目标格不可走（固定站点/料箱），但角色已滑到它的格上、游戏又报出
-        # 可交互句柄 → 同样直接到位。半格惯性滑动会让 round 把「站在箱子
-        # 正前方」算进箱子自己那格（trace-20261018-104804 t=194~220 取意面：
-        # pickup/placement/grid 句柄全指向箱子，但 cur != goal），旧逻辑会
-        # 反向纠正 + Face 回正，白白转身。interact_ready 是游戏自己算的
-        # 「现在能交互吗」，不受这 0.5 格量化误差影响，用它兜这一层。
-        if cur == cell and P.interact_ready(chef, st, self.kind, w.to_grid):
-            hands.set_move(None)
-            ctx["motion"] = {"phase": "arrived", "frame_seq": ctx.get("frame_seq"),
-                             "fresh": True, "direction": None,
-                             "target": list(cell), "goal": list(cell)}
-            return Status.SUCCESS
-
-        goals = navigation.interact_cells_multi(
-            interact_cells_src, w.walkable, w.belt_cells)
+        blocked = _blocked_cells(ctx, P.resource_id(st))
+        goals = _station_interact_cells(st, cell, w, self.kind)
         if self.allow_target:
-            # 裸地板落点允许站上目标格，沿用 EnsureHandsFree 的原契约。
             goals = [cell] + goals
         if not goals:
-            # 四邻全不可走：站点被围死。也允许直接站上目标格（地面物）
             goals = [cell]
-
-        got = ((self._goal, field[self._goal])
-               if self._goal in goals and self._goal in field and self._goal not in unusable_goals
-               else navigation.nearest_cost(field, [g for g in goals if g not in unusable_goals]))
+        goals = self._avoid_occupied(st, w, goals)
+        field = ctx["field"]
+        got = navigation.nearest_cost(field, [g for g in goals if g not in blocked])
         if got is None:
-            # 非传送带交互位全不可达 → 放回传送带位再试。站在传送带上会被
-            # 推走，交互由 TapWhileHolding 顶住反向键兜底（spec §7.2），
-            # 但「站传送带上够得着」总比「永远够不着」强。
-            goals = navigation.interact_cells_multi(
-                interact_cells_src, w.walkable, w.belt_cells, include_belts=True)
-            got = ((self._goal, field[self._goal])
-                   if self._goal in goals and self._goal in field and self._goal not in unusable_goals
-                   else navigation.nearest_cost(field, [g for g in goals if g not in unusable_goals]))
+            goals = _station_interact_cells(st, cell, w, self.kind,
+                                            include_belts=True)
+            got = navigation.nearest_cost(field, [g for g in goals if g not in blocked])
         if got is None:
-            hands.set_move(None)
-            return Status.FAILURE      # 不可达 → 交还 Planner
-
-        if self._goal != got[0]:
-            # 首次赋值（上一拍目标就在脚下，SUCCESS 分支从没走到这里过
-            # self._goal 还是 None）不算"换目标"，不该顺带把刚建好的
-            # MotionControl 扔掉。
-            had_goal = self._goal is not None
-            self._goal = got[0]
-            # 目标身份稳定（同一站点，只是随移动平台漂移，如气球关篮子上的
-            # 料箱）时，goal 每拍漂一格也不 reset 运动状态——reset 会把走到
-            # 一半的巡航/震荡进度清空，篮子上下一动就反复"起步→清零→再起步"。
-            # 只有无稳定身份（拼装格等按坐标比较）才退回旧的"goal 变了就 reset"。
-            if had_goal and self._target_identity is None:
-                self._motion = MotionControl()
-                self._oscillating = False
-                self._last_dir = None
-        path = navigation.trace_back(field, self._goal, w.belt_dir, soft,
-                                     edge_blocked=getattr(w, "edge_blocked", None))
+            return Status.FAILURE
+        goal = got[0]
+        path = navigation.trace_back(field, goal, w.belt_dir, ctx.get("soft_cost"))
         if not path:
-            hands.set_move(None)
-            return Status.FAILURE
-        nxt = path[1] if len(path) > 1 else None
-        d = _dir_towards(cur, nxt) if nxt is not None else None
-        arrived = cur == self._goal
-        if d is None and not arrived:
-            hands.set_move(None)
             return Status.FAILURE
 
-        # 最后一步仍走精确档（短按 + 停稳）：满速冲过交互格会来回振荡
-        # ——实机端饭时在盘旁振荡约 8 秒、米烧糊起火，这条不能退。
-        final = (nxt == self._goal)
-
-        # 最后一步若前进方向的前方有阻碍物（目标格的下一格不可走），长按不会
-        # 冲过目标格——墙会把角色挡在交互格上。此时可省去「短按 + 停稳」的
-        # 精确档，直接巡航更快（正对灶台/柜台的最后一步尤其常见）。
-        wall_ahead = False
-        if final and d is not None:
-            dx, dz = DIR2D[d]
-            wall_ahead = not w.walkable(self._goal[0] + dx, self._goal[1] + dz)
-
-        # 自适应防震荡：默认按老跑法一路巡航（快）；只在近目标处检测到
-        # 「反向折返」（越过目标又掉头，即 a—c—b 震荡）时切到短按+停稳，
-        # 真正落定（motion 报 SUCCESS）后恢复巡航。不能用瞬态 arrived 复位：
-        # 人还在滑、压过目标格的那一帧 arrived 也是 True，会把震荡标记清掉，
-        # 导致永远检不出来。
-        if d is not None:
-            if len(path) <= 3:
-                # 近目标跨过后反向折返，进入精确档直到真正停稳到位。
-                # 脚下散落物已在前面的 cur==cell 分支完成，不在此来回拉扯。
-                if self._last_dir is not None and d == OPPOSITE.get(self._last_dir):
-                    self._oscillating = True
-                self._last_dir = d
-            else:
-                self._last_dir = d
-                self._oscillating = False
-
-        # 站在传送带上横穿时顶住反向键，否则被推偏绕圈
-        extra = None
-        against_belt = False
-        bd = w.belt_dir.get(cur)
-        if bd is not None and d is not None:
-            dv = DIR2D[d]
-            if dv[0] * bd[0] + dv[1] * bd[1] == 0:
-                # 垂直穿越：额外按住反向键顶住，避免被推偏
-                extra = hands.counter_dir(w.belt_dir, cur)
-            elif dv[0] == -bd[0] and dv[1] == -bd[1]:
-                # 逆向行走：必须长按顶住传送带推力，且要冲刺——普通步速会被
-                # 传送带抵消，净前进 ≈ 0（实机 trace：按住方向键反而被推回、
-                # 卡在带上一格打转）。也不能切短按：短按+松键会被带推回来。
-                against_belt = True
-        # 冲刺要**提前**退出，给惯性留刹车距离：旧判据只看路径长短
-        # （len(path) > 3），于是一路冲到倒数第二格才松冲刺，惯性已经把人
-        # 带过了交互格（实机：横穿传送带去中间柜台反复冲过头、错过好几次）。
-        # 现在距目标 ≤ DASH_BRAKE_CELLS 步就停冲——方向键仍按住（继续走、
-        # 不慢），只是不再加速。例外：逆向行走必须全程冲刺，且传送带本身
-        # 提供反向减速、冲过头风险低，无需留刹车距离。垂直穿越（extra）与
-        # 震荡仍不冲。
-        remaining = len(path) - 1          # 还要走几步
-        dash = (d is not None and extra is None and not self._oscillating
-                and (remaining > DASH_BRAKE_CELLS or against_belt))
-        gx, gz = w.to_world(*self._goal)
-        error = ((chef["x"] - gx)**2 + (chef["z"] - gz)**2)**0.5
-        status = self._motion.tick(ctx, d, extra,
-                                   self._oscillating and not against_belt,
-                                   arrived, error, cur in w.belt_cells,
-                                   final=final, dash=dash, wall_ahead=wall_ahead,
-                                   against_belt=against_belt, replan_after_drift=True,
-                                   contact_ready=P.interact_ready(chef, st, self.kind, w.to_grid))
-        if status == Status.SUCCESS:
-            self._oscillating = False
-            self._last_dir = None
-        ctx["motion"].update(target=list(cell), goal=list(self._goal))
-        if status == Status.FAILURE:
-            ctx["motion_failure"].update(target=st.get("n") or cell,
-                                         blocked_cell=nxt or self._goal)
-        return status
+        if self._pending_cmd is None:
+            cmd = build_command(
+                "move",
+                goal=list(w.to_world(*goal)),
+                path=[list(w.to_world(*c)) for c in path],
+                target=handle_desc(st, target_grid_callbacks(w, st)[0]),
+                kind=self.kind,
+                dash=False,
+                timeout_ms=MOVE_TIMEOUT_MS,
+            )
+            return self._begin_exec(ctx, ex, cmd)
+        return self._poll_exec(ctx, ex)
 
 
 class Face(Primitive):
-    """转向 target。朝向以 interactions.gx/gz 为准。
-
-    Approach 只管站位（spec §7.2 定稿），所以所有定向交互都要显式带这个
-    节点。旧 _fire_tick 有专门的 face_fire 子状态 + face_ticks 计数，
-    证明这是真实需求：灭火必须面朝火源才喷得到。
-
-    转向用短按方向键——移动方向 = 面向方向。每次松键后观察新帧，直到
-    交互格信号指向目标；max_ticks 只是兜底，不作为"转好了"的判据（旧实现用
-    face_ticks >= 2 当判据，那是赌两拍必然转过去）。
-    """
+    """转向 target。委托后端（exec）下转向已并入 move/tap 的重瞄，Face 是 no-op。"""
 
     def __init__(self, target, max_ticks=FACE_MAX_TICKS):
         # type: (Any, int) -> None
         Primitive.__init__(self)
         self.target = target
         self.max_ticks = max_ticks
-        self._motion = MotionControl()
 
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
-        self._motion = MotionControl()
 
     def tick(self, ctx):
         # type: (Dict) -> str
         self._enter(ctx)
-        w, chef, hands = ctx["w"], ctx["chef"], ctx["hands"]
-        st = resolve(self.target, ctx)
-        if st is None:
-            hands.set_move(None)
-            return Status.FAILURE
-
-        # 目标没有朝向信号（裸散落料：无 grid 且无 gx/gz）：游戏不会为它报
-        # 稳定的 interactions.gx/gz，Face 转不到位，只会反复短按把角色一点
-        # 点挪走（实机 trace-20261016-122733，米饭捡不起来）。直接 SUCCESS，
-        # 交 Tap 用 pickup 句柄判断。
-        if (isinstance(st, dict) and st.get("grid") is None and st.get("gx") is None
-                and st.get('interaction_gx') is None):
-            hands.set_move(None)
-            self.reset()
-            return Status.SUCCESS
-
-        cell = target_cell(st, ctx)
-        if cell is None:
-            hands.set_move(None)
-            return Status.FAILURE
-
-        # arrived 判据改用 interact_ready，不再手写 facing_cell == cell
-        # （Task 19 实机回归修正，trace-20261016-122733：篮子料箱站在交互
-        # 位却永远 Face 不到位，Tap 发不出去）。facing_cell 读的是游戏
-        # 上报的 interactions.gx/gz——这是目标站点**自身网格**的局部坐标，
-        # 跟上面那行的 cell（target_cell 为 Approach/寻路而做的主网格
-        # 世界坐标投影，下面仅供转向按键的主轴方向判断用，不再参与到位
-        # 判定）不是同一基准，跨网格站点上两者永远不等，arrived 永远为
-        # False、Face 必定 max_ticks 超时 FAILURE。interact_ready 内部走
-        # predicates._target_cell（gx/gz 优先），basis 跟 facing_cell 一致，
-        # 同时自带名字兜底（出餐口等无 gx/gz 信号的站点，原来这里单独写的
-        # 那段 fallback 现已折叠进去，不用重复维护）。
-        arrived = P.interact_ready(chef, st, None, w.to_grid)
-
-        if not arrived and self._ticks > self.max_ticks:
-            hands.set_move(None)
-            self.reset()
-            return Status.FAILURE
-
-        cur = P.chef_cell(chef, w.to_grid)
-        if cur is None:
-            hands.set_move(None)
-            return Status.FAILURE
-        # 多格站点应面向眼前这一半占地，而非追逐唯一的逻辑锚点。
-        # 1-2 实机 t=2777：站 (3,2)，出餐口占 (2,3)/(3,3)，应向上。
-        aim = cell
-        if st.get("t") == PLATE_STATION:
-            footprint = O.station_block_cells(st, getattr(w, 'terrain', {}),
-                                               getattr(w, 'mapping', None))
-            if footprint:
-                aim = min(footprint, key=lambda p: (
-                    abs(p[0] - cur[0]) + abs(p[1] - cur[1]), p))
-        d = _dir_towards(cur, aim)
-        if d is None:
-            # 不相邻：按世界坐标的主轴差压方向（Approach 还在路上时的过渡）
-            wx, wz = w.to_world(*aim)
-            dx, dz = wx - chef["x"], wz - chef["z"]
-            if abs(dx) >= abs(dz):
-                d = "right" if dx > 0 else "left"
-            else:
-                d = "up" if dz > 0 else "down"
-        status = self._motion.tick(ctx, d, None, True, arrived,
-                                   belt=cur in w.belt_cells)
-        ctx["motion"].update(target=list(cell), facing_target=list(aim))
-        if status != Status.RUNNING:
-            self.reset()
-        return status
+        return Status.SUCCESS

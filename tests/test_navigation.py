@@ -9,6 +9,7 @@ from ai.space.navigation import (
     interact_cells_multi,
     interact_cells_with_belts,
     nearest_cost,
+    serving_hatch_interact_cells,
     step_cost,
 )
 
@@ -22,7 +23,7 @@ def test_step_cost_is_one_without_belt():
     assert step_cost({}, (0, 0), (1, 0)) == 1
 
 
-def test_step_cost_penalizes_against_belt_direction():
+def test_step_cost_returns_reverse_cost_for_against_belt():
     belt = {(0, 0): (1, 0)}  # 该格把人向 +x 推
 
     assert step_cost(belt, (0, 0), (-1, 0)) == BELT_REVERSE_COST
@@ -67,14 +68,18 @@ def test_distance_field_respects_edge_blocker():
     assert field[(1, 0)] == 3
 
 
-def test_distance_field_prefers_cheap_path_around_belt():
-    """逆带代价 8，绕路 1+1+1=3 更便宜，距离场应取 3。"""
+def test_distance_field_prefers_direct_reverse_over_long_detour():
+    """逆带不加惩罚（代价 1），绕路 3 步更贵，距离场应直接逆带取 1。
+
+    这正是「别逼 AI 绕远路」的语义：逆带直穿一步（BELT_REVERSE_COST=1）比
+    绕三格（3）便宜，所以距离场走直线。
+    """
     walkable = lambda gx, gz: 0 <= gx <= 1 and 0 <= gz <= 1
     belt = {(1, 0): (1, 0)}  # 站在 (1,0) 会被推向 +x，往 (0,0) 走是逆向
 
     field = distance_field((1, 0), walkable, belt)
 
-    assert field[(0, 0)] == 3  # (1,0)->(1,1)->(0,1)->(0,0)
+    assert field[(0, 0)] == BELT_REVERSE_COST  # (1,0)->(0,0) 直接逆带
 
 
 def test_distance_field_start_unwalkable_still_includes_start():
@@ -145,6 +150,52 @@ def test_interact_cells_multi_include_belts():
     assert set(cells) == {(0, 0), (2, 0)}
 
 
+def test_serving_hatch_interact_cells_front_only_horizontal():
+    """水平出餐口（贴北墙）：只返回南侧（厨房内侧），北侧死路被排除。"""
+    # 占地 (0,1)/(1,1)；北侧 (0,2)/(1,2) 可走但再北 (0,3) 是墙（死路），
+    # 南侧 (0,0)/(1,0) 起是开放的厨房。
+    blocked = {(0, 1), (1, 1), (0, 3), (1, 3), (-1, 1), (2, 1)}
+    walkable = lambda gx, gz: -5 <= gx <= 5 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+
+    cells = serving_hatch_interact_cells({(0, 1), (1, 1)}, walkable)
+
+    assert set(cells) == {(0, 0), (1, 0)}
+
+
+def test_serving_hatch_interact_cells_front_only_vertical():
+    """垂直出餐口（贴西墙）：只返回东侧（厨房内侧），西侧死路被排除。"""
+    blocked = {(1, 0), (1, 1), (-1, 0), (-1, 1)}
+    walkable = lambda gx, gz: -5 <= gx <= 5 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+
+    cells = serving_hatch_interact_cells({(1, 0), (1, 1)}, walkable)
+
+    assert set(cells) == {(2, 0), (2, 1)}
+
+
+def test_serving_hatch_interact_cells_both_sides_open_falls_back():
+    """出餐口两侧都开放（不在墙边）→ 不分前/后，退回全部四邻。"""
+    blocked = {(0, 1), (1, 1)}
+    walkable = lambda gx, gz: -20 <= gx <= 20 and -20 <= gz <= 20 \
+        and (gx, gz) not in blocked
+
+    cells = serving_hatch_interact_cells({(0, 1), (1, 1)}, walkable)
+
+    assert set(cells) == {(0, 2), (1, 2), (0, 0), (1, 0), (-1, 1), (2, 1)}
+
+
+def test_serving_hatch_interact_cells_single_cell_falls_back():
+    """1×1 占地（方向不明确）→ 退回全部四邻。"""
+    blocked = {(0, 0)}
+    walkable = lambda gx, gz: -5 <= gx <= 5 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+
+    cells = serving_hatch_interact_cells({(0, 0)}, walkable)
+
+    assert set(cells) == {(1, 0), (-1, 0), (0, 1), (0, -1)}
+
+
 def test_nearest_cost_picks_minimum():
     field = {(0, 0): 0, (1, 0): 1, (2, 0): 5}
 
@@ -210,15 +261,15 @@ def test_trace_back_rejects_gradient_descent_trap():
     """反向走传送带时，最小邻居不是合法前驱。
 
     布局：(0,0) 起点，(1,0) 是往**左**推的带。从 (0,0) 走到 (2,0) 必须
-    穿过 (1,0)，而离开 (1,0) 往右是逆带（代价 8）。
-    field: (0,0)=0, (1,0)=1, (2,0)=9。
-    回溯 (2,0) 时邻居只有 (1,0)，但必须验账 1 + 8 == 9 才认它——
-    若只按"field 最小"选，遇到多邻居场景会选出 1 + 1 != 9 的非法边。
+    穿过 (1,0)，而离开 (1,0) 往右是逆带（代价 BELT_REVERSE_COST）。
+    field: (0,0)=0, (1,0)=1, (2,0)=1+BELT_REVERSE_COST。
+    回溯 (2,0) 时邻居只有 (1,0)，但必须验账 1 + BELT_REVERSE_COST 才认它——
+    若只按"field 最小"选，遇到多邻居场景会选出 1 + 1 的非法边。
     """
     walk = lambda gx, gz: gz == 0 and 0 <= gx <= 2
     belt = {(1, 0): (-1, 0)}
     field = distance_field((0, 0), walk, belt)
-    assert field[(2, 0)] == 9
+    assert field[(2, 0)] == 1 + BELT_REVERSE_COST
     assert N.trace_back(field, (2, 0), belt) == [(0, 0), (1, 0), (2, 0)]
 
 

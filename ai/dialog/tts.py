@@ -31,11 +31,12 @@ class TTSClient:
     """
 
     def __init__(self, api_key, resource_id, voice, sample_rate=24000,
-                 ws_factory=None, timeout=DEFAULT_WS_TIMEOUT_S):
+                 rate=1.0, ws_factory=None, timeout=DEFAULT_WS_TIMEOUT_S):
         self.api_key = api_key
         self.resource_id = resource_id
         self.voice = voice
         self.sample_rate = int(sample_rate)
+        self.rate = float(rate)
         self.ws_factory = ws_factory or websockets.connect
         self.timeout = float(timeout)
 
@@ -53,6 +54,7 @@ class TTSClient:
         session_id = str(uuid.uuid4())
         params = {
             "speaker": self.voice,
+            "rate": self.rate,
             "audio_params": {
                 "format": "pcm",
                 "sample_rate": self.sample_rate,
@@ -171,10 +173,10 @@ class WarmTTSClient(TTSClient):
     """
 
     def __init__(self, api_key, resource_id, voice, sample_rate=24000,
-                 ws_factory=None, timeout=DEFAULT_WS_TIMEOUT_S):
+                 rate=1.0, ws_factory=None, timeout=DEFAULT_WS_TIMEOUT_S):
         super(WarmTTSClient, self).__init__(
             api_key, resource_id, voice, sample_rate=sample_rate,
-            ws_factory=ws_factory, timeout=timeout)
+            rate=rate, ws_factory=ws_factory, timeout=timeout)
         self._jobs = queue.Queue()
         self._thread = None
         self._lock = threading.Lock()
@@ -238,6 +240,7 @@ class WarmTTSClient(TTSClient):
         session_id = str(uuid.uuid4())
         params = {
             "speaker": self.voice,
+            "rate": self.rate,
             "audio_params": {
                 "format": "pcm",
                 "sample_rate": self.sample_rate,

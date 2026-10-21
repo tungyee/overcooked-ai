@@ -13,7 +13,6 @@ class InteractionRecovery:
 
     def ready(self, ctx):
         if self.wait_frame is not None and ctx.get('frame_seq') == self.wait_frame:
-            ctx['hands'].set_move(None)
             ctx['interaction'] = {'phase': 'wait_new_frame', 'attempt': self.attempts}
             return False
         self.wait_frame = None
@@ -35,7 +34,6 @@ class InteractionRecovery:
             return False
         self.attempts += 1
         self.wait_frame = ctx['frame_seq']
-        ctx['hands'].set_move(None)
         ctx['interaction_recovery'] = dict(event, attempt=self.attempts,
                                            target=target_cell(target, ctx))
         ctx.pop('motion_failure', None)

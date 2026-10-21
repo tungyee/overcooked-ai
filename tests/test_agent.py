@@ -51,22 +51,16 @@ def test_agent_initialization():
         assert agent.bb is not None
 
 
-def test_skip_ticks_decrements_and_releases_keys(agent, mock_state_client):
-    """步骤 ② skip_ticks > 0 时松键并递减。"""
+def test_skip_ticks_decrements(agent, mock_state_client):
+    """步骤 ② skip_ticks > 0 时递减并跳过本拍。"""
     from ai.state.blackboard import StuckScratch
 
     agent.bb.scratch = StuckScratch()
     agent.bb.scratch.skip_ticks = 2
 
-    # Mock hands
-    agent.hands = MagicMock()
-
     # 执行一拍
     snapshot = mock_state_client.receive.return_value
     agent._tick_once(World(snapshot))
-
-    # 验证松键
-    agent.hands.release_all.assert_called_once()
 
     # 验证递减
     assert agent.bb.scratch.skip_ticks == 1

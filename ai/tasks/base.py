@@ -388,6 +388,19 @@ def _station_for_item(world, item):
     for st in getattr(world, "stations", None) or ():
         if str(st.get("n") or "") == name:
             return st
+    # 名字没匹配到（功能站 GameObject 命名可能不一致）时，退一步按位置匹配
+    # 传送带段：物料就挂在段上，两者世界坐标接近。
+    x, z = item.get("x"), item.get("z")
+    if x is None or z is None:
+        return None
+    for st in getattr(world, "stations", None) or ():
+        if st.get("t") != "conveyor":
+            continue
+        sx, sz = st.get("x"), st.get("z")
+        if sx is None or sz is None:
+            continue
+        if abs(sx - x) < 1.0 and abs(sz - z) < 1.0:
+            return st
     return None
 
 
@@ -465,6 +478,31 @@ def loose_count(world, raw):
         if str(it.get("n") or "").lower() == want:
             n += 1
     return n
+
+
+def loose_on_station(world, raw, segment):
+    # type: (Any, str, Any) -> bool
+    """散落生料 raw 当前是否挂在站点 segment 上（传送带拦截等料判据）。
+
+    传送带上的料（1-6 的米/鱼/海苔）在持续移动：`ingredient_source` 每拍把
+    料解析成它当前所在的传送带段，段随料跨段移动而变。要改成「走到固定段
+    旁等料经过」就必须能问「这份料现在是不是在我锁定的这一段上」。判据与
+    `_station_for_item` 同源：优先 `on_station` 名称匹配，名字对不上退回按
+    世界坐标就近匹配 conveyor 段。
+    """
+    if not segment:
+        return False
+    seg_name = str(segment.get("n") or "") if isinstance(segment, dict) else str(segment)
+    if not seg_name:
+        return False
+    want = str(raw or "").lower()
+    for it in getattr(world, "items", None) or ():
+        if str(it.get("n") or "").lower() != want:
+            continue
+        st = _station_for_item(world, it)
+        if st is not None and P.station_name_matches(str(st.get("n") or ""), seg_name):
+            return True
+    return False
 
 
 def need_count(world, name):

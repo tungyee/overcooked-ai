@@ -11,7 +11,7 @@ from ai import primitives as PR
 from ai.query import stations as S
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
-                           plate_cell, placed_plates, station_at_cell)
+                           plate_cell, station_at_cell)
 
 # 洗盘按住交互键的上限（拍）。done() 现在是「一池子全洗完」（见 WashPlate.done），
 # 每块实测约 2.8 秒（~56 拍），一整摞 3~4 块要 168~224 拍，故给 240 拍（12 秒）。
@@ -238,13 +238,10 @@ class WashPlate(Task):
             if commitment is not None else None
         if active is not None and active == self:
             return True
-        # 不在续洗态 → 按「要不要开始洗」判断：场上还有「干净空盘」或「已就位
-        # 的装配盘」就别洗——前者还能拿去摆盘、后者说明装配链正在/可以继续，
-        # 洗盘会抢走本可装配的工时。只有两者都为 0（拼装彻底卡死）才启动洗盘。
-        # 实机复现：盘已摆在拼装格上（装配盘=1），却因旧规则 clean < PLATE_BUFFER
-        # 而跑去洗盘——明明 FetchToPlate 还能往上倒料。
-        if P.clean_plate_count(ctx["w"].plates) > 0 or placed_plates(ctx):
-            return False
+        # 不在续洗态 → 只判物理可行性：有要洗的盘就可行。「要不要洗」的软闸
+        # （场上还有干净盘 / 装配盘就别洗）已拆到 L4 层谓词（spec §A.3）——
+        # feasible 这里若再拦，`now 洗盘` 这种硬指令就够不到 WashPlate 候选，
+        # 因为 _select_imperative 只在 feasible 过滤后的候选里选。
         return dirty_plate_exists(ctx, self.sink_id)
 
     def build(self):

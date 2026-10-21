@@ -396,6 +396,34 @@ def test_match_plates_pins_committed_plate_to_its_order():
     assert got == {"plate_18": "order1", "plate_16": "order2"}, got
 
 
+def test_match_plates_prefers_head_order_over_complete_tail():
+    """队首优先：生菜盘对队尾已齐、对队首还缺一样，仍配给队首。
+
+    旧口径（完成度感知）会把这块生菜盘配给缺 0 样的队尾单，队首反而没盘 →
+    跳单送餐断 combo。新口径第一键是「是否队首」，队首优先拿盘继续补料。
+    """
+    w = World({
+        "orders": [
+            {"id": "order1", "composition": ["Tomato", "Lettuce"], "remaining": 60},
+            {"id": "order2", "composition": ["Lettuce"], "remaining": 90},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [],
+        "chefs": [{"name": "Player 2", "x": 4.0, "z": 4.0, "held": None}],
+        "plates": [
+            {"n": "plate_lettuce", "name": "equipment_plate_01",
+             "x": 1.0, "z": 1.0, "count": 1, "contents": ["Lettuce"]},
+        ],
+        "workstations": [], "cookers": [], "items": [], "extinguishers": [],
+        "grid": {"nodeMap": None},
+    })
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    got = planner._match_plates_to_orders(w, bb, book)
+    assert got == {"plate_lettuce": "order1"}, got
+
+
 def test_order_needs_cooked_false_with_loose_cooked_pot():
     """散熟锅已匹配给该单 → 不再生成下锅候选（从煮的范围排出）。"""
     w = _loose_cooked_world()

@@ -372,6 +372,27 @@ def test_interact_ready_handle_grid_mismatch():
     assert P.interact_ready(chef, target, "placement") is False
 
 
+def test_interact_ready_name_wins_over_buggy_station_grid():
+    """站点 gz 坏值（WashingPart 报 gz=2 而非 -4）时，句柄名字对就该放行。
+
+    实机 trace-20261020-223413：WashingPart 站点 gz=2，游戏句柄
+    placement_gz=-4，坐标比对恒 False 导致脏盘放不进洗碗池；名字（对象身份）
+    才是权威信号，应优先于坐标。
+    """
+    chef = {"interactions": _inter(placement="WashingPart",
+                                   placement_gx=4, placement_gz=-4)}
+    target = {"n": "WashingPart", "gx": 4, "gz": 2}
+    assert P.interact_ready(chef, target, "placement") is True
+
+
+def test_interact_ready_name_first_still_rejects_stolen_handle():
+    """名字优先也不能放行「句柄被邻近同名不同实例抢走」：名字与坐标都不中 → 拒绝。"""
+    chef = {"interactions": _inter(placement="countertop_01_standard_wood (9)",
+                                   placement_gx=8, placement_gz=-2)}
+    target = {"n": "countertop_01_standard_wood (8)", "gx": 7, "gz": -2}
+    assert P.interact_ready(chef, target, "placement") is False
+
+
 def test_interact_ready_generic_grid_when_no_kind():
     chef = {"interactions": _inter(gx=1, gz=3)}
     target = {"n": "board", "gx": 1, "gz": 3}

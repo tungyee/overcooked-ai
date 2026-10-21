@@ -6,9 +6,8 @@
 净效果 = -urgency —— slack 越小（越紧迫）总分越低，正好把 53d6a2b 那次
 「解 94% 倒挂」的修复反转回去。
 
-根因是 `_deadline_forecast` 的订单到期路径对同一事实重复计分：硬否决已在
-可行性层（`_is_doomed_investment`），软梯度已由 urgency 承担。该路径已删，
-只保留锅烧糊路径（那是真前瞻，与 urgency 无关）。
+根因是 `_deadline_forecast` 的订单到期路径对同一事实重复计分：软梯度已由
+urgency 承担。该路径已删，只保留锅烧糊路径（那是真前瞻，与 urgency 无关）。
 """
 import pytest
 

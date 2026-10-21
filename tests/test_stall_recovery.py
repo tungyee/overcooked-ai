@@ -5,12 +5,12 @@ from ai import tasks as T
 from ai.core import planner, arbiter
 from ai.state.blackboard import StuckScratch
 from ai.state.world import World
-from tests.test_agent_lifecycle import _agent, _snapshot, RecordingCtrl
+from tests.test_agent_lifecycle import _agent, _snapshot
 from tests.test_arbiter import _make_world, _make_bb, _make_chef, _make_cooker, _make_extinguisher
 
 
 def test_alternating_failures_eventually_back_off_each_operation():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     a, b = T.ReturnPot(resources=('a',)), T.ReturnPot(resources=('b',))
     for _ in range(3):
         agent._note_failure(a)
@@ -21,7 +21,7 @@ def test_alternating_failures_eventually_back_off_each_operation():
 
 
 def test_order_changes_do_not_erase_repeated_physical_failure():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     for oid in ('1', '2', '3'):
         task = T.FetchToCooker(oid, ('hob', ('Rice',)), 'BoiledRice')
         agent._note_failure(task)
@@ -29,7 +29,7 @@ def test_order_changes_do_not_erase_repeated_physical_failure():
 
 
 def test_another_task_success_does_not_erase_failures():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     a, b = T.ReturnPot(resources=('a',)), T.ReturnPot(resources=('b',))
     for _ in range(3):
         agent._note_failure(a)
@@ -38,7 +38,7 @@ def test_another_task_success_does_not_erase_failures():
 
 
 def test_same_task_success_clears_old_failure_history():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     task = T.ReturnPot(resources=('a',))
     agent._note_failure(task)
     agent._note_failure(task)
@@ -48,7 +48,7 @@ def test_same_task_success_clears_old_failure_history():
 
 
 def test_old_failure_history_expires_and_cooldown_eventually_retries():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     task = T.ReturnPot(resources=('a',))
     agent._note_failure(task)
     agent.tick += 201
@@ -63,7 +63,7 @@ def test_old_failure_history_expires_and_cooldown_eventually_retries():
 
 
 def test_motion_failure_does_not_blacklist_other_actions_on_same_hob():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     fill = T.FetchToCooker('1', ('hob', ('Rice',)), 'BoiledRice')
     restore = T.ReturnPot(resources=('hob',))
     agent._note_motion_failure(fill, {'motion_failure': {'reason': 'no_progress'}})
@@ -88,20 +88,18 @@ def test_stationary_firefighter_exits_when_fire_is_gone():
 
 
 def test_new_level_discards_old_resource_cooldowns_and_orders():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     frame = _snapshot()
     with patch('ai.agent.planner.plan', return_value=(None, {})):
         agent._tick_once(World(frame))
-        agent.bb.doomed_orders['old_order'] = 1000
         agent.bb.scratch = StuckScratch(abandoned={'old_hob': 1000})
         frame['level'] = 'Balloon_1_5_2P'
         agent._tick_once(World(frame))
-    assert not agent.bb.doomed_orders
     assert not getattr(agent.bb.scratch, 'abandoned', {})
 
 
 def test_pause_does_not_erase_recovery_but_menu_reentry_does():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     frame = _snapshot()
     with patch('ai.agent.planner.plan', return_value=(None, {})):
         agent._tick_once(World(frame))
@@ -115,7 +113,7 @@ def test_pause_does_not_erase_recovery_but_menu_reentry_does():
 
 
 def test_failed_task_releases_own_claims():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     task = T.ReturnPot(resources=('hob',))
     record = {'candidates': []}
     with patch('ai.agent.planner.plan', return_value=(task, record)), \
@@ -126,7 +124,7 @@ def test_failed_task_releases_own_claims():
 
 def test_waiting_reason_is_written_to_trace():
     from ai.output import trace
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     record = {'candidates': [(T.ReturnPot(resources=('hob',)), 0, {}, False, 'platform_moving', False)]}
     with patch('ai.agent.planner.plan', return_value=(None, record)):
         agent._tick_once(World(_snapshot()))
@@ -136,7 +134,7 @@ def test_waiting_reason_is_written_to_trace():
 
 
 def test_preempted_task_does_not_keep_obsolete_resource_claims():
-    agent = _agent(RecordingCtrl())
+    agent = _agent()
     a, b = T.ReturnPot(resources=('a',)), T.ReturnPot(resources=('b',))
     with patch('ai.agent.planner.plan', side_effect=[(a, {}), (b, {})]), \
          patch.object(agent.executor_inst, 'tick', return_value='running'):

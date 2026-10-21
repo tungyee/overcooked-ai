@@ -10,7 +10,7 @@
   1. 单位耗时与两个成功订单的实际工时吻合；
   2. 沉没进度（盘里已有的料、锅里煮了一半的米）要折掉；
   3. 多单共享一双手 → 队列累计；
-  4. slack < 0 的单判为必死。
+  4. 队列累计 slack 反映并发溢出（队尾单 slack < 0）。
 """
 import pytest
 
@@ -210,7 +210,7 @@ def test_queue_orders_by_deadline_first():
     assert [r.order_id for r in rows] == ["5", "7", "9"]
 
 
-# ---------- slack 与必死判定 ----------
+# ---------- slack ----------
 
 def test_slack_is_remaining_minus_eta():
     w = world(plates=[plate()])
@@ -220,26 +220,11 @@ def test_slack_is_remaining_minus_eta():
         r.remaining * E.TICKS_PER_SECOND - r.eta, abs=1.0)
 
 
-def test_doomed_when_eta_exceeds_remaining():
-    """只剩 5 秒、还差三样料 → 必死，别再投入。"""
-    w = world(orders=[order("1", "Sushi_Cucumber", 5.0)], plates=[])
-    rows = E.order_queue(w, book(w), plate_match={})
-    assert rows[0].doomed is True
-
-
-def test_not_doomed_when_plenty_of_time():
-    w = world(orders=[order("1", "Sushi_Cucumber", 130.0)], plates=[plate()])
-    rows = E.order_queue(w, book(w), plate_match={"p1": "1"})
-    assert rows[0].doomed is False
-
-
 def test_five_concurrent_orders_overflow_the_queue():
     """本局实况：5 单并发、一份 ≈37s 工时、单寿命 130s → 队列必然溢出。
 
-    这是「order#3 吞掉 1214 拍仍过期、#4/#5 全程饿死」的量化形式。注意钉住
-    的是**队列口径算出溢出**，不是「所以要判死」：这批单全都很新
-    （remaining/lifetime 0.62~0.92），judgment 该留给新鲜度闸，见
-    test_fresh_concurrent_orders_are_not_doomed_yet。
+    这是「order#3 吞掉 1214 拍仍过期、#4/#5 全程饿死」的量化形式：队列口径
+    的 slack 会算出溢出（队尾单 slack < 0），队首仍来得及。
     """
     orders = [order(str(i), "Sushi_Cucumber", 130.0 - i * 10) for i in range(1, 6)]
     w = world(orders=orders, plates=[])
@@ -247,77 +232,6 @@ def test_five_concurrent_orders_overflow_the_queue():
     assert rows[0].slack > 0, "队首来得及"
     assert sum(1 for r in rows if r.slack < 0) >= 3, \
         [(r.order_id, r.slack) for r in rows]
-
-
-def test_fresh_concurrent_orders_are_not_doomed_yet():
-    """实机 t=549 的原始局面：刚到的 #4 不该被判死。
-
-    数值取自 trace-20261014-204822 t=549（#4 出现后第 19 拍就被拉黑）。那一拍
-    #4 的 remaining=129.0/130s —— 寿命剩 99%。早期不该放弃任何单，该做的是排
-    优先级；队列会因为前面送出而松动（本局 t=3352 order#3 正是这样解禁，只是
-    已经太晚）。
-    """
-    orders = [order("1", "Sushi_Cucumber", 108.9),
-              order("2", "Sushi_Cucumber", 108.9),
-              order("3", "Sushi_Fish", 118.9),
-              order("4", "Sushi_Fish", 129.0)]
-    w = world(orders=orders, plates=[])
-    rows = {r.order_id: r for r in E.order_queue(w, book(w), plate_match={})}
-    assert rows["4"].doomed is False, \
-        [(r.order_id, r.remaining, r.slack, r.doomed) for r in rows.values()]
-
-
-def test_doomed_orders_do_not_consume_queue_capacity():
-    """判死的单不占队列容量——既然放弃它，工时就该让给后面的单。
-
-    少了这一步判死会沿队列雪崩：真实帧 t=1800 原本把 #4~#7 全判死，而实况是
-    #3/#4/#5 过期、#6/#7 送达成功。放开容量后结论变成「#3 可救、#4/#5 必死、
-    #6/#7 可救」，与实况逐条吻合。
-    """
-    # 中间插一个铁定做不完的单（只剩 2 秒），它不该把后面的单也拖死
-    orders = [order("1", "Sushi_Cucumber", 130.0),
-              order("2", "Sushi_Fish", 2.0),        # 必死
-              order("3", "Sushi_Cucumber", 130.0)]
-    w = world(orders=orders, plates=[plate("p1"), plate("p3")])
-    rows = {r.order_id: r for r in E.order_queue(
-        w, book(w), plate_match={"p1": "1", "p3": "3"})}
-    assert rows["2"].doomed is True
-    # #3 的 eta 不含 #2 的工时：必死单让出了容量
-    assert rows["3"].eta == rows["1"].eta + rows["3"].hand_ticks
-    assert rows["3"].doomed is False
-
-
-def test_fresh_order_is_never_doomed():
-    """刚到的单不判死，哪怕队列算出它必死。
-
-    实机 trace-20261014-204822：order#4 在 t=530 出现、t=549 判死，当时
-    remaining=129.0/130s（寿命剩 99%）；#5 同样 19 拍被拉黑。队列累计下只要
-    有 4 单以上，队尾**定义上** slack<0 —— 判死退化成排位歧视。
-    """
-    orders = [order("1", "Sushi_Fish", 100.0), order("2", "Sushi_Fish", 105.0),
-              order("3", "Sushi_Fish", 110.0),
-              order("4", "Sushi_Fish", 129.0)]      # 寿命剩 99%
-    w = world(orders=orders, plates=[])
-    rows = {r.order_id: r for r in E.order_queue(w, book(w), plate_match={})}
-    assert rows["4"].slack < 0, "队列仍应算出它来不及（口径没变）"
-    assert rows["4"].doomed is False, "但太新，不该判死"
-
-
-def test_stale_tail_order_is_still_doomed():
-    """新鲜度闸只豁免新单：已经过半还排在队尾的单照样判死。"""
-    orders = [order("1", "Sushi_Fish", 60.0), order("2", "Sushi_Fish", 62.0),
-              order("3", "Sushi_Fish", 64.0), order("4", "Sushi_Fish", 66.0)]
-    w = world(orders=orders, plates=[])
-    rows = {r.order_id: r for r in E.order_queue(w, book(w), plate_match={})}
-    assert rows["4"].doomed is True, [(r.order_id, r.slack) for r in rows.values()]
-
-
-def test_doom_freshness_floor_is_a_ratio_not_absolute():
-    """判死豁免按 remaining/lifetime，不按绝对秒数。"""
-    assert E._too_fresh_to_doom({"remaining": 129.0, "lifetime": 130}) is True
-    assert E._too_fresh_to_doom({"remaining": 60.0, "lifetime": 130}) is False
-    # 缺字段 → 不豁免（保守，按原规则判）
-    assert E._too_fresh_to_doom({"remaining": 129.0}) is False
 
 
 # ---------- 独立 slack（打分口径）----------
@@ -333,19 +247,6 @@ def test_solo_slack_is_monotone_in_remaining():
     w = world(orders=orders, plates=[])
     solo = E.solo_slack_by_order(w, book(w), plate_match={})
     assert solo["1"] < solo["2"] < solo["3"], solo
-
-
-def test_queue_slack_is_the_one_that_inverts():
-    """钉住两个口径的差别本身：队列 slack 对 remaining 是**反**的。
-
-    若哪天队列 slack 也变单调了，说明 busy 累计没生效（那是另一个 bug），
-    这条会报警。
-    """
-    orders = [order("1", "Sushi_Fish", 90.0), order("2", "Sushi_Fish", 100.0),
-              order("3", "Sushi_Fish", 110.0)]
-    w = world(orders=orders, plates=[])
-    q = E.slack_by_order(w, book(w), plate_match={})
-    assert q["1"] > q["3"], q          # 队首反而最从容
 
 
 def test_queue_exposes_edf_rank():

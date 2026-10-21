@@ -31,8 +31,10 @@ OUT="$ROOT/plugin/build"
 
 mkdir -p "$OUT"
 "$DOTNET" "$SDK" -nostdlib -noconfig -target:library \
-  -r:"$M/mscorlib.dll" -r:"$M/System.dll" -r:"$M/UnityEngine.dll" \
-  -r:"$M/UnityEngine.CoreModule.dll" -r:"$BE/BepInEx.dll" \
+  -r:"$M/mscorlib.dll" -r:"$M/System.dll" -r:"$M/System.Core.dll" \
+  -r:"$M/UnityEngine.dll" -r:"$M/UnityEngine.CoreModule.dll" \
+  -r:"$M/Assembly-CSharp.dll" -r:"$M/Assembly-CSharp-firstpass.dll" \
+  -r:"$BE/BepInEx.dll" \
   -out:"$OUT/Oc2AIPlugin.dll" \
   "$ROOT"/plugin/*.cs
 

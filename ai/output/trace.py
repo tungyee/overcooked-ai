@@ -192,6 +192,8 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         # `rescue_override` 是截止闸抢回的订单 id（没抢单时缺省）。
         "branches": record.get("branches") or {},
         "rescue_override": record.get("rescue_override"),
+        # 「马上去」硬指令闸的覆盖标记（planner record 的 imperative 转发）。
+        "imperative": record.get("imperative"),
         # 对话层本拍做的事：命令/ack、事件、偏好条数（spec §6.3 第 5 条）。
         # 没有对话 worker 时是空 dict，复盘能直接看出语音是否接入。
         "dialog": record.get("dialog") or {},
@@ -204,6 +206,11 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
     # （"revenue 缺失" 本身就是"这拍没在玩"的信号）。
     if state:
         log_entry["revenue"] = _revenue(state)
+
+    # 卡住事件只在判据成立时写（grep 友好：没卡住的拍不带这个 key）。
+    stuck = record.get("stuck")
+    if stuck:
+        log_entry["stuck"] = stuck
 
     with open(TRACE_PATH, "a") as f:
         f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")

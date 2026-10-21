@@ -9,8 +9,8 @@ from ai.query import placement
 from ai.query import predicates as P
 from ai.exec.bt import Status
 from ai.primitives.align import AlignToCell
-from ai.primitives.base import Primitive, resolve
-from ai.primitives.hold import TapWhileHolding
+from ai.primitives.base import Primitive, resolve, counter_dir
+from ai.primitives.hold import TapWhileHolding, WaitUntil
 from ai.primitives.move import Approach, Face
 from ai.primitives.tap import Tap, Confirm
 from ai.primitives.interaction_recovery import InteractionRecovery
@@ -37,7 +37,7 @@ def _belt_hold_key(ctx):
     cell = P.chef_cell(chef, w.to_grid)
     if cell is None:
         return None
-    return ctx["hands"].counter_dir(w.belt_dir, cell)
+    return counter_dir(w.belt_dir, cell)
 
 
 class EnsureHandsFree(Primitive):
@@ -176,7 +176,7 @@ class EnsureHandsFree(Primitive):
 
     def _step(self, ctx):
         # type: (Dict) -> str
-        w, chef, hands = ctx["w"], ctx["chef"], ctx["hands"]
+        w, chef = ctx["w"], ctx["chef"]
 
         # 手里拿的正是任务要保留的目标物 → 视为"已空手"，别放下再捡
         if self._keep is not None and self._keep(ctx):
@@ -192,7 +192,6 @@ class EnsureHandsFree(Primitive):
             self._lock_target(ctx)
             self._drop_held = P.held_name(chef)
             if self._tgt is None:
-                hands.set_move(None)
                 return Status.FAILURE      # 无处可放 → 交还 Planner
 
         if self._phase == _P_APPROACH:
@@ -289,8 +288,9 @@ class InteractWith(Primitive):
     _goto_grab_cell 的那条路）。
     """
 
-    def __init__(self, target, kind, expect, face=True, retries=5):
-        # type: (Any, Optional[str], Callable[[Dict], bool], bool, int) -> None
+    def __init__(self, target, kind, expect, face=True, retries=5,
+                 wait_pred=None, wait_timeout=None):
+        # type: (Any, Optional[str], Callable[[Dict], bool], bool, int, Optional[Callable[[Dict], bool]], Optional[int]) -> None
         Primitive.__init__(self)
         self.target = target
         self.kind = kind
@@ -299,6 +299,10 @@ class InteractWith(Primitive):
         self._face = Face(target) if face else None
         self._align = AlignToCell(target, kind)
         self._reface = Face(target) if face else None
+        # 可选「到位后先等世界谓词成立再 tap」：传送带上的料在持续移动，
+        # 走到固定段旁后要等料经过该段（wait_pred 成立）再按，否则按早了
+        # 段上空无一物。非传送带路径不传，行为不变。
+        self._wait = WaitUntil(wait_pred, wait_timeout) if wait_pred is not None else None
         self._tap = TapWhileHolding("pickup", _belt_hold_key, target, kind)
         self._confirm = Confirm(expect, retries)
         self._phase = 0
@@ -322,6 +326,8 @@ class InteractWith(Primitive):
         out.append(self._align)
         if self._reface is not None:
             out.append(self._reface)
+        if self._wait is not None:
+            out.append(self._wait)
         out.extend([self._tap, self._confirm])
         return out
 
@@ -363,7 +369,6 @@ class InteractWith(Primitive):
         # 只在 Tap 还没按下时查：按下之后手里本来就该变，那是 expect 的
         # 职责。_tap._fired 正好是"本次激活期按过没"的权威标记。
         if not self._tap._fired and self.hands_changed(ctx):
-            ctx["hands"].set_move(None)
             self.reset()
             return Status.FAILURE
         self._remember_hands(ctx)
@@ -371,7 +376,6 @@ class InteractWith(Primitive):
         # 拾取后目标可以先从台面消失、手持状态稍后才更新；这时必须留在
         # Confirm，而不是把目标消失当成失败、重新走路甚至重按 toggle。
         if not self._tap._fired and resolve(self.target, ctx) is None:
-            ctx["hands"].set_move(None)
             self.reset()
             return Status.FAILURE
 
@@ -390,7 +394,7 @@ class InteractWith(Primitive):
             child = children[self._phase]
             phase = ('approach' if child is self._approach else 'face' if child is self._face
                      else 'align' if child is self._align else 'reface' if child is self._reface
-                     else 'tap' if child is self._tap else 'confirm')
+                     else 'wait' if child is self._wait else 'tap' if child is self._tap else 'confirm')
             ctx['interaction'] = {'phase': phase, 'attempt': self._recovery.attempts,
                                   'target': P.resource_id(resolve(self.target, ctx)), 'kind': self.kind}
             s = child.tick(ctx)

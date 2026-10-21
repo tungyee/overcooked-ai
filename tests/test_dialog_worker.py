@@ -434,7 +434,7 @@ def test_empty_transcript_never_calls_llm():
     worker._handle_transcript("", {"tick": 100})
 
     assert worker.clients.llm.prompts == []
-    assert bundle.tts.spoken == []
+    assert bundle.tts.spoken == ["没听清，再说一遍", "没听清，再说一遍"]
 
 
 def test_identical_speech_within_4s_is_deduped():
@@ -446,13 +446,31 @@ def test_identical_speech_within_4s_is_deduped():
     assert len(worker.clients.llm.prompts) == 1
 
 
-def test_llm_error_is_swallowed():
+def test_llm_error_speaks_missed_speech_fallback():
     worker, bundle = make_worker(llm=FakeLLM(error=RuntimeError("boom")))
 
     worker._handle_transcript("我来切", {"tick": 100})
 
-    assert bundle.tts.spoken == []
+    assert bundle.tts.spoken == ["没听清，再说一遍"]
     assert worker.state.history == []
+
+
+def test_empty_asr_speaks_missed_speech_fallback():
+    worker, bundle = make_worker()
+
+    class _EmptyASRSession(object):
+        def poll(self):
+            return [("done", None)]
+
+    utterance = worker_mod._Utterance(
+        session=_EmptyASRSession(),
+        timing=worker_mod.TurnTiming(source="vad", event="speech",
+                                     started=time.monotonic()),
+        texts=[],
+    )
+
+    assert worker._poll_utterance(utterance) is True
+    assert bundle.tts.spoken == ["没听清，再说一遍"]
 
 
 # -------------------------------------------------------------- speaking
@@ -628,6 +646,51 @@ def test_reset_state_clears_dialog_state():
     assert worker.state.last_speech_tick == 0
     assert worker.state.pending_orders == []
     assert worker.last_proactive_tick == 0
+
+
+def test_reset_state_clears_checkin_schedule():
+    worker, _ = make_worker()
+    worker._next_checkin_at = time.monotonic() + 100.0
+
+    worker.reset_state()
+
+    assert worker._next_checkin_at is None
+
+
+def test_run_llm_schedules_next_checkin_after_normal_turn():
+    worker, _ = make_worker(llm=FakeLLM(reply("你好呀。")))
+    before = time.monotonic()
+
+    worker._handle_transcript("你好", {"tick": 100, "tools": TOOLS})
+
+    assert worker._next_checkin_at is not None
+    assert worker._next_checkin_at - before >= worker_mod.CHECKIN_MIN_S
+
+
+def test_checkin_llm_error_does_not_leave_schedule_in_past():
+    worker, _ = make_worker(llm=FakeLLM(error=RuntimeError("llm down")))
+    worker.publish_context({"level": "Sushi_1_4_2P",
+                            "orders": [{"id": 1, "dish": "X"}],
+                            "tick": 100,
+                            "live": True})
+    worker._next_checkin_at = time.monotonic() - 1.0
+
+    worker._maybe_checkin(None, False, False)
+
+    assert worker._next_checkin_at is None
+
+
+def test_checkin_clears_schedule_when_not_live():
+    worker, _ = make_worker(llm=FakeLLM())
+    worker.publish_context({"level": "Sushi_1_4_2P",
+                            "orders": [{"id": 1, "dish": "X"}],
+                            "tick": 100,
+                            "live": False})
+    worker._next_checkin_at = time.monotonic() - 1.0
+
+    worker._maybe_checkin(None, False, False)
+
+    assert worker._next_checkin_at is None
 
 
 def test_publish_context_keeps_only_latest():
@@ -829,6 +892,18 @@ def test_default_clients_construct_without_opening_devices():
     assert isinstance(worker.clients.tts, TTSClient)
     assert isinstance(worker.clients.player, AudioPlayer)
     assert isinstance(worker.clients.llm, LLMClient)
+
+
+def test_default_clients_wires_voice_rate_into_tts():
+    config = make_config()
+    config.rate = 1.3
+
+    worker = DialogWorker(
+        config, queue.Queue(), queue.Queue(),
+        queue.Queue(maxsize=1), queue.Queue(maxsize=1),
+    )
+
+    assert worker.clients.tts.rate == pytest.approx(1.3)
 
 
 # ---------------------------------------------------------------- logging

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -34,6 +35,7 @@ from ai.dialog.llm import (assistant_message, event_note, speech_message,
 from ai.dialog.policy import (
     PROACTIVE_MIN_INTERVAL_TICKS,
     merge_new_orders,
+    should_checkin,
     should_trigger,
 )
 from ai.dialog.schema import DialogState
@@ -62,6 +64,11 @@ PTT_MIN_FRAMES = 4
 ASR_FINISH_TIMEOUT_S = 15.0
 # LLM 文本按句号/问号/感叹号/分号/换行切句，逐句交给 TTS。
 _SENTENCE_RE = re.compile(r"[。！？!?；;\n]+")
+# 漏听兜底：ASR 空/失败或 LLM 第一段失败时，回一句而不是静默（spec §G.2）。
+MISSED_SPEECH_TEXT = "没听清，再说一遍"
+# 定时送单 check-in：每轮结束后随机排下一次主动开口的时间窗（秒）。
+CHECKIN_MIN_S = 35
+CHECKIN_MAX_S = 75
 
 
 @dataclass
@@ -221,6 +228,10 @@ class StreamingTTS(object):
         while (self.worker.clients.player.is_playing
                and not self.worker._stop.is_set()):
             self.worker._poll_first_audio(self.timing, self._snippet())
+            if not self.worker._context_live():
+                # 游戏暂停/退出时立刻停播，别把过期的播报念完。
+                self.worker._shutdown(self.worker.clients.player, ("stop",))
+                break
             if time.monotonic() >= deadline:
                 self.worker._shutdown(self.worker.clients.player, ("stop",))
                 break
@@ -338,6 +349,8 @@ class DialogWorker(object):
         # 延迟打点的锚点；主循环写 level_start 时由 worker 线程读取。
         self._level_started = None
         self._pending_order_at = None
+        # 下次定时 check-in 的单调时钟时间点；None 表示尚未排期。
+        self._next_checkin_at = None
 
     # -------------------------------------------------------------- logging
 
@@ -527,6 +540,7 @@ class DialogWorker(object):
             self.last_proactive_tick = 0
             self._pending_order_at = None
             self._level_started = None
+            self._next_checkin_at = None
 
     # ------------------------------------------------------------- queues
 
@@ -626,6 +640,8 @@ class DialogWorker(object):
             self._log_event(
                 "turn_latency",
                 **self._latency_fields(utterance.timing, outcome="no_asr"))
+            # 漏听主动提示：识别为空不再静默（spec §G.2）。
+            self._speak(MISSED_SPEECH_TEXT, timing=utterance.timing)
         return True
 
     def _await_utterance(self, utterance):
@@ -698,6 +714,7 @@ class DialogWorker(object):
                         ptt_preroll.clear()
                     self._stop.wait(IDLE_S)
                     continue
+                self._maybe_checkin(utterance, vad_active, ptt_recording)
                 if frames is None:
                     try:
                         frames = self.clients.capture.frames()
@@ -842,6 +859,39 @@ class DialogWorker(object):
                 except Exception:
                     log.debug("关闭帧迭代器失败", exc_info=True)
 
+    def _maybe_checkin(self, utterance, vad_active, ptt_recording):
+        # type: (Any, bool, bool) -> None
+        """定时 check-in：空闲且排期到点时，主动报一句送单局面。
+
+        只在没有正在录的人声 / VAD 开口 / PTT 按住时开口（播放期 VAD 已暂停，
+        调用点也在 `vad.paused` 分支之后）；排期由 `_run_llm` 每轮结束重置。
+        """
+        now = time.monotonic()
+        context = self._latest_context() or {}
+        live = bool(context.get("live"))
+        if not live:
+            # 暂停 / 退出关卡：清掉随机排期，恢复后再由下一轮正常回合重排。
+            # 这样退出后不会再冒出 check-in。
+            self._next_checkin_at = None
+            return
+        has_orders = bool(context.get("orders"))
+        in_level = context.get("level") is not None
+        if (not utterance and not vad_active and not ptt_recording
+                and should_checkin(self._next_checkin_at, now,
+                                   has_orders, in_level, live)):
+            # 先清排期再开口：正常结束会重排，LLM 失败等早退路径则停在
+            # None，下一拍 `should_checkin` 返回 False，不会空转打 LLM。
+            self._next_checkin_at = None
+            self._run_llm(context, "checkin", "",
+                          timing=TurnTiming(source="event", event="checkin",
+                                            started=now))
+
+    def _context_live(self):
+        # type: () -> bool
+        """游戏是否在「关卡内且未暂停」；不满足时不再开口/继续播报。"""
+        ctx = self._latest_context() or {}
+        return bool(ctx.get("live"))
+
     def _drain_events(self):
         # type: () -> None
         while not self._stop.is_set():
@@ -920,6 +970,8 @@ class DialogWorker(object):
         """一段 ASR final：去重 → LLM → 账本落地 → 播报。"""
         text = (text or "").strip()
         if not text:
+            # 空文本 = 没识别到内容，主动提示（spec §G.2）。
+            self._speak(MISSED_SPEECH_TEXT, timing=timing)
             return
         context = context or {}
         tick = int(context.get("tick", 0) or 0)
@@ -976,6 +1028,13 @@ class DialogWorker(object):
             self._run_llm(context, name, "", new_orders=batch,
                           timing=timing)
             return
+        if name in ("last_seconds", "round_summary"):
+            # 主循环一次性触发（各只发一次），直接说，不调工具、不再套限频闸。
+            self.last_proactive_tick = tick
+            timing = TurnTiming(source="event", event=name,
+                                started=time.monotonic())
+            self._run_llm(context, name, "", timing=timing)
+            return
         log.debug("忽略未知事件: %r", name)
 
     def _run_llm(self, context, event, transcript, new_orders=None,
@@ -1028,6 +1087,9 @@ class DialogWorker(object):
                 self._log_event(
                     "turn_latency",
                     **self._latency_fields(timing, outcome="llm_error"))
+                # 漏听主动提示：第一段 LLM 失败时回一句，而不是静默（spec §G.2）。
+                if event == "speech":
+                    self._speak(MISSED_SPEECH_TEXT, timing=timing)
             return
         final = first
         if first.tool_calls:
@@ -1064,6 +1126,9 @@ class DialogWorker(object):
         timing.llm_done_at = time.monotonic()
         stream.finish()
         stream.wait()
+        # 每轮正常结束后随机排下一次定时 check-in（失败早退不重排，沿用旧排期）。
+        self._next_checkin_at = (time.monotonic()
+                                 + random.uniform(CHECKIN_MIN_S, CHECKIN_MAX_S))
         if stream.error is not None:
             outcome = "tts_error"
         elif stream.text_seen.strip():
@@ -1239,7 +1304,8 @@ class DialogWorker(object):
             deadline = time.monotonic() + SPEAK_TIMEOUT_S
             while producer.is_alive():
                 self._poll_first_audio(timing, text)
-                if self._stop.is_set() or time.monotonic() >= deadline:
+                if (self._stop.is_set() or not self._context_live()
+                        or time.monotonic() >= deadline):
                     break
                 time.sleep(SPEAK_POLL_S)
             if producer.is_alive():
@@ -1255,6 +1321,9 @@ class DialogWorker(object):
                 while (self.clients.player.is_playing
                        and not self._stop.is_set()):
                     self._poll_first_audio(timing, text)
+                    if not self._context_live():
+                        self._shutdown(self.clients.player, ("stop",))
+                        break
                     if time.monotonic() >= deadline:
                         log.warning("TTS 播放超时，强制恢复 VAD")
                         outcome = "timeout"
@@ -1350,7 +1419,7 @@ class DialogWorker(object):
             asr=ASRClient(config.asr_key, config.asr_resource_id,
                           timeout=15.0),
             tts=WarmTTSClient(config.tts_key, config.tts_resource_id,
-                              config.tts_voice),
+                              config.tts_voice, rate=config.rate),
             player=AudioPlayer(volume=config.volume),
             llm=LLMClient(config.ark_key, config.ark_base_url,
                           config.ark_model, timeout=config.llm_timeout),

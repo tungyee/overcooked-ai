@@ -21,13 +21,12 @@ from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
 from ai.state.blackboard import Blackboard, Claim, Commitment
-from ai.output.hands import Hands
 from ai.primitives.stuck import ABANDON_TTL_TICKS, note_motion_failure
 from ai.core.recovery import FailureHistory, abandon_actions, waiting_reason
-from ai.primitives.motion import FRAME_MAX_AGE
 from ai.query import recipe_graph
 from ai.query.recipes import RecipeBook
 from ai.state.world import StateClient, World
+from ai.exec.client import ExecClient
 
 log = logging.getLogger(__name__)
 
@@ -36,9 +35,20 @@ log = logging.getLogger(__name__)
 # 20 Hz 理解，与插件 5 Hz 推帧（200 ms）不是一个量级——混用会让阈值差 4 倍。
 TICK_INTERVAL = 0.05
 
+# 帧最大年龄（秒）：超过视为断流，进入空闲守卫（halt 执行树、不做决策）。
+# 原定义在 ai.primitives.motion，随键盘注入轨删除后挪到这里。
+FRAME_MAX_AGE = 0.75
+
 # L3 兜底：同一物理操作在 TTL 内失败满 N 次，对其认领动作短暂退避。
 # 按操作独立累计，切换任务/订单不能清零；不同动作不会互相拉黑。
 ABANDON_FAIL_STREAK = 3
+
+# 对话上下文的「临期订单」阈值（秒）：remaining 低于此值的订单算快过期。
+# 只给 LLM 提醒，不参与决策——决策口径仍走 planner 的 slack。
+EXPIRING_ORDER_SECONDS = 20
+
+# 最后 N 秒提醒：剩余时间首次降到该值以下时发一次 last_seconds 事件。
+LAST_SECONDS_WARN_S = 10
 
 def _timer_expired(timer):
     # type: (Any) -> bool
@@ -176,9 +186,115 @@ def _cooker_text(index, cooker):
     return {"name": "%d 号灶" % (index,), "text": text}
 
 
+def _dirty_plate_count(world):
+    # type: (World) -> int
+    """待洗脏盘数：所有洗碗池待洗盘 + 场上脏盘摞。
+
+    与 ai/tasks/plate.py 的 sink_plate_count / dirty_plate_exists 同一口径
+    （washing 站点的 plate_count + items 里名字含 dirtyplate 的条数），只是
+    把「单个池子的 plate_count」推广成「所有池子求和」。
+    """
+    count = 0
+    for st in getattr(world, "stations", None) or ():
+        if isinstance(st, dict) and st.get("t") == "washing":
+            try:
+                count += int(st.get("plate_count") or 0)
+            except (TypeError, ValueError):
+                pass
+    for it in getattr(world, "items", None) or ():
+        if isinstance(it, dict) and \
+                "dirtyplate" in str(it.get("n") or "").lower():
+            count += 1
+    return count
+
+
+def _board_item_text(item):
+    # type: (Any) -> str
+    """板上的物品名 → 可读文本：ChoppedX → X(已切)。"""
+    s = str(item or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("chopped") and len(s) > len("chopped"):
+        return "%s(已切)" % (s[len("chopped"):],)
+    return s
+
+
+def _board_texts(world):
+    # type: (World) -> List[str]
+    """切菜板内容列表（板名 + 板上物），空板不列；与 recipe_graph 同口径。"""
+    out = []
+    for name, item in recipe_graph._board_items(world).items():
+        text = _board_item_text(item)
+        if not text:
+            continue
+        out.append("%s：%s" % (name, text))
+    return out
+
+
+def _cooker_idle(cooker):
+    # type: (Dict) -> bool
+    """灶是否空：与 `_cooker_text` 的「空」同口径（无料、没火、没在煮）。"""
+    contents = [c for c in (cooker.get("pot_contents") or ()) if c]
+    return not contents and not (cooker.get("onFire") or cooker.get("burning")
+                                 or cooker.get("cooked")
+                                 or cooker.get("isCooking"))
+
+
+def _idle_cooker_count(world):
+    # type: (World) -> int
+    return sum(1 for c in getattr(world, "cookers", None) or ()
+               if isinstance(c, dict) and _cooker_idle(c))
+
+
+def _score_field(world, field):
+    # type: (World, str) -> Optional[int]
+    """world.score / world.raw.score 里的整数结算字段；取不到返回 None。"""
+    for src in (getattr(world, "score", None),
+                (getattr(world, "raw", None) or {}).get("score")):
+        if isinstance(src, dict) and src.get(field) is not None:
+            try:
+                return int(src[field])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _combo(world):
+    # type: (World) -> Optional[int]
+    """当前连击数；取不到返回 None（与 planner._current_combo 同源，缺省不猜 0）。"""
+    return _score_field(world, "combo")
+
+
+def _score_total(world):
+    # type: (World) -> Optional[int]
+    """结算总分 = 送餐 base + 小费 tips；取不到 base 返回 None。"""
+    base = _score_field(world, "base")
+    if base is None:
+        return None
+    return base + (_score_field(world, "tips") or 0)
+
+
+def _expiring_orders(orders):
+    # type: (List[Dict]) -> List[Dict]
+    """remaining 低于阈值的订单（给 LLM 的临期提醒，不参与决策）。"""
+    out = []
+    for order in orders or ():
+        try:
+            remaining = float(order.get("remaining"))
+        except (TypeError, ValueError):
+            continue
+        if remaining < EXPIRING_ORDER_SECONDS:
+            out.append({
+                "id": order.get("id"),
+                "dish": order.get("dish"),
+                "remaining": order.get("remaining"),
+            })
+    return out
+
+
 def _plates_text(world, book):
     # type: (World, Any) -> str
-    """盘子概况：空盘数、装了料的盘各装了什么（token 归一后可读）。"""
+    """盘子概况：空盘数、装了料的盘各装了什么（token 归一后可读）、待洗脏盘。"""
     empty, filled = 0, []
     for plate in getattr(world, "plates", None) or ():
         try:
@@ -193,6 +309,7 @@ def _plates_text(world, book):
     parts = ["空盘 %d 个" % (empty,)]
     if filled:
         parts.append("装了料的盘 " + " ".join(filled))
+    parts.append("脏盘 %d 个" % (_dirty_plate_count(world),))
     return "；".join(parts)
 
 
@@ -231,25 +348,67 @@ def _ranked_tasks(plan_record):
     return out
 
 
-class NullController:
-    """默认 controller（仅用于测试）。"""
-    def tap(self, name, hold=0.12): pass
-    def press(self, name): pass
-    def release(self, name): pass
-    def release_all(self): pass
+def _stuck_info(bb, world, motion=None):
+    # type: (Any, World, Optional[Dict]) -> Optional[Dict]
+    """卡住事实（纯读）：arbiter 同格卡住优先，回退 motion 空转（spec §G.1）。
+
+    只读 `bb.scratch` / `bb.commitment`，**不调用** arbiter._is_stuck——那会原地
+    推进计数，而这里一拍内可能被对话上下文 + trace 各读一次，重复推进会污染
+    arbiter 的卡住判据。返回 None 表示未卡住，否则是 trace 用的结构化字段。
+    """
+    from ai.state.blackboard import StuckScratch
+    scratch = getattr(bb, "scratch", None)
+    commitment = getattr(bb, "commitment", None)
+    active = getattr(commitment, "active_task", None) if commitment else None
+    retries = int(getattr(commitment, "retries", 0) or 0)
+    task_text = _task_text(active)
+    if isinstance(scratch, StuckScratch) and \
+            scratch.same_count >= arbiter.STUCK_SAME_CELL_THRESHOLD:
+        return {
+            "task": task_text,
+            "reason": "stuck detected",
+            "pos": list(scratch.last_cell) if scratch.last_cell else None,
+            "duration_ticks": int(scratch.same_count),
+            "retries": retries,
+        }
+    motion = motion or {}
+    if motion.get("stalled"):
+        chef = P.chef_by_name(world.chefs, P.P2_NAME)
+        cell = P.chef_cell(chef, world.to_grid) if chef is not None else None
+        return {
+            "task": task_text,
+            "reason": "stalled",
+            "pos": list(cell) if cell else None,
+            "duration_ticks": int(round(
+                (motion.get("stall_seconds") or 0.0) * planner.TICKS_PER_SECOND)),
+            "retries": retries,
+        }
+    return None
+
+
+def _stuck_text(info):
+    # type: (Optional[Dict]) -> Optional[str]
+    """卡住 → LLM 可读一句（位置 + 持续拍数）。"""
+    if not info:
+        return None
+    pos = info.get("pos")
+    loc = "(%s,%s)" % (pos[0], pos[1]) if pos and len(pos) == 2 else "未知位置"
+    return "卡在 %s，%d 拍" % (loc, int(info.get("duration_ticks") or 0))
 
 
 class Agent:
     """AI 主循环：13 步装配。"""
 
-    def __init__(self, ctrl=None, voice=None, dialog_worker=None):
+    def __init__(self, voice=None, dialog_worker=None, exec_client=None):
         # type: (Optional[Any], Optional[Any], Optional[Any]) -> None
         self.client = StateClient()
         self.bb = Blackboard()
         self.executor_inst = executor.Executor()
-        self.ctrl = ctrl or NullController()
-        self.hands = Hands(self.ctrl)
         self.book = None  # type: Optional[RecipeBook]
+        # 唯一执行后端：插件 exec 通道（27412），叶子原语发命令而非按键。
+        # exec_client 可注入（测试 / --dry-run 用 NullExec）；默认创建并连接真实客户端。
+        self.exec_client = exec_client if exec_client is not None else ExecClient()
+        self.exec_client.connect()
         self.tick = 0
         self.idle_logged = False  # 暂停/非关卡的心跳日志是否已写过
         self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)
@@ -287,8 +446,12 @@ class Agent:
             self.ctx_q = self.ctx_q or queue.Queue(maxsize=1)
             self.event_q = self.event_q or queue.Queue(maxsize=1)
 
-        self._dialog_level = None      # 上一次观察到的关卡名；换关清账本
+        self._dialog_scene_key = None  # 上次观察到的场景身份 (session_id, scene_epoch, level)；换关清账本
         self._seen_orders = {}         # 本关见过的菜 → 首张订单（新菜只说一次）
+        self._seen_materials = set()   # 本关已分配过的物料（新单无新物料则不播）
+        self._last_seconds_fired = False   # 最后 10 秒提醒只发一次
+        self._round_summary_fired = False  # 结束总结只发一次
+        self._round_started = False        # 计时器是否跑过（区分未开局/已结束）
         self._last_ranked = []         # 上一拍 planner 打分前几名（给 LLM 看）
         # 分工账本：`bb.preferences` 只由它编译（ai/dialog/duties.py）。
         self.ledger = Ledger()
@@ -302,7 +465,10 @@ class Agent:
                 self.dialog_worker.start()
             while (end_at is None or time.monotonic() < end_at) and not (stop_requested and stop_requested()):
                 started = time.monotonic()
-                self.hands.service(started)
+                # exec 通道（27412）可能晚于快照端口就绪，或运行中短暂断开：
+                # 未连接就重试，避免一次性 connect 失败后 AI 永久空转。
+                if not self.exec_client.connected:
+                    self.exec_client.connect()
                 snapshot = self.client.read_latest()
                 if snapshot is not None:
                     latest = World(snapshot)
@@ -319,8 +485,8 @@ class Agent:
         except (KeyboardInterrupt, EOFError):
             pass
         finally:
-            # 断线、读帧错误与意外异常均要释放持续方向键。
-            self.hands.release_all()
+            # 断线、读帧错误与意外异常均要 halt 在途命令。
+            self.executor_inst.halt_and_discard()
             if self.dialog_worker is not None:
                 self.dialog_worker.stop()
 
@@ -398,19 +564,24 @@ class Agent:
         # type: (World) -> None
         """换关卡时清空账本与对话历史（spec §4.7 / §6.3）。
 
-        只看关卡名：暂停/菜单不清，玩家暂停一下回来，分工和聊天记录都还在。
-        首次观察只记账，不重置——启动晚于玩家进入关卡时不该把已说的话抹掉。
+        用场景身份 (session_id, scene_epoch, level) 判变，与 `_observe_scene`
+        同口径：同一关重开（level 名不变、scene_epoch 变）也要清，否则上局
+        的事实会漏进这一局的 LLM 上下文。暂停/菜单不清——玩家暂停一下回来，
+        分工和聊天记录都还在。首次观察只记账，不重置——启动晚于玩家进入
+        关卡时不该把已说的话抹掉。
         """
         level = getattr(world, "level", None)
         if level is None:
             return
-        if self._dialog_level is None:
-            self._dialog_level = level
+        raw = getattr(world, "raw", {})
+        key = (raw.get("session_id"), raw.get("scene_epoch"), level)
+        if self._dialog_scene_key is None:
+            self._dialog_scene_key = key
             self._log_dialog_level_start(level)
             return
-        if level == self._dialog_level:
+        if key == self._dialog_scene_key:
             return
-        self._dialog_level = level
+        self._dialog_scene_key = key
         self._log_dialog_level_start(level)
         self.ledger.clear()
         self.bb.preferences[:] = []
@@ -418,6 +589,10 @@ class Agent:
         self.bb.abandoned_orders = {}
         self.bb.rescue_cooldown_until = 0
         self._seen_orders = {}
+        self._seen_materials = set()
+        self._last_seconds_fired = False
+        self._round_summary_fired = False
+        self._round_started = False
         # 上一关遗留的批次和 ack 必须丢掉：它们代表旧 World 上的决定。
         self._drain_dialog_queues()
         reset = getattr(self.dialog_worker, "reset_state", None)
@@ -495,15 +670,34 @@ class Agent:
 
         # ④ 新菜谱事件：每种菜一局只说一次（开局第一批也算，spec §5.1）。
         new_ids = []
+        book = self.book or RecipeBook(world.recipes, world.stations)
         for order in world.orders:
             order_id, dish = order.get("id"), order.get("dish")
             if order_id is None or not dish:
                 continue
             if dish not in self._seen_orders:
                 self._seen_orders[dish] = dict(order)
-                new_ids.append(order_id)
+                # 只有带来「新物料」的菜才播：新单的物料若全被之前的单覆盖，
+                # 分工没变，不再打扰（spec §5.1 的收窄）。
+                ingredients = [str(i).lower()
+                               for i in book.requirements(order)]
+                new_mats = [i for i in ingredients
+                            if i not in self._seen_materials]
+                if new_mats:
+                    self._seen_materials.update(new_mats)
+                    new_ids.append(order_id)
         if new_ids:
             event = ("new_order", new_ids)
+            self._put_event(event)
+            events.append(event)
+
+        # ④.5 临结束提醒：最后 10 秒发一次（结束总结在 _tick_once 的等待分支里，
+        # 因为 round_finished 时本函数已不会被执行）。
+        time_left = planner._time_left_ticks(world)
+        if (not self._last_seconds_fired and time_left is not None
+                and time_left <= LAST_SECONDS_WARN_S * 20):
+            self._last_seconds_fired = True
+            event = ("last_seconds", None)
             self._put_event(event)
             events.append(event)
 
@@ -584,17 +778,27 @@ class Agent:
         tools = _duty_tools(kitchen, self.ledger)
         return {
             "level": getattr(world, "level", None),
+            "live": bool(getattr(world, "phase", None) == "level"
+                         and not getattr(world, "paused", False)),
             "tick": tick,
             "time_left": _seconds(planner._time_left_ticks(world)),
-            "score": ((getattr(world, "raw", None) or {}).get("score") or {}
-                      ).get("base"),
+            "score": _score_field(world, "base"),
+            "total": _score_total(world),
             "orders": orders,
             "cookers": [_cooker_text(i, c) for i, c
                         in enumerate(world.cookers or (), 1)],
             "plates": _plates_text(world, book),
+            "dirty_plates": _dirty_plate_count(world),
+            "boards": _board_texts(world),
+            "idle_cookers": _idle_cooker_count(world),
+            "combo": _combo(world),
+            "deliveries": _score_field(world, "deliveries"),
+            "tips": _score_field(world, "tips"),
+            "expiring_orders": _expiring_orders(live_orders),
             "p1": {"holding": P.held_name(p1_chef) or None},
             "p2": {
                 "doing": _task_text(active) if active is not None else None,
+                "stuck": _stuck_text(_stuck_info(self.bb, world)),
             },
             "p2_options": options,
             "duties": self._duty_rows(world, kitchen, tick),
@@ -620,15 +824,12 @@ class Agent:
         # 生命周期守卫（spec §8.1）：暂停 / 非关卡 → 松键、不做任何决策。
         stale = (self._frame_received_at is not None and
                  time.monotonic() - self._frame_received_at > FRAME_MAX_AGE)
-        foreground = getattr(self.ctrl, 'is_game_foreground', None)
-        unfocused = callable(foreground) and not foreground()
         missing_protocol = self.require_live_protocol and not (
             world.raw.get('grids') and (world.terrain.get(9) or world.raw.get('level_bounds')))
         missing_player = self.require_live_protocol and any(
             P.chef_by_name(world.chefs, name) is None for name in (P.P1_NAME, P.P2_NAME))
         round_finished = _timer_expired(world.raw.get('timer'))
-        if stale or unfocused or missing_protocol or missing_player or round_finished or world.paused or world.phase != "level":
-            self.hands.release_all()
+        if stale or missing_protocol or missing_player or round_finished or world.paused or world.phase != "level":
             self.executor_inst.halt_and_discard()
             self.bb.commitment = Commitment()
             # 进入这个状态时记一条，之后不再逐拍记（一局里大部分时间可能
@@ -636,7 +837,7 @@ class Agent:
             # "trace 里什么都没有"到底是 agent 没起来还是 AI 没决策。
             if not self.idle_logged:
                 self.idle_logged = True
-                reason = ("stale_frame" if stale else 'unfocused' if unfocused
+                reason = ("stale_frame" if stale
                           else 'protocol_unavailable' if missing_protocol else 'missing_player' if missing_player
                           else 'round_finished' if round_finished
                           else "paused" if world.paused
@@ -644,8 +845,28 @@ class Agent:
                 trace.emit({"mode_reason": reason, "p1": {}, "candidates": []},
                            self.bb.mode, self.bb.commitment,
                            {"status": "skipped"}, [], self.tick)
+            # 结束总结：round_finished 首次成立时发一次，并立刻发布上下文让
+            # worker 读到最终战绩。其余等待原因（暂停/失焦等）按 2 Hz 发布
+            # `live=False` 的上下文：worker 靠它停掉正在播的语音、清掉 check-in
+            # 排期——否则上下文停在上一拍的 live=true，语音会继续念。
+            publish_now = (round_finished and self._round_started
+                           and not self._round_summary_fired)
+            if publish_now:
+                self._round_summary_fired = True
+                self._put_event(("round_summary", None))
+            if self.dialog_worker is not None and (publish_now or self.tick % 10 == 0):
+                publish = getattr(self.dialog_worker, "publish_context", None)
+                if callable(publish):
+                    try:
+                        publish(self._build_dialog_context(world))
+                    except Exception:               # noqa: BLE001
+                        log.exception("发布暂停/结束上下文失败")
             return
         self.idle_logged = False
+        # 计时器在跑（left > 0）→ 本局确实开始过；用于区分「未开局」和
+        # 「已结束」——两者插件都报 left=0，_timer_expired 都会返回 True。
+        if planner._time_left_ticks(world) is not None:
+            self._round_started = True
 
         # 黑板拍号与主循环对齐：planner 的可行性 ctx、认领过期、以及
         # abandoned 的 TTL 都读 bb.tick，必须在每拍推进（否则 TTL 恒为 0）。
@@ -660,12 +881,8 @@ class Agent:
         # 对话服务：命令先落偏好/硬否决，本拍规划立刻可见（spec §6.3）。
         dialog_record = self._service_dialog(world)
 
-        # 拍号推进：Tap 冷却按拍计（hands 内部状态）
-        self.hands.tick()
-
         # ② skip_ticks 跳过
         if self.bb.scratch and getattr(self.bb.scratch, "skip_ticks", 0) > 0:
-            self.hands.release_all()
             self.bb.scratch.skip_ticks -= 1
             return
 
@@ -756,6 +973,8 @@ class Agent:
             # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
             "branches": plan_record.get("branches") or {},
             "rescue_override": plan_record.get("rescue_override"),
+            # 「马上去」硬指令闸（Task 2）的覆盖标记：chosen 是闸选中的 task key。
+            "imperative": plan_record.get("imperative"),
             "chosen": str(planner_choice) if planner_choice is not None else None,
         }
 
@@ -791,6 +1010,11 @@ class Agent:
         if status == "success":
             success_task = chosen_task  # 保存成功的 task（trace 记录用）
             self._note_success(chosen_task)
+            # 「马上去」落实**成功**才降级成 do：失败不降，now 的紧迫性保留到
+            # 下次重试。执行期间由 planner 层去抖兜住（当前承诺命中 now 时
+            # 闸不再抢选），这里只做终态消费。
+            if chosen_task and self.ledger.consume_now(chosen_task):
+                self.bb.preferences[:] = self.ledger.preferences()
             if chosen_task and hasattr(chosen_task, "claims"):
                 for res_id, action in chosen_task.claims():
                     self.bb.claims.pop((res_id, action), None)
@@ -806,10 +1030,12 @@ class Agent:
             self.bb.commitment = None
 
         # ⑭ 日志
-        # 记全按键（移动 + 冲刺 + 按住的动作键 + 本拍 tap），不只是移动方向：
-        # 旧版只记 move_dir/move_extra，于是「喷灭火器那 50 拍到底按住 chop
-        # 了没」从 trace 无法回答（trace-20261014-011202 t=2477~2526 keys 全空）。
-        keys = self.hands.active_keys()
+        # 委托后端不再有「按住的键」，keys 恒为空；命令/结果由插件 step_done
+        # 与 exec_state 记录，按键级观测随键盘注入轨一并移除。
+        keys = []
+        # 卡住事件：arbiter 同格卡住优先，回退本拍 motion 空转（spec §G.1）。
+        # 在 ⑫ 执行之后算，motion 的 stalled/stall_seconds 这时才被原语填进 ctx。
+        record["stuck"] = _stuck_info(self.bb, world, ctx.get("motion"))
         # commitment 在终态已清空，仍记录本拍 task 和移动/观测阶段。
         exec_state = trace.execution_record(
             status, success_task if status == "success" else chosen_task, ctx,
@@ -853,7 +1079,6 @@ class Agent:
         key = (raw.get('session_id'), raw.get('scene_epoch'), world.level)
         if self._scene_key is not None and (key != self._scene_key or self._left_level):
             self.executor_inst.halt_and_discard()
-            self.hands.release_all()
             self.bb = Blackboard()
             # 黑板整体换新：账本是 bb.preferences 的唯一来源，必须一起清，
             # 否则下一次同步会把上一局的约定编回新黑板。
@@ -900,7 +1125,7 @@ class Agent:
         # type: (World) -> dict
         """构造执行层上下文（primitives/base.py 的 ctx 契约）。
 
-        keys: w / chef / hands / bb / field / book / tick。
+        keys: w / chef / bb / field / book / tick。
         field 是每拍从 P2 位置做一次的 flood-fill 距离场（spec §6.4），
         并叠加 P1 周边软代价（Plan 4 Task 2）。
         """
@@ -933,7 +1158,6 @@ class Agent:
         ctx = {
             "w": world,
             "chef": chef,
-            "hands": self.hands,
             "bb": self.bb,
             "field": field, "soft_cost": soft, "navigation_blocked": blocked,
             "book": self.book,
@@ -943,6 +1167,8 @@ class Agent:
             ctx.update(frame_seq=self._frame_seq,
                        frame_received_at=self._frame_received_at,
                        now=time.monotonic())
+        if self.exec_client is not None:
+            ctx["exec"] = self.exec_client
         return ctx
 
     def _make_resource_view(self, world):

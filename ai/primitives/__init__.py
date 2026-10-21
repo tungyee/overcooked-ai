@@ -9,7 +9,6 @@ from ai.primitives.base import (
     _blocked_cells,
     target_cell,
     target_grid_callbacks,
-    _dir_towards,
 )
 from ai.primitives.align import (
     AlignToCell,
@@ -23,7 +22,6 @@ from ai.primitives.interact import EnsureHandsFree, InteractWith
 from ai.primitives.throw import ThrowTo
 from ai.primitives.stuck import (
     MarkBlocked,
-    Nudge,
     AbandonTarget,
     Timeout,
 )
@@ -47,7 +45,6 @@ __all__ = [
     "InteractWith",
     "ThrowTo",
     "MarkBlocked",
-    "Nudge",
     "AbandonTarget",
     "Timeout",
 ]

@@ -31,6 +31,21 @@ def _normalize_transcript(text):
     ).lower()
 
 
+def should_checkin(next_checkin_at, now, has_orders, in_level, live):
+    # type: (Any, float, bool, bool, bool) -> bool
+    """是否到点该主动报一次送单局面（定时 check-in）。
+
+    - 没排期（None）不触发；
+    - 不在关卡 / 已暂停 / 已退出（`live=False`）或当前没有订单时不聊；
+    - 其余看单调时钟是否已到排期点。
+    """
+    if next_checkin_at is None:
+        return False
+    if not (has_orders and in_level and live):
+        return False
+    return now >= next_checkin_at
+
+
 def should_trigger(event, state, tick, transcript=""):
     # type: (str, DialogState, int, str) -> bool
     """本拍是否应就该事件调一次 LLM。

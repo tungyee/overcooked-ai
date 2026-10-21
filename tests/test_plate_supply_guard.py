@@ -127,8 +127,8 @@ def test_wash_pressure_weight_covers_prep_ceiling():
     **口径已修正（Ruling 23）**：原先把五项同时吃满相加当上限
     （urgency 5.0 + async 2.0 + reuse 0.5 + completion 1.0 + combo 2.0 = 10.5），
     而那个组合内部自相矛盾、实机不可能出现：
-      - urgency 满分需要 slack <= 0（订单必死），而必死单会被
-        _is_doomed_investment 从候选里否决，压根不参与打分；
+      - urgency 满分需要 slack <= 0（订单紧迫到极限），此时通常还没盘/缺料，
+        与 completion_ratio 满分的前提互斥；
       - completion_ratio 需要盘里已有料，而本条讨论的正是「0 干净盘」；
       - async_resource 只给 FetchToCooker/Chop，与 completion_ratio 适用的
         task 也不重合。

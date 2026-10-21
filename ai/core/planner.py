@@ -72,8 +72,8 @@ def _dialog_live_orders(world, bb):
     # type: (World, Blackboard) -> List[Dict]
     """未被放弃（`bb.abandoned_orders`）的订单。
 
-    放弃是**订单级**的，不只是「不给它发候选」：盘/灶 1:1 匹配、判死队列与
-    打分 slack 都必须只看这些单，否则被放弃的单会替活单占掉匹配或队列容量
+    放弃是**订单级**的，不只是「不给它发候选」：盘/灶 1:1 匹配与打分 slack
+    都必须只看这些单，否则被放弃的单会替活单占掉匹配或队列容量
     （两单同菜 + 一张盘时，活单会拿不到盘）。
     """
     return [o for o in world.orders if not _order_is_abandoned(bb, o.get("id"))]
@@ -210,7 +210,7 @@ def _gen_misc(world, bb, book, chef, hands_empty):
     """
     cands = []  # type: List[Candidate]
 
-    # 第 2 号 WashPlate：有洗碗池且有脏盘才生成；feasible 再判"没干净盘"。
+    # 第 2 号 WashPlate：有洗碗池且有脏盘才生成；feasible 再判物理可行性。
     # 只按洗碗池生成会把「没有脏盘」也当成一个当前候选，玩家说「去洗碗」
     # 时 ack 会误报 accepted（spec §4.7：目标不存在时应 pending，等盘出现）。
     if hands_empty:
@@ -401,6 +401,27 @@ def _is_stopped(task, bb):
     return False
 
 
+def _breaks_combo(task, world):
+    # type: (Any, World) -> bool
+    """送餐是否会把 combo 打断：送非队首菜（队首存在）。
+
+    队首 = _combo_head_id（id 最小）；credited = _credited_order_id（游戏把
+    一盘菜记给同 dish 存活单里 remaining 最小者）。credited != 队首时 combo 断。
+
+    刻意**不做跳单 escape**：多人协作下 solo_slack 是 P2 单人手口径、不准，
+    用它当「队首没救就放开跳单」的信号会误放行。先严格保顺序；队首做不出来
+    时的取舍，留到有更准的协作口径再处理。
+    """
+    if getattr(task, "TYPE", None) != "DeliverPlate":
+        return False
+    head = _combo_head_id(world.orders)
+    if head is None:
+        return False
+    dish = _dish_of_order(world.orders, getattr(task, "order_id", None))
+    credited = _credited_order_id(world.orders, dish)
+    return credited is not None and credited != head
+
+
 def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     # type: (Candidate, Dict, Blackboard, bool, Optional[float]) -> Tuple[bool, str]
     """判断单个候选是否可行，返回 (ok, 否决原因)。
@@ -422,8 +443,8 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
         return False, "p2_suppressed"
     if not ignore_abandon and _is_abandoned(task, bb):
         return False, "abandoned"
-    if _is_doomed_investment(task, bb):
-        return False, "doomed"
+    if _breaks_combo(task, ctx["w"]):
+        return False, "combo_break"
     # 终局否决暂时禁用（用户反馈：临近结束角色停摆，看起来像卡了）。
     # 需要恢复时取消下面两行注释即可。
     # if _is_endgame_waste(task, cand, time_left):
@@ -434,90 +455,6 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     if route_veto:
         return False, route_veto
     return True, ""
-
-
-# 判死的迟滞期（拍）。slack 每拍重算会在 0 附近抖动，不加迟滞候选会 flap；
-# 与 L3 的 ABANDON_TTL_TICKS 同量级。
-DOOM_TTL_TICKS = 200
-
-# 判死的**入口**迟滞（拍）：要连续这么多拍算出必死才真的写表。
-# 原先入口无迟滞、出口 200 拍，这个不对称会让一次 slack 抖动把候选打翻：
-# 实机 trace-20261014-195652 的 order#3 在 t=9098 解禁（TTL 到期）、t=9120
-# 被选中开始走、t=9171 又判死 —— AI 在 50 拍的路上目标被抽掉，折返白走一个
-# 来回，最后重新拿起脚下那份黄瓜片。20 拍 = 1 秒，比 slack 的抖动周期长，
-# 又远短于一个 task 的典型时长（50~180 拍），不会让真必死的单多吃工时。
-DOOM_CONFIRM_TICKS = 20
-
-
-def _is_doomed_investment(task, bb):
-    # type: (Any, Blackboard) -> bool
-    """这个候选是否在往一个来不及做完的订单里**继续投入**（第 2 组 2.3）。
-
-    必死单不该靠「分数低一点」来躲——它应该根本不在候选里。本局 order#3
-    吞掉 1214 拍（全局 26% 注意力）仍然过期，而 #4/#5 全程饿死。
-
-    两条例外：
-      - 订单无关的 task（order_id 为 None：填灶/洗盘/灭火/清理）从不牵连；
-      - **送餐例外**。盘已料齐只差送出去时，沉没成本已经付了，送出去还有
-        60 分 base；连送餐都挡住会让料齐的盘烂在手里。否决只针对新投入。
-      - **在飞例外**。当前承诺正在执行的那一个 task 不被抽走：它的路也走了
-        一半、料也许已在手上，半途改选等于两头都白费（实机
-        trace-20261014-195652 t=9120~9173 正是这样折返的）。planner 永不
-        **选中**已判死单的 task，所以承诺只会建立在当时未判死的单上 ——
-        豁免只覆盖这一个 task 的时长，它做完后同单的下一个 task 照样被否决。
-    """
-    oid = getattr(task, "order_id", None)
-    if oid is None:
-        return False
-    if getattr(task, "TYPE", None) == "DeliverPlate":
-        return False
-    commitment = getattr(bb, "commitment", None)
-    active = getattr(commitment, "active_task", None) if commitment else None
-    if active is not None and _tasks_equal(active, task):
-        return False
-    doomed = getattr(bb, "doomed_orders", None)
-    if not doomed:
-        return False
-    return doomed.get(oid, 0) > getattr(bb, "tick", 0)
-
-
-def mark_doomed_orders(world, bb, book, plate_match=None, cooker_match=None,
-                       orders=None):
-    # type: (World, Blackboard, RecipeBook, Optional[Dict], Optional[Dict], Optional[List[Dict]]) -> None
-    """算一遍 slack，把来不及的订单写进 bb.doomed_orders（带 TTL）。
-
-    每拍在 plan() 开头调用。只**新增/续期**判死，不主动撤销——撤销靠 TTL
-    自然过期，这样 slack 抖动不会让候选集抖动。
-
-    入口同样有迟滞：要连续 DOOM_CONFIRM_TICKS 拍算出必死才真的写表，中间
-    任何一拍「有救」就把确认计数清零。orders 显式传入时只排这些单（放弃的
-    单不该占队列容量）；缺省仍读 world.orders。
-    """
-    table = getattr(bb, "doomed_orders", None)
-    if table is None:
-        return
-    tick = getattr(bb, "tick", 0)
-    try:
-        doomed = ETA.doomed_order_ids(world, book, plate_match, cooker_match,
-                                      orders=orders)
-    except Exception:                       # noqa: BLE001
-        return                              # 残帧算不出来就不判死（保守）
-    streak = getattr(bb, "doom_streak", None)
-    if streak is None:
-        streak = {}
-        bb.doom_streak = streak
-    confirmed = set(doomed)
-    # 本拍没判死的，确认计数清零（已经写进 table 的仍由 TTL 兜着）
-    for oid in [k for k in streak if k not in confirmed]:
-        del streak[oid]
-    for oid in doomed:
-        streak[oid] = streak.get(oid, 0) + 1
-        if streak[oid] < DOOM_CONFIRM_TICKS and oid not in table:
-            continue                        # 还没攒够确认拍数
-        table[oid] = tick + DOOM_TTL_TICKS
-    # 顺手清掉过期条目，避免字典随局面无限增长
-    for oid in [k for k, v in table.items() if v <= tick]:
-        del table[oid]
 
 
 def filter_feasible(world, bb, candidates, book):
@@ -604,8 +541,9 @@ W_PRESSURE = 5.0
 # 9.58），**没检查 1 盘档对它的同层兄弟** W_NO_PLATE_PLACED=3.0 —— 1 盘时洗盘
 # 3.5 仍压过摆盘 3.0，而 spec §7 的 L4 层内序是「0 盘 > 无盘就位 > 1 盘」。
 # 顺序反了，且当时这一档占 L4 可达域的一半（_plate_pressure > 0 仅当
-# clean <= 1，那时 WashPlate.feasible 允许 clean < 2）。如今 feasible 只在
-# 「干净盘 + 装配盘 = 0」时成立，1 盘洗盘已不可达，但下面的权重区间仍保留。
+# clean <= 1，那时 WashPlate.feasible 允许 clean < 2）。如今 L4 层谓词要求
+# clean==0 且无装配盘（spec §A.3 把「要不要洗」从 feasible 拆进层），
+# 1 盘洗盘进不了 L4，但下面的权重区间仍保留。
 #
 # 讽刺的是这正是本权重上一次改动（5.0 → 3.5）诊断出的那个「同一教训只修一半」
 # 的病：那次改完 W_NO_PLATE_PLACED 却没回头看本权重，这次改完本权重的 0 盘档
@@ -848,35 +786,18 @@ def _match_plates_to_orders(world, bb, book, orders=None):
 
     带成本的贪心边选取：边 (盘, 单) 兼容当且仅当 盘token ⊆ 单需求token，
     成本 missing = |单需求token − 盘token|。空盘 missing=整道菜，自然排最后、
-    只填没盘的订单。接近完成的盘优先配更紧的单（完成度感知）。
+    只填没盘的订单。
 
-    排序第一键是「该单是否有熟料在产（锅在煮/熟）」：有熟料的单优先拿盘，
-    否则空盘会先配给「需求更少」的虾单、米饭单没盘 → 熟锅无盘可接 → 烧糊
-    （实机复现：锅 4 米熟了却没人端，因为空盘全被虾单抢走）。
+    排序第一键是「是否队首」：队首（combo 队首，id 最小）优先拿盘，否则
+    接近完成的盘会被配给需求更少的非队首单、队首反而没盘 → 跳单送餐、combo
+    断。熟锅没盘可由 RescueCooked 端锅离火兜住，不必在这里优先。
     """
     raw_orders = orders if orders is not None else world.orders
     orders = [o for o in raw_orders if o.get("id") is not None]
     if not orders:
         return {}
     want = {o["id"]: book.order_want_tokens(o) for o in orders}
-
-    # 有熟料在产的订单：锅在煮/熟/糊/着火，pot_contents 反查熟料 token。
-    cooking_orders = set()  # type: Set[Any]
-    for c in world.cookers:
-        raw = parse_pot_contents(c.get("pot_contents") or [])
-        if not raw:
-            continue
-        if not (c.get("isCooking") or c.get("cooked")
-                or c.get("burning") or c.get("onFire")):
-            continue
-        names = book.cooked_of_raw(raw[0])
-        for n in names:
-            token = book.rich_token(n)
-            if not token:
-                continue
-            for o in orders:
-                if token in want[o["id"]]:
-                    cooking_orders.add(o["id"])
+    head = _combo_head_id(orders)
 
     # 匹配「已就位」的盘（落在 counter 拼装格上）+ P2 手里正端着的盘
     # + 掉在地上且带料的半成品盘。仍排除：
@@ -925,8 +846,8 @@ def _match_plates_to_orders(world, bb, book, orders=None):
             oid = o["id"]
             wt = want[oid]
             if tokens <= wt:
-                has_cooking = 0 if oid in cooking_orders else 1
-                edges.append((has_cooking, len(wt - tokens), _remaining_of(o),
+                is_not_head = 0 if oid == head else 1
+                edges.append((is_not_head, len(wt - tokens), _remaining_of(o),
                               str(pid), str(oid), pid, oid))
     # 钉死手持盘：P2 当前承诺绑定的盘不参与贪心重排，保持它和订单的配对。
     # 否则 P1 往另一块盘里放一样料，就能让贪心 tiebreak 翻盘、把 P2 手里的盘
@@ -937,7 +858,7 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     used_orders = set(matched.values())  # type: Set[Any]
     edges = [e for e in edges if e[5] not in used_plates]
     edges.sort(key=lambda e: (e[0], e[1], e[2], e[3], e[4]))
-    for has_cooking, _missing, _rem, _pid_s, _oid_s, pid, oid in edges:
+    for _is_head, _missing, _rem, _pid_s, _oid_s, pid, oid in edges:
         if pid in used_plates or oid in used_orders:
             continue
         matched[pid] = oid
@@ -1131,19 +1052,17 @@ def plan(world, bb, order, book):
     # 被换掉）或保护期已过就释放，别把一条旧 hold 带进下一轮。
     _release_stale_rescue_hold(bb)
 
-    # ⓪.5 放弃的订单是整单硬排除：匹配、判死队列、打分 slack 都只算活单，
-    # 否则它会替活单占掉 1:1 盘/灶匹配或队列容量。
+    # ⓪.5 放弃的订单是整单硬排除：匹配、打分 slack 都只算活单，否则它会
+    # 替活单占掉 1:1 盘/灶匹配或队列容量。
     live_orders = _dialog_live_orders(world, bb)
 
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
     cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
                                             orders=live_orders)
-
-    # ①.5 判死（第 2 组 2.3）：算 slack，把来不及的单写进黑板（带 TTL 迟滞）。
-    # 必须在可行性过滤之前——否决必死单的新投入，把手让给能救的单。
-    mark_doomed_orders(world, bb, book, plate_match, cooker_match,
-                       orders=live_orders)
+    # 独立 slack：打分 urgency、截止闸 cushion 两处共用。
+    slack_map = ETA.solo_slack_by_order(world, book, plate_match,
+                                        cooker_match, orders=live_orders)
 
     # ② 生成候选（多订单模式：枚举所有订单）
     candidates = generate_candidates(world, bb, order, book,
@@ -1165,6 +1084,30 @@ def plan(world, bb, order, book):
         if ok:
             feasible.append(cand)
 
+    # ③.5「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中，跳过
+    # 层选择 / 打分 / 承诺惯性。L0-L2 救援在闸内让位，这里只在无火情时抢选。
+    imperative = _select_imperative(feasible, world, bb)
+    if imperative is not None:
+        chosen_task = imperative.task
+        # 仍用 layer_filter 算 layer_map 供 trace（闸跳过了层选择，但层号是
+        # 复盘候选可观测性的基础）；打分项记 0、terms 空，chosen 只标闸选中的。
+        from ai.core.planner_layers import layer_filter
+        _ignored_top, _ignored_in_layer, layer_map = layer_filter(feasible, world)
+        record_cands = []
+        for cand in candidates:
+            key = cand.task.key
+            ok, veto = ok_map[key]
+            record_cands.append((cand.task, 0.0, {}, ok, veto,
+                                 key == chosen_task.key,
+                                 layer_map.get(key), False))
+        record = _record(record_cands, plate_match, cooker_match)
+        record["top_layer"] = None
+        record["layers"] = {str(k): v for k, v in layer_map.items()}
+        record["branches"] = {str(c.task.key): c.branch for c in candidates}
+        record["imperative"] = chosen_task.key
+        _finalize_rescue_hold(bb, chosen_task)
+        return chosen_task, record
+
     chosen_task = None  # type: Optional[Any]
     score_map = {}      # type: Dict[Any, Tuple[float, Dict]]
     top_layer = None    # type: Optional[int]
@@ -1183,16 +1126,11 @@ def plan(world, bb, order, book):
         _ignored_top, _ignored_in_layer, layer_map = layer_filter(feasible, world)
 
         # ④ 打分选择
-        # 打分读**独立** slack，不读队列累计 slack：后者是判死口径，队尾单
-        # 背着全队工时 → slack 最小 → urgency 最高，得出「排得越后越优先」。
-        # 实机 trace-20261014-204822 有 94% 的可比候选组（3516/3745）urgency
-        # 与到期顺序反向；t=890 选了到期最晚、盘里还空的 order#3，放着盘里
-        # 已有米饭的 order#1 不管。
-        #
-        # slack_map 必须在选层之前算好：选层要用它当截止闸的 cushion
-        # （spec §4.6）。
-        slack_map = ETA.solo_slack_by_order(world, book, plate_match,
-                                            cooker_match, orders=live_orders)
+        # 打分读**独立** slack，不读队列累计 slack：后者队尾单背着全队工时 →
+        # slack 最小 → urgency 最高，得出「排得越后越优先」。实机
+        # trace-20261014-204822 有 94% 的可比候选组（3516/3745）urgency 与
+        # 到期顺序反向。slack_map 已在候选过滤前算好（选层用它当截止闸 cushion，
+        # 送餐 combo 闸用它当 escape）。
         top_layer, in_layer = _select_layer(
             feasible, world, layer_map, bb, slack_map, bb.tick)
 
@@ -1364,6 +1302,8 @@ def _matching_preferences(candidate, bb, layer):
     immune = layer in (0, 1, 2) or task.TYPE in RESCUE_TYPES
     out = []  # type: List[Tuple[Any, float]]
     for pref in getattr(bb, "preferences", None) or ():
+        if getattr(pref, "kind", None) == "now":
+            continue            # now 是 trace-only 权重，唯一消费点是 _select_imperative
         expires = getattr(pref, "expires_tick", 0) or 0
         if expires and tick >= expires:
             continue
@@ -1395,19 +1335,64 @@ def _claim_penalty(candidate, bb, layer):
                if getattr(pref, "kind", None) == "claim" and weight < 0)
 
 
+def _select_imperative(feasible, world, bb):
+    # type: (List[Candidate], World, Blackboard) -> Optional[Candidate]
+    """「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中候选。
+
+    找未过期的 now 偏好；没有则返回 None。任一 feasible 候选落在
+    L0/L1/L2（火 / 快糊 / 刚熟救锅）→ 让位返回 None，交给正常分层路径；
+    否则返回第一个命中 now scope 的 feasible 候选（feasible 顺序即链的
+    下一步）。
+
+    这是 now 的**唯一**消费点：`_matching_preferences` 已跳过 kind=="now"，
+    weight=WEIGHT_NOW 从不进普通打分（trace-only 不变量保持干净）。
+    """
+    tick = getattr(bb, "tick", 0) or 0
+    now_prefs = [p for p in (getattr(bb, "preferences", None) or ())
+                 if getattr(p, "kind", None) == "now"
+                 and (not getattr(p, "expires_tick", 0)
+                      or tick < getattr(p, "expires_tick", 0))]
+    if not now_prefs:
+        return None
+    # 「马上去」已经认下：把它**钉住**，别让普通打分（送餐等更高分任务）抢走。
+    # 否则 now 任务每拍被更高分候选顶掉、永远做不成——trace-20261021-145504 的
+    # 1-6 段正是 FetchToBoard(Cucumber)↔DeliverPlate 逐拍交替、角色在 (0,-3)↔(1,-3)
+    # 来回卡。当前承诺已不可行（不在 feasible）才交回正常流程。
+    commitment = getattr(bb, "commitment", None)
+    current = getattr(commitment, "active_task", None) if commitment else None
+    if current is not None and any(preference_matches_task(p, current)
+                                   for p in now_prefs):
+        for cand in feasible:
+            if cand.task == current:
+                return cand
+        return None
+    from ai.core.planner_layers import layer_of_task
+    for cand in feasible:
+        if layer_of_task(cand.task, world) in (0, 1, 2):
+            return None
+    for cand in feasible:
+        for pref in now_prefs:
+            if preference_matches_task(pref, cand.task):
+                return cand
+    return None
+
+
 # ---------- 截止闸与层内 fallthrough（spec §4.6）----------
 
 def _rescue_margin_ticks(task_type):
     # type: (Any) -> int
-    """截止闸的余量（拍）：5 秒起步、长链封顶 10 秒（spec §4.6）。
+    """截止闸的余量（拍）：2.5 秒起步、长链封顶 5 秒（spec §4.6）。
 
     `D` 是「做完这个动作、再送到出餐口」的耗时。DeliverPlate 本身就是
     送餐，不再加送餐段；其它动作都要留出 `COST_DELIVER`。
+
+    收窄到 2.5~5 秒是「P1 有把握时不抢、真放鸽子还抢得回来」的折中：
+    窗口太宽会抢 P1 正在做的活，太窄则 P1 真放鸽子时来不及补救。
     """
     d = ETA.task_cost_ticks(task_type)
     if task_type != "DeliverPlate":
         d += ETA.COST_DELIVER
-    return int(max(100, min(int(0.3 * d), 200)))
+    return int(max(50, min(int(0.15 * d), 100)))
 
 
 def _rescue_gate_open(candidate, cushion, bb, tick=None):
@@ -1454,7 +1439,7 @@ def _candidate_cushion(candidate, world, slack_map):
     不绑订单的候选（洗盘 / 填灶 / 预取等 housekeeping）取**最紧的活单**
     slack：它们服务于所有订单，玩家认领后迟迟不做时，截止闸要能按最急
     的那张单把活抢回来，否则「我来洗碗」之后盘子耗尽、全部订单一起饿死。
-    已判死（slack < 0）的单不参与，与按单的口径一致。
+    slack < 0 的单不参与，与按单的口径一致。
     """
     oid = _effective_order_id(world, candidate.task)
     if oid is not None:
@@ -1466,7 +1451,7 @@ def _candidate_cushion(candidate, world, slack_map):
 
 def _tightest_order(slack_map):
     # type: (Optional[Dict[Any, float]]) -> Any
-    """slack 最小（且没判死）的订单 id；没有返回 None。"""
+    """slack 最小（且 slack >= 0）的订单 id；没有返回 None。"""
     live = [(v, oid) for oid, v in (slack_map or {}).items()
             if v is not None and v >= 0]
     return min(live, key=lambda r: r[0])[1] if live else None
@@ -1651,18 +1636,24 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # ① 订单紧迫：读 slack（remaining - ETA）而非裸 remaining（第 3 组 3.1）。
     # 旧曲线 W_URGENCY/remaining 在 60s 处只有 0.08、100s 处 0.05，中段分不出
     # 先后，只有最后 1~2s 才爆到 5.0——整局 deadline 近乎不参与决策。
+    # 只对「dish 会记到队首」的候选生效：队首快过期才催它，不催非队首——
+    # 否则会去备一个暂时送不出去（combo 闸挡着）的单。
     # slack 为 None（算不出 / 订单无关）时退回 0：宁可不给紧迫分，也不要用
     # 一个错的量级去挤别的项。
     urgency_score = 0.0
     order = None
     slack = None   # type: Optional[float]
     if effective_order_id:
-        order = _find_order_by_id(world, effective_order_id)
-        if order:
-            slack = (slack_map or {}).get(effective_order_id)
-            if slack is None:
-                slack = _fallback_slack(order)
-            urgency_score = _urgency_from_slack(slack)
+        head = _combo_head_id(world.orders)
+        dish = _dish_of_order(world.orders, task.order_id)
+        credited = _credited_order_id(world.orders, dish)
+        if head is not None and credited == head:
+            order = _find_order_by_id(world, effective_order_id)
+            if order:
+                slack = (slack_map or {}).get(effective_order_id)
+                if slack is None:
+                    slack = _fallback_slack(order)
+                urgency_score = _urgency_from_slack(slack)
     terms["urgency"] = urgency_score
 
     # ② 时间压力
@@ -1725,9 +1716,8 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
             # 这种菜会记在队首头上 → 连击能接上。
             # 连击越高、保住它越值钱（combo 2→3 系数翻倍，远超一次备菜）
             combo_head = W_COMBO_HEAD * min(1.0, mult / 2.0) * scale
-        elif head is not None and not _is_doomed_order(head, bb):
-            # 这种菜会记给别人、把连击打断，而队首仍有救 → 罚。
-            # 队首已判死则不罚：连击注定要断，再罚只会让料齐的盘也送不出去。
+        elif head is not None:
+            # 这种菜会记给别人、把连击打断 → 罚。
             combo_break = -W_COMBO_BREAK * scale
     terms["combo_head"] = combo_head
     terms["combo_break"] = combo_break
@@ -1925,6 +1915,31 @@ def _plate_pressure(world):
     if clean == 1:
         return 1.0
     return 0.0
+
+
+def _placed_plates(world):
+    # type: (Any) -> bool
+    """是否有盘落在 counter 拼装格上（world 级；spec §A.3）。
+
+    与 ai/tasks/base.placed_plates(ctx) 同口径，但按 world 重写：拼装格由
+    stations 里 t=="counter" 且带 gx/gz 的站点给出，盘用 to_grid 反解网格
+    坐标后比对。只认 world.plates（非手持）：还在盘堆/晾干架/手上的盘不算
+    「已就位」，不能往上倒料。
+    """
+    counters = set()
+    for st in world.stations:
+        if st.get("t") != "counter":
+            continue
+        gx, gz = st.get("gx"), st.get("gz")
+        if gx is not None and gz is not None:
+            counters.add((gx, gz))
+    for p in world.plates:
+        x, z = p.get("x"), p.get("z")
+        if x is None or z is None:
+            continue
+        if world.to_grid(x, z) in counters:
+            return True
+    return False
 
 
 def _cooker_lookup(world, cid):
@@ -2372,13 +2387,6 @@ def _current_combo(world):
     return 0
 
 
-def _is_doomed_order(order_id, bb):
-    # type: (Any, Blackboard) -> bool
-    """这一单是否已被判死（读第 2 组写进黑板的表）。"""
-    doomed = getattr(bb, "doomed_orders", None) or {}
-    return doomed.get(order_id, 0) > getattr(bb, "tick", 0)
-
-
 def _order_sort_key(order):
     # type: (Dict) -> Tuple[int, Any]
     """订单 id 的数值序（非数字 id 排在后面，按字符串序）。"""
@@ -2453,8 +2461,8 @@ def _deadline_forecast(task, candidate, world, bb, slack_ticks=None,
        而 `_doom_penalty` 与 `_urgency_from_slack` 读同一条 slack 曲线、形状相同
        符号相反：接上 W_DEADLINE_LOOKAHEAD=10 后 `-10d` 永远压过 `+5u`，净效果
        = -urgency，紧迫度越高总分越低（把 53d6a2b 解掉的 94% 倒挂反转回去）。
-       同一事实不该计两次分：硬否决在可行性层（`_is_doomed_investment`），软梯度
-       由 urgency 独家承担。
+       同一事实不该计两次分：软梯度由 urgency 独家承担（硬否决曾由
+       `_is_doomed_investment` 承担，现已随判死逻辑一并移除）。
        若将来确实需要独立于 urgency 的到期惩罚，必须设计一条**不同形状**的曲线
        （例如只在 slack < 20s 时陡降），而不是复用 `_doom_penalty`。
     """

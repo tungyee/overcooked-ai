@@ -20,11 +20,28 @@ target 一律可以是 dict（静态）或 ctx -> Optional[Dict] 的可调用。
 构造时抓的 dict 第二拍就是过期数据——锅被 P1 端走、盘被端走、灭火器被捡走
 都会让它失真。解析不出来 → FAILURE 交还 Planner（spec §7.6 纪律 1）。
 """
+import time
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from ai.query import predicates as P
-from ai.exec.bt import Node
-from ai.output.hands import DIR2D
+from ai.exec.bt import Node, Status
+from ai.exec.commands import build_command
+
+# 方向键 → 网格位移。exec 委托路径里传送带顶向（hold_dir）需要它；
+# 原 ai.output.hands 已随键盘注入轨删除，这两个纯函数挪到这里。
+DIR2D = {"left": (-1, 0), "right": (1, 0), "up": (0, 1), "down": (0, -1)}
+
+
+def counter_dir(belt_dir, cell):
+    # type: (Dict[Tuple[int, int], Tuple[int, int]], Tuple[int, int]) -> Optional[str]
+    """站在传送带上要顶住的反向键；不在带上则 None。"""
+    bd = (belt_dir or {}).get(cell)
+    if not bd:
+        return None
+    for name, vec in DIR2D.items():
+        if vec[0] == -bd[0] and vec[1] == -bd[1]:
+            return name
+    return None
 
 # "还没看过手里有什么"的哨兵。不能用 None 或 ""——held_name 对空手正是
 # 返回 ""，两者混用会让"首次 tick"与"手本来就空"无法区分。
@@ -45,11 +62,16 @@ def resolve(target, ctx):
 
 def _surface_hint(target, ctx):
     # type: (Dict, Dict) -> Dict
-    """台面上的盘/散物借用容器交互坐标，保留物品自身身份与世界位置。
+    """台面/沥水架/回盘台上的盘/散物借用容器交互坐标，保留物品自身身份与世界位置。
 
     物品没有 GridLocation 不代表在地面。将它一律跳过 Face 会在 1-4
     唯一可用站位上校验失败，然后规划器反复重选。只借同位置的真实静态
     台面，不借远处/相邻台面，也不改原始快照或资源认领键。
+
+    plate_return（沥水架 DryingPart / 回盘台 workstation_plate_return）是
+    功能站、不进 BuildStationMap，其上的盘 grid 为 null；不把 plate_return
+    算进去，非主网格的沥水架（1-5 气球篮）上的盘会回退到主网格算句柄
+    坐标，句柄对不上拾取失败（实机 1-5 拿不起沥水架上的盘）。
     """
     if (target.get('held_by') or (target.get('gx') is not None and target.get('gz') is not None)
             or not any(k in target for k in ('name', 'detail', 'contents'))):
@@ -61,7 +83,7 @@ def _surface_hint(target, ctx):
     cell = getattr(getattr(w, 'mapping', None), 'cell', 1.2)
     best, best_dist = None, (cell / 4.) ** 2
     for station in getattr(w, 'stations', ()):
-        if station.get('t') not in ('counter', 'chopping', 'cooking', 'cooker'):
+        if station.get('t') not in ('counter', 'chopping', 'cooking', 'cooker', 'plate_return'):
             continue
         if station.get('gx') is None or station.get('gz') is None:
             continue
@@ -174,14 +196,36 @@ def target_grid_callbacks(world, target):
     return world.to_grid, world.to_world, cell
 
 
-def _dir_towards(cur, nxt):
-    # type: (Tuple[int, int], Tuple[int, int]) -> Optional[str]
-    """cur → nxt 的方向键名。两格不相邻则 None。"""
-    d = (nxt[0] - cur[0], nxt[1] - cur[1])
-    for name, vec in DIR2D.items():
-        if vec == d:
-            return name
-    return None
+def handle_desc(target, to_grid=None):
+    # type: (Optional[Dict], Any) -> Dict
+    """目标句柄描述（exec 命令用）。核心是**网格坐标**：放置/拾取句柄按
+    「网格位置」匹配（盘放在柜台上时，句柄指向柜台，但盘的 x/z 换算成网格
+    跟柜台同格，所以按格匹配才对）。name 只做无网格时的兜底。
+
+    网格优先用 target 自带的 gx/gz；缺失时（盘/散料只有 x/z）用 to_grid
+    从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。"""
+    if not target:
+        return {"grid": None, "gx": None, "gz": None, "name": None}
+    gx, gz = target.get("gx"), target.get("gz")
+    if gx is None and to_grid is not None:
+        x, z = target.get("x"), target.get("z")
+        if x is not None and z is not None:
+            cell = to_grid(x, z)
+            if cell is not None:
+                gx, gz = cell
+    return {"grid": target.get("grid"), "gx": gx, "gz": gz,
+            "name": target.get("name") or target.get("n")}
+
+
+def target_world(target):
+    # type: (Optional[Dict]) -> Optional[List[float]]
+    """目标世界坐标 [x,z]（exec 命令重瞄/朝向用）；缺坐标返回 None。"""
+    if not target:
+        return None
+    x, z = target.get("x"), target.get("z")
+    if x is None or z is None:
+        return None
+    return [x, z]
 
 
 class Primitive(Node):
@@ -194,9 +238,11 @@ class Primitive(Node):
 
     def __init__(self):
         # type: () -> None
-        self._hands = None   # type: Any
         self._ticks = 0
         self._held_seen = _UNSET   # type: Any
+        self._exec = None        # type: Any   # 委托后端的 ExecClient（首拍从 ctx 记）
+        self._pending_cmd = None # type: Optional[int]  # 在途命令 id
+        self._exec_deadline = 0.0  # type: float  # 在途命令的客户端截止时间
 
     def tick(self, ctx):
         # type: (Dict) -> str
@@ -206,17 +252,69 @@ class Primitive(Node):
         # type: () -> None
         self._ticks = 0
         self._held_seen = _UNSET
+        self._pending_cmd = None
+        self._exec_deadline = 0.0
 
     def halt(self):
         # type: () -> None
-        if self._hands is not None:
-            self._hands.set_move(None)
+        self._exec_halt()
         self.reset()
+
+    # ---------- exec 委托（EXEC_BACKEND=plugin 时叶子原语发命令而非按键）----------
+    def _begin_exec(self, ctx, ex, cmd_dict):
+        # type: (Dict, Any, Dict) -> str
+        """发一条 exec 命令并进入轮询；未连接返回 FAILURE。"""
+        self._exec = ex
+        self._pending_cmd = ex.issue(cmd_dict)
+        if self._pending_cmd < 0:
+            self._pending_cmd = None
+            return Status.FAILURE
+        # 客户端截止 = 命令 timeout + 1s 裕度（插件结果丢失时兜底 FAILURE）。
+        self._exec_deadline = self._now(ctx) + (cmd_dict.get("timeout_ms", 8000) / 1000.0) + 1.0
+        return Status.RUNNING
+
+    def _poll_exec(self, ctx, ex):
+        # type: (Dict, Any) -> str
+        """轮询在途命令结果；拿到则 SUCCESS/FAILURE，超时 FAILURE，否则 RUNNING。"""
+        r = ex.poll()
+        if r is not None and r["cmd_id"] == self._pending_cmd:
+            self._pending_cmd = None
+            # move 命令 stuck 会把挡路的目标格（世界坐标）回传。把它翻译成
+            # 主网格格写入 motion_failure，note_motion_failure 据此写 bad_cells，
+            # 下一次寻路绕开这一格——否则同一个 stuck move 会被反复重发。
+            if not r.get("ok") and r.get("why") == "stuck" \
+                    and isinstance(r.get("blocked_cell"), (list, tuple)) \
+                    and len(r["blocked_cell"]) >= 2:
+                w = ctx.get("w")
+                if w is not None:
+                    try:
+                        cell = w.to_grid(float(r["blocked_cell"][0]),
+                                         float(r["blocked_cell"][1]))
+                        ctx.setdefault("motion_failure", {}).update(
+                            reason="no_progress", blocked_cell=cell)
+                    except (TypeError, ValueError):
+                        pass
+            return Status.SUCCESS if r["ok"] else Status.FAILURE
+        if self._now(ctx) > self._exec_deadline:
+            self._exec_halt()
+            return Status.FAILURE
+        return Status.RUNNING
+
+    def _now(self, ctx):
+        # type: (Dict) -> float
+        n = ctx.get("now")
+        return n if n is not None else time.monotonic()
+
+    def _exec_halt(self):
+        # type: () -> None
+        """有在途命令时发 halt，让插件松键（任务抢占/树被丢弃）。"""
+        if self._exec is not None and self._pending_cmd is not None:
+            self._exec.issue(build_command("halt"))
+            self._pending_cmd = None
 
     def _enter(self, ctx):
         # type: (Dict) -> None
-        """子类在 tick 开头调，记下 hands 以便 halt 能松键。"""
-        self._hands = ctx.get("hands")
+        """子类在 tick 开头调，拍号 +1。"""
         self._ticks += 1
 
     def hands_changed(self, ctx):

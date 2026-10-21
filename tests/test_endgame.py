@@ -160,28 +160,5 @@ def test_firefighting_is_never_endgame_vetoed():
 #         assert veto == "endgame", (task.TYPE, veto)
 
 
-# ---------- Prefetch 的 slack 约束（4.2）----------
-
-def test_prefetch_infeasible_when_all_wanting_orders_are_doomed():
-    """给必死单备料是纯损失。"""
-    w = world(orders=[order("1", "Sushi_Cucumber", 2.0),
-                      order("2", "Sushi_Cucumber", 3.0)], plates=[])
-    bb, book = _bb(), RecipeBook(w.recipes, w.stations)
-    # 判死有入口迟滞（连续 DOOM_CONFIRM_TICKS 拍才生效），喂满才进表
-    for i in range(planner.DOOM_CONFIRM_TICKS):
-        bb.tick = i
-        planner.mark_doomed_orders(w, bb, book, plate_match={})
-    bb.tick = 0
-    ctx = planner._make_context(w, bb, book)
-    assert T.Prefetch(item="Seaweed").feasible(ctx) is False
-
-
-def test_prefetch_feasible_when_some_wanting_order_survives():
-    w = world(orders=[order("1", "Sushi_Cucumber", 2.0),
-                      order("2", "Sushi_Cucumber", 125.0),
-                      order("3", "Sushi_Cucumber", 128.0)], plates=[])
-    bb, book = _bb(), RecipeBook(w.recipes, w.stations)
-    planner.mark_doomed_orders(w, bb, book, plate_match={})
-    ctx = planner._make_context(w, bb, book)
-    # 至少两单仍要海苔且未判死 → 仍值得提前取
-    assert T.Prefetch(item="Seaweed").feasible(ctx) is True
+# Prefetch 的 slack 约束（4.2）已随判死逻辑移除：给「必死单」备料与否的判据
+# 依赖 bb.doomed_orders，现无此概念，Prefetch 改为对所有现存订单备料。

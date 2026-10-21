@@ -361,12 +361,16 @@ class RecipeBook(object):
 
 def _merge_station_coords(entry, stations):
     # type: (Dict, Optional[List[Dict]]) -> Dict
-    """给没有坐标的条目补上 stations[] 里同名条目的坐标。
+    """给没有坐标的条目补上 stations[] 里同名条目的坐标与站点身份字段。
 
     为什么需要：workstations[]（砧板等）只报 n/item/interacting/
-    interacters，不报位置；同名的 stations[] 条目才有 gx/gz/x/z。而
+    interacters，不报位置；同名的 stations[] 条目才有 grid/gx/gz/x/z/t。而
     Approach 靠 target_cell 解析目标格——拿到没坐标的条目会立即 FAILURE，
     表现为「切好的料摆在砧板上，AI 却站在原地不去捡」的死循环（实机复现）。
+
+    grid / t 也必须拷：缺 grid 会让 resource_id / target_identity 产出
+    ('', name) 空网格键，认领与 bad_pairs 按 (grid, name) 比对时错位；缺 t
+    会让 _avoid_occupied 把砧板当成散落物、跳过交互位避让。
     """
     if not isinstance(entry, dict):
         return entry
@@ -378,7 +382,7 @@ def _merge_station_coords(entry, stations):
     for st in stations or ():
         if isinstance(st, dict) and st.get("n") == n:
             merged = dict(entry)
-            for k in ("gx", "gz", "x", "z"):
+            for k in ("grid", "t", "gx", "gz", "x", "z"):
                 v = st.get(k)
                 if v is not None:
                     merged[k] = v

@@ -13,7 +13,9 @@ FillCooker 的谓词是纯世界谓词（照 Prefetch 的形态）：有空灶 +
 import pytest
 
 from ai import tasks as T
+from ai import primitives as PR
 from ai.query.recipes import RecipeBook
+from ai.tasks.base import loose_on_station
 from tests.test_cook_supply import RECIPES, W, cooker, order, plate
 
 
@@ -135,3 +137,37 @@ def test_not_done_when_pot_empty():
 
 def test_build_returns_a_tree():
     assert task().build() is not None
+
+
+# ---------- 传送带拦截（1-6 拿不到米的根因） ----------
+
+def test_loose_on_station_matches_on_station_name():
+    """料挂在哪个传送带段，loose_on_station 只对那一段为真。"""
+    w = W(items=[{"n": "SushiRice", "x": 12.0, "z": -2.8,
+                  "on_station": "attach:ConveyorStation (6)"}])
+    w.stations = [
+        {"t": "conveyor", "n": "ConveyorStation (6)", "gx": -6, "gz": -2,
+         "x": 12.0, "z": -2.4},
+        {"t": "conveyor", "n": "ConveyorStation (5)", "gx": -6, "gz": -3,
+         "x": 12.0, "z": -3.6},
+    ]
+    assert loose_on_station(w, "SushiRice", w.stations[0]) is True
+    assert loose_on_station(w, "SushiRice", w.stations[1]) is False
+
+
+def test_loose_on_station_no_matching_item_is_false():
+    w = W(items=[])
+    w.stations = [{"t": "conveyor", "n": "ConveyorStation (6)",
+                   "gx": -6, "gz": -2, "x": 12.0, "z": -2.4}]
+    assert loose_on_station(w, "SushiRice", w.stations[0]) is False
+
+
+def test_fetch_to_cooker_pickup_locks_segment_and_waits():
+    """传送带取料：pickup 用锁定目标 + WaitUntil 等料，而不是每拍追移动段。"""
+    from ai.exec.bt import Selector
+    t = T.FetchToCooker("o1", (("c1",), ("SushiRice",)), "BoiledSushiRice")
+    fill = t.build().child
+    assert isinstance(fill, Selector)
+    pickup = fill.children[0].children[2]
+    assert isinstance(pickup, PR.InteractWith)
+    assert pickup._wait is not None, "传送带取料必须带等料谓词（拦截等料）"

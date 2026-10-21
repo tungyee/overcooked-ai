@@ -1,6 +1,7 @@
 """对话策略：事件触发、限频、新单合并窗口与固定模板（spec §5.1–5.3）。"""
 from ai.dialog.policy import (
     merge_new_orders,
+    should_checkin,
     should_trigger,
 )
 from ai.dialog.schema import DialogState
@@ -124,5 +125,21 @@ def test_new_order_gate_reports_only_aged_batch():
 
 def test_unknown_event_never_triggers():
     assert should_trigger("level_start", DialogState(), tick=100) is False
+
+
+# -------------------------------------------------------------- check-in
+
+def test_checkin_requires_schedule_orders_level_live():
+    now = 1_000_000.0
+    # 没排期：不触发
+    assert should_checkin(None, now, True, True, True) is False
+    # 排期还没到：不触发
+    assert should_checkin(now + 10, now, True, True, True) is False
+    # 到点且有关卡有订单：触发
+    assert should_checkin(now - 1, now, True, True, True) is True
+    # 无订单不聊；不在关卡不聊；暂停/退出不聊
+    assert should_checkin(now - 1, now, False, True, True) is False
+    assert should_checkin(now - 1, now, True, False, True) is False
+    assert should_checkin(now - 1, now, True, True, False) is False
 
 

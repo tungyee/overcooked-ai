@@ -77,36 +77,22 @@ def test_real_frame_select_task_returns_feasible_task():
 
 
 def test_real_frame_agent_runs_without_crash():
-    """真实帧喂给完整主循环：不崩溃、持续执行、产生移动键。"""
-    class FakeCtrl(object):
-        def __init__(self):
-            self.moves = []
-
-        def tap(self, name, hold=0.12):
-            pass
-
-        def press(self, name):
-            self.moves.append(name)
-
-        def release(self, name):
-            pass
-
-        def release_all(self):
-            pass
+    """真实帧喂给完整主循环：不崩溃、持续执行、发 exec 命令。"""
+    from ai.exec.client import NullExec
 
     frame = _frame()
     frame["paused"] = False
-    ctrl = FakeCtrl()
+    ex = NullExec()
 
     trace.clear_log()
     with patch("ai.agent.StateClient", return_value=object()):
-        agent = Agent(ctrl=ctrl)
+        agent = Agent(exec_client=ex)
     for _ in range(5):
         agent._tick_once(World(frame))
         agent.tick += 1
 
     logs = trace.read_log()
     assert len(logs) == 5
-    # 至少有一拍在真正执行（running），并压了移动键
+    # 至少有一拍在真正执行（running），并发了 exec 命令
     assert any(entry["exec"].get("status") == "running" for entry in logs)
-    assert ctrl.moves, "真实帧上应按下过移动键"
+    assert ex.issued, "真实帧上应发过 exec 命令"

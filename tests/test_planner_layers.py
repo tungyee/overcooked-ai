@@ -17,10 +17,11 @@ class _T(object):
         self.TYPE = type_name
 
 
-def _rules(pressure=0.0, plate_pressure=0.0):
-    # type: (float, float) -> tuple
-    """固定返回值的规则表，让层判定与两条曲线的实现解耦。"""
-    return PL.build_rules(lambda t, w: pressure, lambda w: plate_pressure)
+def _rules(pressure=0.0, plate_pressure=0.0, placed=False):
+    # type: (float, float, bool) -> tuple
+    """固定返回值的规则表，让层判定与三条曲线的实现解耦。"""
+    return PL.build_rules(lambda t, w: pressure, lambda w: plate_pressure,
+                          lambda w: placed)
 
 
 def test_layer_constants_are_ordered_high_to_low():
@@ -156,12 +157,17 @@ def _cooker(n="cooker1", progress=None, ctime=12.0, cooked=False,
 
 
 class _W(object):
-    """最小 world 替身：层判定只读 cookers / plates。"""
+    """最小 world 替身：层判定只读 cookers / plates / stations。"""
 
-    def __init__(self, cookers=(), plates=()):
-        # type: (Any, Any) -> None
+    def __init__(self, cookers=(), plates=(), stations=()):
+        # type: (Any, Any, Any) -> None
         self.cookers = list(cookers)
         self.plates = list(plates)
+        self.stations = list(stations)
+
+    def to_grid(self, x, z):
+        # type: (float, float) -> tuple
+        return (int(round(x / 1.2)), int(round(z / 1.2)))
 
 
 class _CookTask(object):
@@ -220,12 +226,12 @@ def test_task_without_cooker_id_never_enters_cook_layers():
 
 
 def test_plate_pressure_three_tiers():
-    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。前两档进 L4，
-    第三档掉 L7。"""
+    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。L4 层谓词收紧为
+    clean==0 且无装配盘，所以只有 0 盘档进 L4，1 盘与 >=2 盘都掉 L7。"""
     clean = {"n": "plate1", "contents": []}
     t = _T("WashPlate")
     assert PL.layer_of_task(t, _W(plates=[])) == PL.L_UNBLOCK
-    assert PL.layer_of_task(t, _W(plates=[clean])) == PL.L_UNBLOCK
+    assert PL.layer_of_task(t, _W(plates=[clean])) == PL.L_CLEANUP
     assert PL.layer_of_task(
         t, _W(plates=[clean, dict(clean, n="plate2")])) == PL.L_CLEANUP
 

@@ -89,6 +89,12 @@ _OVERLAP_EPS = 1e-3
 # 墙里顶墙 no_progress）。远小于格宽 1.2，只兜住边界浮点噪声，不误伤相邻格。
 _POINT_EPS = 1e-6
 
+# 厨师胶囊体半径约 0.4，但阻挡层外扩只取 0.35——比半径略小，让「恰好贴墙」
+# 的格（格心距障碍物 0.4，胶囊体刚好触碰）仍可走；只挡「身体明显过不去」
+# 的格（障碍物溢出邻格 0.2~0.3，如绿植 collider 溢出 0.3）。取 0.4 会把
+# Balloon_1_5 顶层地板那排「墙只溢出 0.2」的格误封（tests 钉住）。
+CHEF_CLEARANCE = 0.35
+
 
 def station_blocked_cells(stations, mapping):
     # type: (Optional[List[Dict]], GridMapping) -> Set[Tuple[int, int]]
@@ -337,11 +343,11 @@ def parse_level_bounds(bounds_list):
     return out
 
 
-def _point_in_any_box(x, z, boxes):
-    # type: (float, float, List[Tuple[float, float, float, float]]) -> bool
+def _point_in_any_box(x, z, boxes, margin=0.0):
+    # type: (float, float, List[Tuple[float, float, float, float]], float) -> bool
     for minx, maxx, minz, maxz in boxes:
-        if (minx - _POINT_EPS <= x <= maxx + _POINT_EPS
-                and minz - _POINT_EPS <= z <= maxz + _POINT_EPS):
+        if (minx - margin - _POINT_EPS <= x <= maxx + margin + _POINT_EPS
+                and minz - margin - _POINT_EPS <= z <= maxz + margin + _POINT_EPS):
             return True
     return False
 
@@ -401,7 +407,7 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
         # AABB 会朝邻格溢出一点点，若按格子区域相交判，会把贴着墙站立的
         # 可走地板整排误判成不可走（Balloon_1_5 上层地板、上左走廊被封死，
         # trace-20261017-193620）。点判只拦「格中心真的被占」的格子。
-        if _point_in_any_box(x, z, blocking):
+        if _point_in_any_box(x, z, blocking, margin=CHEF_CLEARANCE):
             return False
         if (gx, gz) in occupancy_cells and (gx, gz) not in belts:
             return False

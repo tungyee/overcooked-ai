@@ -27,7 +27,7 @@ class Preference(object):
     """一条分工偏好：候选打分上的加法项，由账本编译（ai/dialog/duties.py）。
 
     - `kind`：direct（P2 优先做，正分）/ now（马上去，正分，权重 WEIGHT_NOW）
-      / claim（P1 在做，负分，截止闸可抢回）
+      / claim（P1 优先做，负分；P2 仍可按订单价值补位）
       / stop（硬压制，权重 0，`planner._is_stopped` 读）；
     - `scope`：`{(task 类型或 None, item 小写或 None)}`，见 `scope_matches`；
     - `exclude`：从 scope 里扣掉的部分（被更新的账本条目接管）；

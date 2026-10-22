@@ -236,9 +236,9 @@ def test_unrelated_family_suppression_does_not_veto_cook(bb, world, book):
     assert planner._feasibility_of(f2c, _ctx(world, bb, book), bb) == (True, "")
 
 
-# ---------- 认领/派活清承诺 ----------
+# ---------- 分工偏好与承诺 ----------
 
-def test_claim_clears_matching_commitment(bb):
+def test_claim_keeps_matching_commitment(bb):
     task = T.Chop(order_id=1, resources=("board_1",), item="Cucumber")
     bb.commitment.active_task = task
     bb.commitment.infeasible_streak = 2
@@ -247,9 +247,9 @@ def test_claim_clears_matching_commitment(bb):
 
     planner._clear_claimed_commitment(bb)
 
-    assert bb.commitment is original, "只清 active_task，不替换 Commitment 对象"
-    assert bb.commitment.active_task is None
-    assert bb.commitment.infeasible_streak == 0
+    assert bb.commitment is original
+    assert bb.commitment.active_task == task
+    assert bb.commitment.infeasible_streak == 2
 
 
 def test_non_matching_preference_keeps_commitment(bb):
@@ -346,14 +346,14 @@ def test_rescue_task_is_not_cleared_by_suppression(bb):
     assert bb.commitment.infeasible_streak == 2
 
 
-def test_plan_clears_claimed_commitment_at_start(bb, world, book):
+def test_plan_keeps_claimed_commitment_at_start(bb, world, book):
     task = T.Chop(order_id=1, resources=("board_1",), item="Cucumber")
     bb.commitment.active_task = task
     bb.preferences = [Preference(kind="claim", weight=-8.0, scope=CUCUMBER_CHAIN)]
 
     planner.plan(world, bb, None, book)
 
-    assert bb.commitment.active_task is None
+    assert bb.commitment.active_task == task
 
 
 def test_suppression_does_not_veto_rescue_candidates(bb):

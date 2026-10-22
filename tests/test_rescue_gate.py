@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""截止闸与层内 fallthrough（spec §4.6）。
+"""截止闸与分工补位（spec §4.6）。
 
 规则回顾：
 
 - `cushion = solo_slack`（剩余拍 − 该单完整 solo ETA），**不是**剩余时间；
 - `margin = max(2.5 秒, min(0.15 × D, 5 秒))`，`D` = 这个动作 + 送餐的耗时；
-- `0 <= cushion < margin` 且不在抢单冷却期 → 开闸，允许无视 claim/assign 负分；
-- 本层全被认领且无闸 → 逐层向下掉，不是只掉一层。
+- `0 <= cushion < margin` 且不在抢单冷却期 → 开闸，撤销 claim/assign 负分；
+- `leave_to_p1` 是层内软偏好，不会把高层收尾动作排除；`stop` 仍是硬禁止。
 
 这些测试不 mock 闸本身：世界、配方、黑板都是真的，候选也走 `plan()` 的
 生产路径。闸的输入 `cushion` 由真实的 `ETA.solo_slack_by_order` 算出。
@@ -182,10 +182,10 @@ def test_l2_take_cooked_stays_eligible_under_cook_claim(bb):
     assert eligible == [cand]
 
 
-# ---------- 层内 fallthrough ----------
+# ---------- 软分工不降层 ----------
 
-def test_claimed_delivery_falls_through_to_unblock(bb):
-    """L3 全被认领且闸没开 → 掉到 L4 洗盘，而不是硬选被认领的送餐。"""
+def test_claimed_delivery_remains_eligible_as_soft_preference(bb):
+    """leave_to_p1 只减分：料齐的盘仍留在最高层并优先兑现。"""
     w = _world([_order("o1", remaining=100.0)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
@@ -194,22 +194,18 @@ def test_claimed_delivery_falls_through_to_unblock(bb):
     chosen, record = planner.plan(w, bb, None, book)
 
     assert chosen is not None
-    assert chosen.TYPE == "WashPlate"
-    assert record["top_layer"] == PL.L_UNBLOCK
+    assert chosen.TYPE == "DeliverPlate"
+    assert record["top_layer"] == PL.L_REDEEM
     assert "rescue_override" not in record
 
     deliver_row = _row(record, "DeliverPlate")
     assert deliver_row is not None
     assert deliver_row[6] == PL.L_REDEEM       # layer
-    assert deliver_row[7] is False             # in_top_layer：本拍没用这层
+    assert deliver_row[7] is True              # in_top_layer：软偏好不降层
 
 
-def test_fallthrough_is_iterative_not_one_layer(bb):
-    """L3、L4 两层都被认领 → 继续掉到更低的清理层，只掉一层是不够的。
-
-    本场景里 Prefetch 与 ResetPlate 都落 L7（Prefetch 不在 LAYER_PREP_TYPES
-    里，这是既有分层行为），所以断言「选中层 = L7」同时证明跳过了 L3/L4。
-    """
+def test_soft_preferences_do_not_demote_higher_layers(bb):
+    """软分工不跨层降级：送餐仍压过洗盘与清理。"""
     stations = list(STATIONS) + [
         {"t": "crate", "n": "crate_weed", "ing": "Seaweed", "gx": 1, "gz": 1},
     ]
@@ -224,10 +220,10 @@ def test_fallthrough_is_iterative_not_one_layer(bb):
     chosen, record = planner.plan(w, bb, None, book)
 
     assert chosen is not None
-    assert record["top_layer"] == PL.L_CLEANUP
-    assert chosen.TYPE == "ResetPlate"
+    assert record["top_layer"] == PL.L_REDEEM
+    assert chosen.TYPE == "DeliverPlate"
     assert _row(record, "DeliverPlate")[6] == PL.L_REDEEM
-    assert _row(record, "DeliverPlate")[7] is False
+    assert _row(record, "DeliverPlate")[7] is True
     assert _row(record, "WashPlate")[6] == PL.L_UNBLOCK
     assert _row(record, "WashPlate")[7] is False
 
@@ -255,8 +251,8 @@ def test_gate_open_claimed_delivery_is_selected_and_announced(bb):
     assert bb.dialog.rescue_hold_until == bb.tick + 200
 
 
-def test_cooldown_blocks_a_second_gate_open(bb):
-    """第一拍抢过之后，同一单在冷却期内不再开闸，层照常向下掉。"""
+def test_cooldown_blocks_second_announcement_not_soft_fill_in(bb):
+    """冷却期不重复播报，但软分工下仍继续完成同一盘。"""
     w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
@@ -270,8 +266,8 @@ def test_cooldown_blocks_a_second_gate_open(bb):
     second, record = planner.plan(w, bb, None, book)
 
     assert second is not None
-    assert second.TYPE == "WashPlate"
-    assert record["top_layer"] == PL.L_UNBLOCK
+    assert second.TYPE == "DeliverPlate"
+    assert record["top_layer"] == PL.L_REDEEM
     assert "rescue_override" not in record
     assert bb.dialog.pending_event is None    # 没有第二次救援事件
 
@@ -328,10 +324,11 @@ def test_hold_release_lets_the_other_order_rescue(bb):
     w.orders = [o for o in w.orders if o["id"] != "o1"]
     w.plates = [p for p in w.plates if p["n"] != "plate_a"]
 
-    # 冷却期内不能改抢别的单，保护期也已释放
+    # 冷却期内不重复播报；软分工仍允许完成另一张料齐的盘
     bb.tick = 1010
     blocked, _ = planner.plan(w, bb, None, book)
-    assert blocked.TYPE == "WashPlate"
+    assert blocked.TYPE == "DeliverPlate"
+    assert blocked.order_id == "o2"
     assert bb.dialog.rescue_task_key is None
 
     # 冷却过后 → o2 正常开闸抢回
@@ -344,8 +341,8 @@ def test_hold_release_lets_the_other_order_rescue(bb):
     assert bb.dialog.rescue_hold_until == 1101 + 200
 
 
-def test_hold_expiry_releases_the_rescue_task(bb):
-    """保护期到期后认领重新生效：任务被清、层向下掉。"""
+def test_hold_expiry_clears_metadata_but_keeps_soft_candidate(bb):
+    """保护期到期后元数据释放；软分工下任务仍可继续竞争。"""
     w = _world([_order("o1", remaining=3.5)])
     book = RecipeBook(w.recipes, w.stations)
     bb.preferences = [Preference(kind="claim", weight=-8.0,
@@ -361,8 +358,8 @@ def test_hold_expiry_releases_the_rescue_task(bb):
 
     chosen, _ = planner.plan(w, bb, None, book)
 
-    assert chosen.TYPE == "WashPlate"       # 认领重新生效 → 掉到 L4
-    assert bb.commitment.active_task is None
+    assert chosen.TYPE == "DeliverPlate"
+    assert bb.commitment.active_task == first
     assert bb.dialog.rescue_task_key is None
     assert bb.dialog.rescue_hold_until == 0
 

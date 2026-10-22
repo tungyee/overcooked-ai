@@ -177,13 +177,13 @@ def test_player_claims_rice_branch_penalizes_rice_not_cucumber(monkeypatch):
             if c.branch == "SushiRice" and c.task.TYPE in rice_types]
     assert rice, "fixture 帧应产生米链候选"
 
-    # 非 L1/L2 的米链候选吃 -8；L1/L2 的免疫由场景 4 单独覆盖。
+    # 非 L1/L2 的米链候选只吃软偏好 -1；L1/L2 的免疫由场景 4 单独覆盖。
     penalized = [c for c in rice
                  if PL.layer_of_task(c.task, world) > PL.L_RESCUE]
     assert penalized
     for cand in penalized:
         layer = PL.layer_of_task(cand.task, world)
-        assert planner._preference_score(cand, agent.bb, layer) == -8.0
+        assert planner._preference_score(cand, agent.bb, layer) == -1.0
 
     cucumbers = [c for c in cands
                  if c.branch == "Cucumber"
@@ -222,7 +222,7 @@ def _make_wash_world():
 
 
 def test_pending_wash_starts_when_dirty_plate_appears(monkeypatch):
-    """没有脏盘时说「去洗碗」→ 账本保留 +4；盘子出现后去洗。"""
+    """没有脏盘时说「去洗碗」→ 账本保留 +1；盘子出现后去洗。"""
     world = _make_wash_world()
     agent = _make_agent(monkeypatch, world)
 
@@ -232,7 +232,7 @@ def test_pending_wash_starts_when_dirty_plate_appears(monkeypatch):
     pref = agent.bb.preferences[0]
     assert pref.kind == "direct"
     assert pref.owner == "P2"
-    assert pref.weight == 4.0
+    assert pref.weight == 1.0
 
     # 盘子出现：同一份偏好必须立刻兑现（不是重新下命令）。
     world.items.append({"n": "DirtyPlateStack", "x": 3.0, "z": 0.0})
@@ -243,7 +243,7 @@ def test_pending_wash_starts_when_dirty_plate_appears(monkeypatch):
     assert record["top_layer"] == PL.L_UNBLOCK
     row = _row(record, chosen)
     assert row is not None
-    assert row[2].get("pref") == 4.0
+    assert row[2].get("pref") == 1.0
 
 
 # --------------------------------------------------------- 场景 4：L2 救援

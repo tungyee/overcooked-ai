@@ -129,7 +129,7 @@ def test_batch_applies_duties_and_compiles_preferences(agent, world):
     assert [r["ok"] for r in results] == [True, True]
     assert [r["id"] for r in results] == ["a1", "a2"]
     kinds = {p.duty_id: (p.kind, p.weight) for p in agent.bb.preferences}
-    assert kinds == {"a1": ("claim", -8.0), "a2": ("direct", 4.0)}
+    assert kinds == {"a1": ("claim", -1.0), "a2": ("direct", 1.0)}
     assert agent.ledger.get("a1").source == "我来切，你洗盘"
 
 
@@ -155,14 +155,14 @@ def test_wash_rejected_without_sink(agent):
     assert results[0]["ok"] is False and "WashPlate" in results[0]["reason"]
 
 
-def test_leave_to_p1_clears_matching_commitment(agent, world):
+def test_leave_to_p1_keeps_matching_commitment(agent, world):
     active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
     agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
 
     agent._apply_duty_batch(world, _batch(
         _duty(op="add", mode="leave_to_p1", target="Cucumber")))
 
-    assert agent.bb.commitment.active_task is None
+    assert agent.bb.commitment.active_task == active
 
 
 def test_do_keeps_commitment(agent, world):
@@ -390,7 +390,7 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["level"] == "Sushi_1_4_2P"
     assert ctx["live"] is True
     assert ctx["tick"] == 100
-    assert ctx["p2"]["doing"] is None   # 认领清掉了承诺
+    assert ctx["p2"]["doing"] == "Chop:Cucumber（订单 #1）"
     assert ctx["p1"] == {"holding": "plate"}
     assert ctx["orders"][0]["id"] == 1
     assert ctx["orders"][0]["dish"] == "CucumberSushi"

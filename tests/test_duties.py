@@ -179,8 +179,8 @@ def test_add_compiles_modes_to_preferences(kitchen):
     assert _add(ledger, kitchen, "leave_to_p1", "Cucumber")["id"] == "a1"
     assert _add(ledger, kitchen, "do", "WashPlate")["id"] == "a2"
     by_id = {p.duty_id: p for p in ledger.preferences()}
-    assert (by_id["a1"].kind, by_id["a1"].weight) == ("claim", -8.0)
-    assert (by_id["a2"].kind, by_id["a2"].weight) == ("direct", 4.0)
+    assert (by_id["a1"].kind, by_id["a1"].weight) == ("claim", -1.0)
+    assert (by_id["a2"].kind, by_id["a2"].weight) == ("direct", 1.0)
 
 
 def test_deliver_plate_accepts_only_now_and_do(kitchen):

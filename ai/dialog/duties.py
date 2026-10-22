@@ -5,7 +5,7 @@ LLM 只通过 `update_duties` 工具改账本：`add` / `edit` / `remove` 三种
 
 - `do`          —— P2 优先做（「你负责 X」「X 归你」），有空就做；
 - `now`         —— P2 马上去（「去 X」「马上 X」「先 X」「现在 X」「帮我 X」）；
-- `leave_to_p1` —— P1 在做，P2 避开（「我来 X」「X 交给我」），截止闸仍可抢回；
+- `leave_to_p1` —— P1 优先做，P2 尽量避开，但订单收尾需要时可以补位；
 - `stop`        —— P2 先别做（「先别 X」「别做 X」），30 秒后自动解除。
 
 「做什么」= `target`，只有两类：
@@ -42,9 +42,11 @@ STOP_TTL_TICKS = STOP_TTL_S * TICKS_PER_SECOND
 # 约定挡住 P2 可做的活超过这么久，LLM 在回话时顺带提议调整（prompt 用）。
 BLOCKED_NUDGE_S = 10
 
-# 编译权重（spec §4.5）：direct +4、claim -8。
-WEIGHT_DO = 4.0
-WEIGHT_CLAIM = -8.0
+# 分工是软偏好：它应影响同等价值任务的选择，不能盖过订单紧迫度、完成度
+# 与熟料压力。旧值 direct +4 / claim -8 会把 P2 锁死在自己的一种物料上，
+# 即使另一张盘只差最后一味也继续填灶（trace-20261022-142224）。
+WEIGHT_DO = 1.0
+WEIGHT_CLAIM = -1.0
 # now 权重仅 trace 展示；实际「马上去」的选中由 planner 闸消费（Task 2）。
 WEIGHT_NOW = 20.0
 
@@ -502,7 +504,7 @@ def tool_schemas(targets, duty_ids):
                "description": "add 新增（同一 target 已有约定时就是改写它）；edit 改已有条目（必须带 id，只写要改的字段）；remove 删除（必须带 id）"},
         "id": {"type": "string", "description": "约定条目 id，edit/remove 必填"},
         "mode": {"type": "string", "enum": list(MODES),
-                 "description": "do=有空优先做；now=马上去；leave_to_p1=交给P1，P2避开；stop=先别做"},
+                 "description": "do=有空优先做；now=马上去；leave_to_p1=P1优先，P2可为收尾补位；stop=先别做"},
         "target": {"type": "string", "enum": list(targets),
                    "description": "物料名（代表这种料的整条加工链）或共享动作"},
     }

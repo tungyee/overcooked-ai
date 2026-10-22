@@ -536,8 +536,9 @@ class Agent:
         # type: () -> None
         """账本是唯一事实来源：重编 `bb.preferences`，并让新约定立刻作用到承诺。
 
-        新的 leave_to_p1 / stop 命中 P2 当前承诺 → 清承诺（救援动作豁免，
-        与 planner `_clear_claimed_commitment` 同口径）。
+        新的 stop 命中 P2 当前承诺 → 清承诺（救援动作豁免，与 planner
+        `_clear_claimed_commitment` 同口径）。leave_to_p1 是软偏好，不中断
+        已经在做的差事，后续重规划时自然倾向别的活。
         """
         prefs = self.ledger.preferences()
         self.bb.preferences[:] = prefs
@@ -549,7 +550,7 @@ class Agent:
         if planner._rescue_hold_live(self.bb, active):
             return
         for pref in prefs:
-            if pref.kind in ("claim", "stop") and \
+            if pref.kind == "stop" and \
                     preference_matches_task(pref, active):
                 commitment.active_task = None
                 commitment.infeasible_streak = 0

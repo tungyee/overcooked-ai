@@ -1039,15 +1039,14 @@ def plan(world, bb, order, book):
        "branches": {str(task.key): 生料名 | None}}
     与 trace._format_candidates 的入参格式一致（spec §8.3 决策可观测性）。
     尾部两项由分层添加：layer 是该候选所在层，in_top_layer 标记它是否进了打分
-    （spec §6）。`top_layer` 是**实际选中**的层：本层全被认领且截止闸没开时
-    会逐层向下掉（spec §4.6）。闸被打开且抢到的候选还会写 `rescue_override`
-    （订单 id）。plan_firefighting 不分层，仍发 6 元组。
+    （spec §6）。`top_layer` 是**实际选中**的层；分工认领只影响该层内评分。
+    截止闸打开且抢到的候选还会写 `rescue_override`（订单 id）。
+    plan_firefighting 不分层，仍发 6 元组。
 
     candidates 含**全部**生成候选：被可行性过滤掉的（ok=False）也保留，
     并用 veto 标注被否决原因，方便复盘「为什么没选拿熟饭」。
     """
-    # ⓪ 玩家认领/派活命中当前承诺 → 立刻放弃承诺（spec §4.6）。
-    # 必须在生成候选之前：否则本拍的候选仍会围绕旧承诺打分。
+    # ⓪ 同步硬停止/放弃整单；柔性分工认领不打断当前承诺。
     _clear_claimed_commitment(bb)
     # ⓪.1 抢回保护期只保护「还在执行的那个 task」：承诺已清（做完/失败/
     # 被换掉）或保护期已过就释放，别把一条旧 hold 带进下一轮。
@@ -1116,9 +1115,8 @@ def plan(world, bb, order, book):
     in_layer = []       # type: List[Candidate]
     rescue_order = None  # type: Optional[Any]
     if feasible:
-        # ③.5 分层（spec §6）。**层判定不变**，只是选择集合从「最高层的
-        # 全部候选」换成「第一个还有未认领候选的层」——本层全被 claim/
-        # assign 认领时逐层向下掉（spec §4.6 fallthrough）。
+        # ③.5 分层（spec §6）。分工偏好只参与同层打分，不改变业务层级：
+        # 高层收尾动作即使由 P1 优先负责，仍留在最高层供 P2 必要时补位。
         #
         # 层是**派生值**——每拍从 feasible 重算。所以「高层动作不可达」
         # （盘被 P1 拿走 / 锅被端走）自然表现为该候选从 feasible 消失、
@@ -1378,7 +1376,7 @@ def _select_imperative(feasible, world, bb):
     return None
 
 
-# ---------- 截止闸与层内 fallthrough（spec §4.6）----------
+# ---------- 截止闸与分工补位（spec §4.6）----------
 
 def _rescue_margin_ticks(task_type):
     # type: (Any) -> int
@@ -1514,16 +1512,11 @@ def _finalize_rescue_hold(bb, chosen_task):
 
 def _select_layer(feasible, world, layer_map, bb, slack_map, tick):
     # type: (List[Candidate], World, Dict[Any, int], Blackboard, Optional[Dict[Any, float]], int) -> Tuple[Optional[int], List[Candidate]]
-    """按层向下找第一个还有「未被认领」候选的层（spec §4.6）。
+    """取最高优先层的全部可行候选。
 
-    层内 eligibility：
-      - `_claim_penalty >= 0`（没有被认领/派活负分）；
-      - 或者截止闸开着（本层全被认领、但有单进入最后窗口）；
-      - 或者是闸抢回后仍处在保护期内的那个 task（闸/冷却已关，但它还没
-        做完——否则抢回只维持一拍）。
-
-    **逐层向下**，不是只掉一层：本层全部候选都被认领且没有单要丢时，
-    继续看下一层，直到找到可用层或没有可行候选。
+    `leave_to_p1` 现在是软偏好，只在层内分数里减分，不再把候选从本层排除。
+    因此订单紧迫度、完成度和物理压力能让 P2 主动补位；`stop` 仍由
+    `_is_stopped` 硬否决，实际资源认领仍由 task claims 保护。
 
     返回 `(选中的层, 该层可用候选)`；全层都不可用返回 `(None, [])`。
     候选顺序保持 `feasible` 的原顺序——下游同分时靠稳定排序决定胜者。
@@ -1536,19 +1529,8 @@ def _select_layer(feasible, world, layer_map, bb, slack_map, tick):
         by_layer.setdefault(layer, []).append(cand)
 
     for layer in sorted(by_layer):
-        eligible = []  # type: List[Candidate]
-        for cand in by_layer[layer]:
-            if _claim_penalty(cand, bb, layer) >= 0:
-                eligible.append(cand)
-                continue
-            if _rescue_hold_live(bb, cand.task, tick):
-                eligible.append(cand)
-                continue
-            cushion = _candidate_cushion(cand, world, slack_map)
-            if _rescue_gate_open(cand, cushion, bb, tick):
-                eligible.append(cand)
-        if eligible:
-            return layer, eligible
+        if by_layer[layer]:
+            return layer, by_layer[layer]
     return None, []
 
 
@@ -1556,10 +1538,12 @@ def _clear_claimed_commitment(bb):
     # type: (Blackboard) -> None
     """硬意图命中当前承诺 → 立刻放弃当前 task（spec §4.6）。
 
-    三种来源都算硬意图，不走 3 拍承诺惯性宽限：
-      1. 玩家的 `claim` 负分命中（认领到了就停手）；
-      2. 当前 task 落在账本 `stop` 的作用域里；
-      3. 当前 task 属于被放弃的订单（`abandoned_orders`）。
+    两种来源算硬意图，不走 3 拍承诺惯性宽限：
+      1. 当前 task 落在账本 `stop` 的作用域里；
+      2. 当前 task 属于被放弃的订单（`abandoned_orders`）。
+
+    `claim`（leave_to_p1）是软偏好，不清当前承诺；否则玩家说自己负责某种
+    物料时，P2 即使已经快做完也会当场丢下，既浪费进度也妨碍主动补位。
 
     只清 `active_task` 与 `infeasible_streak`，**不替换 Commitment 对象**：
     Executor / Arbiter 持有它的引用并继续写 steps_done / retries，换成新对象
@@ -1589,19 +1573,6 @@ def _clear_claimed_commitment(bb):
         commitment.active_task = None
         commitment.infeasible_streak = 0
         return
-    tick = getattr(bb, "tick", 0) or 0
-    for pref in getattr(bb, "preferences", None) or ():
-        if getattr(pref, "kind", None) != "claim":
-            continue
-        if float(getattr(pref, "weight", 0.0) or 0.0) >= 0:
-            continue
-        expires = getattr(pref, "expires_tick", 0) or 0
-        if expires and tick >= expires:
-            continue
-        if preference_matches_task(pref, active):
-            commitment.active_task = None
-            commitment.infeasible_streak = 0
-            return
 
 
 def _is_rescue_action(task):
@@ -1825,6 +1796,15 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；
     # layer=None（扁平老路）时照常全量求和。
     terms["pref"] = _preference_score(candidate, bb, layer)
+    # 截止闸既要放行候选，也要撤销同一条 claim 的负分。只放行而保留
+    # -8 会让危急装盘仍输给「优先煮饭」；保护期内也必须保持同一口径。
+    # 仅豁免 claim，不修改账本，不抹掉其它偏好或 stop 的硬否决。
+    if layer is not None and (
+            _rescue_hold_live(bb, task)
+            or _rescue_gate_open(candidate,
+                                 _candidate_cushion(candidate, world, slack_map),
+                                 bb)):
+        terms["pref"] -= _claim_penalty(candidate, bb, layer)
 
     # 总分 = terms 的和。**不要**改回手写加法：旧版把 16 项重抄一遍、还混用
     # 局部变量与 terms[...]，加一项要改两处；漏掉求和那处的症状是「trace 里

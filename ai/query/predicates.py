@@ -119,12 +119,36 @@ def held_is_cookware(chef, recipes=None):
     h = held_name(chef)
     if not h:
         return False
-    if any(k in h for k in _NOT_COOKWARE):
+    # 插件 0.22+：按游戏组件（ServerCookableContainer）判，不看名字。
+    flag = chef.get("held_cookware") if isinstance(chef, dict) else None
+    if isinstance(flag, bool):
+        return flag
+    return _name_is_cookware(h, recipes)
+
+
+def _name_is_cookware(name, recipes=None):
+    # type: (str, Optional[List[Dict]]) -> bool
+    """旧帧兜底：按名字判锅具。配方 cook 名与物品名要归一化后比
+    （"fryingpan" vs "utensil_frying_pan_01"，原样子串匹配恒失败，
+    端下灶的熟平底锅因此不被当熟料源，trace-20261029-130632）。"""
+    h = str(name or "").lower()
+    if not h or any(k in h for k in _NOT_COOKWARE):
         return False
     names = cookware_names(recipes)
     if names:
-        return any(n in h for n in names)
+        return any(cookware_matches(h, n) for n in names)
     return any(k in h for k in COOKWARE_KEYWORDS)
+
+
+def item_is_cookware(item, recipes=None):
+    # type: (Optional[Dict], Optional[List[Dict]]) -> bool
+    """items[] 里的这件是不是锅具：插件 cookware 字段优先，旧帧按名字。"""
+    if not isinstance(item, dict):
+        return False
+    flag = item.get("cookware")
+    if isinstance(flag, bool):
+        return flag
+    return _name_is_cookware(item.get("n"), recipes)
 
 
 
@@ -271,6 +295,26 @@ def plate_count(plate):
     return plate.get("count") or 0
 
 
+def plate_stack_top(plate):
+    # type: (Optional[Dict]) -> bool
+    """盘是干净盘堆（取盘站/沥碗架）的顶层：能直接倒料、直接端走。
+
+    插件 0.23.4+ 才报 stack/stack_top；旧帧没有这些字段一律 False，
+    保持「堆里的盘不参与匹配」的旧口径。脏盘堆的顶层不算。
+    """
+    if not plate:
+        return False
+    return bool(plate.get("stack_top")) and bool(plate.get("stack_clean"))
+
+
+def plate_buried_in_stack(plate):
+    # type: (Optional[Dict]) -> bool
+    """盘压在盘堆中间层/底层：交互只会作用到顶层，不能绑定它。"""
+    if not plate or not plate.get("stack"):
+        return False
+    return not plate.get("stack_top")
+
+
 def clean_plate_count(plates):
     # type: (Optional[List[Dict]]) -> int
     """干净空盘数量（count==0 且 contents 空）。"""
@@ -304,9 +348,18 @@ def cooker_for(cookers, station_name):
 
 def cooker_has_pot(cooker):
     # type: (Optional[Dict]) -> bool
-    """插件约定：cooked=null → 灶上没锅（m_itemPot 空）；false/true → 有锅。"""
+    """灶上有没有锅：优先看炊具字段（cookware 名 / cook_type），旧帧再看 cooked。
+
+    只看 cooked 不够：插件 0.21 及以前在灶多于 4 口时会把服务端条截掉、只剩
+    客户端条，cooked 恒为 null，有锅的灶被当空灶，从不发下锅候选
+    （Balloon_2_3 两口煮锅，trace-20261029-130632）。cookware/cook_type 两种
+    条目都有，判得出。"""
     if not cooker:
         return False
+    for key in ("cookware", "cook_type"):
+        v = cooker.get(key)
+        if v is not None and str(v).strip().lower() not in ("", "null", "none"):
+            return True
     return cooker.get("cooked") is not None
 
 

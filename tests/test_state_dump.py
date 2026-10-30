@@ -138,6 +138,14 @@ def test_snapshot_map_includes_terrain_and_occupancy():
     ]
 
 
+def test_snapshot_map_passes_walk_probe_through():
+    """插件 walk_probe 诊断原样落进 map，旧帧缺字段时为 None。"""
+    probe = {"ms": 1.2, "ox": 0.0, "oz": 0.0, "cell": 1.2, "sub": 3,
+             "chefs": [], "blockers": []}
+    assert snapshot(World({"grid": {"nodeMap": None}, "walk_probe": probe}))["map"]["walk_probe"] == probe
+    assert snapshot(World({"grid": {"nodeMap": None}}))["map"]["walk_probe"] is None
+
+
 def test_snapshot_keeps_recipe_chop_fields():
     """配方自带的切配信息要进 trace：回放从 trace 重建 RecipeBook 时，传送带
     供料、无箱子的食材（1-6 的鱼）才不会被当成不用切。旧帧没有就不写。"""
@@ -145,10 +153,11 @@ def test_snapshot_keeps_recipe_chop_fields():
     from ai.state.world import World
     world = World({"phase": "level", "recipes": [
         {"name": "SushiFish", "comp": [], "cook": "null",
-         "chop": "ChoppedSushiFish", "chop_stages": 8},
+         "chop": "ChoppedSushiFish", "chop_stages": 8, "chop_node": "SushiFish"},
         {"name": "Seaweed", "comp": [], "cook": "null"},
     ]})
     recipes = state_dump.snapshot(world)["recipes"]
     assert recipes[0]["chop"] == "ChoppedSushiFish"
     assert recipes[0]["chop_stages"] == 8
-    assert "chop" not in recipes[1]
+    assert recipes[0]["chop_node"] == "SushiFish"
+    assert "chop" not in recipes[1] and "chop_node" not in recipes[1]

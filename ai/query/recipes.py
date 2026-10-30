@@ -438,6 +438,11 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_ac
                 return {"kind": "plate", "st": p}
 
     for it in getattr(world, "items", None) or ():
+        # 飞行中的料（投掷途中）不算散落来源：坐标是空中的过渡点，走过去
+        # 料早已落在别处（trace-20261029-202903 t=231：锁定 x=18.7 的飞行
+        # 意面，实际落在 x≈23.6，P2 对空地反复拾取到关卡结束）。
+        if it.get("flying") is True:
+            continue
         if str(it.get("n") or "").lower() == il and can_access(it):
             return {"kind": "loose", "st": it}
 

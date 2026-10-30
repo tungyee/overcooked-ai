@@ -41,6 +41,8 @@ def snapshot(world):
         "scene_epoch": raw.get('scene_epoch'),
         "score": raw.get("score"),
         "timer": raw.get("timer"),
+        # 插件关卡时钟（门洞时间表 seam_clock 的时基）
+        "level_time": raw.get("level_time"),
         "chefs": [_chef(world, c) for c in (getattr(world, "chefs", None) or [])],
         "orders": [_copy(o) for o in (getattr(world, "orders", None) or [])],
         "plates": [_copy(p) for p in (getattr(world, "plates", None) or [])],
@@ -96,7 +98,8 @@ def _recipe(r):
     # 切配跟着食材走（插件 0.19+ 随配方下发）：回放从 trace 重建 RecipeBook
     # 时少了它，传送带供料、无箱子的食材会被当成不用切。旧帧没有就不写，
     # 让 RecipeBook 照旧退回箱子。
-    for key in ("chop", "chop_stages"):
+    # chop_node（插件 0.23+）：切好产物的配方节点，鱼 ChoppedFish → UncookedFish。
+    for key in ("chop", "chop_stages", "chop_node"):
         if key in r:
             out[key] = r.get(key)
     return out
@@ -144,6 +147,9 @@ def _map(world):
         "terrain": raw.get("terrain") or [],
         "occupancy": raw.get("occupancy") or [],
         "level_bounds": raw.get('level_bounds'),
+        # 插件可走性物理诊断（会动网格关卡才有，其余为 None）：逐子点掩码 +
+        # 阻挡体明细，离线用 tools/walk_probe_report.py 对照 terrain 判定。
+        "walk_probe": raw.get('walk_probe'),
         "belts": raw.get('belts') or [],
         "wind_zones": raw.get('wind_zones') or [],
         "belt_cells": sorted([list(c) for c in belt_cells]),

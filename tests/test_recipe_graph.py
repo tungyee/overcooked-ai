@@ -277,6 +277,23 @@ def test_emit_plate_skips_held_plate():
     assert [t.TYPE for t in tasks] == []
 
 
+def test_emit_plate_skips_counter_with_item():
+    """台面上已有锅时不往上摆盘（对锅摆盘 = 倒料，trace-20261031-002224）。"""
+    w = _world(
+        orders=[{"id": "order1", "dish": "Sushi", "composition": ["Seaweed"],
+                 "remaining": 60}],
+        recipes=[],
+        stations=[{"t": "counter", "n": "counter_01", "gx": 3, "gz": 3}],
+        plates=[{"n": "plate_01", "x": 6.0, "z": 6.0, "count": 0,
+                 "contents": []}],
+        # 台面 (3,3) 在合成帧的默认网格下对应世界坐标 (18.0, -2.4)
+        items=[{"n": "utensil_frying_pan_01", "x": 18.0, "z": -2.4,
+                "cooked": "Cooked"}],
+    )
+    tasks = recipe_graph._emit_plate(w, Blackboard(), "order1")
+    assert [t.TYPE for t in tasks] == []
+
+
 def test_emit_plate_uses_non_held_empty_plate():
     """非手持空盘照旧生成 PlaceCleanPlate（对照）。"""
     w = _world(

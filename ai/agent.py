@@ -16,7 +16,7 @@ from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
-from ai.space import navigation, reachability
+from ai.space import navigation, reachability, seam_clock, seams
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
@@ -914,6 +914,7 @@ class Agent:
         # ⑨ 规划（多订单模式：不再选择单个订单）
         ctx = self._exec_context(world)
         planner_choice = None  # type: Optional[Any]
+        settle_active = False  # ⑨.5 接回的旧 task 后置条件已成立：⑫ 直接收尾
         if new_mode == "Normal":
             chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
             # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
@@ -930,10 +931,16 @@ class Agent:
             #
             # 只在 Normal 分支里做：模式切换（火情等）已经 halt_and_discard
             # 过了，此时 active_task 是 None，不会把任务"复活"。
+            #
+            # 接回来之后**不再 tick 旧树**，直接按成功收尾（⑫ settle_active）：
+            # 后置条件可能是别人替我们达成的，树只认自己的 expect，接着 tick
+            # 会把整段流程重走一遍（trace-20261030-214824 t=1743~1795：P1 先把
+            # 面下进锅，P2 的 FillCooker 已 done，树照样走去面箱又拿一份，52 拍）。
             active = self.executor_inst.active_task
             if active is not None and active != chosen_task \
                     and self._task_done(active, world, ctx):
                 chosen_task = active
+                settle_active = True
             claims_new = {}
             if chosen_task and hasattr(chosen_task, "claims"):
                 # 认领绑定到任务的 order_id（而非全局 current_order_id）
@@ -981,6 +988,9 @@ class Agent:
             # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
             "branches": plan_record.get("branches") or {},
             "rescue_override": plan_record.get("rescue_override"),
+            "gate_waits": plan_record.get("gate_waits"),
+            # 门洞时间表：每道接缝学没学会、周期/开门时长、此刻开没开、几秒后开/关
+            "seam_clock": seam_clock.summary(self.bb.seam_clock),
             # 「马上去」硬指令闸（Task 2）的覆盖标记：chosen 是闸选中的 task key。
             "imperative": plan_record.get("imperative"),
             "chosen": str(planner_choice) if planner_choice is not None else None,
@@ -999,7 +1009,12 @@ class Agent:
                 self.bb.commitment = Commitment(chosen_task, self.tick, 0, 0, 0)
 
         # ⑫ 执行
-        if chosen_task:
+        if settle_active:
+            # 后置条件已成立：halt 旧树（停移动）、按成功走 ⑬ 记账，不再 tick。
+            # 这一拍不开新树，下一拍 planner 在已收尾的状态上重选。
+            self.executor_inst.halt_and_discard()
+            status = "success"
+        elif chosen_task:
             if self._frame_seq is not None:
                 # 规划可能耗时；短按的时基必须接近真正发键的时刻。
                 ctx["now"] = time.monotonic()
@@ -1098,6 +1113,24 @@ class Agent:
             self._balloon_frame_seq = None
             trace.reset_revenue_state()
         self._scene_key, self._left_level = key, False
+        self._observe_seams(world)
+
+    def _observe_seams(self, world):
+        # type: (World) -> None
+        """记一帧接缝门洞开关，学门洞时间表（ai/space/seam_clock.py）。
+
+        时钟用插件 level_time（随暂停停）；旧插件没有时退回本地单调时钟。
+        暂停中不记：门洞不动，单调时钟却在走，会把周期学错。
+        """
+        if getattr(world, 'seam_gates', None) is None or world.paused:
+            return
+        if self.bb.seam_clock is None:
+            self.bb.seam_clock = seam_clock.SeamClock()
+        now = world.raw.get('level_time')
+        if not isinstance(now, (int, float)):
+            now = time.monotonic()
+        self.bb.seam_clock.observe(float(now), world.seam_gates,
+                                   seam_clock.anim_period(world.raw.get('grids')))
 
     def _note_motion_failure(self, task, ctx):
         # type: (Any, Dict) -> None
@@ -1160,9 +1193,12 @@ class Agent:
                 soft = p1model.p1_soft_cost_map(world, self.bb.p1_model)
                 field = reachability.field_for(world, self.bb, soft_cost=soft)
                 if field is None:  # 缺地形的历史测试仍使用旧距离场。
+                    walkable, edge_blocked = seams.nav_predicates(world, self.bb)
                     field = navigation.distance_field(
-                        cell, world.walkable, world.belt_dir, blocked, soft_cost=soft,
-                        edge_blocked=world.edge_blocked)
+                        cell, walkable, world.belt_dir, blocked, soft_cost=soft,
+                        edge_blocked=edge_blocked,
+                        wait_cost=seams.wait_cost_of(world, self.bb),
+                        jumps=seams.nav_jumps(world, self.bb)[0])
         ctx = {
             "w": world,
             "chef": chef,

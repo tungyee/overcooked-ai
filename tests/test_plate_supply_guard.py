@@ -130,8 +130,9 @@ def test_wash_pressure_weight_covers_prep_ceiling():
       - urgency 满分需要 slack <= 0（订单紧迫到极限），此时通常还没盘/缺料，
         与 completion_ratio 满分的前提互斥；
       - completion_ratio 需要盘里已有料，而本条讨论的正是「0 干净盘」；
-      - async_resource 只给 FetchToCooker/Chop，与 completion_ratio 适用的
-        task 也不重合。
+      - async_resource 只给进灶的加工链（FetchToCooker，及下游要下锅的
+        FetchToBoard/Chop，见 planner._feeds_cooker），与 completion_ratio
+        适用的 task 也不重合。
 
     实测备菜合计是 4.97（urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，
     灶全空 3 单要米，见 ai/planner.py 的 W_COOKER_IDLE 注释）。这与 A 组

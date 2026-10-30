@@ -148,6 +148,88 @@ def station_blocked_cells(stations, mapping):
     return blocked
 
 
+def _box_of(entry):
+    # type: (Dict) -> Optional[Tuple[float, float, float, float]]
+    vals = [entry.get(k) for k in ("minx", "maxx", "minz", "maxz")]
+    if any(v is None for v in vals):
+        return None
+    try:
+        return tuple(float(v) for v in vals)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _box_cells(box, to_grid, to_world):
+    # type: (Tuple[float, float, float, float], Callable, Callable) -> Set[Tuple[int, int]]
+    """AABB 让哪些主网格格不可走：判据与 make_walkable_from_terrain 第 4 步
+    相同（格中心落在 AABB 外扩 CHEF_CLEARANCE 内）。
+
+    必须与可走性同口径：阈值不一致时，溢进邻格的量落在两套阈值之间，那一格
+    被判不可走、却又不算占地 → 交互位仍为空（实测 t=947 溢出 0.26）。
+    只依赖 to_grid / to_world，单测的轻量 World 也能用。
+    """
+    minx, maxx, minz, maxz = box
+    gx0, gz0 = to_grid(minx, minz)
+    gx1, gz1 = to_grid(maxx, maxz)
+    out = set()  # type: Set[Tuple[int, int]]
+    for gx in range(min(gx0, gx1) - 1, max(gx0, gx1) + 2):
+        for gz in range(min(gz0, gz1) - 1, max(gz0, gz1) + 2):
+            cx, cz = to_world(gx, gz)
+            if _point_in_any_box(cx, cz, [box], margin=CHEF_CLEARANCE):
+                out.add((gx, gz))
+    return out
+
+
+def _support_station(entry, stations):
+    # type: (Dict, Optional[List[Dict]]) -> Optional[Dict]
+    """承载 entry（盘/散锅/散料）的站点：x/z 落在其 AABB 内，取中心最近的。"""
+    x, z = entry.get("x"), entry.get("z")
+    if x is None or z is None:
+        return None
+    best, best_d = None, None
+    for st in stations or ():
+        if not isinstance(st, dict) or st is entry or st.get("t") == "floor":
+            continue
+        box = _box_of(st)
+        if box is None or not (box[0] - _POINT_EPS <= x <= box[1] + _POINT_EPS
+                               and box[2] - _POINT_EPS <= z <= box[3] + _POINT_EPS):
+            continue
+        d = ((box[0] + box[1]) / 2.0 - x) ** 2 + ((box[2] + box[3]) / 2.0 - z) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = st, d
+    return best
+
+
+def interaction_footprint(entry, cell, stations, to_grid, to_world, is_walkable):
+    # type: (Dict, Tuple[int, int], Optional[List[Dict]], Callable, Callable, Callable[[int, int], bool]) -> Set[Tuple[int, int]]
+    """交互目标的占地格：单格四邻有可走格时就是 {cell}；四邻全不可走时，
+    扩成 目标格 ∪ 自身（或承载站点）collider 让其不可走的格。
+
+    为什么不能只用目标中心投影的单格：移动篮上的台面相对静态主网格有亚格
+    偏移时，一张 1.2 m 的台面会跨两格。盘心越过格界被量化到后一格，前一格
+    又被台面 collider（外扩 CHEF_CLEARANCE）判成不可走 → 单格四邻全不可走、
+    判 unreachable；物理上站在台面前照样拿得到（Balloon_2_3_2P
+    trace-20261030-002104 t=853：盘 -16202 量化到 (13,6)，台面压着 (13,5)，
+    能站的 (13,4) 只是 (13,5) 的邻格）。按完整占地取四邻并集即可。
+
+    只在单格无路时才扩：静态厨房站点与格对齐，单格四邻总有交互位，行为
+    逐字不变，也不会多出离站点更远的备选站位。盘/散锅没有自己的 AABB，
+    借用承载它的站点；都没有时退回单格。
+    """
+    cells = {cell}
+    gx, gz = cell
+    if any(is_walkable(gx + dx, gz + dz)
+           for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+        return cells
+    box = _box_of(entry)
+    if box is None:
+        support = _support_station(entry, stations)
+        box = _box_of(support) if support is not None else None
+    if box is not None:
+        cells |= _box_cells(box, to_grid, to_world)
+    return cells
+
+
 def make_walkable(node_map, rows, cols, bounds, blocked, belt_cells,
                   off_x, off_z):
     # type: (Optional[List[List[bool]]], int, int, Optional[Tuple[int,int,int,int]], Set[Tuple[int,int]], Set[Tuple[int,int]], int, int) -> Callable[[int, int], bool]

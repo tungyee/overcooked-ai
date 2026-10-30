@@ -326,6 +326,42 @@ def test_place_clean_plate_not_done_when_plate_held_at_counter():
     assert t.feasible(ctx) is True   # 还没真放好，仍应可行
 
 
+def test_place_clean_plate_infeasible_when_counter_has_pan():
+    """拼装格上已放着锅 → 摆不上去。
+
+    实机 trace-20261031-002224 t=2752~2837：对放熟虾锅的台面摆盘，游戏把
+    这次放置变成倒料——虾在盘与锅之间来回倒，0.4 s 一轮振荡 6 次。
+    """
+    pan = {"n": "utensil_frying_pan_01", "x": 7 * 1.2, "z": 0.0,
+           "cooked": "Cooked", "cookware": True}
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES,
+                  orders=[ORDER], plates=[plate("p1", -1, 0)], items=[pan])
+    ctx, _ = make_ctx(w)
+    t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
+    assert t.feasible(ctx) is False
+
+
+def test_place_clean_plate_keep_requires_bound_plate():
+    """树首清手只放过**绑定的那块盘**；端着别的盘必须先放下。
+
+    实机同上 trace：P2 端着装虾的 -34858 去摆 -34158，旧 keep/expect 只看
+    「手里是盘」，把装料盘当空盘直接摆到台面上。
+    """
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0,
+            "held": "equipment_plate_01", "interactions": inter()}
+    other = dict(plate("pOther", 0, 0, ["Prawn"]), held_by="Player 2")
+    bound = dict(plate("p1", -1, 0), held_by=None)
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES, orders=[ORDER],
+                  plates=[bound, other], chefs=[chef])
+    ctx, _ = make_ctx(w, chef=chef)
+    tree = T.PlaceCleanPlate("1", ("p1", (7, 0))).build()
+    keep = tree.child.children[0]._keep
+    assert keep(ctx) is False
+    # 对照：手里正是绑定盘 → 不放下
+    bound["held_by"], other["held_by"] = "Player 2", None
+    assert keep(ctx) is True
+
+
 def test_place_clean_plate_tree_is_two_interactions():
     """spec §7.3：树退化为几步线性顺序。拿盘 + 放盘。"""
     t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
@@ -1341,8 +1377,9 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     TASK_TIMEOUT_TICKS=200 里——第二轮没结束就被砍，drop() 一次都没执行
     过，米全堆在地上、灶始终空着（trace-20261014-011202，2527 拍 0 送达）。
 
-    钉住：① 没有 RepeatUntil；② 没有 ThrowTo；③ 每个分支都以 placement
-    收尾（真的会下锅）。
+    钉住：① 没有 RepeatUntil；② 不往地上投——投掷只出现在「投进锅」
+    （ThrowIntoCooker，投完等锅收下）里；③ 每个分支都以下锅收尾：先试投进锅，
+    不成就走过去 placement（真的会下锅）。
     """
     tree = T.FetchToCooker(
         "1", ("cooker", ("SushiRice",)), "BoiledSushiRice").build()
@@ -1365,14 +1402,19 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     assert not any(isinstance(n, RepeatUntil) for n in nodes), \
         "单料下锅不该有批量循环：投满 N 份才下锅必然超时"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes), \
-        "N=1 时投掷摊销为零，只剩落点不可控的缺点"
+        "不往地上投：投锅的 ThrowTo 在 ThrowIntoCooker 内部按需建，不在静态树里"
 
-    # 两个分支都必须以「往灶里放」收尾
+    # 两个分支都必须以「下锅」收尾：先试投进锅，不成走过去放
     for branch in sel.children:
         assert isinstance(branch, Sequence)
         last = branch.children[-1]
-        assert isinstance(last, PR.InteractWith)
-        assert last.kind == "placement", "每个分支都要真的走到下锅"
+        assert isinstance(last, Selector)
+        assert isinstance(last.children[0], PR.ThrowIntoCooker)
+        fallback = last.children[-1]
+        assert isinstance(fallback, Sequence)
+        place = fallback.children[-1]
+        assert isinstance(place, PR.InteractWith)
+        assert place.kind == "placement", "每个分支都要真的走到下锅"
 
 
 def test_chop_feasible_when_raw_on_board():
@@ -2234,6 +2276,7 @@ def test_all_spec_tasks_are_registered():
         "Mix",                                                # 16（拌合，阶段 4）
         "PlaceToRelay",                                       # 17（1-3 中转传盘）
         "FillCooker",                                         # 18（订单无关填灶）
+        "ThrowBatch",                                         # 20（批量投掷备料）
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

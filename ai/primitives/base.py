@@ -282,7 +282,9 @@ class Primitive(Node):
             # move 命令 stuck 会把挡路的目标格（世界坐标）回传。把它翻译成
             # 主网格格写入 motion_failure，note_motion_failure 据此写 bad_cells，
             # 下一次寻路绕开这一格——否则同一个 stuck move 会被反复重发。
-            if not r.get("ok") and r.get("why") == "stuck" \
+            # 「gate closed」同理：插件在平台接缝门洞口等到上限门还没开，回传门洞格，
+            # 绕开它一阵子；否则插件判关、Python 判通时会在缝口反复重发同一条 move。
+            if not r.get("ok") and r.get("why") in ("stuck", "gate closed") \
                     and isinstance(r.get("blocked_cell"), (list, tuple)) \
                     and len(r["blocked_cell"]) >= 2:
                 w = ctx.get("w")
@@ -290,8 +292,9 @@ class Primitive(Node):
                     try:
                         cell = w.to_grid(float(r["blocked_cell"][0]),
                                          float(r["blocked_cell"][1]))
+                        reason = "gate_closed" if r.get("why") == "gate closed" else "no_progress"
                         ctx.setdefault("motion_failure", {}).update(
-                            reason="no_progress", blocked_cell=cell)
+                            reason=reason, blocked_cell=cell)
                     except (TypeError, ValueError):
                         pass
             return Status.SUCCESS if r["ok"] else Status.FAILURE

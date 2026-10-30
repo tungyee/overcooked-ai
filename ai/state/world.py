@@ -14,8 +14,11 @@ import socket
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ai.space import occupancy
+from ai.space import occupancy, seams
 from ai.space.geometry import GridMapping, GridSet
+
+# 旧帧（无 grids[].main）里关卡主网格的约定名：已录关卡里静态厨房都叫它。
+MAIN_GRID_NAME = "GridManager"
 
 _FRAME_SEP = b"\n"
 _RECV_SIZE = 65536
@@ -258,6 +261,18 @@ class World(object):
         # 盖不住任何格中心，点判漏掉它，交给 distance_field 的边检查。
         self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping)
 
+        # 平台接缝门洞（ai/space/seams.py）：寻路专用的 walkable / edge_blocked，
+        # 门洞开在两排格中心之间时也能穿缝。站位/交互位仍用 self.walkable。
+        killplane = self.terrain.get(occupancy.LAYER_KILLPLANE) or []
+
+        def _clear(x, z):
+            # type: (float, float) -> bool
+            return not (occupancy._point_in_any_box(x, z, killplane)
+                        or occupancy._point_in_any_box(x, z, hazard_boxes))
+
+        # 寻路方取用走 seams.nav_predicates(world)：现取 walkable，测试替换后不失同步。
+        self.seam_gates = seams.build(self.terrain, self.mapping, clear=_clear)
+
     @property
     def all_plates(self):
         # type: () -> List[Dict]
@@ -291,12 +306,32 @@ class World(object):
 
     def _majority_grid(self):
         # type: () -> Optional[str]
-        """stations[].grid 出现次数最多的网格名（静态计数，不随篮子漂移）。"""
+        """关卡主网格名（静态，不随木筏/篮子漂移）。
+
+        判据按优先级：
+          1. 插件 0.21+ 的 grids[].main（挂 GridNavSpace 的网格，同参考项目
+             cortico-world Kitchen.Rescan）；
+          2. 旧帧：站点里出现过名为 GridManager 的网格就取它；
+          3. 再退回 stations[].grid 众数，并排除 grids[].moving。
+        单靠众数会选错：Rapids_2_1 木筏 Raft_Top 15 站 > 厨房 13 站、Balloon_2_3
+        RightBasket 14 > GridManager 7，主网格原点跟着木筏漂、静止的 P1 格坐标
+        每帧跳（trace-20261028-234917）。
+        """
+        grids = [g for g in (self.raw.get("grids") or ()) if isinstance(g, dict)]
+        for g in grids:
+            if g.get("main") is True and g.get("id"):
+                return str(g["id"])
         votes = Counter()  # type: Counter
         for st in self.stations:
             g = st.get("grid")
             if g:
                 votes[str(g)] += 1
+        if MAIN_GRID_NAME in votes:
+            return MAIN_GRID_NAME
+        moving = {str(g.get("id")) for g in grids if g.get("moving") is True}
+        for name, _ in votes.most_common():
+            if name not in moving:
+                return name
         return votes.most_common(1)[0][0] if votes else None
 
     def _primary_grid_name(self, occupancy_list):

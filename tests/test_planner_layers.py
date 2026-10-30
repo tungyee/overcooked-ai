@@ -440,7 +440,7 @@ _ALL_TERMS = (
     "completion_ratio", "ingredient_reuse", "combo_head",
     "combo_break", "freshness", "deadline_lookahead", "hands", "move_penalty",
     "deliver_bonus", "plate_pressure", "relay_1_3_bonus", "cooker_idle",
-    "no_plate_placed", "pref",
+    "no_plate_placed", "pref", "batch_bonus",
 )
 
 

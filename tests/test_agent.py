@@ -203,6 +203,88 @@ def test_task_success_releases_claims(agent, mock_state_client):
             assert agent.bb.commitment is None
 
 
+class _FakeTask(object):
+    """done() 由外部开关控制；树每拍 RUNNING 并计数，用来看它是否还在被 tick。"""
+
+    TYPE = "FillCooker"
+    order_id = None
+    item = "BoiledPasta"
+
+    def __init__(self, name):
+        self.key = (self.TYPE, None, (name,), "BoiledPasta")
+        self.resources = (name,)
+        self.is_done = False
+        self.ticks = 0
+        self.halted = 0
+
+    def claims(self):
+        return [((self.key[2][0],), "fill")]
+
+    def done(self, ctx):
+        return self.is_done
+
+    def build(self):
+        task = self
+
+        class _Tree(object):
+            def tick(self, ctx):
+                task.ticks += 1
+                return "running"
+
+            def halt(self):
+                task.halted += 1
+        return _Tree()
+
+    def __eq__(self, other):
+        return getattr(other, "key", None) == self.key
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __str__(self):
+        return "FillCooker(%s)" % self.key[2][0]
+
+
+def test_done_active_task_settles_instead_of_ticking(agent, mock_state_client):
+    """⑨.5：正在跑的 task 后置条件已成立 → 当拍收尾成功，不再 tick 旧树。
+
+    实机 trace-20261030-214824 t=1743~1795：P1 先把面下进了 cooker_01，P2 的
+    FillCooker.done() 已为真，⑨.5 把 planner 选的 DeliverPlate 压回 FillCooker，
+    但树只认自己的 expect，照样走去面箱又拿了一份面，白跑 52 拍。
+    """
+    from ai.core.executor import Executor
+
+    agent.bb.mode = "Normal"
+    agent.executor_inst = Executor()
+    fill = _FakeTask("cooker_01")
+    other = _FakeTask("cooker_02")
+    snapshot = mock_state_client.receive.return_value
+
+    with patch("ai.core.planner.plan") as mock_plan, \
+            patch("ai.output.trace.emit"):
+        # 第 1 拍：planner 选 fill，建树并 tick 一次
+        mock_plan.return_value = (fill, {"candidates": []})
+        agent._tick_once(World(snapshot))
+        assert fill.ticks == 1
+        assert agent.executor_inst.active_task == fill
+        agent.bb.claims[((("cooker_01",), "fill"))] = Claim("P2", None, 0)
+
+        # 第 2 拍：P1 替我们完成了 → fill.done 为真；planner 改选别的
+        fill.is_done = True
+        mock_plan.return_value = (other, {"candidates": []})
+        agent._tick_once(World(snapshot))
+
+    assert fill.ticks == 1, "后置条件已成立，不该再 tick 旧树"
+    assert fill.halted == 1, "旧树要 halt（松键/停移动）"
+    assert agent.executor_inst.active_task is None
+    assert agent.bb.commitment is None, "按成功收尾：承诺清空"
+    assert (("cooker_01",), "fill") not in agent.bb.claims, "成功收尾释放认领"
+    assert other.ticks == 0, "收尾这一拍不顺带开新树，下一拍由 planner 重选"
+
+
 def test_order_selection_by_remaining(agent, mock_state_client):
     """Plan 4 多订单模式：不再需要单订单选择逻辑。"""
     # Plan 4: _update_current_order 已移除（多订单模式）

@@ -245,14 +245,19 @@ class FetchToCooker(Task):
                 # 追着移动的料跑永远追不上（trace-20261021-131529 全程 0 帧拿到
                 # 米、灶从没开煮）。这里把取料目标**锁死在第一次解析出的站点**，
                 # 再 WaitUntil 等料经过这一段才 tap——拦截等料，不追移动目标。
+                #
+                # 只锁传送带段：散落料解析出的是 item 快照（带当时的 x/z），
+                # 锁住就是锁住旧坐标，料被弹开/踢走后 P2 走向空地反复拾取
+                # （trace-20261029-202903 t=231~312）。箱子/台面/散落每拍重新解析。
                 locked = {}
 
                 def target(c):
                     st = locked.get("st")
-                    if st is None:
-                        st = ingredient_source(c, form(c))
-                        if st is not None:
-                            locked["st"] = st
+                    if st is not None:
+                        return st
+                    st = ingredient_source(c, form(c))
+                    if isinstance(st, dict) and st.get("t") == "conveyor":
+                        locked["st"] = st
                     return st
 
                 def arrived(c):
@@ -266,8 +271,17 @@ class FetchToCooker(Task):
                     wait_pred=arrived, wait_timeout=CONVEYOR_WAIT_TICKS)
 
             def drop():
-                return PR.InteractWith(
-                    lambda x: cooker_station(x, cooker_id), "placement", placed)
+                # 最后几步：离锅还远、能直线投进时精准投进锅（ThrowIntoCooker），
+                # 否则 / 投偏后走过去放。投偏料落在锅附近地上，先捡回来再放
+                # （ingredient_source 散落优先于料箱），不回料箱重取。
+                station = lambda x: cooker_station(x, cooker_id)  # noqa: E731
+                return Selector([
+                    PR.ThrowIntoCooker(station, holding, placed, cooker_id),
+                    Sequence([
+                        Selector([Condition(holding), pickup()]),
+                        PR.InteractWith(station, "placement", placed),
+                    ]),
+                ])
 
             fill = Selector([
                 # 分支1：地上有散落米 → 直接拿散落米下锅（最便宜的一路，

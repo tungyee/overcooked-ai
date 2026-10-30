@@ -270,6 +270,17 @@ def plate_matches_order(ctx, plate, order_id):
     return False
 
 
+def plate_on_counter(ctx, p, counter):
+    # type: (Dict, Optional[Dict], Any) -> bool
+    """盘此刻是否落在拼装位 counter 上（(gx, gz) 或移动台面的 (grid, 站名)）。
+
+    移动台面按同一帧的站点投影比：盘和台面一起随篮子走，同帧投影一致。
+    """
+    from ai.query.placement import counter_cell_now
+    cell = counter_cell_now(ctx["w"], counter)
+    return cell is not None and plate_cell(ctx, p) == tuple(cell)
+
+
 def placed_plates(ctx):
     # type: (Dict) -> List[Dict]
     """已就位（落在某个 counter 拼装格上）的盘。
@@ -300,8 +311,20 @@ def station_at_cell(ctx, cell, kinds=None):
     """
     if cell is None:
         return None
-    for st in ctx["w"].stations:
-        if st.get("gx") == cell[0] and st.get("gz") == cell[1]:
+    from ai.query.placement import _station_cell, is_station_key, station_by_key
+    w = ctx["w"]
+    # 移动网格台面的拼装位 id 是 (grid, 站名)：按名字取，不按格——篮子一动
+    # 格就对不上（placement.counter_key）。取不到返回 None，交给 feasible 判。
+    if is_station_key(cell):
+        st = station_by_key(w, cell)
+        if st is not None and (kinds is None or st.get("t") in kinds):
+            return st
+        return None
+    # 拼装格是主网格坐标（recipe_graph._counter_cells）：按 x/z 投影比，不比
+    # 站点自带的 gx/gz——篮子台面的 gx/gz 是篮子本地坐标。
+    for st in w.stations:
+        sc = _station_cell(w, st)
+        if sc is not None and tuple(sc) == tuple(cell):
             if kinds is None or st.get("t") in kinds:
                 return st
     # 快照里没有该格的站点条目：合成一个最小 dict（原语只要 n/gx/gz/x/z）
@@ -416,12 +439,22 @@ def _station_for_item(world, item):
     name = os.split(":", 1)[1].strip()
     if not name:
         return None
-    for st in getattr(world, "stations", None) or ():
-        if str(st.get("n") or "") == name:
-            return st
+    x, z = item.get("x"), item.get("z")
+    named = [st for st in getattr(world, "stations", None) or ()
+             if str(st.get("n") or "") == name]
+    # 同名站点跨网格并存（Rapids_2_1 厨房与木筏各有一张 countertop_01_standard_old
+    # (4)/(5)/(6)/(11)）：只认第一个会把木筏台面上的鸡块解析成厨房台面，P2 走
+    # 不过去、FetchToBoard 反复失败被拉黑（trace-20261029-122831 t=1268~1996）。
+    # 按离物品最近选。不能按 item.grid：插件也是按站点名反查网格，同名时
+    # 一样取错（实测鸡块在木筏台面 (31.3,10.1)，item.grid 却报 GridManager）。
+    if len(named) > 1 and x is not None and z is not None:
+        named.sort(key=lambda st: (st.get("x") is None,
+                                   (float(st.get("x") or 0) - x) ** 2
+                                   + (float(st.get("z") or 0) - z) ** 2))
+    if named:
+        return named[0]
     # 名字没匹配到（功能站 GameObject 命名可能不一致）时，退一步按位置匹配
     # 传送带段：物料就挂在段上，两者世界坐标接近。
-    x, z = item.get("x"), item.get("z")
     if x is None or z is None:
         return None
     for st in getattr(world, "stations", None) or ():
@@ -460,7 +493,7 @@ def cooked_sources(world, book):
             out.append({"kind": "cooker", "id": cid, "tokens": toks})
 
     for it in world.items:
-        if not P.held_is_cookware({"held": it.get("n")}, world.recipes):
+        if not P.item_is_cookware(it, world.recipes):
             continue
         if P.item_on_cooker(it):
             continue                       # 在灶台上 = 在用，不是散锅（字段判据）
@@ -478,9 +511,27 @@ def cooked_sources(world, book):
                     t = book.rich_token(cooked)
                     if t:
                         toks.add(t)
+        toks = _only_cookware(toks, it.get("n"), world.recipes)
         if any(t.startswith("cooked:") for t in toks):
             out.append({"kind": "loose", "id": it.get("n"), "tokens": toks})
     return out
+
+
+def _only_cookware(toks, item_name, recipes):
+    # type: (Set[str], Any, Any) -> Set[str]
+    """散锅 token 只留与这口锅炊具类型一致的：cooked_of_raw(prawn) 同时给出
+    BoiledPrawns/PanFriedPrawns，平底锅里的虾不该同时声称是 cooked:prawn:pot
+    （否则会被配给要「煮虾」的单）。认不出锅的类型时原样返回。"""
+    kinds = [k for k in P.cookware_names(recipes)
+             if P.cookware_matches(str(item_name or "").lower(), k)]
+    if not kinds:
+        return toks
+    keep = set()
+    for t in toks:
+        parts = t.split(":")
+        if len(parts) < 3 or parts[0] != "cooked" or parts[-1] in kinds:
+            keep.add(t)
+    return keep
 
 
 def _cooker_cooked_tokens(c, book):
@@ -502,10 +553,13 @@ RELAY_BUFFER = 1
 
 def loose_count(world, raw):
     # type: (Any, str) -> int
-    """场上散落的该料数量（投掷落地后变成 loose）。"""
+    """场上散落的该料数量（投掷落地后变成 loose；飞行中的不算，与
+    find_ingredient 的散落口径一致）。"""
     want = str(raw).lower()
     n = 0
     for it in world.items or ():
+        if it.get("flying") is True:
+            continue
         if str(it.get("n") or "").lower() == want:
             n += 1
     return n

@@ -49,7 +49,7 @@ def loose_cookware(ctx):
     out = []
     recipes = ctx["w"].recipes
     for it in ctx["w"].items:
-        if not P.held_is_cookware({"held": it.get("n")}, recipes):
+        if not P.item_is_cookware(it, recipes):
             continue
         if P.item_on_cooker(it):
             continue                       # 在灶台上 → 在用，不是"散落"
@@ -103,29 +103,22 @@ def _has_free_chopping_board(world):
     return False
 
 
-def _chopped_form_available(world, book, raw):
-    # type: (Any, Any, Optional[str]) -> bool
-    """该生料的切好形态是否已可用（砧板 / 手上 / 散落）。
+def _chopped_form_available(world, book, raw, plate_match=None, cooker_match=None):
+    # type: (Any, Any, Optional[str], Any, Any) -> bool
+    """手里这份生料是否已多余：切好的份数已够所有还在等它的单。
 
-    与 ai.query.recipe_graph._chopped_available 同源：recipe_graph 用它判
-    Chop 链 done、不再发 FetchToBoard/Chop 候选，这里用它判「手里这份生料
-    是否已经多余」。两者口径必须一致，否则手持生料 + 场上已有切好料时，
-    一边说不用切、一边说不放下，死锁（1-6 trace-20261021-125032 t=8559）。
+    与 ai.query.recipe_graph 的 Chop done 同源（chop_waiters / chopped_count）：
+    recipe_graph 据此不再发 FetchToBoard/Chop，这里据此判可以放下。两者口径
+    必须一致，否则一边说不用切、一边说不放下，死锁（1-6 trace-20261021-125032
+    t=8559）。曾经两边都按「有一份切好的就算够」判，两单要薯条时第二单的土豆
+    没人切（trace-20261029-125348 t=434~584）。
     """
-    form = book.chop_target(raw)
-    if not form:
+    from ai.query import recipe_graph
+    if not raw or not book.chop_target(raw):
         return False
-    low = str(form).lower()
-    for ws in world.workstations or ():
-        if str(ws.get("item") or "").lower() == low:
-            return True
-    for c in world.chefs or ():
-        if P.held_name(c) == low:
-            return True
-    for it in world.items or ():
-        if str(it.get("n") or "").lower() == low:
-            return True
-    return False
+    waiters = recipe_graph.chop_waiters(world, book, raw, plate_match, cooker_match)
+    have = recipe_graph.chopped_count(world, book, raw)
+    return have > 0 and have >= len(waiters)
 
 
 @_register
@@ -350,7 +343,9 @@ class StashHeld(Task):
         if item_wanted_by_orders(ctx, held) > 0:
             if book.needs_chopping(held) and (
                     not _has_free_chopping_board(ctx["w"])
-                    or _chopped_form_available(ctx["w"], book, held)):
+                    or _chopped_form_available(ctx["w"], book, held,
+                                               ctx.get("plate_match"),
+                                               ctx.get("cooker_match"))):
                 return True
             return False
         return True

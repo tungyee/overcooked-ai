@@ -9,9 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
+from ai.query.placement import counter_occupied
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
-                           plate_cell, station_at_cell)
+                           plate_cell, plate_on_counter, station_at_cell)
 
 # 洗盘按住交互键的上限（拍）。done() 现在是「一池子全洗完」（见 WashPlate.done），
 # 每块实测约 2.8 秒（~56 拍），一整摞 3~4 块要 168~224 拍，故给 240 拍（12 秒）。
@@ -119,8 +120,9 @@ def dirty_plate_exists(ctx, sink_id=None):
 class PlaceCleanPlate(Task):
     """第 1 号：拿一块干净盘摆到拼装格。
 
-    resources = (plate_id, counter_cell)。counter_cell 是 (gx, gz)，由
-    Planner 的候选生成绑定——spec §9 记 PLATE_COUNTERS 的替代品是
+    resources = (plate_id, counter_cell)。counter_cell 是拼装位 id：主网格
+    台面为 (gx, gz)，移动网格台面为 (grid, 站名)（placement.counter_key），
+    由 Planner 的候选生成绑定——spec §9 记 PLATE_COUNTERS 的替代品是
     "Planner 的多拼装位候选生成 + 认领，不是一个 find 函数"（归 Plan 3）。
     """
 
@@ -151,7 +153,7 @@ class PlaceCleanPlate(Task):
         手空是"真的放下去了"的必要信号——盘还攥在手里就绝不能算完成。
         """
         p = plate_by_id(ctx, self.plate_id)
-        return (plate_cell(ctx, p) == tuple(self.counter_cell)
+        return (plate_on_counter(ctx, p, self.counter_cell)
                 and P.hands_free(ctx["chef"]))
 
     def feasible(self, ctx):
@@ -161,23 +163,32 @@ class PlaceCleanPlate(Task):
         p = plate_by_id(ctx, self.plate_id)
         if p is None:
             return False                   # 盘被端走/消失
+        if station_at_cell(ctx, self.counter_cell) is None:
+            return False                   # 移动台面不在快照里
+        if counter_occupied(ctx["w"], self.counter_cell, self.plate_id):
+            return False                   # 台面上已有锅/料/别的盘
         return P.plate_count(p) == 0       # 必须是干净空盘
 
     def build(self):
         # type: () -> Node
         plate_id, cell = self.plate_id, self.counter_cell
+
+        def holding_bound(c):
+            # 必须是绑定的那块盘：只看「手里是盘」会把上一单端着的装料盘当成
+            # 这块空盘，直接拿去摆（trace-20261031-002224 t=2752：端着装虾的
+            # -34858 去摆 -34158）。
+            return P.holds_plate(c["chef"], plate_by_id(c, plate_id))
+
         return PR.Timeout(Sequence([
             # 树首清手：被抢占时手里可能端着上一 task 的东西（spec §7.4）；
-            # keep：手里已经是盘就别放下再捡
-            PR.EnsureHandsFree(keep=lambda c: P.held_is_plate(c["chef"])),
+            # keep：手里已经是这块盘就别放下再捡
+            PR.EnsureHandsFree(keep=holding_bound),
             PR.InteractWith(
-                lambda c: plate_by_id(c, plate_id), "pickup",
-                lambda c: P.held_is_plate(c["chef"])),
+                lambda c: plate_by_id(c, plate_id), "pickup", holding_bound),
             PR.InteractWith(
                 lambda c: station_at_cell(c, cell), "placement",
-                lambda c: (plate_cell(
-                    c, plate_by_id(c, plate_id)) == tuple(cell)
-                    and P.hands_free(c["chef"]))),
+                lambda c: (plate_on_counter(c, plate_by_id(c, plate_id), cell)
+                           and P.hands_free(c["chef"]))),
         ]), TASK_TIMEOUT_TICKS)
 
 
@@ -350,7 +361,7 @@ class ResetPlate(Task):
             return True       # 盘不见了，楔死也解除了
         if P.plate_count(p) == 0:
             return True
-        return plate_cell(ctx, p) != tuple(self.counter_cell)
+        return not plate_on_counter(ctx, p, self.counter_cell)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool

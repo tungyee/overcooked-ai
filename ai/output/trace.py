@@ -207,6 +207,13 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
     if state:
         log_entry["revenue"] = _revenue(state)
 
+    # 等门让位：要在平台接缝门洞口等门的候选 {task key: 秒}（只在有等门时写）。
+    if record.get("gate_waits"):
+        log_entry["gate_waits"] = record["gate_waits"]
+    # 门洞时间表快照（只在有接缝的关卡写）。
+    if record.get("seam_clock"):
+        log_entry["seam_clock"] = record["seam_clock"]
+
     # 卡住事件只在判据成立时写（grep 友好：没卡住的拍不带这个 key）。
     stuck = record.get("stuck")
     if stuck:

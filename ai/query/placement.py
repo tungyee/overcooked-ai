@@ -2,24 +2,29 @@
 
 从 oc/ai/agent.py:483 的 _find_drop_cell 抽取。spec §6.1 原话：那段
 筛选逻辑"是功能性的、不是优化，必须保留"——落点须可落脚、非传送带，
-且不贴灶台（会继续加热）、不贴出餐口（会被误上菜）、不贴拼装台（会挡盘）。
+不贴出餐口（会被误上菜），且不放在已有东西（盘/锅/料）的那一格上。
+
+「不贴灶台」「不贴拼装台」已去掉（2026-10-30）：只有放**到灶台上**才会接着
+加热，旁边的台面不会，落点候选本来就只取 counter / 地板、不含灶台本身；
+放在盘旁边也不挡往盘里装菜，盘自己那一格由「已占用」挡住。两条四邻禁区
+让灶旁、盘旁台面全不可用，Balloon_2_3 救锅时右篮近处台面全被禁，锅被搬
+到另一只篮子上（trace-20261030-214824 t=1164）。
 
 一处升级：spec §7.4 要求"放**就近的合法空台面**而非地上（地上虽也能捡，
 但可能挡路或在传送带上被冲走）"。旧实现只找地板格，这里先找空 counter
 站点（find_drop_station），找不到才退到地板（find_drop_cell）。
 
 不含 find_plate_counter / PLATE_COUNTERS：spec §9 明确归 Plan 3（替代品
-是 Planner 的多拼装位候选生成 + 认领，不是一个 find 函数）。所以"拼装台"
-禁区只能从**已就位的盘**位置反推——盘在哪格，那格就是在用的拼装位。
+是 Planner 的多拼装位候选生成 + 认领，不是一个 find 函数）。
 """
 from typing import Dict, Optional, Set, Tuple
 
 from ai.space import navigation
 from ai.query import predicates as P
-from ai.space.occupancy import _POS_ROUND
 
-# 这两类站点的四邻不可作落点：灶台会继续加热，出餐口会把东西当成上菜
-_HOT_STATION_TYPES = ("cooking", "plate_station")
+# 这类站点的四邻不可作落点：出餐口会把东西当成上菜。灶台不在内——只有放
+# 到灶台上才会继续加热，灶旁台面可以放（见模块说明）。
+_FORBIDDEN_NEIGHBOR_TYPES = ("plate_station",)
 
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
@@ -53,15 +58,83 @@ def _station_cell(world, st):
     return _grid_of(st)
 
 
+# ---------- 拼装位身份（主网格台面 = 坐标；移动网格台面 = (grid, 站名)） ----------
+
+
+def _moving_grid_ids(world):
+    # type: (object) -> Set[str]
+    raw = getattr(world, "raw", None) or {}
+    return {str(g.get("id")) for g in (raw.get("grids") or ())
+            if isinstance(g, dict) and g.get("moving") is True and g.get("id")}
+
+
+def counter_key(world, st):
+    # type: (object, Dict) -> Optional[object]
+    """台面站点的拼装位资源 id。
+
+    主网格台面沿用「坐标即身份」(gx, gz)（spec §4.4）。移动网格（气球篮、
+    木筏）上的台面用 (grid, 站名)，同灶/板：主网格投影随篮子漂，task 存下
+    的格子过几秒就指向空地（trace-20261030-224658 t=2991→3127：拼装格
+    (6,0) 上的台面 (13) 被篮子带到 (6,-2)，P2 站在空地上反复放盘失败）。
+    """
+    grid = st.get("grid")
+    if grid and st.get("n") and str(grid) in _moving_grid_ids(world):
+        return (str(grid), str(st["n"]))
+    return _station_cell(world, st)
+
+
+def is_station_key(key):
+    # type: (object) -> bool
+    """(grid, 站名) 形式的拼装位 id（区别于 (gx, gz) 整数坐标）。"""
+    return (isinstance(key, tuple) and len(key) == 2
+            and isinstance(key[0], str))
+
+
+def counter_key_at(world, cell):
+    # type: (object, Optional[Tuple[int, int]]) -> Optional[object]
+    """当前帧投影到 cell 的台面的拼装位 id；没有台面就原样返回 cell。"""
+    if cell is None:
+        return None
+    for st in world.stations:
+        if st.get("t") != "counter":
+            continue
+        sc = _station_cell(world, st)
+        if sc is not None and tuple(sc) == tuple(cell):
+            return counter_key(world, st)
+    return tuple(cell)
+
+
+def station_by_key(world, key):
+    # type: (object, object) -> Optional[Dict]
+    """按 (grid, 站名) 取站点；取不到返回 None。"""
+    grid, name = key
+    for st in world.stations:
+        if str(st.get("n") or "") == name and str(st.get("grid") or "") == grid:
+            return st
+    return None
+
+
+def counter_cell_now(world, key):
+    # type: (object, object) -> Optional[Tuple[int, int]]
+    """拼装位此刻在主网格上的格：移动台面每帧按站点 x/z 重投影。"""
+    if key is None:
+        return None
+    if is_station_key(key):
+        st = station_by_key(world, key)
+        return _station_cell(world, st) if st is not None else None
+    return tuple(key)
+
+
 def forbidden_adjacent_cells(stations):
     # type: (Optional[list]) -> Set[Tuple[int, int]]
-    """灶台 / 出餐口四邻的禁区格。
+    """出餐口四邻的禁区格。
 
-    只收这两类：普通台面若也算禁区，整张图就落不下任何东西了。
+    普通台面、灶台都不算：普通台面若也算禁区，整张图就落不下任何东西了；
+    灶旁台面不会加热，放在灶台**上**才会，而落点候选不含灶台。
     """
     bad = set()  # type: Set[Tuple[int, int]]
     for st in stations or ():
-        if not isinstance(st, dict) or st.get("t") not in _HOT_STATION_TYPES:
+        if not isinstance(st, dict) or st.get("t") not in _FORBIDDEN_NEIGHBOR_TYPES:
             continue
         cell = _grid_of(st)
         if cell is None:
@@ -70,63 +143,6 @@ def forbidden_adjacent_cells(stations):
             bad.add((cell[0] + dx, cell[1] + dz))
     return bad
 
-
-def _plate_cells(world):
-    # type: (object) -> Set[Tuple[float, float]]
-    """盘所在位置（世界坐标，量化后）。盘在哪就是在用的拼装位。"""
-    out = set()  # type: Set[Tuple[float, float]]
-    for p in getattr(world, "plates", None) or ():
-        if not isinstance(p, dict):
-            continue
-        x, z = p.get("x"), p.get("z")
-        if x is None or z is None:
-            continue
-        out.add((round(x, _POS_ROUND), round(z, _POS_ROUND)))
-    return out
-
-
-def _plate_grid_cells(world):
-    # type: (object) -> Set[Tuple[int, int]]
-    """盘所在的网格格。走 `World.to_grid`，**不手算**。
-
-    ⚠️ 旧实现是 `int(round(plate_x / 1.2))`，漏了 mapping 偏移：本关的映射
-    是 `(round(x/1.2) - 12, round(z/1.2) + 5)`，于是真实格 `(-1, 0)` 被算成
-    `(11, -5)`——而全关 71 个站点的 gx 只到 7，禁的全是地图外的格子。结果
-    这条"不贴拼装台"的规则**一直是空转**，真正拦住"往盘上放"的只剩
-    `_occupied_station_cells`（那条按世界坐标比，是对的），而它只保护盘自己
-    那一格、四邻没人管——实机地板兜底落点算出来是 `(0, 0)`，正好落在两列
-    盘子正中间。
-    """
-    to_grid = getattr(world, "to_grid", None)
-    out = set()  # type: Set[Tuple[int, int]]
-    if to_grid is None:
-        return out
-    for p in getattr(world, "plates", None) or ():
-        if not isinstance(p, dict):
-            continue
-        x, z = p.get("x"), p.get("z")
-        if x is None or z is None:
-            continue
-        cell = to_grid(x, z)
-        if cell is None:
-            continue
-        out.add((int(round(cell[0])), int(round(cell[1]))))
-    return out
-
-
-def _assembly_forbidden(world):
-    # type: (object) -> Set[Tuple[int, int]]
-    """已就位的盘所在格 + 其四邻（会挡盘）。"""
-    bad = set()  # type: Set[Tuple[int, int]]
-    plate_grid_cells = _plate_grid_cells(world)
-    if not plate_grid_cells:
-        return bad
-
-    for cell in plate_grid_cells:
-        bad.add(cell)
-        for dx, dz in _NEIGHBORS:
-            bad.add((cell[0] + dx, cell[1] + dz))
-    return bad
 
 
 def _occupied_station_cells(world):
@@ -171,7 +187,6 @@ def find_drop_station(world, field, extra_forbidden=None):
     """
     forbidden = set(extra_forbidden or ())
     forbidden |= forbidden_adjacent_cells(getattr(world, "stations", None))
-    forbidden |= _assembly_forbidden(world)
     occupied = _occupied_station_cells(world)
     belt_cells = getattr(world, "belt_cells", None) or set()
 
@@ -200,9 +215,8 @@ def find_empty_cooker(world, field):
     表示有锅（predicates.cooker_has_pot）。状态读不到的灶台一律跳过——
     宁可不用也不能把"读不到"当成"是空的"。
 
-    与 find_drop_station 的差别：这里**不禁"贴灶台"**。那套禁区是给"东西
-    放哪儿"用的（贴灶台会继续加热），而这里目标本来就是灶台、落点就在灶
-    台格上。
+    与 find_drop_station 的差别：这里目标本来就是灶台、落点就在灶台格上；
+    find_drop_station 只取 counter，熟料锅不会被放回灶台接着烧。
     """
     belt_cells = getattr(world, "belt_cells", None) or set()
     cookers = getattr(world, "cookers", None) or []
@@ -236,7 +250,7 @@ def find_drop_cell(world, field, extra_forbidden=None):
     """
     forbidden = set(extra_forbidden or ())
     forbidden |= forbidden_adjacent_cells(getattr(world, "stations", None))
-    forbidden |= _assembly_forbidden(world)
+    forbidden |= _occupied_station_cells(world)   # 盘/锅/料自己那一格
     belt_dir = getattr(world, "belt_dir", None) or {}
     belt_cells = getattr(world, "belt_cells", None) or set()
 
@@ -255,6 +269,43 @@ def occupied_cells(world):
     return _occupied_station_cells(world)
 
 
+def counter_occupied(world, key, ignore_plate=None):
+    # type: (object, object, object) -> bool
+    """拼装位上已经有别的东西（盘/锅/料/板），往上摆空盘不成立。
+
+    摆盘到放着锅的台面上，游戏会把这次放置变成「锅里的料倒进/倒出盘」：
+    实机 Balloon_2_3（trace-20261031-002224 t=2752~2837）P2 端着装了虾的盘
+    对着放熟虾锅的台面摆盘，虾从盘倒回锅、再被 TakeCookedToPlate 盛回盘，
+    0.4 s 一轮来回 6 次。`ignore_plate` 是本 task 自己要摆的盘（已摆好时
+    它自己就占着那一格，不能算别人）。手持物不占格——
+    World.plates/items 本就只含非手持。items 里的盘与 plates 重复，跳过以
+    免按名字认不出 `ignore_plate`。
+    """
+    cell = counter_cell_now(world, key)
+    to_grid = getattr(world, "to_grid", None)
+    if cell is None or to_grid is None:
+        return False
+    cell = (int(cell[0]), int(cell[1]))
+    for arr, skip in ((getattr(world, "plates", None), "plate"),
+                      (getattr(world, "items", None), "item"),
+                      (getattr(world, "workstations", None), None)):
+        for it in arr or ():
+            if not isinstance(it, dict) or it.get("held_by"):
+                continue
+            if skip == "plate" and ignore_plate is not None \
+                    and str(it.get("n")) == str(ignore_plate):
+                continue
+            if skip == "item" and P.PLATE_KEYWORD in str(it.get("n") or "").lower():
+                continue
+            x, z = it.get("x"), it.get("z")
+            if x is None or z is None:
+                continue
+            c = to_grid(x, z)
+            if c is not None and (int(round(c[0])), int(round(c[1]))) == cell:
+                return True
+    return False
+
+
 def find_drop_at(world, field, target_cell):
     # type: (object, Dict, Optional[Tuple[int, int]]) -> Optional[Dict]
     """指定 counter 格可放置则返回合成站点 dict，否则 None。
@@ -268,7 +319,6 @@ def find_drop_at(world, field, target_cell):
         return None
     cell = (int(target_cell[0]), int(target_cell[1]))
     forbidden = forbidden_adjacent_cells(getattr(world, "stations", None))
-    forbidden |= _assembly_forbidden(world)
     if cell in forbidden or cell in _occupied_station_cells(world):
         return None
     belt_cells = getattr(world, "belt_cells", None) or set()

@@ -612,3 +612,62 @@ def test_async_resource_suppressed_when_order_has_no_plate():
     # 盘↔订单匹配里没有 order1（没盘）→ 不给 async
     _, terms2 = planner._score_candidate(world, bb, cand, plate_match={})
     assert terms2["async_resource"] == 0.0
+
+
+# ---------------------------------------------------------------- 异步资源：进灶才给
+
+
+def _cook_chain_world():
+    """一张 PanFriedFish+BoiledPasta 单（鱼要切再下平底锅），一张寿司鱼单（切完直接装盘）。"""
+    world = _make_test_world(orders=[
+        {"id": "1", "dish": "FishPasta", "remaining": 120,
+         "composition": ["BoiledPasta", "PanFriedFish"]},
+        {"id": "2", "dish": "Sushi_PlainFish", "remaining": 120,
+         "composition": ["SushiFish"]},
+    ])
+    world.recipes = [
+        {"name": "BoiledPasta", "comp": ["Pasta"], "cook": "Pot"},
+        {"name": "PanFriedFish", "comp": ["UncookedFish"], "cook": "FryingPan"},
+        {"name": "UncookedFish", "comp": [], "cook": "null",
+         "chop": "ChoppedFish", "chop_stages": "8"},
+        {"name": "SushiFish", "comp": [], "cook": "null",
+         "chop": "ChoppedSushiFish", "chop_stages": "8"},
+    ]
+    return world
+
+
+def _async_term(world, task):
+    from ai.query.recipes import RecipeBook
+    bb = Blackboard()
+    bb.commitment = Commitment()
+    book = RecipeBook(world.recipes, world.stations)
+    cand = planner.Candidate(task=task, preconditions=[], estimated_steps=10)
+    _, terms = planner._score_candidate(world, bb, cand, book)
+    return terms["async_resource"]
+
+
+def test_async_resource_given_to_board_fetch_that_feeds_cooker():
+    """取鱼上砧板：鱼切完要下平底锅，整条链进灶 → 与下锅同吃异步加分。
+
+    旧判据按类型名只认 FetchToCooker/Chop，意面（取料即下锅）第一步吃 +2、
+    肉/鱼/虾第一步 FetchToBoard 吃不到，一直被意面压着（trace-20261029-213506）。
+    """
+    world = _cook_chain_world()
+    assert _async_term(world, T.FetchToBoard("1", ("board",), "UncookedFish")) > 0
+    assert _async_term(world, T.Chop("1", ("board",), "UncookedFish")) > 0
+    assert _async_term(world, T.FetchToCooker("1", ("cooker",), "BoiledPasta")) > 0
+
+
+def test_async_resource_not_given_to_chop_that_skips_cooker():
+    """寿司鱼切完直接装盘、不进灶：切配本身不是异步的（有人切才推进），不给。"""
+    world = _cook_chain_world()
+    assert _async_term(world, T.FetchToBoard("2", ("board",), "SushiFish")) == 0.0
+    assert _async_term(world, T.Chop("2", ("board",), "SushiFish")) == 0.0
+
+
+def test_feeds_cooker_without_book_keeps_legacy_types():
+    """无配方书的调用方保持旧语义：FetchToCooker / Chop 是，FetchToBoard 不是。"""
+    world = _cook_chain_world()
+    assert planner._feeds_cooker(T.FetchToCooker("1", ("c",), "BoiledPasta"), world)
+    assert planner._feeds_cooker(T.Chop("1", ("b",), "UncookedFish"), world)
+    assert not planner._feeds_cooker(T.FetchToBoard("1", ("b",), "UncookedFish"), world)

@@ -248,9 +248,10 @@ def test_match_cookers_includes_loose_cooked_pot():
 
 
 def test_match_plates_ignores_drying_rack_and_held_plates():
-    """沥碗架里的空盘、P1 手里端着的空盘仍不参与盘↔订单匹配。
+    """旧帧（无 stack 字段）沥碗架里的空盘、P1 手里端着的空盘不参与盘↔订单匹配。
 
-    两者都不能往上倒料（实机：P2 往沥碗架的盘倒料）；空盘该走 PlaceCleanPlate。
+    旧帧分不出盘堆顶层，直接匹配会误绑中间层；空盘该走 PlaceCleanPlate。
+    新帧的堆顶盘见 test_match_plates_binds_clean_stack_top。
     地上的**带料**盘现在会参与匹配，见 test_match_plates_includes_ground_plate_with_contents。
     """
     w = _loose_cooked_world()
@@ -286,6 +287,96 @@ def test_match_plates_includes_p2_held_plate():
     bb = Blackboard()
     got = planner._match_plates_to_orders(w, bb, book)
     assert got == {"plate_01": "order1"}, got
+
+
+def _stack_world(plates, counter_plate=False):
+    # 取盘站在 (5,1)，拼装台在 (1,1)；counter_plate=True 时台面上再摆一块空盘
+    ps = list(plates)
+    if counter_plate:
+        ps.append({"n": "plate_counter", "x": 1.0, "z": 1.0,
+                   "count": 0, "contents": [], "held_by": None,
+                   "stack": None, "stack_clean": False, "stack_top": False})
+    return World({
+        "orders": [{"id": "order1", "composition": ["BoiledSushiRice"],
+                    "remaining": 30},
+                   {"id": "order2", "composition": ["BoiledSushiRice"],
+                    "remaining": 60}],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2},
+                     {"t": "plate_return", "n": "DryingPart", "gx": 5, "gz": 1,
+                      "x": 5.0, "z": 1.0}],
+        "recipes": [{"name": "BoiledSushiRice", "comp": ["SushiRice"],
+                     "cook": "Pot"}],
+        "chefs": [{"name": "Player 2", "x": 3.0, "z": 3.0, "held": None}],
+        "plates": ps,
+        "workstations": [], "cookers": [], "items": [], "extinguishers": [],
+        "grid": {"nodeMap": None},
+    })
+
+
+def _stacked(pid, top, clean=True, count=0):
+    return {"n": pid, "x": 5.0, "z": 1.0, "count": count,
+            "contents": ["Seaweed"] * count, "held_by": None,
+            "stack": "CleanPlateStack", "stack_clean": clean, "stack_top": top}
+
+
+def test_match_plates_binds_clean_stack_top():
+    """新帧：干净盘堆的顶层盘直接参与匹配，中间层不参与。"""
+    w = _stack_world([_stacked("plate_top", True), _stacked("plate_mid", False),
+                      _stacked("plate_bot", False)])
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"plate_top": "order1"}, got
+
+
+def test_match_plates_ignores_dirty_stack_top():
+    w = _stack_world([_stacked("plate_dirty", True, clean=False)])
+    book = RecipeBook(w.recipes, w.stations)
+    assert planner._match_plates_to_orders(w, Blackboard(), book) == {}
+
+
+def test_match_plates_prefers_counter_plate_over_empty_stack_top():
+    """台面空盘与堆顶空盘同等缺料时，台面盘先配给队首单。"""
+    w = _stack_world([_stacked("plate_top", True)], counter_plate=True)
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"plate_counter": "order1", "plate_top": "order2"}, got
+
+
+def test_match_plates_ignores_buried_stack_plate_with_contents():
+    """堆里中间层的盘即使报了内容也不当散落盘匹配（只有顶层能交互）。"""
+    w = _stack_world([_stacked("plate_top", True),
+                      _stacked("plate_mid", False, count=1)])
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert "plate_mid" not in got, got
+
+
+def test_stack_top_order_skips_place_clean_plate_and_takes_cooked():
+    """单配到堆顶盘 → 不再发 PlaceCleanPlate，直接发端堆顶盘去盛锅。"""
+    w = _stack_world([_stacked("plate_top", True), _stacked("plate_mid", False)])
+    w.orders = w.orders[:1]
+    w.cookers = [{"n": "cooker_01", "x": 3.0, "z": 1.0,
+                  "isCooking": True, "cooked": False,
+                  "pot_contents": ["ing:SushiRice"]}]
+    book = RecipeBook(w.recipes, w.stations)
+    bb = Blackboard()
+    pm = planner._match_plates_to_orders(w, bb, book)
+    cm = planner._match_cookers_to_orders(w, bb, book, pm)
+    cands = recipe_graph.emit(w, bb, book, w.orders[0], pm, cm)
+    types = [c.TYPE for c in cands]
+    assert "PlaceCleanPlate" not in types, types
+    take = [c for c in cands if c.TYPE == "TakeCookedToPlate"]
+    assert take and take[0].plate_id == "plate_top", cands
+
+
+def test_emit_plate_skips_buried_stack_plates():
+    """没盘的单摆盘时，只能绑盘堆顶层，不能绑中间层（pickup 只拿顶层）。"""
+    w = _stack_world([_stacked("plate_top", True), _stacked("plate_mid", False)])
+    bb = Blackboard()
+    cands = recipe_graph._emit_plate(w, bb, "order2")
+    pids = {c.plate_id for c in cands}
+    assert pids == {"plate_top"}, cands
 
 
 def test_match_plates_includes_ground_plate_with_contents():
@@ -422,6 +513,74 @@ def test_match_plates_prefers_head_order_over_complete_tail():
     bb = Blackboard()
     got = planner._match_plates_to_orders(w, bb, book)
     assert got == {"plate_lettuce": "order1"}, got
+
+
+def _pasta_world(cookers):
+    """一块空盘在拼装格上；队首 order1=MeatOnly，order2=Marinara。"""
+    return World({
+        "orders": [
+            {"id": "order1", "dish": "Pasta_MeatOnly_New",
+             "composition": ["BoiledPasta", "FriedBurritoMeat"],
+             "remaining": 60},
+            {"id": "order2", "dish": "Pasta_Marinara_New",
+             "composition": ["BoiledPasta", "PanFriedPrawns", "PanFriedFish"],
+             "remaining": 90},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [
+            {"name": "BoiledPasta", "comp": ["Pasta"], "cook": "Pot"},
+            {"name": "FriedBurritoMeat", "comp": ["BurritoMeat"],
+             "cook": "FryingPan"},
+            {"name": "PanFriedPrawns", "comp": ["Prawn"], "cook": "FryingPan"},
+            {"name": "PanFriedFish", "comp": ["UncookedFish"],
+             "cook": "FryingPan"},
+        ],
+        "chefs": [{"name": "Player 2", "x": 4.0, "z": 4.0, "held": None}],
+        "plates": [{"n": "plate_01", "name": "equipment_plate_01",
+                    "x": 1.0, "z": 1.0, "count": 0, "contents": [],
+                    "detail": []}],
+        "workstations": [], "cookers": cookers, "items": [],
+        "extinguishers": [], "grid": {"nodeMap": None},
+    })
+
+
+def _cooked_pan(name, raw, x=3.0):
+    # 同坐标的灶会被 dedupe_cookers 合并，多口锅要给不同 x
+    return {"n": name, "x": x, "z": 1.0, "cook_type": "FryingPan",
+            "isCooking": False, "cooked": True, "burning": False,
+            "cooking_progress": 13.0, "cooking_time": 12.0,
+            "pot_contents": ["CookedCompositeAssembledNode(FryingPan){ ing:%s }"
+                             % raw]}
+
+
+def test_match_plates_cooked_order_takes_plate_head_cannot_use():
+    """队首这拍用不上盘（肉没在煮）、非队首的熟鱼等着装盘 → 盘让给非队首。
+
+    实机 2-2（trace-20261030-224658 t=660 等）：缺料数键让 MeatOnly 永远赢
+    共用意面的盘，Marinara 的熟鱼没盘只能 RescueCooked。
+    """
+    w = _pasta_world([_cooked_pan("pan_fish", "UncookedFish")])
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"plate_01": "order2"}, got
+
+
+def test_match_plates_head_keeps_plate_when_it_can_use_it():
+    """队首也有熟料等装盘时，照旧队首优先（combo）。"""
+    w = _pasta_world([_cooked_pan("pan_fish", "UncookedFish"),
+                      _cooked_pan("pan_meat", "BurritoMeat", x=5.0)])
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"plate_01": "order1"}, got
+
+
+def test_match_plates_head_keeps_plate_when_nobody_can_use_it():
+    """都没有熟料可装 → 退回原序，队首拿盘。"""
+    w = _pasta_world([])
+    book = RecipeBook(w.recipes, w.stations)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"plate_01": "order1"}, got
 
 
 def test_order_needs_cooked_false_with_loose_cooked_pot():

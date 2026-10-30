@@ -94,8 +94,7 @@ def cooked_supply(world, book, item):
 
     # ③ 台面/地上的散熟锅
     for it in (getattr(world, "items", None) or ()):
-        if not P.held_is_cookware({"held": it.get("n")},
-                                  getattr(world, "recipes", None)):
+        if not P.item_is_cookware(it, getattr(world, "recipes", None)):
             continue
         detail = it.get("detail") or []
         toks = parse_plate_detail(detail)
@@ -159,8 +158,7 @@ def recoverable_cookers(world, book):
     for it in (getattr(world, "items", None) or ()):
         if not isinstance(it, dict):
             continue
-        if not P.held_is_cookware({"held": it.get("n")},
-                                  getattr(world, "recipes", None)):
+        if not P.item_is_cookware(it, getattr(world, "recipes", None)):
             continue
         if P.item_on_cooker(it):
             continue

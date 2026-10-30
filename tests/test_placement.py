@@ -1,7 +1,8 @@
 """落点约束单测（spec §6.1 / §7.4）。
 
-旧 _find_drop_cell 的筛选逻辑是功能性的不是优化：贴灶台会继续加热、
-贴出餐口会被误上菜、贴拼装台会挡盘。这些断言就是那三条。
+旧 _find_drop_cell 的筛选逻辑是功能性的不是优化：贴出餐口会被误上菜、
+贴拼装台会挡盘。「贴灶台」已去掉：只有放到灶台上才会继续加热，灶旁台面
+可以放（trace-20261030-214824 t=1164 救锅）。
 """
 import pytest
 from ai.query import placement
@@ -30,13 +31,32 @@ class FakeWorld(object):
         return (gx * 1.2, gz * 1.2)
 
 
-def test_forbidden_includes_cooker_neighbors():
-    """贴灶台的格不可落 —— 锅放那儿会继续加热。"""
+def test_cooker_neighbors_not_forbidden():
+    """灶旁的格可以落 —— 只有放到灶台上才会继续加热。"""
     sts = [{"t": "cooking", "n": "cooker1", "gx": 5, "gz": 0}]
-    bad = placement.forbidden_adjacent_cells(sts)
-    assert (4, 0) in bad and (6, 0) in bad
-    assert (5, 1) in bad and (5, -1) in bad
-    assert (3, 0) not in bad
+    assert placement.forbidden_adjacent_cells(sts) == set()
+
+
+def test_find_drop_station_allows_counter_next_to_cooker():
+    """救锅：灶旁空台面最近就放灶旁，不舍近求远（trace-20261030-214824 t=1164）。"""
+    sts = [
+        {"t": "cooking", "n": "ck", "gx": 2, "gz": 0, "x": 2.4, "z": 0.0},
+        {"t": "counter", "n": "beside_cooker", "gx": 1, "gz": 0,
+         "x": 1.2, "z": 0.0},
+        {"t": "counter", "n": "far", "gx": 6, "gz": 0, "x": 7.2, "z": 0.0},
+    ]
+    w = FakeWorld(stations=sts, walkable=lambda gx, gz: gz == 0 and gx != 2)
+    field = distance_field((0, 0), w.walkable, {})
+    got = placement.find_drop_station(w, field)
+    assert got is not None and got["n"] == "beside_cooker"
+
+
+def test_find_drop_station_never_picks_cooker():
+    """落点候选只取 counter：熟料锅不会被放回灶台接着烧。"""
+    sts = [{"t": "cooking", "n": "ck", "gx": 1, "gz": 0, "x": 1.2, "z": 0.0}]
+    w = FakeWorld(stations=sts, walkable=lambda gx, gz: gz == 0)
+    field = distance_field((0, 0), w.walkable, {})
+    assert placement.find_drop_station(w, field) is None
 
 
 def test_forbidden_includes_plate_station_neighbors():
@@ -86,12 +106,8 @@ def test_find_drop_station_skips_occupied_counter():
     assert got is not None and got["n"] == "free"
 
 
-def test_find_drop_station_skips_assembly_counter():
-    """盘所在的那格就是在用的拼装位 → 它的四邻也是禁区（会挡盘）。
-
-    PLATE_COUNTERS 硬编码表归 Plan 3 删/替（spec §9），所以这里只能从
-    已就位的盘反推拼装位。
-    """
+def test_find_drop_station_allows_counter_next_to_plate():
+    """盘旁的空台面可以放 —— 放旁边不挡往盘里装菜（trace-20261030-214824 t=1164）。"""
     sts = [
         {"t": "counter", "n": "beside_plate", "gx": 1, "gz": 0,
          "x": 1.2, "z": 0.0},
@@ -103,7 +119,15 @@ def test_find_drop_station_skips_assembly_counter():
                   walkable=lambda gx, gz: gz == 0)
     field = distance_field((0, 0), w.walkable, {})
     got = placement.find_drop_station(w, field)
-    assert got is not None and got["n"] == "clear"
+    assert got is not None and got["n"] == "beside_plate"
+
+
+def test_find_drop_cell_skips_occupied_cell():
+    """地板兜底不落在盘/锅自己那一格上。"""
+    w = FakeWorld(plates=[{"n": "p1", "x": 0.0, "z": 0.0, "count": 1}],
+                  walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 2)
+    field = distance_field((0, 0), w.walkable, {})
+    assert placement.find_drop_cell(w, field) != (0, 0)
 
 
 def test_find_drop_station_unreachable_is_none():
@@ -203,17 +227,17 @@ def test_find_drop_cell_avoids_belt():
 
 
 def test_find_drop_cell_avoids_forbidden_adjacency():
-    sts = [{"t": "cooking", "n": "cooker", "gx": 2, "gz": 0}]
+    sts = [{"t": "plate_station", "n": "window", "gx": 2, "gz": 0}]
     w = FakeWorld(stations=sts,
                   walkable=lambda gx, gz: gz == 0 and 0 <= gx <= 4)
     field = distance_field((0, 0), w.walkable, {})
     cell = placement.find_drop_cell(w, field)
-    assert cell not in ((1, 0), (3, 0)), "不该落在贴灶台的格上"
+    assert cell not in ((1, 0), (3, 0)), "不该落在贴出餐口的格上"
 
 
 def test_find_drop_cell_none_when_nothing_legal():
     """全图都是禁区 → None。调用方据此转 FAILURE，不是无限找。"""
-    sts = [{"t": "cooking", "n": "c", "gx": 1, "gz": 0}]
+    sts = [{"t": "plate_station", "n": "w", "gx": 1, "gz": 0}]
     w = FakeWorld(stations=sts, walkable=lambda gx, gz: (gx, gz) in
                   ((0, 0), (2, 0)))
     field = distance_field((0, 0), w.walkable, {})

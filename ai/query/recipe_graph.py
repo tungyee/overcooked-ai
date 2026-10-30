@@ -24,15 +24,22 @@ _MAX_ASSEMBLY_CELLS = 6
 
 def _counter_cells(world):
     # type: (Any) -> List[Tuple[int, int]]
+    """台面格，**主网格坐标**（x/z 投影，同 placement._station_cell）。
+
+    篮子上的台面 gx/gz 是篮子本地坐标：直接拿来当格，「离 P2 最近」排序全错，
+    选出的 6 个拼装格全在 P2 够不着的地方，摆盘候选 48 个全判 unreachable，
+    熟锅没盘可装（Balloon_2_3，trace-20261029-130632 t=1300/1700）。
+    """
+    from ai.query.placement import _station_cell
     cells = []  # type: List[Tuple[int, int]]
     seen = set()
     for st in world.stations:
         if st.get("t") != "counter":
             continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is None or gz is None:
+        cell = _station_cell(world, st)
+        if cell is None:
             continue
-        cell = (gx, gz)
+        cell = (int(cell[0]), int(cell[1]))
         if cell in seen:
             continue
         seen.add(cell)
@@ -40,17 +47,37 @@ def _counter_cells(world):
     return cells
 
 
-def _assembly_cells(world, counters):
-    # type: (Any, List[Tuple[int, int]]) -> List[Tuple[int, int]]
+def _assembly_cells(world, counters, bb=None):
+    # type: (Any, List[Tuple[int, int]], Any) -> List[Tuple[int, int]]
+    """拼装格候选：P2 够得着的台面优先，再按离 P2 近排。
+
+    只按直线距离排会选中隔着篮子缝、够不着的台面；够得着的不够数时才补上
+    够不着的（无拓扑的合成帧 field 为 None，全部当够得着）。
+    """
     if len(counters) <= _MAX_ASSEMBLY_CELLS:
         return counters
     p2 = P.chef_by_name(world.chefs, P.P2_NAME)
     if not p2 or p2.get("x") is None or p2.get("z") is None:
         return counters[:_MAX_ASSEMBLY_CELLS]
     pc = world.to_grid(p2["x"], p2["z"])
-    return sorted(
-        counters, key=lambda c: (c[0] - pc[0]) ** 2 + (c[1] - pc[1]) ** 2
-    )[:_MAX_ASSEMBLY_CELLS]
+    from ai.space import reachability
+    field = reachability.field_for(world, bb, P.P2_NAME)
+
+    def cost(c):
+        if field is None:
+            return 0
+        best = None
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = field.get((c[0] + dx, c[1] + dz))
+            if v is not None and (best is None or v < best):
+                best = v
+        return best
+
+    def key(c):
+        v = cost(c)
+        return (v is None, v if v is not None else 0,
+                (c[0] - pc[0]) ** 2 + (c[1] - pc[1]) ** 2)
+    return sorted(counters, key=key)[:_MAX_ASSEMBLY_CELLS]
 
 
 def _plate_cell(world, plate):
@@ -200,23 +227,86 @@ def _raw_on_board(world, raw):
     return False
 
 
-def _chopped_available(world, book, raw):
-    # type: (Any, RecipeBook, str) -> bool
-    """切好形态是否可用（板上 / 手上 / 散落）。不含盘（盘里记的是生料名）。"""
+def chopped_count(world, book, raw):
+    # type: (Any, RecipeBook, str) -> int
+    """切好形态有几份可用（板上 / 手上 / 散落）。不含盘（盘里记的是生料名）。"""
     form = book.chop_target(raw)
     if not form:
-        return False
+        return 0
     low = str(form).lower()
+    n = 0
     for _name, item in _board_items(world).items():
         if str(item or "").lower() == low:
-            return True
+            n += 1
     for c in world.chefs:
         if str(P.held_name(c)).lower() == low:
-            return True
+            n += 1
     for it in world.items:
         if str(it.get("n") or "").lower() == low:
-            return True
-    return False
+            n += 1
+    return n
+
+
+def _chopped_available(world, book, raw):
+    # type: (Any, RecipeBook, str) -> bool
+    return chopped_count(world, book, raw) > 0
+
+
+def _order_uses_raw(book, order, raw):
+    # type: (RecipeBook, Dict, str) -> List[str]
+    """order 里要用到「切好的 raw」的成分（熟料或直接装盘的切料）。"""
+    low = str(raw).lower()
+    out = []  # type: List[str]
+    for prod in book.requirements(order):
+        if book.needs_cooking(prod):
+            if any(str(r).lower() == low for r in book.raws_of(prod)):
+                out.append(prod)
+        elif str(prod).lower() == low and book.needs_chopping(prod):
+            out.append(prod)
+    return out
+
+
+def chop_waiters(world, book, raw, plate_match, cooker_match):
+    # type: (Any, RecipeBook, str, Dict[Any, Any], Dict[Any, Any]) -> List[Any]
+    """还在等「切好的 raw」的订单 id（按屏幕顺序）。
+
+    已越过切这一步的单不算：熟料单已有灶在产（cooker_match），直接装盘的切料
+    已在该单的盘里。
+    """
+    cooking = set((cooker_match or {}).values())
+    out = []  # type: List[Any]
+    for order in world.orders:
+        oid = order.get("id")
+        prods = _order_uses_raw(book, order, raw)
+        if not prods:
+            continue
+        pid = _order_plate_id(plate_match or {}, oid)
+        plate = _plate_by_n(world, pid) if pid is not None else None
+        for prod in prods:
+            if book.needs_cooking(prod):
+                if oid in cooking:
+                    continue
+            elif plate is not None and book.plate_has(plate, prod):
+                continue
+            out.append(oid)
+    return out
+
+
+def _chop_done_for_order(world, book, raw, ctx):
+    # type: (Any, RecipeBook, str, Dict) -> bool
+    """这一单的「切 raw」是否已有着落：切好的份数 ≥ 排在它前面（含它）的等料单数。
+
+    旧口径是「场上有一份切好的就算全部单都切完」：两单都要薯条、只有一份
+    切好的土豆时，第二单不再发 FetchToBoard/Chop，P2 手里接住的土豆没人
+    认领，原地拿着站了 7.5 秒（trace-20261029-125348 t=434~584）。
+    """
+    waiters = chop_waiters(world, book, raw, ctx.get("plate_match"),
+                           ctx.get("cooker_match"))
+    oid = ctx.get("order_id")
+    if oid not in waiters:
+        return True
+    rank = waiters.index(oid) + 1
+    return chopped_count(world, book, raw) >= rank
 
 
 def _node_done(node, ctx):
@@ -302,6 +392,24 @@ def _takeable_cooked_source(world, book, cid):
     for src in cooked_sources(world, book):
         if src["kind"] == "loose" and src["id"] == cid:
             return True
+    return False
+
+
+def _source_has(world, book, cid, item):
+    # type: (Any, RecipeBook, Any, str) -> bool
+    """熟料源 cid（灶或散锅）装的是不是 item 这样熟料（rich token 比对）。"""
+    token = book.rich_token(item)
+    if not token:
+        return True                       # 认不出 token 的配方不拦（旧口径）
+    c = _cooker_by_id(world, cid)
+    if c is not None:
+        from ai.tasks.base import _cooker_cooked_tokens
+        toks = _cooker_cooked_tokens(c, book)
+        # 灶没报 pot_contents（旧帧/合成帧）= 内容未知，不拦；知道且不含才拦。
+        return not toks or token in toks
+    for src in cooked_sources(world, book):
+        if src["kind"] == "loose" and src["id"] == cid:
+            return token in src["tokens"]
     return False
 
 
@@ -420,6 +528,11 @@ def _inst_take_cooked(node, ctx):
             continue
         if not _takeable_cooked_source(ctx["world"], ctx["book"], cid):
             continue
+        # cooker_match 是「源 → 单」，一单可能配到多口锅（意面锅、鱼锅各一）：
+        # 必须是装着这一样熟料的那口，否则会去鱼锅里「取意面」
+        # （trace-20261029-130632 回放：TakeCookedToPlate(BoiledPasta, 鱼锅)）。
+        if not _source_has(ctx["world"], ctx["book"], cid, item):
+            continue
         if _claimed(cid, "take_cooked", ctx["bb"]):
             continue
         tasks.append(T.TakeCookedToPlate(ctx["order_id"], (cid, plate_id), item))
@@ -497,20 +610,50 @@ def _walk(node, ctx, out):
             _walk(c, ctx, out)
     else:
         out.extend(_instantiate(node, ctx))
+    # 切好的料「有」但「不够」：上游照常放行（下锅/装盘用现成那份），同时给
+    # 这一单补发切菜链。只按存在性判，两单要薯条、只有一份切好的土豆时，
+    # 第二单不发 FetchToBoard/Chop，P2 接住的土豆没人认领、拿着干站 7.5 秒
+    # （trace-20261029-125348 t=434~584）。不能改成按份数挡住上游：唯一的板
+    # 被那份切好的料占着时，第二单就一个候选都没有了。
+    for c in node.get("children", []):
+        if c["type"] == "Chop" and c not in deps_not_done \
+                and not _chop_done_for_order(ctx["world"], ctx["book"], c["item"], ctx):
+            _walk_chop(c, ctx, out)
+
+
+def _walk_chop(node, ctx, out):
+    # type: (Dict, Dict, List[Any]) -> None
+    """按「这一单的切菜还没着落」展开 Chop 节点：板上有生料就切，否则取料上板。"""
+    deps_not_done = [c for c in node.get("children", [])
+                     if not _node_done(c, ctx)]
+    if deps_not_done:
+        for c in deps_not_done:
+            _walk(c, ctx, out)
+    else:
+        out.extend(_instantiate(node, ctx))
 
 
 def _emit_plate(world, bb, order_id):
     # type: (Any, Any, Any) -> List[Any]
     """订单没盘 → 拿干净盘摆上（第 1 号 PlaceCleanPlate）。"""
+    from ai.query.placement import counter_key_at, counter_occupied
     counters = _counter_cells(world)
     placed_ids = set(p.get("n") for p in _placed_plates(world, counters))
     tasks = []  # type: List[Any]
-    for cell in _assembly_cells(world, counters):
+    for cell in _assembly_cells(world, counters, bb):
+        # 排序/可达按当前投影格；task 身份用拼装位 id（篮子台面是站名）
+        cell = counter_key_at(world, cell)
         if _claimed(cell, "assemble", bb):
+            continue
+        # 台面上已有锅/料/盘：摆不上去（对锅摆盘会变成倒料，见 counter_occupied）
+        if counter_occupied(world, cell):
             continue
         for p in world.plates:
             pid = p.get("n")
             if not pid or P.plate_count(p) != 0 or pid in placed_ids:
+                continue
+            # 盘堆中间层拿不到：pickup 只会拿起顶层，绑定的盘 id 永远不上台面
+            if P.plate_buried_in_stack(p):
                 continue
             if _claimed(pid, "place", bb):
                 continue
@@ -543,6 +686,7 @@ def emit(world, bb, book, order, plate_match, cooker_match):
             "world": world, "bb": bb, "book": book, "order": order,
             "order_id": order_id, "plate_id": plate_id,
             "cooker_match": cooker_match, "used_cookers": {},
+            "plate_match": plate_match,
         }
         _walk(root, ctx, out)
     return out

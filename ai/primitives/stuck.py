@@ -45,12 +45,16 @@ def _resolve_value(v, ctx):
 def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
     # type: (Any, Any, int, Dict, Any, Any) -> None
     """按位置 / 资源避让已证实的无进展；订单切换不能重置同一处故障。"""
-    if failure.get("reason") not in ("no_progress", "observation_timeout") or bb.mode != "Normal":
+    if failure.get("reason") not in ("no_progress", "observation_timeout", "gate_closed") \
+            or bb.mode != "Normal":
         return
     scratch = _ensure_stuck_scratch({"bb": bb})
     cell = failure.get("blocked_cell")
     if cell is not None:
         scratch.bad_cells[tuple(cell)] = tick + BAD_CELL_TTL_TICKS
+    # 门洞没开：门会再开，资源本身没问题——只绕开门洞格，不拉黑资源。
+    if failure.get("reason") == "gate_closed":
+        return
     # 风区里被吹得动不了：不是 AI 的错，只写 bad_cells 让寻路绕开这一格，
     # **不拉黑资源**——否则一阵风就把端料/盛饭的整个资源判死刑（实机：
     # 端番茄时被风推、位置无法移动，observation_timeout 把料箱拉黑 10 秒）。

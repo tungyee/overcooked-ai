@@ -55,7 +55,7 @@ PRESSURE_RESCUE = 1.0
 # **不是** planner._COMBO_PREP_TYPES——后者还含 PlaceCleanPlate（分层后在 L4）。
 LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                     "FetchToCooker", "FillCooker", "Mix", "PlaceToRelay",
-                    "TakeCookedToPlate")
+                    "TakeCookedToPlate", "ThrowBatch")
 
 
 def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):
@@ -198,6 +198,8 @@ TERM_WHITELIST = {
         # 59% 的拍三口灶一个都没在煮、三单全过期）。只给 FillCooker 算，
         # 按单发射的 FetchToCooker 走 async_resource，不重复给。
         "cooker_idle",
+        # ThrowBatch 的批量加分：W_BATCH × (N−1)，见 planner._score_throw_batch。
+        "batch_bonus",
     ]),
     # L7 清理：就近。pref 让「去洗碗」这类账本约定在清理层也生效。
     L_CLEANUP: frozenset(["eta", "hands", "pref"]),

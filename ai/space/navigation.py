@@ -56,10 +56,33 @@ def cross_grid_bridges(primary_to_world, other_cells_world, max_gap=0.5):
     return bridges
 
 
+class Field(dict):
+    """距离场 {格子: 代价}，额外带等门信息（平台接缝门洞，ai/space/seams.py）。
+
+    waits: {格子: 一路上等门的步数}（没等过门的格不在里面）。
+    wait_cost: 建场用的等门代价函数；trace_back 必须用同一个才对得上账。
+    普通 dict 用法不受影响。
+    """
+
+    def __init__(self, *args, **kwargs):
+        dict.__init__(self, *args, **kwargs)
+        self.waits = {}        # type: Dict[Tuple[int, int], int]
+        self.wait_cost = None  # type: Optional[Callable]
+        # 经跳边（seams.nav_jumps：门洞格 ↔ 开门时对面那格现在的位置）到达的格 → 前驱
+        self.via = {}          # type: Dict[Tuple[int, int], Tuple[int, int]]
+
+
 def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
-                   soft_cost=None, bridges=None, edge_blocked=None):
-    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]]) -> Dict[Tuple[int, int], int]
+                   soft_cost=None, bridges=None, edge_blocked=None, wait_cost=None,
+                   jumps=None):
+    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]], Optional[Callable]) -> Dict[Tuple[int, int], int]
     """从 start 做 Dijkstra，返回 {格子: 最小代价}。
+
+    wait_cost(cost, cur, nxt) -> Optional[int]：走进 nxt 前要等几步（门洞没开
+    时到缝口等），None = 这一步走不了。cost 是到 cur 的代价（按它推算到达时刻）。
+    只要「早到不会晚走」（等门时刻表满足 FIFO），Dijkstra 照样最短。
+    jumps：{格: [格]} 额外的非相邻边（同样收 1 步 + 等门代价），到达方式记在
+    返回 Field 的 via 里，trace_back 据此回溯。
 
     start 本身总在结果里（代价 0），即使它被判为不可走——厨师可能正站在
     被站点占用兜底误判的格子上，直接返回空会让所有 ETA 失效。
@@ -78,7 +101,11 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
     blocked = set(blocked or ())
     soft_cost = soft_cost or {}
     bridges = bridges or {}
-    dist = {start: 0}
+    dist = Field({start: 0})
+    dist.wait_cost = wait_cost
+    waits = dist.waits
+    via = dist.via
+    jumps = jumps or {}
     pq = [(0, start)]
     while pq:
         if len(dist) > max_cells:
@@ -86,24 +113,41 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
         cost, cur = heapq.heappop(pq)
         if cost > dist.get(cur, 1 << 60):
             continue
-        for dx, dz in _NEIGHBORS:
-            nxt = (cur[0] + dx, cur[1] + dz)
+        steps = [((cur[0] + dx, cur[1] + dz), False) for dx, dz in _NEIGHBORS]
+        steps.extend((j, True) for j in jumps.get(cur, ()))
+        for nxt, jumped in steps:
             if nxt in blocked:
                 continue
             if not is_walkable(nxt[0], nxt[1]):
                 continue
-            if edge_blocked is not None and edge_blocked(cur, nxt):
+            if not jumped and edge_blocked is not None and edge_blocked(cur, nxt):
                 continue
-            # 基础代价 + P1 软代价
-            ncost = cost + step_cost(belt_dir, cur, nxt) + soft_cost.get(nxt, 0)
+            wait = 0
+            if wait_cost is not None:
+                wait = wait_cost(cost, cur, nxt)
+                if wait is None:
+                    continue
+            # 基础代价 + P1 软代价 + 等门
+            ncost = cost + (1 if jumped else step_cost(belt_dir, cur, nxt)) + soft_cost.get(nxt, 0) + wait
             if ncost < dist.get(nxt, 1 << 60):
                 dist[nxt] = ncost
+                if jumped:
+                    via[nxt] = cur
+                else:
+                    via.pop(nxt, None)
+                w_total = waits.get(cur, 0) + wait
+                if w_total:
+                    waits[nxt] = w_total
+                else:
+                    waits.pop(nxt, None)
                 heapq.heappush(pq, (ncost, nxt))
         bridge_target = bridges.get(cur)
         if bridge_target is not None and bridge_target not in blocked:
             ncost = cost + 1
             if ncost < dist.get(bridge_target, 1 << 60):
                 dist[bridge_target] = ncost
+                if waits.get(cur):
+                    waits[bridge_target] = waits[cur]
                 heapq.heappush(pq, (ncost, bridge_target))
     return dist
 
@@ -231,8 +275,8 @@ def nearest_cost(field, cells):
     return best
 
 
-def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
-    # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[Tuple[int, int]]
+def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None, wait_cost=None):
+    # type: (Dict, Tuple[int, int], Dict, Optional[Dict], Optional[Callable], Optional[Callable]) -> Optional[Tuple[int, int]]
     """cur 在距离场里的合法前驱。
 
     判据是**代价账对得上**：field[n] + step_cost(n → cur) == field[cur]，
@@ -257,19 +301,27 @@ def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
         if edge_blocked is not None and edge_blocked(n, cur):
             continue
         # 软代价按进入的格子收费，必须与 distance_field 的账一致。
-        if c + step_cost(belt_dir, n, cur) + extra == want:
+        wait = 0
+        if wait_cost is not None:
+            wait = wait_cost(c, n, cur)
+            if wait is None:
+                continue
+        if c + step_cost(belt_dir, n, cur) + extra + wait == want:
             return n
     return None
 
 
-def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
-    # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[List[Tuple[int, int]]]
+def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None, wait_cost=None):
+    # type: (Dict, Tuple[int, int], Dict, Optional[Dict], Optional[Callable], Optional[Callable]) -> Optional[List[Tuple[int, int]]]
     """从距离场回溯 start → goal 的格子序列（含两端）。
 
     goal 不在 field 里（不可达）返回 None。start 自身返回 [start]。
+    wait_cost 缺省取建场时挂在 Field 上的那个（等门代价要与建场同一套账）。
     """
     if goal not in field:
         return None
+    if wait_cost is None:
+        wait_cost = getattr(field, "wait_cost", None)
     path = [goal]
     cur = goal
     # 上限 len(field)：每格最多进路径一次，断链/环都在这里止住而不是死循环
@@ -277,7 +329,9 @@ def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
         if field[cur] == 0:
             path.reverse()
             return path
-        prev = _predecessor(field, cur, belt_dir, soft_cost, edge_blocked)
+        prev = getattr(field, "via", {}).get(cur)
+        if prev is None:
+            prev = _predecessor(field, cur, belt_dir, soft_cost, edge_blocked, wait_cost)
         if prev is None:
             return None          # 距离场被破坏，交还调用方（原语会转 FAILURE）
         path.append(prev)

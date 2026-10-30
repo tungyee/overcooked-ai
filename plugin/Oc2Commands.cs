@@ -324,17 +324,39 @@ namespace Oc2AI
         }
     }
 
-    /// <summary>throw：面朝目标 → 单击 WorkstationInteract（切/洗/喷/投掷同键，靠上下文区分）。</summary>
+    /// <summary>throw：原地转向目标（朝向闭环）→ 单击 WorkstationInteract → 确认离手。
+    ///
+    /// 照参考项目 cortico-world Actor.ThrowAt：小推杆转身、dot(forward, 目标方向)
+    /// &gt; 0.97（≈14°）才按，按后 0.6s 内手空才算成功。旧版固定推 0.6 摇杆 0.35s
+    /// 不看朝向，既会挪位置（出手点偏离 Python 算好的站位），也会投歪。
+    /// 投掷射程固定（实测 ≈7.5m），落点只由出手点 + 朝向决定，所以朝向必须闭环。</summary>
     public sealed class ThrowCommand : IExecCommand
     {
-        private const float FACE_TIME = 0.35f;
+        private const float FACE_TIMEOUT = 0.6f;
+        private const float FACE_DOT = 0.97f;
+        private const float FACE_STICK = 0.25f;   // 小推杆：只转身不怎么走
         private const float TAP_HOLD = 0.1f;
+        private const float VERIFY_TIME = 0.6f;
 
+        // 精准投锅（可选字段，缺省 = 旧行为）：
+        //   aim_dot          朝向与目标方向的点积门槛（0.996 ≈ 5°）。锅的接料触发器
+        //                    约一格宽，4~5m 外 14°（0.97）的偏差横向就差 1m 多，
+        //                    实测 13° 落在锅旁地上、4° 进锅（trace-20261029-213506 t=558）。
+        //   strict           转向超时仍没对准就失败，不硬投（投偏了料落地还得再捡）。
+        //   face_timeout_ms  转向时限；精准投锅需要更久。
+        // 对准判定要连续 AIM_SETTLE_FRAMES 帧都满足，防止转身甩过头那一帧误判。
+        private const int AIM_SETTLE_FRAMES = 2;
+
+        private enum Phase { Face, Press, Verify }
+        private Phase _phase = Phase.Face;
         private readonly Vector2 _targetWorld;
         private readonly bool _hasTargetWorld;
+        private readonly float _aimDot = FACE_DOT;
+        private readonly bool _strict;
+        private readonly float _faceTimeout = FACE_TIMEOUT;
+        private int _alignedFrames;
         private bool _started;
-        private float _startTime;
-        private bool _tapped;
+        private float _phaseStart;
 
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
@@ -349,30 +371,66 @@ namespace Oc2AI
                 _targetWorld = new Vector2((float)(double)tw[0], (float)(double)tw[1]);
                 _hasTargetWorld = true;
             }
+            double? ad = Req.Num(cmd, "aim_dot");
+            if (ad.HasValue && ad.Value > 0.0 && ad.Value < 1.0) _aimDot = (float)ad.Value;
+            _strict = Req.Bool(cmd, "strict");
+            double? ft = Req.Num(cmd, "face_timeout_ms");
+            if (ft.HasValue && ft.Value > 0.0) _faceTimeout = (float)(ft.Value / 1000.0);
         }
 
         public void Tick(ChefFrame f, float now)
         {
             if (Done) return;
-            if (!_started) { _started = true; _startTime = now; }
+            if (!_started) { _started = true; _phaseStart = now; }
             if (!f.Valid) { Finish(false, "no chef"); return; }
 
-            if (!_tapped)
+            switch (_phase)
             {
-                if (_hasTargetWorld && now - _startTime < FACE_TIME)
-                {
-                    // 面朝目标：短暂朝目标方向推（投掷方向 = 朝向）。
-                    Vector2 pos = new Vector2(f.PosX, f.PosZ);
-                    Vector2 dir = (_targetWorld - pos).normalized;
-                    PadEngagement.Pad.Move(f.Chef, dir.x * 0.6f, dir.y * 0.6f);
-                    return;
-                }
-                PadEngagement.Pad.Stop();
-                PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
-                _tapped = true;
-                _startTime = now;   // 复用计时：给单击时长
+                case Phase.Face:
+                    if (_hasTargetWorld)
+                    {
+                        Vector2 pos = new Vector2(f.PosX, f.PosZ);
+                        Vector2 dir = (_targetWorld - pos).normalized;
+                        Vector3 fw = f.Chef.transform.forward;
+                        Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+                        bool aligned = Vector2.Dot(fwd, dir) > _aimDot;
+                        _alignedFrames = aligned ? _alignedFrames + 1 : 0;
+                        bool settled = _alignedFrames >= (_strict ? AIM_SETTLE_FRAMES : 1);
+                        if (!settled)
+                        {
+                            if (now - _phaseStart < _faceTimeout)
+                            {
+                                if (aligned) PadEngagement.Pad.Stop();   // 已对准、等稳一帧，别再推
+                                else PadEngagement.Pad.Move(f.Chef, dir.x * FACE_STICK, dir.y * FACE_STICK);
+                                return;
+                            }
+                            if (_strict) { Finish(false, "aim timeout"); return; }
+                        }
+                    }
+                    // 对准了，或非 strict 下转向超时（照样投，落点偏差由 Python 落地后重算接管）
+                    PadEngagement.Pad.Stop();
+                    f.RefreshInteraction();
+                    if (f.HeldName == null) { Finish(false, "hands empty"); return; }
+                    _phase = Phase.Press;
+                    _phaseStart = now;
+                    break;
+
+                case Phase.Press:
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+                    if (now - _phaseStart >= TAP_HOLD)
+                    {
+                        PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, false);
+                        _phase = Phase.Verify;
+                        _phaseStart = now;
+                    }
+                    break;
+
+                case Phase.Verify:
+                    f.RefreshInteraction();
+                    if (f.HeldName == null) { Finish(true, null); return; }
+                    if (now - _phaseStart > VERIFY_TIME) { Finish(false, "still held"); return; }
+                    break;
             }
-            if (now - _startTime >= TAP_HOLD) { Finish(true, null); return; }
         }
 
         private void Finish(bool ok, string why)

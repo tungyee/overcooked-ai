@@ -3,9 +3,9 @@
 Approach：走到能跟 target 交互的位置。
 Face：转向 target（委托后端下为 no-op，转向已并入 move/tap 的重瞄）。
 """
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from ai.space import navigation
+from ai.space import navigation, seams
 from ai.space import occupancy as O
 from ai.query import predicates as P
 from ai.query import placement
@@ -36,7 +36,9 @@ def _station_interact_cells(st, cell, w, kind, include_belts=False):
     if st.get("t") == "washing" and kind == "placement":
         cells = sink_place_cells(st, w.stations, w.to_grid)
     else:
-        cells = {cell}
+        # 与规划层 reachability.can_interact 同一口径（见 interaction_footprint）。
+        cells = O.interaction_footprint(st, cell, getattr(w, "stations", ()),
+                                        w.to_grid, w.to_world, w.walkable)
     return navigation.interact_cells_multi(
         cells, w.walkable, w.belt_cells, include_belts=include_belts)
 
@@ -77,6 +79,9 @@ class Approach(Primitive):
                                                getattr(w, 'mapping', None)) or footprint
         elif st.get('t') == 'washing' and self.kind == 'placement':
             footprint = sink_place_cells(st, w.stations, w.to_grid)
+        else:
+            footprint = O.interaction_footprint(st, cell, getattr(w, 'stations', ()),
+                                                w.to_grid, w.to_world, w.walkable)
         goals = navigation.interact_cells_multi(footprint, w.walkable,
                                                 w.belt_cells, include_belts=True)
         return cur not in goals
@@ -136,22 +141,113 @@ class Approach(Primitive):
         if got is None:
             return Status.FAILURE
         goal = got[0]
-        path = navigation.trace_back(field, goal, w.belt_dir, ctx.get("soft_cost"))
+        path = navigation.trace_back(field, goal, w.belt_dir, ctx.get("soft_cost"),
+                                     seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             return Status.FAILURE
 
         if self._pending_cmd is None:
+            points, gates = seams.path_points(w, path, field, ctx.get("bb"))
             cmd = build_command(
                 "move",
                 goal=list(w.to_world(*goal)),
-                path=[list(w.to_world(*c)) for c in path],
+                path=points,
                 target=handle_desc(st, target_grid_callbacks(w, st)[0]),
                 kind=self.kind,
                 dash=False,
-                timeout_ms=MOVE_TIMEOUT_MS,
+                # 路上要在门洞口等门时放宽超时（插件按 gates[].max_wait 等）
+                timeout_ms=MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)),
             )
+            if gates:
+                cmd["gates"] = gates
             return self._begin_exec(ctx, ex, cmd)
         return self._poll_exec(ctx, ex)
+
+
+# GoToCell 的单段 move 超时（毫秒）：比 Approach 短。漂流平台上格心会被带走，
+# 一段追不上就换新格重发，不在一条过期的 move 上耗满 8 秒。
+GOTO_MOVE_TIMEOUT_MS = 2500
+# move 失败后重算目标格重试的次数。
+GOTO_RETRIES = 3
+
+
+class GoToCell(Primitive):
+    """走到指定的格（不是「目标旁的交互位」）：投掷出手位用。
+
+    cell_fn(ctx) -> (gx, gz)。每段 move 发出时定格，段内不追新格（每拍换格
+    move 命令永远在被替换）；段失败（超时/stuck）就按当前帧**重算**目标格再
+    发，最多 GOTO_RETRIES 次。
+
+    arrived(ctx) -> bool：可选的提前到达判据，每拍先看。投掷传它「此刻位置
+    投得出去」：站在漂流木筏上，固定格心被木筏带走、追不上，但只要人当下的
+    位置能投就该投（trace-20261029-122831 t=351~798 拿着料干耗 12s）。
+    """
+
+    def __init__(self, cell_fn, arrived=None):
+        # type: (Any, Any) -> None
+        Primitive.__init__(self)
+        self.cell_fn = cell_fn
+        self.arrived = arrived
+        self._goal = None   # type: Optional[Tuple[int, int]]
+        self._fails = 0
+
+    def reset(self):
+        # type: () -> None
+        Primitive.reset(self)
+        self._goal = None
+        self._fails = 0
+
+    def _done(self):
+        # type: () -> str
+        self.reset()
+        return Status.SUCCESS
+
+    def tick(self, ctx):
+        # type: (Dict) -> str
+        self._enter(ctx)
+        w, chef = ctx["w"], ctx["chef"]
+        cur = P.chef_cell(chef, w.to_grid)
+        if cur is None:
+            return Status.FAILURE
+        if self.arrived is not None and self.arrived(ctx):
+            self._exec_halt()
+            return self._done()
+        if self._pending_cmd is not None:
+            s = self._poll_exec(ctx, ctx["exec"])
+            if s == Status.RUNNING:
+                return s
+            if s == Status.SUCCESS:
+                return self._done()
+            self._goal = None
+            self._fails += 1
+            if self._fails > GOTO_RETRIES:
+                self.reset()
+                return Status.FAILURE
+            return Status.RUNNING     # 下一拍按新帧重算目标格
+        goal = self._goal or self.cell_fn(ctx)
+        if goal is None:
+            return Status.FAILURE
+        if cur == tuple(goal):
+            return self._done()
+        field = ctx["field"] or {}
+        path = navigation.trace_back(field, tuple(goal), w.belt_dir,
+                                     ctx.get("soft_cost"), seams.nav_predicates(w, ctx.get("bb"))[1])
+        if not path:
+            return Status.FAILURE
+        self._goal = tuple(goal)
+        points, gates = seams.path_points(w, path, field, ctx.get("bb"))
+        cmd = build_command(
+            "move",
+            goal=list(w.to_world(*self._goal)),
+            path=points,
+            target=None,
+            kind=None,
+            dash=False,
+            timeout_ms=GOTO_MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)),
+        )
+        if gates:
+            cmd["gates"] = gates
+        return self._begin_exec(ctx, ctx["exec"], cmd)
 
 
 class Face(Primitive):

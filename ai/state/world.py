@@ -228,6 +228,8 @@ class World(object):
         # 可走性改用层号地形 + 运行时占用（spec §5.3），取代
         # playable_bounds + floor 扩 bounds + nodeMap。
         self.terrain = occupancy.parse_terrain(state.get("terrain"))
+        # 插件 0.23.5+ 才带墙高；旧帧为空 dict（投掷不做墙高判定）
+        self.terrain_y = occupancy.parse_terrain_y(state.get("terrain"))
         level_bounds = occupancy.parse_level_bounds(state.get("level_bounds"))
         self.hazards = occupancy.parse_hazards(state.get("hazards"))
         self.wind_zones = occupancy.parse_wind_zones(state.get("wind_zones"))

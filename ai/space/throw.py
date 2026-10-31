@@ -9,9 +9,16 @@
 ServerAttachStation.HandleCatch：站点接住飞来的料）。这里不建弹道，只把
 名义落点沿出手方向往回收，取第一个「落在目标区域」的点，近似「撞墙掉在
 墙前 / 被台面接住」。
+
+飞行路径上的高墙（terrain Walls 层的薄墙）单独判：料撞上就掉在墙前，不会
+飞到墙后。Balloon_2_2（trace-20261031-123418 t=4571/4671）：P2 在左地板
+(7.2,12) 朝右篮炸锅投蘑菇，直线在 x=13.21 处穿过右篮左墙
+[13.21,13.81]×[12.44,15.03]（门洞在 z 8.03~12.44），旧实现只看落点，判
+「落在炸锅旁」，实际两份都撞墙掉进缝里。TableBlock 层的矮栏料能飞过去
+（同一 trace 料飞越左地板 x≈8 的矮栏），不当挡板。
 """
 import math
-from typing import Callable, Dict, Iterable, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 # 射程（m）与容差：4 个实测样本 7.3~7.8m 的中位数，横偏实测 <0.2m 取 0.3 留余量。
 THROW_RANGE = 7.5
@@ -24,10 +31,141 @@ _RETRACT_STEP = 0.6
 # 落点离目标太远就不算「投到它那儿」（m）：超过约 2 格，接收方还得走一段，
 # 远距投掷的意义就没了。
 MAX_LAND_DIST = 2.6
+# 挡料的墙：terrain 层号（Walls 边墙）与厚度上限（m）。篮子/地板边墙厚 0.6；
+# 更厚的盒是底座之类（Balloon_2_2 发餐气球下 10.7×6m），不当墙。
+# TableBlock(26) 不算：Balloon_2_2 门洞里那条 [0.49,1.33] 的盒只挡人走，
+# 边框中间是空的，料能从门洞投过去。
+WALL_LAYERS = (10,)
+WALL_MAX_THICK = 1.0
+# 有墙时瞄准的精度：插件 throw 命令 aim_dot（0.996 ≈ 5.1°）+ strict（没对准
+# 不投）。默认 0.97（14°）6m 外横偏 1.5m，从门洞斜穿必擦框。
+WALL_AIM_DOT = 0.996
+AIM_TOL_DEG = math.degrees(math.acos(WALL_AIM_DOT))
+# 正对被挡时瞄准方向的偏转候选（度）与每度的代价（m 落点距离当量）。
+AIM_OFFSETS_DEG = (0,) + tuple(s * d for d in range(4, 64, 4) for s in (1, -1))
+AIM_OFFSET_COST = 0.01
+# 发给插件的瞄准点放多远（m，沿出手方向）。远点抗站位偏差：trace-20261031-
+# 150043 P2 实停位置离出手格心 0.3m，瞄 10m 处的点方向差 ≈1.7°，瞄 30m 处 <0.6°。
+AIM_FAR_DIST = 30.0
+# 飞行弧线高度（m，相对投掷者脚下）：平飞段 + 末段下落。
+#   h(d) = THROW_RELEASE_H                         d ≤ THROW_FLAT_D
+#   h(d) = THROW_RELEASE_H × (1 − ((d−D0)/(R−D0))²)  D0 < d ≤ R
+# 标定（插件 0.23.5 items[].y，trace-20261031-150043 两投，出手 (7.46,10.65)
+# / (7.47,10.8)）：d=3.8 y=0.99、5.6 0.93/0.99、6.5 0.67~0.75、7.0 0.43、
+# 7.5 ≈0（这几点是撞框后的下落，下落段偏保守）。
+# 推论：1.32m 的边墙在射程内任何距离都挡料（Balloon_2_2 只能从门洞穿）；
+# Rapids_2_1 木筏→厨房料在 ≈6m 处越过厨房边墙，那面墙应低于 h(6)≈0.9m
+# （墙高待 0.23.5 Rapids 帧确认）。
+THROW_RELEASE_H = 1.0
+THROW_FLAT_D = 5.4
+# 撞墙后料停在墙前多远（m）。
+WALL_STOP_MARGIN = 0.3
+# 墙盒外扩（m）：飞行料自身半径的近似。
+WALL_PAD = 0.15
 
 
 Vec = Tuple[float, float]
 Cell = Tuple[int, int]
+Box = Tuple[float, float, float, float]   # (minx, maxx, minz, maxz)
+
+
+def arc_height(d, rng=THROW_RANGE, release_h=THROW_RELEASE_H, flat_d=THROW_FLAT_D):
+    # type: (float, float, float, float) -> float
+    """出手后飞了 d 米时料离投掷者脚下的高度（平飞到 flat_d，再落到射程处着地）。"""
+    if d <= flat_d:
+        return release_h
+    if rng <= flat_d:
+        return 0.0
+    f = min(1.0, (d - flat_d) / (rng - flat_d))
+    return release_h * (1.0 - f * f)
+
+
+def throw_walls(terrain_y, floor_y=0.0):
+    # type: (Optional[Dict[int, List[Tuple[Box, float, float]]]], float) -> List[Tuple[float, ...]]
+    """可能挡住飞行料的薄墙：[(minx,maxx,minz,maxz,lo,hi)]，lo/hi 是墙的
+    下沿/上沿相对 floor_y（投掷者脚下）的高度。挡不挡看飞到墙那儿时的
+    arc_height 落不落在 [lo,hi] 里（wall_hit）。
+
+    terrain_y 是 occupancy.parse_terrain_y 的结果。旧插件帧没有高度 → 空
+    列表：分不出飞得过/飞不过时不拦，保持旧行为。
+    """
+    out = []  # type: List[Tuple[float, ...]]
+    for layer in WALL_LAYERS:
+        for b, miny, maxy in (terrain_y or {}).get(layer) or ():
+            if min(b[1] - b[0], b[3] - b[2]) > WALL_MAX_THICK:
+                continue
+            if maxy - floor_y <= 0:
+                continue      # 墙顶在脚下（篮子底座边缘之类）
+            out.append(tuple(b[:4]) + (miny - floor_y, maxy - floor_y))
+    return out
+
+
+def _seg_box_span(a, b, box):
+    # type: (Vec, Vec, Tuple[float, ...]) -> Optional[Tuple[float, float]]
+    """线段 a→b 穿过 box 平面范围的参数区间 [t0,t1]⊆[0,1]（slab 法）；不相交 None。"""
+    t0, t1 = 0.0, 1.0
+    for p, d, lo, hi in ((a[0], b[0] - a[0], box[0], box[1]),
+                         (a[1], b[1] - a[1], box[2], box[3])):
+        if abs(d) < 1e-9:
+            if p < lo or p > hi:
+                return None
+            continue
+        u, v = (lo - p) / d, (hi - p) / d
+        if u > v:
+            u, v = v, u
+        t0, t1 = max(t0, u), min(t1, v)
+        if t0 > t1:
+            return None
+    return t0, t1
+
+
+def wall_hit(start, ux, uz, length, walls, rng=THROW_RANGE):
+    # type: (Vec, float, float, float, Iterable[Tuple[float, ...]], float) -> Optional[float]
+    """从 start 沿单位方向 (ux,uz) 飞 length 米，第一次撞墙的距离；没撞返回 None。
+
+    墙是 (minx,maxx,minz,maxz) 或带高度的 (…, lo, hi)（throw_walls）。带高度
+    时，料穿过墙平面范围那段的弧线高度 [h(出), h(入)] 与 [lo,hi] 有交集才算
+    撞；不带高度一律算撞。出手点已在墙盒里（贴墙站、碰撞盒溢出）的墙跳过。
+    """
+    end = (start[0] + ux * length, start[1] + uz * length)
+    best = None  # type: Optional[float]
+    for box in walls:
+        if box[0] <= start[0] <= box[1] and box[2] <= start[1] <= box[3]:
+            continue
+        span = _seg_box_span(start, end, box)
+        if span is None:
+            continue
+        d0, d1 = span[0] * length, span[1] * length
+        if len(box) >= 6:
+            h_hi, h_lo = arc_height(d0, rng), arc_height(d1, rng)
+            if h_lo > box[5] or h_hi < box[4]:
+                continue      # 从墙上飞过 / 从墙下（悬空栏杆）穿过
+        if best is None or d0 < best:
+            best = d0
+    return best
+
+
+def _fan_hit(start, ux, uz, length, walls):
+    # type: (Vec, float, float, float, Iterable[Tuple[float, ...]]) -> Optional[float]
+    """中线与左右偏 AIM_TOL_DEG 两条线里最早撞墙的距离；墙盒平面四周外扩
+    WALL_PAD（料自身半径）。
+
+    角度偏差按插件精准对准门槛（WALL_AIM_DOT）算，离得越远横偏越大：从门洞
+    斜穿时 6m 外偏 ≈0.5m，贴着门框瞄会擦框。
+    """
+    walls = [(b[0] - WALL_PAD, b[1] + WALL_PAD, b[2] - WALL_PAD, b[3] + WALL_PAD)
+             + tuple(b[4:]) for b in walls]
+    if not walls:
+        return None
+    best = None  # type: Optional[float]
+    for deg in (0.0, AIM_TOL_DEG, -AIM_TOL_DEG):
+        a = math.radians(deg)
+        rx = ux * math.cos(a) - uz * math.sin(a)
+        rz = ux * math.sin(a) + uz * math.cos(a)
+        h = wall_hit(start, rx, rz, length, walls)
+        if h is not None and (best is None or h < best):
+            best = h
+    return best
 
 
 def landing(x, z, dx, dz, rng=THROW_RANGE):
@@ -52,19 +190,26 @@ def _safe(pt, dx, dz, ok):
     return True
 
 
-def effective_landing(start, target, ok, rng=THROW_RANGE):
-    # type: (Vec, Vec, Callable[[float, float], bool], float) -> Optional[Vec]
+def effective_landing(start, target, ok, rng=THROW_RANGE, walls=None):
+    # type: (Vec, Vec, Callable[[float, float], bool], float, Optional[Iterable[Box]]) -> Optional[Vec]
     """朝 target 投出后料实际停下的点；不安全返回 None。
 
     名义落点超过 target（射程 > 距离）时，沿出手方向往回收，取第一个安全点
     ——近似「越过目标撞到后面的墙/台面掉下来」。回收不越过 target 往出手点
     那侧：再近就等于没投过去。ok(x,z) 判一个点是否落在目标区域。
+
+    walls（throw_walls 的结果）非空时，飞行中线先撞上的墙截断射程：
+    料停在墙前 WALL_STOP_MARGIN，停点要是离 target 还差得远就投不过去。
     """
     dx, dz = target[0] - start[0], target[1] - start[1]
     dist = math.hypot(dx, dz)
     if dist < 1e-6:
         return None
     d = rng
+    if walls:
+        hit = _fan_hit(start, dx / dist, dz / dist, rng + THROW_RANGE_TOL, walls)
+        if hit is not None:
+            d = min(d, hit - WALL_STOP_MARGIN)
     floor = min(dist, rng) - THROW_RANGE_TOL
     while d >= floor:
         pt = landing(start[0], start[1], dx, dz, d)
@@ -74,14 +219,74 @@ def effective_landing(start, target, ok, rng=THROW_RANGE):
     return None
 
 
-def plan_launch(cells, cost, to_world, target, ok, max_land=MAX_LAND_DIST):
-    # type: (Iterable[Cell], Callable[[Cell], Optional[int]], Callable[[int, int], Vec], Vec, Callable[[float, float], bool], float) -> Optional[Dict]
+def best_aim(start, target, ok, max_land=MAX_LAND_DIST, walls=None):
+    # type: (Vec, Vec, Callable[[float, float], bool], float, Optional[Iterable[Box]]) -> Optional[Dict]
+    """站在 start 往哪儿瞄：{aim, landing, land_dist}；投不到 target 附近返回 None。
+
+    先试正对 target；正对被墙挡住（或落点不安全）且有墙时，绕出手点把瞄准
+    方向左右偏 AIM_OFFSETS_DEG 再试，取落点离 target 最近的——Balloon_2_2
+    左地板右边框、右篮左边框中间各有门洞（z 8.03~12.44），正对炸锅的直线
+    撞框，斜着从门洞穿过去能落在右篮里离炸锅 ≈4.5m 处（P1 去捡）。
+    aim 与 target 同距，effective_landing 的回收逻辑照旧。
+    """
+    dx, dz = target[0] - start[0], target[1] - start[1]
+    dist = math.hypot(dx, dz)
+    if dist < 1e-6:
+        return None
+    walls = list(walls or ())
+    offsets = AIM_OFFSETS_DEG if walls else (0,)
+    base = math.atan2(dz, dx)
+    best = None  # type: Optional[Tuple[float, Dict]]
+    for deg in offsets:
+        a = base + math.radians(deg)
+        got = aim_ok(start, (start[0] + math.cos(a), start[1] + math.sin(a)),
+                     target, ok, max_land, walls)
+        if got is None:
+            continue
+        score = got["land_dist"] + AIM_OFFSET_COST * abs(deg)
+        if best is None or score < best[0]:
+            best = (score, got)
+        if deg == 0:
+            break          # 正对就能投：不偏
+    return best[1] if best else None
+
+
+def aim_ok(start, toward, target, ok, max_land=MAX_LAND_DIST, walls=None):
+    # type: (Vec, Vec, Vec, Callable[[float, float], bool], float, Optional[Iterable[Box]]) -> Optional[Dict]
+    """站在 start、朝 toward 方向投，能不能落到 target 附近：
+    {aim, aim_far, landing, land_dist} 或 None。
+
+    aim 在出手方向上、与 target 同距（effective_landing 的回收按它算）；
+    aim_far 是同方向 AIM_FAR_DIST 外的点，发给插件当 target_world：插件按
+    实时位置朝它转身，站位差十几厘米方向几乎不变（瞄近点会跟着站位偏）。
+    """
+    dist = math.hypot(target[0] - start[0], target[1] - start[1])
+    ux, uz = toward[0] - start[0], toward[1] - start[1]
+    n = math.hypot(ux, uz)
+    if dist < 1e-6 or n < 1e-6:
+        return None
+    ux, uz = ux / n, uz / n
+    aim = (start[0] + ux * dist, start[1] + uz * dist)
+    pt = effective_landing(start, aim, ok, walls=list(walls or ()))
+    if pt is None:
+        return None
+    land = math.hypot(target[0] - pt[0], target[1] - pt[1])
+    if land > max_land:
+        return None
+    far = (start[0] + ux * AIM_FAR_DIST, start[1] + uz * AIM_FAR_DIST)
+    return dict(aim=aim, aim_far=far, landing=pt, land_dist=land)
+
+
+def plan_launch(cells, cost, to_world, target, ok, max_land=MAX_LAND_DIST, walls=None):
+    # type: (Iterable[Cell], Callable[[Cell], Optional[int]], Callable[[int, int], Vec], Vec, Callable[[float, float], bool], float, Optional[Iterable[Box]]) -> Optional[Dict]
     """在出手候选格里选一个：落点安全、离 target ≤ max_land，按「走过去的
     代价 + 落点离目标的距离」最小。
 
     cells: 投掷方可站的格（P2 可达场的键）；cost(cell) 是走到该格的代价（拍
-    数量级），None = 不可达。返回 {cell, world, landing, land_dist} 或 None。
+    数量级），None = 不可达。返回 {cell, world, aim, landing, land_dist} 或
+    None；aim 是瞄准点（无墙时 = target）。
     """
+    walls = list(walls or ())
     best = None  # type: Optional[Tuple[float, Dict]]
     for cell in cells:
         c = cost(cell)
@@ -95,16 +300,12 @@ def plan_launch(cells, cost, to_world, target, ok, max_land=MAX_LAND_DIST):
         # 太远：最远也落在 target 前 dist-R 处。
         if dist - THROW_RANGE > max_land:
             continue
-        pt = effective_landing((wx, wz), target, ok)
-        if pt is None:
+        got = best_aim((wx, wz), target, ok, max_land, walls)
+        if got is None:
             continue
-        land = math.hypot(target[0] - pt[0], target[1] - pt[1])
-        if land > max_land:
-            continue
-        score = c + land * 2.0
+        score = c + got["land_dist"] * 2.0
         if best is None or score < best[0]:
-            best = (score, dict(cell=cell, world=(wx, wz), landing=pt,
-                                land_dist=land))
+            best = (score, dict(got, cell=cell, world=(wx, wz)))
     return best[1] if best else None
 
 
@@ -145,17 +346,22 @@ def pot_line_clear(start, target, to_grid, passable):
     return True
 
 
-def pot_throw_ok(start, target, to_grid, passable):
-    # type: (Vec, Vec, Callable[[float, float], Cell], Callable[[Cell], bool]) -> bool
-    """站在 start 能不能把料投进 target 处的锅：距离在带内、路径无遮挡。"""
-    dist = math.hypot(target[0] - start[0], target[1] - start[1])
+def pot_throw_ok(start, target, to_grid, passable, walls=None):
+    # type: (Vec, Vec, Callable[[float, float], Cell], Callable[[Cell], bool], Optional[Iterable[Box]]) -> bool
+    """站在 start 能不能把料投进 target 处的锅：距离在带内、路径无遮挡
+    （格判 + 薄墙线段判：两格之间的墙不盖格中心，格判漏掉）。"""
+    dx, dz = target[0] - start[0], target[1] - start[1]
+    dist = math.hypot(dx, dz)
     if dist < POT_THROW_MIN or dist > POT_THROW_MAX:
+        return False
+    # 只查到锅格边（半格前）：锅背后贴着的墙不算挡
+    if walls and _fan_hit(start, dx / dist, dz / dist, dist - 0.6, walls) is not None:
         return False
     return pot_line_clear(start, target, to_grid, passable)
 
 
-def plan_pot_throw(cells, cost, to_world, to_grid, target, passable):
-    # type: (Iterable[Cell], Callable[[Cell], Optional[int]], Callable[[int, int], Vec], Callable[[float, float], Cell], Vec, Callable[[Cell], bool]) -> Optional[Dict]
+def plan_pot_throw(cells, cost, to_world, to_grid, target, passable, walls=None):
+    # type: (Iterable[Cell], Callable[[Cell], Optional[int]], Callable[[int, int], Vec], Callable[[float, float], Cell], Vec, Callable[[Cell], bool], Optional[Iterable[Box]]) -> Optional[Dict]
     """在可站格里选投锅出手位：能投进（pot_throw_ok），走过去代价最小。
 
     返回 {cell, world, cost, dist} 或 None。
@@ -166,7 +372,7 @@ def plan_pot_throw(cells, cost, to_world, to_grid, target, passable):
         if c is None:
             continue
         wx, wz = to_world(cell[0], cell[1])
-        if not pot_throw_ok((wx, wz), target, to_grid, passable):
+        if not pot_throw_ok((wx, wz), target, to_grid, passable, walls):
             continue
         if best is None or c < best["cost"]:
             best = dict(cell=cell, world=(wx, wz), cost=c,

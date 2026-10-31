@@ -364,4 +364,5 @@ def test_throw_round_waits_for_launch_before_moving():
     seq = _meat_throw().build().child
     waits = [ch for ch in seq.children if isinstance(ch, PR.WaitUntil)]
     assert waits and waits[0].timeout == relay.LAUNCH_WAIT_TICKS
-    assert seq.children.index(waits[0]) == len(seq.children) - 3
+    goto = next(ch for ch in seq.children if isinstance(ch, PR.GoToCell))
+    assert seq.children.index(waits[0]) == seq.children.index(goto) - 1

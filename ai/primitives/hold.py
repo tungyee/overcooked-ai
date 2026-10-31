@@ -146,3 +146,42 @@ class WaitUntil(Primitive):
             self.reset()
             return Status.FAILURE
         return Status.RUNNING
+
+
+class WaitNewFrame(Primitive):
+    """等插件推来下一帧快照才 SUCCESS（按 ctx["frame_seq"] 变化判）。
+
+    插件 5 Hz、Python 20 Hz：move 命令由插件逐帧闭环、到位即回 ok，那一拍
+    Python 手上的快照还是到位前的位置。紧接着按「此刻位置」算瞄准会用到旧
+    位置（trace-20261031-150043 t=153/257：旧位置判投不过去，退回瞄炸锅撞框）。
+    ctx 没有 frame_seq（离线 / 测试）时直接 SUCCESS。timeout 拍数兜底。
+    """
+
+    def __init__(self, timeout):
+        # type: (int) -> None
+        Primitive.__init__(self)
+        self.timeout = timeout
+        self._seq0 = None  # type: Any
+
+    def reset(self):
+        # type: () -> None
+        Primitive.reset(self)
+        self._seq0 = None
+
+    def tick(self, ctx):
+        # type: (Dict) -> str
+        self._enter(ctx)
+        seq = ctx.get("frame_seq")
+        if seq is None:
+            self.reset()
+            return Status.SUCCESS
+        if self._seq0 is None:
+            self._seq0 = seq
+            return Status.RUNNING
+        if seq != self._seq0:
+            self.reset()
+            return Status.SUCCESS
+        if self._ticks > self.timeout:
+            self.reset()
+            return Status.FAILURE
+        return Status.RUNNING

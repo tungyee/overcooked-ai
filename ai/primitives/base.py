@@ -228,6 +228,20 @@ def target_world(target):
     return [x, z]
 
 
+def _note_exec_failure(ctx, cmd, why, blocked_cell):
+    # type: (Dict, Optional[str], Optional[str], Any) -> None
+    """把失败命令的原因写进 ctx["exec_failure"]，trace 的 exec 记录带出。
+
+    插件回的 why（stuck / gate closed / timeout / no chef）原先只用来写
+    bad_cells，trace 里看不到：送餐 approach 连败 9 次却分不清是门洞判关、
+    卡墙还是追不上篮子（trace-20261031-004647 t=1964/2114/2152）。
+    客户端侧失败另记 not_connected / client_deadline。
+    """
+    ctx["exec_failure"] = {"cmd": cmd, "why": why,
+                           "blocked_cell": list(blocked_cell)
+                           if isinstance(blocked_cell, (list, tuple)) else None}
+
+
 class Primitive(Node):
     """原语基类：halt 松键、reset 清边沿状态、手部连续性不变式。
 
@@ -242,6 +256,7 @@ class Primitive(Node):
         self._held_seen = _UNSET   # type: Any
         self._exec = None        # type: Any   # 委托后端的 ExecClient（首拍从 ctx 记）
         self._pending_cmd = None # type: Optional[int]  # 在途命令 id
+        self._pending_name = None  # type: Optional[str]  # 在途命令名（move/tap…），失败记 trace 用
         self._exec_deadline = 0.0  # type: float  # 在途命令的客户端截止时间
 
     def tick(self, ctx):
@@ -265,9 +280,11 @@ class Primitive(Node):
         # type: (Dict, Any, Dict) -> str
         """发一条 exec 命令并进入轮询；未连接返回 FAILURE。"""
         self._exec = ex
+        self._pending_name = cmd_dict.get("cmd")
         self._pending_cmd = ex.issue(cmd_dict)
         if self._pending_cmd < 0:
             self._pending_cmd = None
+            _note_exec_failure(ctx, self._pending_name, "not_connected", None)
             return Status.FAILURE
         # 客户端截止 = 命令 timeout + 1s 裕度（插件结果丢失时兜底 FAILURE）。
         self._exec_deadline = self._now(ctx) + (cmd_dict.get("timeout_ms", 8000) / 1000.0) + 1.0
@@ -297,9 +314,15 @@ class Primitive(Node):
                             reason=reason, blocked_cell=cell)
                     except (TypeError, ValueError):
                         pass
+            if not r["ok"]:
+                _note_exec_failure(ctx, getattr(self, "_pending_name", None),
+                                   r.get("why"), r.get("blocked_cell"))
             return Status.SUCCESS if r["ok"] else Status.FAILURE
         if self._now(ctx) > self._exec_deadline:
             self._exec_halt()
+            # 插件结果没在截止前回来（区别于插件自己判的 "timeout"）
+            _note_exec_failure(ctx, getattr(self, "_pending_name", None),
+                               "client_deadline", None)
             return Status.FAILURE
         return Status.RUNNING
 

@@ -149,7 +149,8 @@ def execution_record(status, task, ctx, frame_seq=None, received_at=None):
         result["task"] = repr(task)
     if "motion" in ctx:
         result["motion"] = ctx["motion"]
-    for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment'):
+    for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment',
+                 'exec_failure', 'throw'):
         if name in ctx:
             result[name] = ctx[name]
     if frame_seq is not None and received_at is not None:

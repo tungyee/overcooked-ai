@@ -18,6 +18,7 @@ from ai.primitives.base import Primitive, resolve, target_world
 from ai.primitives.hold import WaitUntil
 from ai.primitives.move import GoToCell, _station_interact_cells
 from ai.primitives.tap import Confirm
+from ai.revenue import throw_supply as TS
 from ai.space import navigation
 from ai.space import throw as TH
 
@@ -29,14 +30,16 @@ class ThrowTo(Primitive):
     """= throw 命令（插件面朝 + 单击投掷）→ Confirm(手空)。"""
 
     def __init__(self, target, retries=5, aim_dot=None, strict=False,
-                 face_timeout_ms=None):
-        # type: (Any, int, Optional[float], bool, Optional[int]) -> None
+                 face_timeout_ms=None, precise=None):
+        # type: (Any, int, Optional[float], bool, Optional[int], Optional[Callable[[Dict], bool]]) -> None
         Primitive.__init__(self)
         self.target = target
         # 精准投掷（可选）：插件朝向门槛、没对准就不投、转向时限。缺省 = 旧行为。
         self.aim_dot = aim_dot
         self.strict = strict
         self.face_timeout_ms = face_timeout_ms
+        # precise(ctx) 为真时发命令那一拍临时切到精准投掷（墙边投，见 TH.WALL_AIM_DOT）
+        self.precise = precise
         self._confirm = Confirm(lambda c: P.hands_free(c["chef"]), retries)
         self._thrown = False   # throw 命令是否已发出并回 ok
 
@@ -66,18 +69,30 @@ class ThrowTo(Primitive):
         if not self._thrown:
             if self._pending_cmd is None:
                 st = resolve(self.target, ctx)
-                fields = dict(target_world=target_world(st),
-                              timeout_ms=THROW_TIMEOUT_MS)
-                if self.aim_dot is not None:
-                    fields["aim_dot"] = self.aim_dot
-                if self.strict:
+                tw = target_world(st)
+                if tw is None:
+                    # 没有朝向目标的 throw 会朝当前面向直接投——宁可不投
+                    return Status.FAILURE
+                fields = dict(target_world=tw, timeout_ms=THROW_TIMEOUT_MS)
+                aim_dot, strict, face_ms = self.aim_dot, self.strict, self.face_timeout_ms
+                if self.precise is not None and self.precise(ctx):
+                    aim_dot = max(aim_dot or 0.0, TH.WALL_AIM_DOT)
+                    strict = True
+                    face_ms = max(face_ms or 0, POT_FACE_TIMEOUT_MS)
+                if aim_dot is not None:
+                    fields["aim_dot"] = aim_dot
+                if strict:
                     fields["strict"] = True
-                if self.face_timeout_ms is not None:
-                    fields["face_timeout_ms"] = self.face_timeout_ms
+                if face_ms is not None:
+                    fields["face_timeout_ms"] = face_ms
                     # 转向时限变长，命令总超时跟着放宽（+ 按键 0.1s + 确认离手 0.6s + 余量）
-                    fields["timeout_ms"] = max(THROW_TIMEOUT_MS,
-                                               self.face_timeout_ms + 1400)
+                    fields["timeout_ms"] = max(THROW_TIMEOUT_MS, face_ms + 1400)
                 cmd = build_command("throw", **fields)
+                # trace 记下发出去的 throw（瞄哪儿、从哪儿、精度）：以前只能
+                # 从料的飞行轨迹倒推朝向（trace-20261031-150043）
+                chef = ctx.get("chef") or {}
+                ctx["throw"] = dict(fields, from_world=[chef.get("x"), chef.get("z")],
+                                    frame_seq=ctx.get("frame_seq"))
                 return self._begin_exec(ctx, ex, cmd)
             s = self._poll_exec(ctx, ex)
             if s == Status.RUNNING:
@@ -159,7 +174,7 @@ class ThrowIntoCooker(Node):
         if pot is None or chef.get("x") is None:
             return False
         return TH.pot_throw_ok((chef["x"], chef["z"]), pot, ctx["w"].to_grid,
-                               self._passable_fn(ctx))
+                               self._passable_fn(ctx), TS.walls_of(ctx["w"]))
 
     def plan(self, ctx):
         # type: (Dict) -> Optional[Dict]
@@ -179,7 +194,7 @@ class ThrowIntoCooker(Node):
             cur = P.chef_cell(ctx["chef"], w.to_grid)
             return dict(cell=cur, world=pot, cost=0, dist=0.0)
         best = TH.plan_pot_throw(field.keys(), field.get, w.to_world, w.to_grid,
-                                 pot, self._passable_fn(ctx))
+                                 pot, self._passable_fn(ctx), TS.walls_of(w))
         if best is None:
             return None
         st = self.cooker(ctx)

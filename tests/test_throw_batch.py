@@ -167,7 +167,10 @@ def test_throw_batch_tree_is_one_round_ending_with_throw():
     seq = tree.child
     assert isinstance(seq, Sequence)
     assert isinstance(seq.children[-1], PR.ThrowTo)
-    assert isinstance(seq.children[-2], PR.GoToCell)
+    # 走到出手位 → 等新帧 → 按真实位置定瞄准（定不下不投）→ 投
+    assert isinstance(seq.children[-4], PR.GoToCell)
+    assert isinstance(seq.children[-3], PR.WaitNewFrame)
+    assert isinstance(seq.children[-2], PR.WaitUntil)
     assert isinstance(seq.children[1], Selector)
     assert _throw_potato_to_fryer().TIMEOUT_TICKS == relay.THROW_ROUND_TICKS
 
@@ -381,3 +384,346 @@ def test_stash_held_agrees_potato_is_not_redundant(frame_second_chips):
     cm = planner._match_cookers_to_orders(w, bb, book, pm)
     assert _chopped_form_available(w, book, "Potato", pm, cm) is False
 
+
+
+# ---------------------------------------------------------------- 撞墙（trace-20261031-123418，Balloon_2_2）
+
+FIXTURE_WALL = os.path.join(os.path.dirname(__file__), "fixtures", "balloon",
+                            "balloon22-20261031-123418-throw-wall.ndjson.gz")
+# 右篮左墙：门洞在 z 8.03~12.44，往上这段墙挡住了投向炸锅的料。
+RIGHT_BASKET_WALL = (13.21, 13.81, 12.44, 15.03)
+
+
+@pytest.fixture(scope="module")
+def frames_wall():
+    with gzip.open(FIXTURE_WALL, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_wall_hit_segment_vs_box():
+    walls = [RIGHT_BASKET_WALL]
+    d = TH.wall_hit((7.2, 12.0), 1.0, 0.0, 7.5, [(13.21, 13.81, 11.0, 13.0)])
+    assert d == pytest.approx(6.01)
+    # 从门洞下方平飞过去：不撞
+    assert TH.wall_hit((7.2, 10.0), 1.0, 0.0, 7.5, walls) is None
+    # 出手点在墙盒里：跳过这面墙
+    assert TH.wall_hit((13.5, 13.0), 1.0, 0.0, 7.5, walls) is None
+
+
+def test_effective_landing_stops_before_wall():
+    """名义落点在墙后、目标区域也在墙后：撞墙掉在墙前，判不安全。"""
+    ok = lambda x, z: x > 13.81
+    assert TH.effective_landing((7.2, 12.0), (16.8, 15.6), ok) is not None
+    assert TH.effective_landing((7.2, 12.0), (16.8, 15.6), ok,
+                                walls=[RIGHT_BASKET_WALL]) is None
+
+
+def test_throw_walls_keeps_thin_walls_with_height():
+    thick = (13.18, 23.9, 0.03, 6.03)
+    sunk = (13.21, 23.92, 0.03, 6.03)
+    terrain_y = {10: [(RIGHT_BASKET_WALL, 0.0, 1.32), (thick, 0.0, 3.0), (sunk, -2.6, -0.5)],
+                 26: [((13.23, 13.63, 8.03, 12.44), 0.49, 1.33)]}
+    # TableBlock(26) 门洞盒不挡料（边框中间是空的）
+    assert TH.throw_walls(terrain_y) == [RIGHT_BASKET_WALL + (0.0, 1.32)]
+    # 高度相对投掷者脚下
+    lifted = TH.throw_walls({10: [(RIGHT_BASKET_WALL, 0.0, 1.32)]}, floor_y=0.5)
+    assert lifted == [pytest.approx(RIGHT_BASKET_WALL + (-0.5, 0.82))]
+    # 旧插件帧没有高度：不拦
+    assert TH.throw_walls({}) == []
+
+
+def test_wall_hit_uses_arc_height():
+    """弧线：平飞 ≈1m 到 5.4m 再落地（trace-20261031-150043 items[].y 标定）。
+    1.32m 的边墙任何距离都挡；矮墙只在末段料落低了才挡。"""
+    assert TH.arc_height(3.8) == pytest.approx(1.0)
+    assert 0.6 < TH.arc_height(6.5) < 0.8
+    tall_near = (7.86, 8.26, 8.0, 14.0, 0.0, 1.32)
+    tall_far = (13.21, 13.81, 8.0, 14.0, 0.0, 1.32)
+    low_near = (9.0, 9.4, 8.0, 14.0, 0.0, 0.6)
+    low_far = (14.2, 14.6, 8.0, 14.0, 0.0, 0.6)
+    assert TH.wall_hit((7.4, 11.6), 1.0, 0.0, 7.9, [tall_near]) == pytest.approx(0.46)
+    assert TH.wall_hit((7.4, 11.6), 1.0, 0.0, 7.9, [tall_far]) == pytest.approx(5.81)
+    assert TH.wall_hit((7.4, 11.6), 1.0, 0.0, 7.9, [low_near]) is None
+    assert TH.wall_hit((7.4, 11.6), 1.0, 0.0, 7.9, [low_far]) == pytest.approx(6.8)
+    # 悬空栏杆（下沿高于弧线）：从下面穿过
+    assert TH.wall_hit((7.4, 11.6), 1.0, 0.0, 7.9, [tall_far[:4] + (1.33, 2.49)]) is None
+
+
+def test_parse_terrain_accepts_boxes_with_height():
+    from ai.space import occupancy as O
+    raw = [{"layer": 10, "boxes": [[1, 2, 3, 4], [5, 6, 7, 8, -0.5, 2.5], [1, 2, 3]]}]
+    assert O.parse_terrain(raw) == {10: [(1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)]}
+    assert O.parse_terrain_y(raw) == {10: [((5.0, 6.0, 7.0, 8.0), -0.5, 2.5)]}
+
+
+def _with_wall_height(frame, maxy):
+    """给帧里 Walls 层每个盒子补上高度（模拟插件 0.23.5 帧）。"""
+    f = json.loads(json.dumps(frame))
+    for entry in f["terrain"]:
+        if entry["layer"] == 10:
+            entry["boxes"] = [list(b[:4]) + [0.0, maxy] for b in entry["boxes"]]
+    return f
+
+
+def _pan3(w):
+    return next(s for s in w.stations if s.get("t") == "cooking"
+                and s.get("n") == "workstation_cooker_01 (3)")
+
+
+@pytest.mark.parametrize("idx", range(5))
+def test_no_straight_throw_into_basket_wall(frames_wall, idx):
+    """P2 在左地板拿着切好的蘑菇：旧实现选 (7.2,12) 正对炸锅出手，直线穿右篮
+    左墙，两份蘑菇都撞墙掉进缝里（t=4571/4671）。墙高 1.32 时正对投不过去，
+    方案（若有）必须偏开瞄准点。"""
+    w = W.World(_with_wall_height(frames_wall[idx], 1.32))
+    assert P.chef_by_name(w.chefs, P.P2_NAME)["held"] == "ChoppedMushroom"
+    pan = _pan3(w)
+    plan = TS.launch_plan(w, pan, TS.MODE_SPLIT)
+    if plan is not None:
+        assert plan["aim"] != pytest.approx((pan["x"], pan["z"]))
+    walls = TS.walls_of(w)
+    assert TH.effective_landing((7.2, 12.0), (pan["x"], pan["z"]),
+                                lambda x, z: x > 13.81, walls=walls) is None
+
+
+def test_low_walls_or_old_frames_keep_old_plan(frames_wall):
+    """墙矮到弧线飞得过、或旧帧没有墙高：出手方案与旧实现一致。"""
+    for f in (frames_wall[2], _with_wall_height(frames_wall[2], 0.1)):
+        w = W.World(f)
+        assert TS.launch_plan(w, _pan3(w), TS.MODE_SPLIT) is not None
+
+
+# trace-20261031-144101（插件 0.23.5，真实墙高）：P2 三次把切好的肉投向
+# 右篮炸锅，t=157/350 撞右篮左墙（顶 1.32）、t=251 撞门洞栏杆，都掉进缝里。
+FIXTURE_RIM = os.path.join(os.path.dirname(__file__), "fixtures", "balloon",
+                           "balloon22-20261031-144101-throw-rim.ndjson.gz")
+
+
+@pytest.fixture(scope="module")
+def frames_rim():
+    with gzip.open(FIXTURE_RIM, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_rim_fixture_has_wall_heights(frames_rim):
+    w = W.World(frames_rim[0])
+    assert (RIGHT_BASKET_WALL, 0.0, 1.32) in w.terrain_y[10]
+    assert P.chef_by_name(w.chefs, P.P2_NAME).get("y") == 0.0
+
+
+# 两道门洞（左地板右边框 x≈8、右篮左边框 x≈13.2）都在 z 8.03~12.44。
+GAP_Z = (8.03, 12.44)
+
+
+@pytest.mark.parametrize("idx", range(9))
+def test_throw_through_basket_gap(frames_rim, idx):
+    """正对炸锅撞框；改成斜着从两道门洞中间穿过去，落在右篮地板上。"""
+    w = W.World(frames_rim[idx])
+    assert P.chef_by_name(w.chefs, P.P2_NAME)["held"] == "DicedMeat"
+    pan = _pan3(w)
+    plan = TS.launch_plan(w, pan, TS.MODE_SPLIT)
+    assert plan is not None
+    sx, sz = plan["world"]
+    ax, az = plan["aim"]
+    # 瞄准线穿过右篮左边框（x=13.21）时在门洞里，离门框留出 5° 横偏
+    f = (13.21 - sx) / (ax - sx)
+    z_at = sz + (az - sz) * f
+    lateral = (13.21 - sx) * math.tan(math.radians(TH.AIM_TOL_DEG))
+    assert GAP_Z[0] + lateral < z_at < GAP_Z[1] - lateral
+    lx, lz = plan["landing"]
+    assert lx > 13.81 and plan["land_dist"] <= TS.SPLIT_MAX_LAND
+    # 正对炸锅投不过去
+    assert TH.effective_landing((sx, sz), (pan["x"], pan["z"]),
+                                lambda x, z: x > 13.81, walls=TS.walls_of(w)) is None
+
+
+def test_gap_throw_command_is_precise(frames_rim):
+    """t=150 站在能斜穿的位置：ThrowBatch 发的 throw 瞄门洞方向、精准对准。"""
+    from ai.exec.client import NullExec
+    w = W.World(frames_rim[1])
+    pan = _pan3(w)
+    got = TS.aim_here(w, pan, TS.MODE_SPLIT)
+    assert got is not None and got["aim"] != pytest.approx((pan["x"], pan["z"]))
+    aim = got["aim_far"]
+
+    class Ex(NullExec):
+        def __init__(self):
+            NullExec.__init__(self)
+            self.issued = []
+
+        def issue(self, cmd):
+            self.issued.append(cmd)
+            return NullExec.issue(self, cmd)
+
+    ex = Ex()
+    tk = T.ThrowBatch(None, (("GridManager", "workstation_cooker_01 (3)"), "cooker",
+                             "BurritoMeat", "FriedBurritoMeat"), "DicedMeat")
+    book = RecipeBook(w.recipes, w.stations)
+    bb = make_bb(100)
+    bb.commitment.active_task = tk
+    ctx = planner._make_context(w, bb, book)
+    ctx["exec"] = ex
+    tree = tk.build()
+    for _ in range(5):
+        tree.tick(ctx)
+        if any(c.get("cmd") == "throw" for c in ex.issued):
+            break
+    cmd = next(c for c in ex.issued if c.get("cmd") == "throw")
+    assert cmd["target_world"] == [pytest.approx(aim[0]), pytest.approx(aim[1])]
+    assert cmd["aim_dot"] == TH.WALL_AIM_DOT and cmd["strict"] is True
+
+
+# ---------------------------------------------------------------- 旧快照瞄准（trace-20261031-150043）
+
+# t=149/153 P2 在走向出手格途中，t=157 到位（插件已到、Python 快照滞后一帧）；
+# t=257 途中、t=261 到位。旧实现 move 一到位就按旧位置算瞄准，算不出就退回
+# 瞄炸锅本身，两次都撞右篮左框掉进缝里（t=160/265，朝向 61°/58°）。
+FIXTURE_STALE = os.path.join(os.path.dirname(__file__), "fixtures", "balloon",
+                             "balloon22-20261031-150043-stale-aim.ndjson.gz")
+
+
+@pytest.fixture(scope="module")
+def frames_stale():
+    with gzip.open(FIXTURE_STALE, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+class _IssueLog(object):
+    """记录发出的命令；move 立即回 ok（模拟插件到位即回）。"""
+
+    def __init__(self):
+        from ai.exec.client import NullExec
+        self._inner = NullExec()
+        self.issued = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def issue(self, cmd):
+        self.issued.append(cmd)
+        return self._inner.issue(cmd)
+
+
+def _run_mushroom_round(frames, ticks_per_frame=4):
+    tk = T.ThrowBatch(None, (("GridManager", "workstation_cooker_01 (3)"), "cooker",
+                             "Mushroom", "FriedMushrooms"), "ChoppedMushroom")
+    tree, ex, bb = tk.build(), _IssueLog(), make_bb(100)
+    bb.commitment.active_task = tk
+    tick, thrown = 100, None
+    for seq, f in enumerate(frames):
+        w = W.World(f)
+        book = RecipeBook(w.recipes, w.stations)
+        for _ in range(ticks_per_frame):
+            ctx = planner._make_context(w, bb, book)
+            ctx.update(exec=ex, frame_seq=seq, tick=tick, now=tick * 0.05)
+            tick += 1
+            tree.tick(ctx)
+            if thrown is None and "throw" in ctx:
+                thrown = ctx["throw"]
+    return ex, thrown
+
+
+def _gap_z_at(rec, x):
+    (fx, fz), (tx, tz) = rec["from_world"], rec["target_world"]
+    return fz + (tz - fz) * (x - fx) / (tx - fx)
+
+
+@pytest.mark.parametrize("frames_idx", [(0, 1, 2), (3, 4)])
+def test_throw_aims_through_both_gaps_from_fresh_position(frames_stale, frames_idx):
+    ex, rec = _run_mushroom_round([frames_stale[i] for i in frames_idx])
+    assert rec is not None, [c["cmd"] for c in ex.issued]
+    assert rec["aim_dot"] == TH.WALL_AIM_DOT and rec["strict"] is True
+    lat = 6.0 * math.tan(math.radians(TH.AIM_TOL_DEG))
+    for x in (8.1, 13.21):     # 左地板右边框 / 右篮左边框
+        assert GAP_Z[0] + lat < _gap_z_at(rec, x) < GAP_Z[1] - lat
+    # 瞄的是远点（抗站位偏差），不是炸锅
+    assert math.hypot(rec["target_world"][0] - rec["from_world"][0],
+                      rec["target_world"][1] - rec["from_world"][1]) > 20
+
+
+def test_no_fallback_to_cooker_when_walls(frames_stale, monkeypatch):
+    """按真实位置算不出能投通的方向：不投（以前退回瞄炸锅本身，正好撞框）。"""
+    monkeypatch.setattr(TS, "aim_still_ok", lambda *a, **k: None)
+    monkeypatch.setattr(TS, "aim_here", lambda *a, **k: None)
+    ex, rec = _run_mushroom_round([frames_stale[0], frames_stale[1], frames_stale[2]] * 3)
+    assert rec is None
+    assert not any(c["cmd"] == "throw" for c in ex.issued)
+
+
+def test_throw_to_without_target_does_not_throw():
+    from ai.primitives.throw import ThrowTo
+    ex = _IssueLog()
+    chef = {"name": P.P2_NAME, "x": 0.0, "z": 0.0, "held": "Pasta"}
+    assert ThrowTo(lambda c: None).tick({"chef": chef, "exec": ex, "tick": 0}) == Status.FAILURE
+    assert ex.issued == []
+
+
+def test_wait_new_frame():
+    node = PR.WaitNewFrame(3)
+    assert node.tick({"frame_seq": 5}) == Status.RUNNING
+    assert node.tick({"frame_seq": 5}) == Status.RUNNING
+    assert node.tick({"frame_seq": 6}) == Status.SUCCESS
+    assert PR.WaitNewFrame(3).tick({}) == Status.SUCCESS      # 离线：不等
+    node = PR.WaitNewFrame(2)
+    got = [node.tick({"frame_seq": 1}) for _ in range(3)]
+    assert got == [Status.RUNNING, Status.RUNNING, Status.FAILURE]
+
+
+def test_split_relaxed_land_only_when_needed(frames0129):
+    """Rapids 木筏→炸锅仍按 4.5m 那档出方案（老场景不变）。"""
+    w = W.World(frames0129[0])
+    plan = TS.launch_plan(w, _fryer2(w), TS.MODE_SPLIT)
+    assert plan is not None and plan["max_land"] == TS.SPLIT_MAX_LAND
+
+
+# ---------------------------------------------------------------- 意面投煮锅（trace-20261031-152300）
+
+# t=177 / t=407：P2 空手在左地板。两口煮锅在右篮深处，最近落点离锅 7.15 /
+# 8.74m，旧的 4.5/6m 两档都判投不了，ThrowBatch(Pasta) 全局 infeasible。
+FIXTURE_PASTA = os.path.join(os.path.dirname(__file__), "fixtures", "balloon",
+                             "balloon22-20261031-152300-pasta.ndjson.gz")
+PASTA_POTS = ("workstation_cooker_01 (2)", "workstation_cooker_01 (1)")
+
+
+@pytest.fixture(scope="module")
+def frames_pasta():
+    with gzip.open(FIXTURE_PASTA, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def _pasta_throw(pot):
+    return T.ThrowBatch(None, (("GridManager", pot), "cooker", "Pasta", "BoiledPasta"),
+                        "Pasta")
+
+
+@pytest.mark.parametrize("idx", [0, 1])
+@pytest.mark.parametrize("pot", PASTA_POTS)
+def test_pasta_throw_uses_far_split_tier(frames_pasta, idx, pot):
+    w, book, bb, ctx = _ctx(frames_pasta[idx])
+    assert _pasta_throw(pot).feasible(ctx)
+    dest = next(s for s in w.stations if s.get("t") == "cooking" and s.get("n") == pot)
+    plan = TS.launch_plan(w, dest, TS.MODE_SPLIT)
+    assert plan["max_land"] == TS.SPLIT_MAX_LAND_FAR
+    assert TS.SPLIT_MAX_LAND_RELAXED < plan["land_dist"] <= TS.SPLIT_MAX_LAND_FAR
+    assert plan["landing"][0] > 13.81           # 落在右篮地板上
+
+
+def test_planner_picks_pasta_throw(frames_pasta):
+    w, book, bb, _ctx0 = _ctx(frames_pasta[0])
+    task, _rec = planner.plan(w, bb, None, book)
+    assert task.TYPE == "ThrowBatch" and task.item == "Pasta"
+
+
+def test_landed_pasta_counts_as_delivered(frames_pasta):
+    """落在右篮入口的意面（P2 走不到、P1 走得到）算已送到，不重复投。"""
+    f = json.loads(json.dumps(frames_pasta[0]))
+    w = W.World(f)
+    book = RecipeBook(w.recipes, w.stations)
+    pot = next(s for s in w.stations if s.get("t") == "cooking" and s.get("n") == PASTA_POTS[0])
+    before = TS.gap(w, book, "BoiledPasta", "Pasta", "cooker", "Pasta", pot, TS.MODE_SPLIT)
+    f["items"] = list(f["items"]) + [dict(n="Pasta", x=14.39, z=11.72, flying=False,
+                                          throwable=True, on_station=None, held_by=None,
+                                          grid=None, detail=[])]
+    w = W.World(f)
+    after = TS.gap(w, book, "BoiledPasta", "Pasta", "cooker", "Pasta", pot, TS.MODE_SPLIT)
+    assert after == before - 1

@@ -35,6 +35,10 @@ THROW_ROUND_TICKS = 260
 # （trace-20261029-220619 t=706→720 约 0.7 秒）。等满仍没有就失败交还，
 # 不让 P2 端着料一直站着。
 LAUNCH_WAIT_TICKS = 60
+# 到出手位后等新帧的上限（拍）：5 Hz 一帧 4 拍，留一倍余量。
+FRESH_FRAME_TICKS = 10
+# 按真实位置找不到能投通的瞄准时最多再等几拍（约 4 帧），等不到整轮失败。
+AIM_WAIT_TICKS = 20
 # 整批上限：N 不在身份里（每拍重算），按「足够大的一批」给。真正的收敛靠
 # done（缺口归零）与「没有可投的料」。
 THROW_BATCH_TICKS = THROW_ROUND_TICKS * 12
@@ -243,8 +247,48 @@ class ThrowBatch(Task):
             plan = TS.launch_plan(c["w"], st[0], st[1], c.get("bb"))
             return plan["cell"] if plan else None
 
-        def dest(c):
-            return _dest_station(c, task.dest_id)
+        # 本轮锁定的瞄准：{"toward": 方向点, "target": 发给插件的 target_world dict}
+        lock = {}  # type: Dict[str, Any]
+
+        def resolve_aim(c):
+            """按新帧位置定瞄准，定下就锁住；每拍按此刻位置复核，过不去就换。
+
+            依次试：已锁定的方向 → 出手方案的方向（规划时按出手格心算的）→
+            此刻位置重新搜。有墙时三者都不行就不投（WaitUntil 等下一帧，超时
+            整轮失败交还 Planner）；**不再退回瞄消费站本身**——正对炸锅那条线
+            正是撞框的线（trace-20261031-150043 t=160/265）。无墙（旧帧）仍退回
+            消费站，木筏漂移等老场景行为不变。
+            """
+            st = task._state(c)
+            if st is None:
+                lock.clear()
+                return False
+            w, dest, mode, bb = c["w"], st[0], st[1], c.get("bb")
+            tries = []
+            if lock.get("toward") is not None:
+                tries.append(lock["toward"])
+            plan = TS.launch_plan(w, dest, mode, bb)
+            if plan is not None and plan.get("aim_far") is not None:
+                tries.append(plan["aim_far"])
+            for toward in tries:
+                got = TS.aim_still_ok(w, dest, mode, toward, bb)
+                if got is not None:
+                    lock.update(toward=toward, target=dict(x=got["aim_far"][0],
+                                                           z=got["aim_far"][1]))
+                    return True
+            got = TS.aim_here(w, dest, mode, bb)
+            if got is not None:
+                lock.update(toward=got["aim_far"], target=dict(x=got["aim_far"][0],
+                                                               z=got["aim_far"][1]))
+                return True
+            lock.clear()
+            if not TS.walls_of(w):
+                lock["target"] = _dest_station(c, task.dest_id)
+                return lock["target"] is not None
+            return False
+
+        def aim(c):
+            return lock.get("target")
 
         def throw_ok_here(c):
             st = task._state(c)
@@ -263,7 +307,11 @@ class ThrowBatch(Task):
             PR.WaitUntil(lambda c: throw_ok_here(c) or launch_cell(c) is not None,
                          LAUNCH_WAIT_TICKS),
             PR.GoToCell(launch_cell, arrived=throw_ok_here),
-            PR.ThrowTo(dest),
+            # move 到位那一拍快照还是旧位置：等下一帧再按真实位置定瞄准
+            PR.WaitNewFrame(FRESH_FRAME_TICKS),
+            PR.WaitUntil(resolve_aim, AIM_WAIT_TICKS),
+            # 有墙（带高度帧）就精准对准、没对准不投：擦框的料掉进缝里就没了
+            PR.ThrowTo(aim, precise=lambda c: bool(TS.walls_of(c["w"]))),
         ]), THROW_ROUND_TICKS)
 
     TIMEOUT_TICKS = THROW_ROUND_TICKS

@@ -27,7 +27,7 @@ Python 侧无构建步骤；C# 插件需单独编译。命令在仓库根执行�
 
 Windows 语音 PTT 使用只读 GetAsyncKeyState，建议 `caps_lock`，不依赖 Quartz/UAC、不注入按键；macOS PTT 仍用 Quartz，需要安装 pyobjc 并授权。`.env` 支持 UTF-8 BOM，已有环境变量优先。ASR/TTS 的异步队列读取必须可取消，不把无限期 queue.get 留在 executor 中，否则解释器退出会卡住并占住启动锁。
 
-macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.23.4 / 状态协议 7，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
+macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.23.5 / 状态协议 7，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
 
 ```bash
 G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"

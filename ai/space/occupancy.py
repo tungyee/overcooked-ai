@@ -371,13 +371,12 @@ LAYER_KILLPLANE = 30
 BLOCKING_LAYERS = (LAYER_WALLS, LAYER_TABLEBLOCK, LAYER_COOKINGBLOCK, LAYER_PLATEBLOCK)
 
 
-def parse_terrain(terrain_list):
-    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[float, float, float, float]]]
-    """按层号归类 AABB 列表（spec §4.4/§6）：{layer: [(minx,maxx,minz,maxz), ...]}。
+def _iter_terrain(terrain_list):
+    """逐个产出 (layer, (minx,maxx,minz,maxz), (miny,maxy) 或 None)。
 
-    层号跨关稳定（Unity 工程配置，不是场景实例名），取代 Col_* 名字前缀。
+    盒子 4 元素 = 旧格式（只有平面范围）；6 元素 = 插件 0.23.5+ 追加
+    miny/maxy。其它长度、非数值一律丢弃。
     """
-    out = {}  # type: Dict[int, List[Tuple[float, float, float, float]]]
     for entry in terrain_list or ():
         if not isinstance(entry, dict):
             continue
@@ -388,16 +387,39 @@ def parse_terrain(terrain_list):
             layer_i = int(layer)
         except (TypeError, ValueError):
             continue
-        boxes = []  # type: List[Tuple[float, float, float, float]]
         for b in entry.get("boxes") or ():
-            if not isinstance(b, (list, tuple)) or len(b) != 4:
+            if not isinstance(b, (list, tuple)) or len(b) not in (4, 6):
                 continue
             try:
-                boxes.append(tuple(float(v) for v in b))
+                vals = tuple(float(v) for v in b)
             except (TypeError, ValueError):
                 continue
-        if boxes:
-            out.setdefault(layer_i, []).extend(boxes)
+            yield layer_i, vals[:4], (vals[4:6] if len(vals) == 6 else None)
+
+
+def parse_terrain(terrain_list):
+    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[float, float, float, float]]]
+    """按层号归类 AABB 列表（spec §4.4/§6）：{layer: [(minx,maxx,minz,maxz), ...]}。
+
+    层号跨关稳定（Unity 工程配置，不是场景实例名），取代 Col_* 名字前缀。
+    6 元素盒（带高度）也只取平面 4 元素，高度见 parse_terrain_y。
+    """
+    out = {}  # type: Dict[int, List[Tuple[float, float, float, float]]]
+    for layer, box, _y in _iter_terrain(terrain_list):
+        out.setdefault(layer, []).append(box)
+    return out
+
+
+def parse_terrain_y(terrain_list):
+    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]
+    """带高度的盒子：{layer: [((minx,maxx,minz,maxz), miny, maxy), ...]}。
+
+    只收 6 元素盒；旧插件帧返回空 dict，调用方据此退回「不知道墙高」。
+    """
+    out = {}  # type: Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]
+    for layer, box, y in _iter_terrain(terrain_list):
+        if y is not None:
+            out.setdefault(layer, []).append((box, y[0], y[1]))
     return out
 
 

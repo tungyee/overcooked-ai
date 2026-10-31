@@ -17,7 +17,7 @@ from ai.primitives.align import (
 )
 from ai.primitives.move import Approach, Face, GoToCell
 from ai.primitives.tap import Tap, Confirm, Settle
-from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitUntil
+from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitNewFrame, WaitUntil
 from ai.primitives.interact import EnsureHandsFree, InteractWith
 from ai.primitives.throw import ThrowTo, ThrowIntoCooker
 from ai.primitives.stuck import (
@@ -41,6 +41,7 @@ __all__ = [
     "Settle",
     "HoldUntil",
     "TapWhileHolding",
+    "WaitNewFrame",
     "WaitUntil",
     "EnsureHandsFree",
     "InteractWith",

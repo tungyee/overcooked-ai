@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.23.4")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.23.5")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -72,7 +72,7 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.23.4 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.23.5 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             BindWalkProbe();
             StartSocket();
@@ -1120,7 +1120,7 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.23.4\",\"protocol_version\":7,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.23.5\",\"protocol_version\":7,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))
@@ -1396,6 +1396,7 @@ namespace Oc2AI
                 sb.Append("{\"name\":").Append(Jstr(mb.name))
                   .Append(",\"x\":").Append(p.x.ToString("0.00"))
                   .Append(",\"z\":").Append(p.z.ToString("0.00"))
+                  .Append(",\"y\":").Append(p.y.ToString("0.00"))
                   .Append(",\"rel_x\":").Append(relX.ToString("0.00"))
                   .Append(",\"rel_z\":").Append(relZ.ToString("0.00"))
                   .Append(",\"yaw\":").Append(mb.transform.eulerAngles.y.ToString("0"))
@@ -2024,6 +2025,7 @@ namespace Oc2AI
                 sb.Append("{\"n\":").Append(Jstr(RawNames.Map(mb.name)))
                   .Append(",\"x\":").Append(p.x.ToString("0.0"))
                   .Append(",\"z\":").Append(p.z.ToString("0.0"))
+                  .Append(",\"y\":").Append(p.y.ToString("0.00"))
                   .Append(",\"has_contents\":").Append(has == "true" ? "true" : has == "false" ? "false" : "null")
                   .Append(",\"cooked\":").Append(cooked == "null" ? "null" : Jstr(cooked))
                   .Append(",\"detail\":").Append(PotContents(mb))
@@ -2163,7 +2165,11 @@ namespace Oc2AI
                         if (ax == null || az == null || bx == null || bz == null) continue;
                         float axf = (float)ax, azf = (float)az, bxf = (float)bx, bzf = (float)bz;
                         if (bxf <= axf || bzf <= azf) continue;
-                        byLayer[go.layer].Add(new float[] { axf, bxf, azf, bzf });
+                        // 0.23.5：追加 miny/maxy（Python 判投掷料能否飞过这面墙）
+                        object ay = GetField(mn, "y"), by = GetField(mx, "y");
+                        float ayf = ay != null ? (float)ay : float.NaN;
+                        float byf = by != null ? (float)by : float.NaN;
+                        byLayer[go.layer].Add(new float[] { axf, bxf, azf, bzf, ayf, byf });
                     }
                 }
             }
@@ -2219,7 +2225,14 @@ namespace Oc2AI
                     sb.Append('[').Append(b[0].ToString("0.##")).Append(',')
                       .Append(b[1].ToString("0.##")).Append(',')
                       .Append(b[2].ToString("0.##")).Append(',')
-                      .Append(b[3].ToString("0.##")).Append(']');
+                      .Append(b[3].ToString("0.##"));
+                    // [minx,maxx,minz,maxz,miny,maxy]；y 取不到时仍发 4 元素（旧格式）
+                    if (b.Length >= 6 && !float.IsNaN(b[4]) && !float.IsNaN(b[5]))
+                    {
+                        sb.Append(',').Append(b[4].ToString("0.##"))
+                          .Append(',').Append(b[5].ToString("0.##"));
+                    }
+                    sb.Append(']');
                 }
                 sb.Append("]}");
                 i++;

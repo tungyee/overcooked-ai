@@ -43,6 +43,17 @@ NEAR_DEST_RADIUS = 3.6
 # 分割地图的落点容忍距离（m）：落在对面地上即可，P1 去捡。木筏离炸锅
 # 9~10m、射程 7.5m，按连通口径 2.6m 会把「木筏中部」整片判成不能投。
 SPLIT_MAX_LAND = 4.5
+# 分割地图第二档落点容忍（m）：4.5m 内找不到出手位时放宽到它再找一次。
+# Balloon_2_2 左地板→右篮炸锅，从门洞斜穿的最近落点离炸锅 4.49m，贴着 4.5
+# 的线，站位差一点就判「投不了」（trace-20261031-150043 t=153/257）。料只要
+# 落在右篮地板上 P1 就能捡；先按 4.5 找，Rapids 等原有方案不变。
+SPLIT_MAX_LAND_RELAXED = 6.0
+# 第三档（m）：消费站在对面深处、怎么投都落不到它旁边时，落在对面能捡的地方
+# 就投，P1 捡起走过去。Balloon_2_2 两口煮锅在右篮深处，左地板射程最远落到
+# 右篮入口 x≈14.4，最近落点离煮锅 (2)/(1) 7.15/8.74m，前两档全判「投不了」，
+# 意面一份都没投（trace-20261031-152300，ThrowBatch(Pasta) 全局 infeasible）。
+# 前两档找得到就不用它，炸锅 / Rapids 的方案不变。
+SPLIT_MAX_LAND_FAR = 9.0
 
 CONSUMER_BOARD = "board"
 CONSUMER_COOKER = "cooker"
@@ -217,13 +228,6 @@ def _station_cells(world):
     return cells
 
 
-def _max_land(mode):
-    # type: (str) -> float
-    """落点离消费站的容忍距离：分割地图落在对面地上就算送到（P1 捡），放宽；
-    连通地图要落在消费站旁，不然等于没省路。"""
-    return SPLIT_MAX_LAND if mode == MODE_SPLIT else TH.MAX_LAND_DIST
-
-
 def _landing_test(world, target, mode, bb=None):
     # type: (Any, Tuple[float, float], str, Any) -> Optional[Any]
     f2 = RG.field_of(world, bb, P.P2_NAME)
@@ -235,6 +239,21 @@ def _landing_test(world, target, mode, bb=None):
     near = {c for c in f2
             if math.hypot(*(_d(world.to_world(*c), target))) <= NEAR_DEST_RADIUS}
     return TH.region_test(world.to_grid, near, None, _station_cells(world))
+
+
+def walls_of(world):
+    # type: (Any) -> List[Tuple[float, float, float, float]]
+    """当前帧挡飞行料的高墙（每帧缓存）。移动篮子的墙随帧更新。
+
+    墙高按 P2 脚下高度算（插件 0.23.5+ 报 chefs[].y；缺省 0）。旧帧没有墙高
+    时返回空列表，不做墙判定。
+    """
+    def compute():
+        chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME) or {}
+        floor_y = chef.get("y")
+        floor_y = float(floor_y) if isinstance(floor_y, (int, float)) else 0.0
+        return TH.throw_walls(getattr(world, "terrain_y", None), floor_y)
+    return _cached(world, ("walls",), compute)
 
 
 def _cached(world, key, fn):
@@ -250,46 +269,85 @@ def _cached(world, key, fn):
     return cache[key]
 
 
+def _max_lands(mode):
+    # type: (str) -> Tuple[float, ...]
+    """出手方案依次尝试的落点容忍距离：分割地图落在对面地上就算送到（P1
+    捡），放宽；连通地图要落在消费站旁，不然等于没省路。"""
+    if mode == MODE_SPLIT:
+        return (SPLIT_MAX_LAND, SPLIT_MAX_LAND_RELAXED, SPLIT_MAX_LAND_FAR)
+    return (TH.MAX_LAND_DIST,)
+
+
 def launch_plan(world, dest, mode, bb=None):
     # type: (Any, Dict, str, Any) -> Optional[Dict]
-    """当前帧的出手方案（TH.plan_launch 的结果），每帧按 (dest, mode) 缓存。"""
+    """当前帧的出手方案（TH.plan_launch 的结果），每帧按 (dest, mode) 缓存。
+    结果多带 max_land（用的是哪一档容忍距离）。"""
     def compute():
         target = _point(world, dest)
         f2 = RG.field_of(world, bb, P.P2_NAME)
         ok = _landing_test(world, target, mode, bb) if target is not None else None
         if ok is None or not f2:
             return None
-        max_land = _max_land(mode)
-        lo = TH.THROW_RANGE - 2 * TH.THROW_RANGE_TOL - max_land
-        hi = TH.THROW_RANGE + max_land
-        cells = [c for c in f2
-                 if lo <= math.hypot(*_d(world.to_world(*c), target)) <= hi]
-        return TH.plan_launch(cells, f2.get, world.to_world, target, ok, max_land)
+        walls = walls_of(world)
+        for max_land in _max_lands(mode):
+            lo = TH.THROW_RANGE - 2 * TH.THROW_RANGE_TOL - max_land
+            hi = TH.THROW_RANGE + max_land
+            cells = [c for c in f2
+                     if lo <= math.hypot(*_d(world.to_world(*c), target)) <= hi]
+            plan = TH.plan_launch(cells, f2.get, world.to_world, target, ok,
+                                  max_land, walls=walls)
+            if plan is not None:
+                return dict(plan, max_land=max_land)
+        return None
     return _cached(world, ("plan", str(dest.get("n")), str(dest.get("grid")), mode), compute)
 
 
-def throw_ok_here(world, dest, mode, bb=None):
-    # type: (Any, Dict, str, Any) -> bool
-    """P2 **此刻的真实位置**投出去能否安全落到对面/消费站旁。
+def aim_here(world, dest, mode, bb=None):
+    # type: (Any, Dict, str, Any) -> Optional[Dict]
+    """P2 **此刻的真实位置**往哪儿瞄能安全落到对面/消费站旁：TH.aim_ok 的
+    结果（含 aim / aim_far）；投不到返回 None。
 
     站在漂流木筏上，出手格的世界坐标会被木筏带走：走向固定格心的 move 命令
     追不上，P2 拿着料原地耗到 move 超时（trace-20261029-122831 t=351~798，
     含暂停约 12s）。所以出手前先看当下站的位置能不能投，能就直接投。
+    有墙挡时瞄准方向可能偏离消费站（从门洞斜穿，见 TH.best_aim）。
     """
     def compute():
         chef = P.chef_by_name(world.chefs, P.P2_NAME)
         target = _point(world, dest)
         a = _point(world, chef or {})
         if a is None or target is None:
-            return False
+            return None
         ok = _landing_test(world, target, mode, bb)
         if ok is None:
-            return False
-        pt = TH.effective_landing(a, target, ok)
-        if pt is None:
-            return False
-        return math.hypot(target[0] - pt[0], target[1] - pt[1]) <= _max_land(mode)
+            return None
+        walls = walls_of(world)
+        for max_land in _max_lands(mode):
+            got = TH.best_aim(a, target, ok, max_land, walls)
+            if got is not None:
+                return got
+        return None
     return _cached(world, ("here", str(dest.get("n")), str(dest.get("grid")), mode), compute)
+
+
+def aim_still_ok(world, dest, mode, toward, bb=None):
+    # type: (Any, Dict, str, Tuple[float, float], Any) -> Optional[Dict]
+    """按 P2 此刻位置复核一个已锁定的瞄准方向（朝 toward）还投不投得过去。"""
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    target = _point(world, dest)
+    a = _point(world, chef or {})
+    if a is None or target is None:
+        return None
+    ok = _landing_test(world, target, mode, bb)
+    if ok is None:
+        return None
+    return TH.aim_ok(a, toward, target, ok, _max_lands(mode)[-1], walls_of(world))
+
+
+def throw_ok_here(world, dest, mode, bb=None):
+    # type: (Any, Dict, str, Any) -> bool
+    """P2 此刻的位置能投（见 aim_here）。"""
+    return aim_here(world, dest, mode, bb) is not None
 
 
 def _d(a, b):

@@ -109,6 +109,144 @@ class PlaceToRelay(Task):
         ]), TASK_TIMEOUT_TICKS)
 
 
+def _held_clean_plate(ctx):
+    # type: (Dict) -> bool
+    """P2 手里端着干净空盘（不认实例 id：盘从沥碗架拿起时实例可能换）。"""
+    chef = ctx["chef"]
+    if not P.held_is_plate(chef):
+        return False
+    held = [p for p in P.all_plates(ctx["w"]) if p.get("held_by") == P.P2_NAME]
+    return bool(held) and all(P.plate_count(p) == 0 for p in held)
+
+
+def _plate_on_shuttle(ctx, grid):
+    # type: (Dict, str) -> bool
+    """某块干净空盘此刻就在这个渡运网格的台面上（刚放上去）。"""
+    from ai.space import shuttle
+    for p in P.all_plates(ctx["w"]):
+        if p.get("held_by") or P.plate_count(p) != 0:
+            continue
+        st = shuttle.station_of(ctx["w"], p)
+        if st is not None and str(st.get("grid")) == str(grid):
+            return True
+    return False
+
+
+def _shuttle_slot(ctx, grid, lock):
+    # type: (Dict, str, Dict) -> Optional[Dict]
+    """往渡运网格 grid 上放的台面：锁住选中的那格（按站名跟着篮子走）；被占了重选。
+
+    选法：此刻够得着的空格里走得最近的；都够不着按预测等待最短的。
+    """
+    from ai.query.placement import counter_key, counter_occupied
+    from ai.revenue import cross_supply as XS
+    from ai.space import reachability, shuttle
+    w, field = ctx["w"], ctx.get("field")
+    name = lock.get("n")
+    if name is not None:
+        st = next((s for s in shuttle.shuttle_stations(w) if s.get("n") == name), None)
+        if st is not None and not counter_occupied(w, counter_key(w, st)):
+            return st
+        lock.clear()
+    free = [s for s in XS.free_slots(w) if str(s.get("grid")) == str(grid)]
+    if not free:
+        return None
+
+    def cost(st):
+        now = shuttle.reachable_stances(w, st, field)
+        if now:
+            return (0, min(field[s["cell"]] for s in now) if field else 0)
+        wait = reachability.shuttle_wait(ctx, st)
+        return (1, wait if wait is not None else 1e9)
+    best = min(free, key=cost)
+    if cost(best)[1] >= 1e9:
+        return None
+    lock["n"] = best.get("n")
+    return best
+
+
+@_register
+class SendAcross(Task):
+    """把东西放到渡运台面上，让篮子运去对面区（ai/space/shuttle.py）。
+
+    身份 = item 种类（cross_supply.KIND_*）+ resources (来源实例 id, 渡运网格)。
+    **通用送件**：送什么、送几份由 cross_supply.send_deficit 统一判，通道（哪个
+    渡运网格、放哪一格）由本 task 选；取件一侧不需要新 task——篮子上的东西所有
+    task 都能拿（等篮子在 move.Approach 里做）。
+
+    目前 kind 只有干净盘：Balloon_2_2 脏盘回左边洗，右边装盘没盘可用
+    （trace-20261031-204801 t≈132~172）。
+    """
+
+    TYPE = "SendAcross"
+    DESC = "把东西放到移动篮子上送去对面"
+    LABEL = "送过去"
+    HANDS = "empty"
+
+    @property
+    def source_id(self):
+        return self._resources[0]
+
+    @property
+    def grid(self):
+        return self._resources[1]
+
+    def claims(self):
+        return ((self.source_id, "send"),)
+
+    def wait_targets(self, ctx):
+        # type: (Dict) -> List[Dict]
+        """要等篮子的目标（reachability.task_*wait_seconds 读）：放哪一格。"""
+        st = _shuttle_slot(ctx, self.grid, {})
+        return [st] if st is not None else []
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        """手空了，且来源盘已在篮子上（实例 id 跟着走）或已不在快照里（从沥碗架
+        拿起后实例换了）而篮子上多了干净盘。"""
+        from ai.space import shuttle
+        if not P.hands_free(ctx["chef"]):
+            return False
+        p = plate_by_id(ctx, self.source_id)
+        if p is not None:
+            st = shuttle.station_of(ctx["w"], p)
+            return st is not None and str(st.get("grid")) == str(self.grid)
+        return _plate_on_shuttle(ctx, self.grid)
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        from ai.revenue import cross_supply as XS
+        w = ctx["w"]
+        if self.item != XS.KIND_CLEAN_PLATE:
+            return False
+        if XS.send_deficit(w, self.item, ctx.get("book"), ctx.get("bb")) <= 0:
+            return False
+        if not XS.has_send_capacity(w):
+            return False
+        if not _held_clean_plate(ctx):
+            p = plate_by_id(ctx, self.source_id)
+            if p is None or P.plate_count(p) != 0 or P.plate_buried_in_stack(p):
+                return False
+        # 至少有一格此刻够得着、或时间表能预测什么时候够得着
+        return _shuttle_slot(ctx, self.grid, {}) is not None
+
+    def build(self):
+        # type: () -> Node
+        source_id, grid = self.source_id, self.grid
+        lock = {}  # type: Dict[str, Any]
+
+        def placed(c):
+            return P.hands_free(c["chef"]) and _plate_on_shuttle(c, grid)
+
+        return PR.Timeout(Sequence([
+            PR.EnsureHandsFree(keep=_held_clean_plate),
+            PR.InteractWith(lambda c: plate_by_id(c, source_id), "pickup",
+                            _held_clean_plate),
+            # 篮子不在口上时 Approach 原地等 / 先去候车格（不占本 task 超时预算）
+            PR.InteractWith(lambda c: _shuttle_slot(c, grid, lock), "placement", placed),
+        ]), TASK_TIMEOUT_TICKS)
+
+
 def _dest_station(ctx, dest_id):
     # type: (Dict, Any) -> Optional[Dict]
     """按 (grid, name) 资源 id 找消费站的站点 dict（砧板 / 灶）。"""
@@ -306,7 +444,9 @@ class ThrowBatch(Task):
             # Planner（承诺清空 → 拿着料的保护解除 → StashHeld 放下）。
             PR.WaitUntil(lambda c: throw_ok_here(c) or launch_cell(c) is not None,
                          LAUNCH_WAIT_TICKS),
-            PR.GoToCell(launch_cell, arrived=throw_ok_here),
+            # precise：出手方案按格心算，人在格里但离格心远时可能投不过去
+            #（trace-20261031-201659 t=37~93），到格后再朝格心挪一次
+            PR.GoToCell(launch_cell, arrived=throw_ok_here, precise=True),
             # move 到位那一拍快照还是旧位置：等下一帧再按真实位置定瞄准
             PR.WaitNewFrame(FRESH_FRAME_TICKS),
             PR.WaitUntil(resolve_aim, AIM_WAIT_TICKS),

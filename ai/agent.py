@@ -16,7 +16,7 @@ from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
-from ai.space import navigation, reachability, seam_clock, seams
+from ai.space import navigation, reachability, seam_clock, seams, shuttle
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
@@ -42,6 +42,9 @@ FRAME_MAX_AGE = 0.75
 # L3 兜底：同一物理操作在 TTL 内失败满 N 次，对其认领动作短暂退避。
 # 按操作独立累计，切换任务/订单不能清零；不同动作不会互相拉黑。
 ABANDON_FAIL_STREAK = 3
+# 开头清手失败的冷却（拍）：≈一轮投掷（取 → 走位 → 出手 ≈2~3s），让消化手里
+# 东西的 task 跑完；远短于整体放弃，渡运篮子停靠窗口（≈10s）里还来得及回来。
+HANDS_CLEAR_COOLDOWN_TICKS = 60
 
 # 对话上下文的「临期订单」阈值（秒）：remaining 低于此值的订单算快过期。
 # 只给 LLM 提醒，不参与决策——决策口径仍走 planner 的 slack。
@@ -991,6 +994,8 @@ class Agent:
             "gate_waits": plan_record.get("gate_waits"),
             # 门洞时间表：每道接缝学没学会、周期/开门时长、此刻开没开、几秒后开/关
             "seam_clock": seam_clock.summary(self.bb.seam_clock),
+            # 渡运台面时间表（同格式，键 "slot=网格/站名"）：只在渡运关卡出现
+            "shuttle_clock": seam_clock.summary(self.bb.shuttle_clock),
             # 「马上去」硬指令闸（Task 2）的覆盖标记：chosen 是闸选中的 task key。
             "imperative": plan_record.get("imperative"),
             "chosen": str(planner_choice) if planner_choice is not None else None,
@@ -1047,7 +1052,7 @@ class Agent:
                 for resource, action in chosen_task.claims():
                     self.bb.claims.pop((resource, action), None)
                 self._note_motion_failure(chosen_task, ctx)
-                self._note_failure(chosen_task)
+                self._note_failure(chosen_task, ctx)
             if self.bb.commitment:
                 self.bb.commitment.interrupt_failure_count += 1
             self.bb.commitment = None
@@ -1083,10 +1088,26 @@ class Agent:
         except Exception:                       # noqa: BLE001
             return False
 
-    def _note_failure(self, task):
-        # type: (Any) -> None
+    def _note_failure(self, task, ctx=None):
+        # type: (Any, Optional[Dict]) -> None
+        if self._hands_clear_failure(task, ctx):
+            # 开头清手没清掉（手里还是开树时那件）：不是这个 task 本身做不成，不计入
+            # 放弃计数；只冷却一小会儿，让能消化手里东西的 task（投掷 / 下锅）先跑。
+            # trace-20261031-204801 t=55.4：送餐被选中那拍上一个投掷刚拾起肉，送餐
+            # 清手两次放不下 → 整个送餐拉黑 10s，篮子停靠窗口里再也没选它。
+            abandon_actions(self.bb, task, self.tick + HANDS_CLEAR_COOLDOWN_TICKS)
+            return
         if self._failures.failed(task, self.tick):
             abandon_actions(self.bb, task, self.tick + ABANDON_TTL_TICKS)
+
+    def _hands_clear_failure(self, task, ctx):
+        # type: (Any, Optional[Dict]) -> bool
+        if task is None or ctx is None or task.TYPE == "StashHeld":
+            return False      # StashHeld 的本职就是清手，它失败就是它失败
+        if not ctx.get("hands_clear_failed"):
+            return False      # 失败在 task 自己的动作上（取料 / 投 / 送……）
+        held = P.held_name(ctx.get("chef")) or None
+        return held is not None and held == self.executor_inst.held_at_start
 
     def _note_success(self, task):
         # type: (Any) -> None
@@ -1114,6 +1135,7 @@ class Agent:
             trace.reset_revenue_state()
         self._scene_key, self._left_level = key, False
         self._observe_seams(world)
+        self._observe_shuttles(world)
 
     def _observe_seams(self, world):
         # type: (World) -> None
@@ -1131,6 +1153,24 @@ class Agent:
             now = time.monotonic()
         self.bb.seam_clock.observe(float(now), world.seam_gates,
                                    seam_clock.anim_period(world.raw.get('grids')))
+
+    def _observe_shuttles(self, world):
+        # type: (World) -> None
+        """记一帧每个渡运台面 P2 够不够得着，学可交互窗口（ai/space/shuttle.py）。
+
+        P2 可达场缺失（复活中 / 不在关卡）时不记：够不着不等于篮子走了。
+        """
+        if world.paused or not shuttle.shuttle_grids(world):
+            return
+        now = world.raw.get('level_time')
+        if not isinstance(now, (int, float)):
+            now = time.monotonic()
+        field = reachability.field_for(world, self.bb)
+        if not field:
+            return
+        if self.bb.shuttle_clock is None:
+            self.bb.shuttle_clock = seam_clock.SeamClock()
+        shuttle.observe(self.bb.shuttle_clock, world, field, float(now))
 
     def _note_motion_failure(self, task, ctx):
         # type: (Any, Dict) -> None

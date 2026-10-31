@@ -76,6 +76,9 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):
              and plate_pressure_fn(w) >= 2.0
              and not placed_plates_fn(w))
             or (t.TYPE == "PlaceCleanPlate" and plate_pressure_fn(w) > 0)
+            # 跨区送盘：只在对面缺盘时才是候选（cross_supply.send_deficit），
+            # 缺盘就是拼装被卡住，同摆盘一层
+            or t.TYPE == "SendAcross"
         )),
         # L_CAPACITY 现在没有成员，见下方 L_CAPACITY 常量处的说明。规则表里
         # 保留这一行（谓词恒假）而不是删掉，是为了让层号与表的行一一对应 ——

@@ -56,11 +56,11 @@ class SeamClock(object):
         self.anim_period = None  # type: Optional[float]
 
     # ---------- 观测 ----------
-    def observe(self, now, seam_gates, anim_period=None):
-        # type: (float, object, Optional[float]) -> None
-        """记一帧门洞状态。now 不前进（同一帧重 tick）时不重复记沿。"""
+    def _advance(self, now):
+        # type: (float) -> bool
+        """推进时钟；now 不前进（同一帧重 tick）返回 False，调用方不再记沿。"""
         if self.now is not None and now <= self.now:
-            return
+            return False
         if self.now is not None and now - self.now > GAP_RESET:
             # 观测断档：断档里开关了几次不知道，不能把首尾两帧连成一条沿。
             # 只丢「当前开/关」初值，已学到的沿和周期保留（时间表仍按周期外推）。
@@ -69,6 +69,25 @@ class SeamClock(object):
                 tr.dropped = None
                 tr.armed = False
         self.now = now
+        return True
+
+    def observe_flags(self, now, flags, anim_period=None):
+        # type: (float, Dict[GateKey, Dict[Tuple[int, int], float]], Optional[float]) -> None
+        """通用入口：{key: 此刻「开」着的格 → 值}，空 dict = 关。
+
+        渡运台面（ai/space/shuttle.py）用它：每个台面对 P2 可达区够得着 = 开。
+        """
+        if not self._advance(now):
+            return
+        self.anim_period = anim_period
+        for key, cells in flags.items():
+            self._observe_one(key, now, bool(cells), cells)
+
+    def observe(self, now, seam_gates, anim_period=None):
+        # type: (float, object, Optional[float]) -> None
+        """记一帧门洞状态。now 不前进（同一帧重 tick）时不重复记沿。"""
+        if not self._advance(now):
+            return
         self.anim_period = anim_period
         if seam_gates is None:
             return

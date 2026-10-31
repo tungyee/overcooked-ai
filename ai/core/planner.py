@@ -11,6 +11,7 @@ from ai.revenue import cook_supply as CS
 from ai.revenue import economy as ECON
 from ai.revenue import eta as ETA
 from ai.revenue import throw_supply as TS
+from ai.query import carriers as CR
 from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.query import stations as S
@@ -20,7 +21,7 @@ from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.query.recipes import RecipeBook, find_ingredient
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
 from ai.state.world import World
-from ai.space import reachability
+from ai.space import reachability, shuttle
 
 # Plan 3 固定估计步数（spec §7.3.4）
 EST_FETCH, EST_CHOP, EST_COOK_OPS, EST_SERVE = 10, 20, 15, 5
@@ -80,8 +81,9 @@ def _dialog_live_orders(world, bb):
     return [o for o in world.orders if not _order_is_abandoned(bb, o.get("id"))]
 
 
-def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=None):
-    # type: (World, Blackboard, Optional[Any], RecipeBook, Optional[Dict[Any, Any]], Optional[Dict[Any, Any]]) -> List[Candidate]
+def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=None,
+                        carrier_match=None):
+    # type: (World, Blackboard, Optional[Any], RecipeBook, Optional[Dict[Any, Any]], Optional[Dict[Any, Any]], Optional[Dict[Any, Dict]]) -> List[Candidate]
     """为所有订单生成候选任务（Plan 4 多订单模式）。
 
     order 参数保留用于向后兼容，但在多订单模式下被忽略。
@@ -103,7 +105,7 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     # 配方驱动的候选（放盘 + 备菜 + 上盘 + 出餐），逐订单从 DAG 发射
     for ord in orders:
         for task in recipe_graph.emit(world, bb, book, ord,
-                                      plate_match, cooker_match):
+                                      plate_match, cooker_match, carrier_match):
             pre, est = _CAND_META.get(task.TYPE, ([], EST_FETCH))
             candidates.append(Candidate(task, list(pre), est,
                                         branch=branch_of_task(task, book)))
@@ -136,6 +138,7 @@ _CAND_META = {
     "DeliverPlate": (["holding_plated_dish"], EST_SERVE),
     "Mix": (["hands_empty"], EST_COOK_OPS),
     "PlaceToRelay": (["hands_empty"], EST_FETCH),
+    "SendAcross": (["hands_empty"], EST_FETCH),
 }
 
 
@@ -277,6 +280,23 @@ def _gen_misc(world, bb, book, chef, hands_empty):
     # 可投掷食材的批量取+投已并入通用 FetchToBoard（见 chop.py）；这里只剩
     # 传盘（PlaceToRelay）。feasible 再精确判（中转台有空位），这里只做粗枚举。
     # order_id 一律 None：relay 是协作动作，不绑定特定订单（同 Prefetch）。
+    # 跨区送件（SendAcross，ai/revenue/cross_supply.py）：对面区缺、我这边有富余，
+    # 经渡运篮子送过去。每块能用的干净盘一个候选（feasible 再判缺口 / 空格 / 能不能放）。
+    from ai.revenue import cross_supply as XS
+    from ai.space import shuttle as _SH
+    for grid in sorted(_SH.shuttle_grids(world)):
+        if XS.send_deficit(world, XS.KIND_CLEAN_PLATE, book, bb) <= 0:
+            break
+        for p in P.all_plates(world):
+            pid = p.get("n")
+            if (not pid or P.plate_count(p) != 0 or P.plate_buried_in_stack(p)
+                    or p.get("held_by") == P.P1_NAME
+                    or _SH.station_of(world, p) is not None):
+                continue
+            task = T.SendAcross(item=XS.KIND_CLEAN_PLATE, resources=(pid, grid))
+            cands.append(Candidate(task, [], EST_FETCH,
+                                   branch=branch_of_task(task, book)))
+
     relay_cells = S.relay_cells_for(world)
     if relay_cells:
         # 干净盘 → 放中转台（传盘子；feasible 判盘干净 + 中转台有空位）
@@ -866,6 +886,12 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     if not orders:
         return {}
     want = {o["id"]: book.order_want_tokens(o) for o in orders}
+    # 已装料载体能补上的料（不看盘的初配）：缺料数要扣掉它，否则空盘对
+    # 「卷已包齐、只差一只盘」的单也算全缺，唯一的空盘会被分给别的单。
+    # 载体与盘不重复的约束在 match_carriers_to_orders 定盘后再查。
+    carrier_cover = {}  # type: Dict[Any, Set[str]]
+    for oid, c in CR.match_carriers_to_orders(world, book, None, orders=orders).items():
+        carrier_cover[oid] = set(c["contents"]) | {c["base"]}
     head = _combo_head_id(orders)
     # 已熟未糊、可直接倒进盘的熟料供给：token → 几口锅（灶上熟锅 + 散熟锅）
     supply = {}  # type: Dict[str, int]
@@ -924,9 +950,12 @@ def _match_plates_to_orders(world, bb, book, orders=None):
             wt = want[oid]
             if tokens <= wt:
                 is_not_head = 0 if oid == head else 1
-                edges.append((is_not_head, len(wt - tokens), stack_rank,
+                cover = carrier_cover.get(oid, set())
+                if cover & tokens:
+                    cover = set()      # 载体的料盘里已有：这只盘用不上载体
+                edges.append((is_not_head, len(wt - tokens - cover), stack_rank,
                               _remaining_of(o), str(pid), str(oid), pid, oid,
-                              (wt & set(supply)) - tokens))
+                              (wt & set(supply)) - tokens, bool(cover)))
     # 钉死手持盘：P2 当前承诺绑定的盘不参与贪心重排，保持它和订单的配对。
     # 否则 P1 往另一块盘里放一样料，就能让贪心 tiebreak 翻盘、把 P2 手里的盘
     # 改绑走（实机 trace-20261017-172221 t=663：换盘导致丢盘、熟饭烧糊）。
@@ -951,14 +980,16 @@ def _match_plates_to_orders(world, bb, book, orders=None):
             break
     edges = [e for e in edges if e[6] not in used_plates]
     # 第一轮：只配「能立刻用上」的边，每配一条扣一份熟料供给——一口熟鱼锅
-    # 只够让一块盘提前，别让两单 Marinara 都以为自己能用。第二轮：其余边
-    # 按原序（队首 → 缺料数 → …）配。
+    # 只够让一块盘提前，别让两单 Marinara 都以为自己能用。该单有可放进这
+    # 只盘的已装料载体（包好的卷）也算能立刻用上：载体本就 1:1 配给订单，
+    # 不必扣供给。第二轮：其余边按原序（队首 → 缺料数 → …）配。
     for first_pass in (True, False):
         for e in edges:
-            pid, oid, usable = e[6], e[7], e[8]
+            pid, oid, usable, carrier_ready = e[6], e[7], e[8], e[9]
             if pid in used_plates or oid in used_orders:
                 continue
-            if first_pass and not (usable and take_supply(usable)):
+            if first_pass and not carrier_ready \
+                    and not (usable and take_supply(usable)):
                 continue
             matched[pid] = oid
             used_plates.add(pid)
@@ -1020,8 +1051,9 @@ def _burn_eta_ticks(c):
     return max(0.0, (burn_at - prog) * TICKS_PER_SECOND)
 
 
-def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
-    # type: (World, Blackboard, RecipeBook, Dict[Any, Any], Optional[List[Dict]]) -> Dict[Any, Any]
+def _match_cookers_to_orders(world, bb, book, plate_match, orders=None,
+                             carrier_match=None):
+    # type: (World, Blackboard, RecipeBook, Dict[Any, Any], Optional[List[Dict]], Optional[Dict[Any, Dict]]) -> Dict[Any, Any]
     """熟料源↔订单 1:1 匹配（每拍重算）。返回 {source_id: order_id}。
 
     orders 显式传入时只用这些单（同 `_match_plates_to_orders`）；缺省仍读
@@ -1069,8 +1101,11 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
                         "danger": 0.0})
     if not sources:
         return {}
-    needy = {}  # type: Dict[str, List[Tuple[Any, Dict]]]
     raw_orders = orders if orders is not None else world.orders
+    if carrier_match is None:
+        carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                    orders=raw_orders)
+    needy = {}  # type: Dict[str, List[Tuple[Any, Dict]]]
     for o in raw_orders:
         oid = o.get("id")
         if oid is None:
@@ -1081,6 +1116,9 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
             if not book.needs_cooking(ing):
                 continue
             if matched_plate is not None and book.plate_has(matched_plate, ing):
+                continue
+            # 该单的载体里已有这份熟料（包了熟肉的卷饼）：锅留给别的单
+            if CR.carrier_covers(book, carrier_match.get(oid), ing):
                 continue
             token = book.rich_token(ing)
             if token:
@@ -1156,15 +1194,19 @@ def plan(world, bb, order, book):
 
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
+    # 已装料载体（包了熟肉的卷饼等）↔订单：覆盖的料不再配锅、不再备料
+    carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                orders=live_orders)
     cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
-                                            orders=live_orders)
+                                            orders=live_orders,
+                                            carrier_match=carrier_match)
     # 独立 slack：打分 urgency、截止闸 cushion 两处共用。
     slack_map = ETA.solo_slack_by_order(world, book, plate_match,
                                         cooker_match, orders=live_orders)
 
     # ② 生成候选（多订单模式：枚举所有订单）
     candidates = generate_candidates(world, bb, order, book,
-                                     plate_match, cooker_match)
+                                     plate_match, cooker_match, carrier_match)
     if not candidates:
         _finalize_rescue_hold(bb, None)
         record = _record([], plate_match, cooker_match)
@@ -1658,6 +1700,9 @@ def _select_layer(feasible, world, layer_map, bb, slack_map, tick, gate_waits=No
 # 等门让位（_select_layer）：要在门洞口等超过这么久的候选先让别的做。3s ≈ 走 12 格，
 # 让出去做的活一般一两步就能停手；太小会在门快开时来回切。
 GATE_DEFER_S = 3.0
+# 当前承诺等渡运篮子超过这么久（秒）也让位（见 _gate_waits）。比 GATE_DEFER_S 大，
+# 留出迟滞带：3~8s 之间已承诺的接着等，不在快到时来回切换。
+ACTIVE_SHUTTLE_DEFER_S = 8.0
 # 火 / 快糊 / 刚熟的锅：时钟不等人，等门也得去，不让位。
 GATE_DEFER_EXEMPT_LAYERS = (0, 1, 2)
 
@@ -1669,7 +1714,8 @@ def _gate_waits(feasible, ctx, bb):
     两种情况不让位（记 0）：当前承诺的 task（已经在路上 / 门口等，换掉只会
     来回折返）；P2 手里拿着东西（让位去做别的要先放下，放下再拿回来比等门亏）。
     """
-    if not getattr(ctx.get('field'), 'waits', None):
+    if (not getattr(ctx.get('field'), 'waits', None)
+            and not (ctx.get('w') is not None and shuttle.shuttle_grids(ctx['w']))):
         return {}
     active = getattr(getattr(bb, 'commitment', None), 'active_task', None)
     active_key = getattr(active, 'key', None)
@@ -1678,9 +1724,20 @@ def _gate_waits(feasible, ctx, bb):
     out = {}  # type: Dict[Any, float]
     for cand in feasible:
         key = cand.task.key
-        if holding or key == active_key:
+        if key == active_key:
+            # 当前承诺照旧不让门洞（已在路上 / 门口等，换掉只会来回折返）；但渡运篮子
+            # 要等的远超门洞（最长一圈 ≈36s），等太久就让出去先干别的，快到了再回来
+            #（trace-20261031-204801 t=67~99：送餐在口边干站 30s 等篮子转一圈）。
+            w = reachability.task_shuttle_wait_seconds(cand.task, ctx)
+            if w > ACTIVE_SHUTTLE_DEFER_S:
+                out[key] = w
             continue
-        w = reachability.task_wait_seconds(cand.task, ctx)
+        if holding:
+            # 拿着东西时门洞照旧不让位；渡运篮子要等一整段（最长一圈 ≈36s），
+            # 放下手里的料干等太亏，仍让位（ai/space/shuttle.py）。
+            w = reachability.task_shuttle_wait_seconds(cand.task, ctx)
+        else:
+            w = reachability.task_wait_seconds(cand.task, ctx)
         if w > 0:
             out[key] = w
     return out
@@ -1918,6 +1975,12 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # ⑭ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
     if task.TYPE == "WashPlate":
         terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
+    elif task.TYPE == "SendAcross":
+        # 对面缺盘的程度（同一条曲线：0 块=2.0、1 块=1.0），按对面的干净盘数算
+        from ai.revenue import cross_supply as XS
+        acc = XS.far_plate_need(world, book, bb)
+        far = acc["far"]
+        terms["plate_pressure"] = W_PLATE_PRESSURE * (2.0 if far <= 0 else 1.0 if far == 1 else 0.5)
     else:
         terms["plate_pressure"] = 0.0
 
@@ -2553,9 +2616,17 @@ def _order_completion_ratio(task, world, bb, book=None, plate_match=None,
         from ai.query.recipes import RecipeBook
         book = RecipeBook(world.recipes, world.stations)
 
+    # 载体候选（FetchToPlate 带内容签名）按「做完这一步之后」算：底料与它
+    # 装着的料一起进盘。只对这一个候选这样算，同单其它 task 照旧按盘现状——
+    # 否则包肉卷饼与空卷饼同分，凑齐的那一手赢不了 FillCooker
+    # （trace-20261031-233010 t=1790：2/3 盘 + 包肉卷饼，输给填灶到收盘）。
+    extra = set()  # type: Set[str]
+    if getattr(task, "TYPE", None) == "FetchToPlate" and getattr(task, "contents", ()) \
+            and str(task.order_id) == str(oid):
+        extra = set(task.contents) | book.want_tokens(task.item)
     filled_count = 0
     for ingredient in composition:
-        if book.plate_has(plate, ingredient):
+        if book.plate_has(plate, ingredient) or (book.want_tokens(ingredient) & extra):
             filled_count += 1
 
     return float(filled_count) / len(composition)

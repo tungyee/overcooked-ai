@@ -50,6 +50,8 @@ def snapshot(world):
         "workstations": [_copy(s) for s in (getattr(world, "workstations", None) or [])],
         "cookers": [_copy(c) for c in (getattr(world, "cookers", None) or [])],
         "items": [_copy(i) for i in (getattr(world, "items", None) or [])],
+        # 手持物（带 held_by）：手里那件装着什么（包肉的卷饼）只有这里看得到
+        "held_items": [_copy(i) for i in (getattr(world, "held_items", None) or [])],
         "extinguishers": [_copy(e) for e in (getattr(world, "extinguishers", None) or [])],
         "stations": [_copy(s) for s in (getattr(world, "stations", None) or [])],
         "recipes": [_recipe(r) for r in (getattr(world, "recipes", None) or [])],

@@ -150,7 +150,7 @@ def execution_record(status, task, ctx, frame_seq=None, received_at=None):
     if "motion" in ctx:
         result["motion"] = ctx["motion"]
     for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment',
-                 'exec_failure', 'throw'):
+                 'exec_failure', 'throw', 'shuttle_wait'):
         if name in ctx:
             result[name] = ctx[name]
     if frame_seq is not None and received_at is not None:
@@ -214,6 +214,8 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
     # 门洞时间表快照（只在有接缝的关卡写）。
     if record.get("seam_clock"):
         log_entry["seam_clock"] = record["seam_clock"]
+    if record.get("shuttle_clock"):
+        log_entry["shuttle_clock"] = record["shuttle_clock"]
 
     # 卡住事件只在判据成立时写（grep 友好：没卡住的拍不带这个 key）。
     stuck = record.get("stuck")

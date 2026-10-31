@@ -385,8 +385,8 @@ def _source_on_moving_platform(ctx, loc):
     # return P.on_moving_platform(st.get("grid"), ctx)
 
 
-def ingredient_available(ctx, raw):
-    # type: (Dict, Optional[str]) -> bool
+def ingredient_available(ctx, raw, contents=()):
+    # type: (Dict, Optional[str], Any) -> bool
     """生料能否取到（手上 / 板上 / 散落 / 箱子，不含已装盘的）。
 
     排除已装盘的：那是别人的半成品，从盘里抠料出来不是合法操作。但"盘上
@@ -398,7 +398,8 @@ def ingredient_available(ctx, raw):
         return False
     from ai.space import reachability
     loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True,
-        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st))
+        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st),
+        contents=contents)
     if loc is None or loc.get("kind") == "plate":
         return False
     if _source_on_moving_platform(ctx, loc):
@@ -406,12 +407,16 @@ def ingredient_available(ctx, raw):
     return True
 
 
-def ingredient_source(ctx, raw):
-    # type: (Dict, Optional[str]) -> Optional[Dict]
-    """生料的取用站点 dict。在手上时返回 None（无需再取）。"""
+def ingredient_source(ctx, raw, contents=()):
+    # type: (Dict, Optional[str], Any) -> Optional[Dict]
+    """生料的取用站点 dict。在手上时返回 None（无需再取）。
+
+    contents 非空 = 取已装料载体（包了熟肉的卷饼），见 find_ingredient。
+    """
     from ai.space import reachability
     loc = R.find_ingredient(ctx["w"], raw, exclude_plate=True,
-        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st))
+        can_access=lambda st: not _source_on_moving_platform(ctx, {'st': st}) and reachability.can_interact(ctx, st),
+        contents=contents)
     if loc is None or loc.get("kind") in ("plate", "held"):
         return None
     st = loc.get("st")
@@ -425,6 +430,20 @@ def ingredient_source(ctx, raw):
         if resolved is not None:
             return resolved
     return st
+
+
+def held_matches_contents(ctx, item, contents=()):
+    # type: (Dict, Optional[str], Any) -> bool
+    """P2 手里是不是「名字 = item、内容 = contents」的那件。
+
+    只比名字会把同名不同料的物品当成一件：去拿包肉卷饼时游戏句柄选中旁边
+    的空卷饼，确认照样通过。内容读 world.held_items（插件给手持物打 held_by）。
+    """
+    from ai.query.carriers import held_contents
+    chef = ctx["chef"]
+    if not P.held_matches(chef, item):
+        return False
+    return held_contents(ctx["w"], chef.get("name")) == frozenset(contents or ())
 
 
 def _station_for_item(world, item):

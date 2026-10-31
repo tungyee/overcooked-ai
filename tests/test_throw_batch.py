@@ -727,3 +727,85 @@ def test_landed_pasta_counts_as_delivered(frames_pasta):
     w = W.World(f)
     after = TS.gap(w, book, "BoiledPasta", "Pasta", "cooker", "Pasta", pot, TS.MODE_SPLIT)
     assert after == before - 1
+
+
+# ---------------------------------------------------------------- 出手站位离格心太远（trace-20261031-201659）
+
+FIXTURE_OFFCENTER = os.path.join(os.path.dirname(__file__), "fixtures", "balloon",
+                                 "balloon22-20261031-201659-throw-offcenter.ndjson.gz")
+SHROOM_BOARD = ("GridManager", "countertop_01_chopping_dark_wood (1)")
+
+
+@pytest.fixture(scope="module")
+def frame_offcenter():
+    with gzip.open(FIXTURE_OFFCENTER, "rt", encoding="utf8") as fh:
+        return json.loads(fh.readline())
+
+
+def _throw_shroom():
+    return T.ThrowBatch(None, (SHROOM_BOARD, "board", "Mushroom", "FriedMushrooms"),
+                        "Mushroom")
+
+
+def _offcenter_ctx(frame, x=None):
+    f = json.loads(json.dumps(frame))
+    if x is not None:
+        next(c for c in f["chefs"] if c["name"] == P.P2_NAME)["x"] = x
+    return _ctx(f)
+
+
+def test_offcenter_stance_cannot_throw_but_center_can(frame_offcenter):
+    """t=39.2：P2 拿着蘑菇站出手格 (-5,0)、x=6.72（格心 7.2）——投不过门洞框；
+    规划按格心算可行，于是 planner 一直选它、P2 原地不动 56 秒。挪到 x≥6.8 就能投。"""
+    w, book, bb, ctx = _offcenter_ctx(frame_offcenter)
+    st = _throw_shroom()._state(ctx)
+    assert TS.launch_plan(w, st[0], st[1], bb)["cell"] == P.chef_cell(ctx["chef"], w.to_grid)
+    assert TS.aim_here(w, st[0], st[1], bb) is None
+    w2, _b, bb2, ctx2 = _offcenter_ctx(frame_offcenter, x=7.0)
+    assert TS.aim_here(w2, st[0], st[1], bb2) is not None
+
+
+def test_precise_goto_nudges_toward_cell_center_once(frame_offcenter):
+    """同格但离格心 0.48m、此刻投不出去：再发一次 move，终点越过格心；挪完就 SUCCESS。"""
+    from ai.exec.client import NullExec
+    from ai.primitives import move as M
+    w, book, bb, ctx = _offcenter_ctx(frame_offcenter)
+    ex = NullExec()
+    ctx["exec"] = ex
+    st = _throw_shroom()._state(ctx)
+    cell = TS.launch_plan(w, st[0], st[1], bb)["cell"]
+    prim = PR.GoToCell(lambda c: cell, arrived=lambda c: False, precise=True)
+    assert prim.tick(ctx) == Status.RUNNING
+    cmd = ex.issued[-1]
+    cx, cz = w.to_world(*cell)
+    assert cmd["cmd"] == "move" and cmd["target"] is None
+    assert cmd["goal"][0] == pytest.approx(cx + M.GOTO_NUDGE_OVERSHOOT)
+    assert cmd["goal"][1] == pytest.approx(cz)
+    assert prim.tick(ctx) == Status.SUCCESS      # 只挪一次，结果交给后续节点
+    assert len(ex.issued) == 1
+
+
+def test_precise_goto_no_nudge_near_center_or_when_throwable(frame_offcenter):
+    from ai.exec.client import NullExec
+    w, book, bb, ctx = _offcenter_ctx(frame_offcenter, x=7.1)
+    ex = NullExec()
+    ctx["exec"] = ex
+    cell = P.chef_cell(ctx["chef"], w.to_grid)
+    assert PR.GoToCell(lambda c: cell, arrived=lambda c: False,
+                       precise=True).tick(ctx) == Status.SUCCESS
+    w, book, bb, ctx = _offcenter_ctx(frame_offcenter)
+    ctx["exec"] = ex
+    assert PR.GoToCell(lambda c: cell, arrived=lambda c: True,
+                       precise=True).tick(ctx) == Status.SUCCESS
+    # 默认（非精确）行为不变：同格即到
+    assert PR.GoToCell(lambda c: cell).tick(ctx) == Status.SUCCESS
+    assert ex.issued == []
+
+
+def test_throw_trees_use_precise_goto():
+    from ai.primitives.throw import ThrowIntoCooker
+    seq = _throw_shroom().build().child
+    goto = next(ch for ch in seq.children if isinstance(ch, PR.GoToCell))
+    assert goto.precise is True
+    pot = ThrowIntoCooker(lambda c: None, lambda c: True, lambda c: False, "k")._build_child()
+    assert next(ch for ch in pot.children if isinstance(ch, PR.GoToCell)).precise is True

@@ -43,6 +43,7 @@ class Executor:
         self.active_task = None  # type: Optional[object]  当前树对应的 task
         self.task_start_tick = None  # type: Optional[int]
         self.baseline = None  # 出餐基线（建树时抓一次，DeliverPlate.done 用）
+        self.held_at_start = None  # type: Optional[str]  建树时手里的东西
 
     def tick(self, task, ctx):
         # type: (object, dict) -> str
@@ -69,7 +70,16 @@ class Executor:
             ctx["baseline"] = self.baseline
 
         # ② tick 树（Timeout 装饰器内部处理超时）
-        status = self.active_tree.tick(ctx)
+        # 兜底任务（RescueCooked）站位全被拉黑时仍可走原站位，见
+        # reachability._interact_goals；只在本 task 的这一次 tick 内生效。
+        last_resort = getattr(task, "STANCE_LAST_RESORT", False)
+        if last_resort:
+            ctx["stance_last_resort"] = True
+        try:
+            status = self.active_tree.tick(ctx)
+        finally:
+            if last_resort:
+                ctx.pop("stance_last_resort", None)
 
         if status != Status.RUNNING:
             # 终态：这棵树到此为止。留着它有两个坏处：
@@ -111,6 +121,10 @@ class Executor:
         # 抓出餐基线（DeliverPlate.done 的双信号之一）
         from ai.tasks.assembly import delivery_baseline_from
         self.baseline = delivery_baseline_from(ctx.get("w"))
+        # 开树时手里拿着什么：失败时手里还是它 = 「开头清手没清掉」，不是 task 本身
+        # 失败（agent._note_failure 据此只做短冷却，不计入放弃计数）。
+        from ai.query import predicates as P
+        self.held_at_start = P.held_name(ctx.get("chef")) or None
 
     def halt_and_discard(self):
         # type: () -> None

@@ -1,5 +1,5 @@
 """规划与食材查询共用当前帧的可达性；未知拓扑保留离线兼容。"""
-from ai.space import navigation, occupancy, seams
+from ai.space import navigation, occupancy, seams, shuttle
 from ai.query import predicates as P
 
 
@@ -72,9 +72,27 @@ def can_interact(ctx, entry):
     return any(goal in field for goal in goals or ())
 
 
+def shuttle_clock(ctx):
+    # type: (dict) -> object
+    return getattr(ctx.get('bb'), 'shuttle_clock', None)
+
+
+def shuttle_wait(ctx, entry):
+    # type: (dict, dict) -> object
+    """entry 在渡运台面上时走过去还要在口边等几秒（0 = 不用等 / 不在渡运台面；
+    None = 够不着且时间表预测不了）。"""
+    return shuttle.wait_seconds(ctx['w'], entry, ctx.get('field'), shuttle_clock(ctx))
+
+
 def interact_wait(ctx, entry):
     # type: (dict, dict) -> float
-    """走到 entry 旁交互的最短路上要在门洞口等几秒（不可达 / 不用等返回 0）。"""
+    """走到 entry 旁交互的最短路上要在门洞口等几秒（不可达 / 不用等返回 0）。
+
+    渡运台面上的东西：等篮子转回来的秒数（见 shuttle.wait_seconds）。
+    """
+    sw = shuttle_wait(ctx, entry)
+    if sw:
+        return sw
     field = ctx.get('field')
     waits = getattr(field, 'waits', None)
     if not waits:
@@ -88,11 +106,36 @@ def interact_wait(ctx, entry):
     return min(reach)[1] * seams.SEC_PER_STEP
 
 
+def task_shuttle_wait_seconds(task, ctx):
+    # type: (object, dict) -> float
+    """task 要碰的资源里，在渡运台面上、最晚那个还要等篮子几秒（不在 / 预测不了 = 0）。"""
+    world = ctx.get('w')
+    if world is None or not shuttle.shuttle_grids(world):
+        return 0.0
+    worst = 0.0
+    for rid in _task_resource_ids(task):
+        if rid == 'bin':
+            continue
+        target = resource(world, rid)
+        if target is not None:
+            worst = max(worst, shuttle_wait(ctx, target) or 0.0)
+    for target in _extra_wait_targets(task, ctx):
+        worst = max(worst, shuttle_wait(ctx, target) or 0.0)
+    return worst
+
+
+def _extra_wait_targets(task, ctx):
+    # type: (object, dict) -> list
+    """task 资源表之外、执行时还要等的目标（如 SendAcross 要放的渡运台面格）。"""
+    fn = getattr(task, 'wait_targets', None)
+    return list(fn(ctx) or ()) if callable(fn) else []
+
+
 def task_wait_seconds(task, ctx):
     # type: (object, dict) -> float
     """task 要碰的资源里，最晚那个的等门时间（秒）。与 task_veto 同一份资源表。"""
     field = ctx.get('field')
-    if not getattr(field, 'waits', None):
+    if not getattr(field, 'waits', None) and not shuttle.shuttle_grids(ctx['w']):
         return 0.0
     worst = 0.0
     for rid in _task_resource_ids(task):
@@ -101,6 +144,8 @@ def task_wait_seconds(task, ctx):
         target = resource(ctx['w'], rid)
         if target is not None:
             worst = max(worst, interact_wait(ctx, target))
+    for target in _extra_wait_targets(task, ctx):
+        worst = max(worst, interact_wait(ctx, target))
     destination = _DESTINATIONS.get(task.TYPE)
     if destination:
         waits = [interact_wait(ctx, s) for s in ctx['w'].stations
@@ -138,6 +183,10 @@ def _interact_goals(ctx, entry):
     goals = set(navigation.interact_cells_multi(cells, world.walkable, world.belt_cells, include_belts=True))
     if world.walkable(*cell):
         goals.add(cell)
+    # 渡运台面（人上不去、隔着围栏够）：常规四邻交互位没有，用格外站位的落脚格。
+    st = shuttle.station_of(world, entry)
+    if st is not None:
+        goals |= {s['cell'] for s in shuttle.stances(world, st)}
     # 执行层认定「该目标在此站位交互失败」后，规划层也必须读取同一事实。
     # 否则 NO_ABANDON 的盛饭任务会每拍重建，在唯一坏站位上失败数百次。
     bb = ctx.get('bb')
@@ -147,7 +196,13 @@ def _interact_goals(ctx, entry):
     bad = {tuple(stance) for (resource, stance), until
            in (getattr(scratch, 'bad_pairs', None) or {}).items()
            if resource == rid and until > tick}
-    return goals - bad
+    left = goals - bad
+    # 兜底任务（端快糊的锅）：站位全被拉黑时仍按原站位放行。拉黑可能来自
+    # 别的动作的失败（盘已满、往盘里加料被拒 → 封了灶前唯一站位），不能让它
+    # 连带判「锅救不了」，否则锅在 TTL 内烧穿起火（trace-20261031-230344）。
+    if not left and goals and ctx.get('stance_last_resort'):
+        return goals
+    return left
 
 
 def resource(world, rid):
@@ -184,6 +239,8 @@ def task_veto(task, ctx):
     # 由它自己的 feasible 判（throw_supply.sources / launch_plan）。
     if ctx.get('field') is None or task.TYPE == 'ThrowBatch':
         return ''
+    if getattr(task, 'STANCE_LAST_RESORT', False):
+        ctx = dict(ctx, stance_last_resort=True)  # planner 的 ctx 跨候选共享，不能原地改
     for rid in _task_resource_ids(task):
         if rid == 'bin' and task.TYPE == 'Discard':
             continue  # 逻辑共享资源，下面按站点类型解析真实垃圾桶。
@@ -191,7 +248,11 @@ def task_veto(task, ctx):
         if target is None:
             return 'missing_resource'
         if not can_interact(ctx, target):
-            return 'unreachable'
+            # 渡运台面上的东西：篮子转回来就够得着，时间表能预测就不否决，
+            # 由等待成本（task_wait_seconds → planner 等门让位）决定什么时候去。
+            if (shuttle.station_of(ctx['w'], target) is None
+                    or shuttle_wait(ctx, target) is None):
+                return 'unreachable'
     destination = _DESTINATIONS.get(task.TYPE)
     if destination and not any(s.get('t') == destination and can_interact(ctx, s)
                                for s in ctx['w'].stations):

@@ -157,9 +157,14 @@ class Timeout(Node):
             self._ticks = 0
             return Status.FAILURE
         self._ticks += 1
+        waited = ctx.get("external_wait", 0) if isinstance(ctx, dict) else 0
         s = self.child.tick(ctx)
         if s != Status.RUNNING:
             self._ticks = 0
+        elif isinstance(ctx, dict) and ctx.get("external_wait", 0) != waited:
+            # 子树这一拍在等外部（渡运篮子转回来，见 move.Approach._await_shuttle）：
+            # 不算进本 task 的超时预算，上限由等待方自己封顶。
+            self._ticks -= 1
         return s
 
     def halt(self):

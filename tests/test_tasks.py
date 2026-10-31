@@ -2277,6 +2277,7 @@ def test_all_spec_tasks_are_registered():
         "PlaceToRelay",                                       # 17（1-3 中转传盘）
         "FillCooker",                                         # 18（订单无关填灶）
         "ThrowBatch",                                         # 20（批量投掷备料）
+        "SendAcross",                                         # 21（渡运篮子跨区送件）
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

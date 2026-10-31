@@ -153,6 +153,8 @@ class EnsureHandsFree(Primitive):
             return Status.FAILURE
         s = self._step(ctx)
         if s == Status.FAILURE:
+            # 给 agent 的失败归因：这一拍失败的是「清手」，不是 task 本身的动作
+            ctx['hands_clear_failed'] = True
             phase = (ctx.get('interaction') or {}).get('phase', '')
             if (self._on_station and phase != 'approach'
                     and P.held_name(ctx['chef']) == self._drop_held

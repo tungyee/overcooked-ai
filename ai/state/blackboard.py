@@ -114,6 +114,9 @@ class Blackboard:
     # 平台接缝门洞的开关时间表（ai/space/seam_clock.SeamClock）：跨帧学周期，
     # 寻路按到达时刻查要等多久。Agent 每拍 observe；切关随黑板整体换新。
     seam_clock: Any = None
+    # 渡运台面（ai/space/shuttle.py）的可交互窗口时间表，同为 SeamClock：每个
+    # 台面对 P2 可达区「够得着 / 够不着」当一道门。
+    shuttle_clock: Any = None
 
     # ---------- 对话层（spec §4.5–4.7）----------
     # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。

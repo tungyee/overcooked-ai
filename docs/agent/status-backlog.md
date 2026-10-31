@@ -1,5 +1,21 @@
 # 已知限制、当前状态与待办
 
+## 渡运台面：隔着围栏取 / 送篮子上的东西（2026-10-31，未实机验证）
+
+2-3（Balloon_2_2）`trace-20261031-185032`：0 出餐。P1 t≈45s 把两盘成品放上下方 `Server_Balloon` 篮子台面，篮子 t≈57.7~64.1s 停在左口，P2 全程 `DeliverPlate … unreachable`，原地空站，菜又被运回右边。根因：台面在 gz=-6，正前一排格心 z=6.0 落在固定地板外 3cm（Ground minz=6.03），四邻交互位一个都没有；P1 实际站在 z≈6.44（两排格心之间）。人上不了篮子（篮子地板 0.63m），不是门洞问题，`seam_clock` z=6.0 恒 `known: False`。篮子：右停 bx≈18、左停 bx≈3.6，各停 ≈6.4s、单程 ≈11.6s、周期 ≈36.2s（`anim.len=13` 只是单程，不能当周期）。
+
+- `ai/space/shuttle.py`：渡运网格 = 会动、上面有台面、台面外包盒里没有主网格可走格（Balloon_2_3 气球、Rapids 木筏不算）。格外站位：从台面外沿往外每 0.05m 找能站的点（Ground 内、离阻挡层 ≥0.45m，≤1.25m），挂到最近可走格当寻路落脚格。`reachability._interact_goals` 并入落脚格；`Approach` 对渡运台面上的目标走到站位点（朝台面推 0.3m 作 move 终点，插件按句柄判到达）。
+- 时间表 `bb.shuttle_clock`（复用 `SeamClock`，新加 `observe_flags`）：每个台面「P2 可达区够得着」当一道门学周期；trace 顶层 `shuttle_clock`，键 `slot=网格/站名`。离线学出 T=36.2s，单格可交互窗口 10~13s（比停靠长：进出口时也够得着）。
+- `task_veto`：渡运台面上的东西够不着但时间表能预测 → 不否决；`task_wait_seconds` 给等篮子的秒数，planner 照门洞让位（>3s 先做别的）。拿着东西时门洞不让位，渡运仍让位（`task_shuttle_wait_seconds`）。
+- **取件（拿篮子上的东西）不加 task**：等篮子在 `move.Approach` 里做——目标在渡运台面上、此刻够不着但时间表能预测时原地 RUNNING，到口前 4s 先走到上一轮的落脚格（≤800 拍）。每拍 `ctx["external_wait"] += 1`，`Timeout` 不把等待算进 task 超时预算。`DeliverPlate` / `ResetPlate` / 装盘类拿篮子上的东西都一样，树结构不变。trace exec 记 `shuttle_wait`（秒）。
+- **送件（往篮子上放）**：通用 `SendAcross(item=种类, resources=(来源 id, 渡运网格))`，送什么、送几份由 `ai/revenue/cross_supply.send_deficit` 统一判（目前只有干净盘：对面要装盘的单数封顶 2，减对面现有 + 篮子上在途的空盘，再与我这边富余取小）；至少留 1 格给对面送菜；层 L_UNBLOCK，`plate_pressure` 按对面干净盘数。放哪格由 task 选（够得着的里最近，否则预测等待最短），`wait_targets` 让放置格的等篮子时间也进让位。`trace-20261031-204801` t≈132~172 右边 0 干净盘、左边积 3 块、40s 零出餐即此缺口。能投的生料仍走 `ThrowBatch`（下一步可并为同一个 task 的投掷通道）。
+- 让位：当前承诺等篮子 > `ACTIVE_SHUTTLE_DEFER_S`(8s) 也让出去（`trace-20261031-204801` t=67~99 送餐干站 30s）；3~8s 迟滞带不切。
+- 清手失败归因：失败拍 `EnsureHandsFree` 置 `ctx["hands_clear_failed"]` 且手里仍是开树时那件 → 只冷却 60 拍、不计入放弃计数（`trace-20261031-204801` t=55.4 送餐被拉黑 10s、错过停靠窗口）。
+- 拼装格排除渡运台面（`_assembly_cells`），空盘不摆到会被运走的地方。
+- fixture `balloon22-20261031-185032-shuttle` / `balloon22-20261031-204801-send-plates` / `balloon22-20261031-201659-throw-offcenter`，测试 `tests/test_shuttle.py`、`tests/test_throw_batch.py`（投掷站位离格心 0.48m 投不出：`GoToCell(precise=True)` 到格后再朝格心挪一次）。
+
+未做 / 待实机：第一圈时间表还没学会时，篮子到口那几秒照样能取（可达），但不会提前就位；站位贴墙 0.45m，句柄若够不着需调 `GOAL_PUSH`；`SendAcross` 只认干净盘、灶「全在对面」才算对面装盘（未按灶具类型细分）；地板兜底盲按 tap 发全 None target 必 handle mismatch（手里东西放不下时仍会卡）；门洞 / 投掷 / 中转台统一成通道、传送带与人控平台都留到下一轮。
+
 ## 盘匹配优先给「能立刻装熟料」的单（2026-10-31，未实机验证）
 
 2-2（Balloon_2_3）4 局 trace（20261030-214824/224658/230700/233253）共 9 次：意面盘/空盘绑给缺肉、肉锅没开的非队首 MeatOnly（缺料数少，排序永远赢），Marinara 的熟鱼/熟虾没盘只能 `RescueCooked`。`_match_plates_to_orders` 改为两轮贪心：第一轮只配「订单要、盘还缺、且有已熟未糊源」的边，每配一条扣一份熟料供给（`cooked_sources` 计数，一口锅只让一块盘提前）；第二轮按原序（队首 → 缺料数 → 堆顶空盘 → remaining）配其余。队首能立刻用时仍是队首赢；钉住的配对先处理并占供给。fixture `balloon23-20261030-224658-plate-to-cooked`。未做：盘离锅距离 / 来不及就先救锅的 ETA 判断。

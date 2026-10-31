@@ -13,7 +13,7 @@
 decompose() 不在这里——spec §8.2 明确"decompose() 删除"。它输出的线性
 步骤序列正是 §6.2 要换掉的东西：执行顺序从可行性涌现，不预先排序。
 """
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai.query import predicates as P
 from ai.query.plate_tokens import parse_plate_detail
@@ -390,8 +390,9 @@ def _merge_station_coords(entry, stations):
     return entry
 
 
-def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_access=None):
-    # type: (object, Optional[str], str, bool, object) -> Optional[Dict]
+def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
+                    can_access=None, contents=frozenset()):
+    # type: (object, Optional[str], str, bool, object, Any) -> Optional[Dict]
     """定位食材当前位置，返回 {"kind": ..., "st"/"chef": ...}。
 
     可达来源的 kind 优先级：held（被**自己**拿着）→ board（砧板上）→ plate（已装盘）
@@ -406,19 +407,26 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_ac
     的料，宽松匹配会让"去拿生黄瓜"的 task 看到板上的切好黄瓜就以为
     料到手了。生/熟/切好的区分由调用方传对名字。
 
+    **内容也精确匹配**（contents，见 ai.query.carriers）：物品 detail 解析出
+    的 token 集必须与 contents 完全相等。缺省空集 = 普通料，包了熟肉的卷饼
+    不会被当成空卷饼拿去补蘑菇卷；contents={cooked:burritomeat:fryingpan}
+    = 只认包了熟肉的那张。箱子/砧板只出普通料，contents 非空时跳过。
+
     与 oc/ai/task.py:find_ingredient 的差异：kind=="plate" 时**返回盘
     本身**（旧实现只返回 {"kind":"plate"}）。spec §6.0 要求谓词按绑定
     参数求值——两单都缺黄瓜时，必须能区分料在哪只盘里。
     """
+    from ai.query.carriers import held_contents, item_contents
     il = str(ing or "").strip().lower()
     if not il:
         return None
+    want = frozenset(contents or ())
 
     for c in getattr(world, "chefs", None) or ():
         # 只认自己手里的：P1 手里的料 P2 拿不到，跳过继续找箱子/板/散落
         if str(c.get("name") or "").strip().lower() != str(self_name).strip().lower():
             continue
-        if P.held_name(c) == il:
+        if P.held_name(c) == il and held_contents(world, c.get("name")) == want:
             return {"kind": "held", "chef": c.get("name")}
 
     if can_access is None:
@@ -427,12 +435,12 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_ac
         can_access = lambda st: reachability.can_interact(route, st)
 
     for ws in getattr(world, "workstations", None) or ():
-        if str(ws.get("item") or "").lower() == il:
+        if not want and str(ws.get("item") or "").lower() == il:
             station = _merge_station_coords(ws, getattr(world, "stations", None))
             if can_access(station):
                 return {"kind": "board", "st": station}
 
-    if not exclude_plate:
+    if not exclude_plate and not want:
         for p in getattr(world, "plates", None) or ():
             if il in P.plate_contents(p) and can_access(p):
                 return {"kind": "plate", "st": p}
@@ -443,9 +451,15 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_ac
         # 意面，实际落在 x≈23.6，P2 对空地反复拾取到关卡结束）。
         if it.get("flying") is True:
             continue
+        # 内容不符不算：包了肉的卷饼不是「一份卷饼」，拿它去补别的单会把
+        # 不相干的料一起倒进盘（trace-20261031-233010）。
+        if item_contents(it) != want:
+            continue
         if str(it.get("n") or "").lower() == il and can_access(it):
             return {"kind": "loose", "st": it}
 
+    if want:
+        return None
     for st in getattr(world, "stations", None) or ():
         if not isinstance(st, dict) or st.get("t") != "crate":
             continue

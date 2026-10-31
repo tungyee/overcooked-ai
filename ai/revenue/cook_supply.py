@@ -109,6 +109,14 @@ def cooked_supply(world, book, item):
         if book.plate_has(p, item):
             n += 1
 
+    # ⑤ 已装料载体里的（包了熟肉的卷饼等，散落或任一方手持）：放进盘就是
+    # 一份装盘熟料。不算的话 P1 包好肉卷，填灶还按缺一份再煎一锅。
+    from ai.query.carriers import carriers
+    want = book.want_tokens(item)
+    for c in carriers(world, include_held=True):
+        if want & c["contents"]:
+            n += 1
+
     return n
 
 

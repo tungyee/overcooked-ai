@@ -11,7 +11,7 @@
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay）。`T.TASK_TYPES` 登记全部 20 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay）。`T.TASK_TYPES` 登记全部 21 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
 主线 17 个 task 类型（另三个见表后，含 ThrowBatch）：
 
@@ -73,6 +73,10 @@
   每拍用 `counter_cell_now` 重投影
 
 - 盘 → 实例名 `n` 为主
+- 已装料载体（包了熟肉的卷饼、夹了生菜的汉堡胚等，`ai/query/carriers.py`）→
+  **(物品名, 内容签名)**，不用位置：物品无实例 id，拾取后坐标/`on_station` 都会变。
+  `FetchToPlate` 的 resources 为 `(plate_id, 签名)` 时取的是载体，`find_ingredient(..., contents=签名)`
+  按名字 + detail 内容精确匹配（缺省空集 = 普通料，不会把包肉卷饼当空卷饼拿）
 
 认领是 **`(resource_id, action)` 动作级**粒度（不是按资源整锁）：P1 往 1 号锅放生饭只锁 `(cooker1, "fetch_to")`，`(cooker1, "take_cooked")` 仍开放——取熟饭是最有价值的接力。认领的 owner 常量是 `OWNER = "P2"`（AI 控制的是 P2）。
 

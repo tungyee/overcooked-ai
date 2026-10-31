@@ -690,6 +690,9 @@ class RescueCooked(Task):
     DESC = "把快糊的锅端离火"
     LABEL = "端锅离火"
     NO_ABANDON = True     # 端锅离灶是停烧糊的兜底：拉黑它就等于判这口锅死刑
+    # 同理不让「目标-站位」拉黑把灶的全部站位封死：拉黑可能来自别的动作
+    # （往满盘里加料被拒），见 reachability._interact_goals。
+    STANCE_LAST_RESORT = True
 
     @property
     def cooker_id(self):

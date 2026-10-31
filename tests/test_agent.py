@@ -402,3 +402,33 @@ def test_balloon_stationary_after_motion():
     agent._update_balloon_motion(World(_balloon_frame(-8.2, -1.0)))
     agent._frame_seq = 3
     assert agent._update_balloon_motion(World(_balloon_frame(-8.2, -1.0))) is False
+
+
+def test_hands_clear_failure_only_short_cooldown(agent):
+    """开头清手没清掉（手里还是开树时那件）：不计入放弃计数，只短冷却。
+
+    trace-20261031-204801 t=55.4：送餐被选中那拍手里刚多出一块肉，清手两次放不下
+    → 整个送餐拉黑 10s，篮子停靠窗口里再也没选它。
+    """
+    from ai import agent as A
+    from ai import tasks as T
+    task = T.DeliverPlate("1", ("p1",))
+    agent.executor_inst.held_at_start = "dicedmeat"   # 同 P.held_name 口径
+    ctx = {"chef": {"name": "Player 2", "held": "DicedMeat"}, "hands_clear_failed": True}
+    for _ in range(A.ABANDON_FAIL_STREAK + 2):
+        agent._note_failure(task, ctx)
+    until = agent.bb.scratch.abandoned_actions[task.claims()[0]]
+    assert until == agent.tick + A.HANDS_CLEAR_COOLDOWN_TICKS
+    assert A.HANDS_CLEAR_COOLDOWN_TICKS < A.ABANDON_TTL_TICKS
+
+
+def test_task_own_failure_still_abandons(agent):
+    """失败在 task 自己的动作上（没有 hands_clear_failed）：照旧连败 3 次整体放弃。"""
+    from ai import agent as A
+    from ai import tasks as T
+    task = T.DeliverPlate("1", ("p1",))
+    agent.executor_inst.held_at_start = None
+    ctx = {"chef": {"name": "Player 2", "held": None}}
+    for _ in range(A.ABANDON_FAIL_STREAK):
+        agent._note_failure(task, ctx)
+    assert agent.bb.scratch.abandoned_actions[task.claims()[0]] == agent.tick + A.ABANDON_TTL_TICKS

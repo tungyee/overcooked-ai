@@ -11,8 +11,8 @@ from ai import primitives as PR
 from ai.query import stations as S
 from ai.exec.bt import Guard, Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           ingredient_available, ingredient_source,
-                           plate_by_id, plate_matches_order)
+                           held_matches_contents, ingredient_available,
+                           ingredient_source, plate_by_id, plate_matches_order)
 
 
 def _plate_on_serving_hatch(ctx, plate):
@@ -98,6 +98,12 @@ class FetchToPlate(Task):
       - 完成判定：book.plate_has(p, item)（盘里的 cucumber）
     见 RecipeBook.plate_tokens / want_tokens 的注释。
 
+    resources = (plate_id,) 或 (plate_id, contents)。contents 是**已装料载体**
+    的内容签名（ai.query.carriers.signature，如 ('cooked:burritomeat:fryingpan',)）：
+    取的不是一份普通底料，而是包了这些料的那件（包肉的卷饼），放进盘时底料
+    与内容一起进盘。签名进身份，所以「包肉卷饼」与「空卷饼」是两个候选、
+    分开打分；身份不含位置，拿起后承诺不断。
+
     **不认领任何资源**（spec §6.1 第 9 号的认领列为空）：料在箱子里无限
     供应，盘已由 PlaceCleanPlate 认领过。重复认领盘会把自己的下游
     DeliverPlate 挡在外面。
@@ -113,16 +119,24 @@ class FetchToPlate(Task):
     def plate_id(self):
         return self._resources[0]
 
+    @property
+    def contents(self):
+        # type: () -> Tuple[str, ...]
+        """载体内容签名；普通料为空元组。"""
+        return tuple(self._resources[1]) if len(self._resources) > 1 else ()
+
     def claims(self):
         return ()
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        """绑定盘已含该料。按装盘态词汇判（spec §6.0 的绑定参数求值）。"""
+        """绑定盘已含该料（载体：底料与全部内容都已进盘）。按装盘态词汇判。"""
         p = plate_by_id(ctx, self.plate_id)
         if p is None:
             return False
-        return ctx["book"].plate_has(p, self.item)
+        if not ctx["book"].plate_has(p, self.item):
+            return False
+        return set(self.contents) <= ctx["book"].plate_tokens(p)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
@@ -133,7 +147,10 @@ class FetchToPlate(Task):
             return False
         if not plate_matches_order(ctx, p, self.order_id):
             return False       # 盘内容与该单不再兼容（P1 放错料）
-        return ingredient_available(ctx, self._fetch_form(ctx))
+        if self.contents and not _carrier_fits_plate(ctx, p, self.order_id,
+                                                     self.item, self.contents):
+            return False       # 载体的料盘里已有 / 该单不要
+        return ingredient_available(ctx, self._fetch_form(ctx), self.contents)
 
     def _fetch_form(self, ctx):
         # type: (Dict) -> Optional[str]
@@ -143,39 +160,52 @@ class FetchToPlate(Task):
         返回 ChoppedCucumber、ingredient_available 查不到 → 判不可行，
         把机会让给 FetchToBoard / Chop。
         """
-        book = ctx["book"]
-        if book.needs_chopping(self.item):
-            return book.chop_target(self.item)
-        return self.item
+        return _fetch_form_of(ctx, self.item)
 
     def build(self):
         # type: () -> Node
-        plate_id, item = self.plate_id, self.item
+        plate_id, item, contents = self.plate_id, self.item, self.contents
 
         def src(c):
-            return ingredient_source(c, _fetch_form_of(c, item))
+            return ingredient_source(c, _fetch_form_of(c, item), contents)
 
         def holding(c):
-            return P.held_matches(c["chef"], _fetch_form_of(c, item))
+            # 名字 + 内容：只比名字时，句柄选中旁边同名的空卷饼也算拿对了
+            return held_matches_contents(c, _fetch_form_of(c, item), contents)
 
         def in_plate(c):
             p = plate_by_id(c, plate_id)
-            return p is not None and c["book"].plate_has(p, item)
+            return p is not None and c["book"].plate_has(p, item) \
+                and set(contents) <= c["book"].plate_tokens(p)
 
         return PR.Timeout(Sequence([
             # 树首清手：被抢占时手里可能还端着上一 task 的盘子（spec §7.4）；
-            # keep：手里已经是目标料就别放下再捡
-            PR.EnsureHandsFree(keep=lambda c: P.held_matches(
-                c["chef"], _fetch_form_of(c, item))),
+            # keep：手里已经是目标料就别放下再捡（拿错同名不同料的会被放下）
+            PR.EnsureHandsFree(keep=holding),
             PR.InteractWith(src, "pickup", holding),
             PR.InteractWith(lambda c: plate_by_id(c, plate_id),
                             "placement", in_plate),
         ]), TASK_TIMEOUT_TICKS)
 
 
+def _carrier_fits_plate(ctx, plate, order_id, item, contents):
+    # type: (Dict, Dict, Any, Optional[str], Any) -> bool
+    """载体（底料 item + contents）放进这只盘后仍是该单的子集、且不重复。"""
+    from ai.query.carriers import carrier_fits
+    order = None
+    for o in ctx["w"].orders:
+        if str(o.get("id")) == str(order_id):
+            order = o
+    if order is None:
+        return order_id is None
+    base = str(_fetch_form_of(ctx, item) or "").strip().lower()
+    return carrier_fits(ctx["book"], {"base": base, "contents": frozenset(contents)},
+                        order, plate)
+
+
 def _fetch_form_of(ctx, item):
     # type: (Dict, Optional[str]) -> Optional[str]
-    """FetchToPlate._fetch_form 的自由函数版，供树内闭包用。"""
+    """该去取哪个形态的料（需切的取切好的产物）。FetchToPlate 与树内闭包共用。"""
     book = ctx["book"]
     if book.needs_chopping(item):
         return book.chop_target(item)

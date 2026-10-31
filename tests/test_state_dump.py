@@ -56,6 +56,15 @@ def test_snapshot_is_json_serializable():
     json.dumps(snap, ensure_ascii=False)
 
 
+def test_snapshot_includes_held_items():
+    w = _world()
+    w.held_items = [{"n": "Tortilla", "held_by": "Player 2",
+                     "detail": ["CookedCompositeAssembledNode(FryingPan){ ing:BurritoMeat }"]}]
+    snap = snapshot(w)
+    assert snap["held_items"] == w.held_items
+    assert snap["held_items"][0] is not w.held_items[0]
+
+
 def test_snapshot_preserves_held_plate_identity():
     w = _world()
     w.held_plates = [{"n": "bound-plate", "name": "equipment_plate_01",

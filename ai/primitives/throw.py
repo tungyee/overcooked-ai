@@ -213,7 +213,7 @@ class ThrowIntoCooker(Node):
             return node._plan["cell"] if node._plan else None
 
         return Sequence([
-            GoToCell(stance, arrived=self.ok_here),
+            GoToCell(stance, arrived=self.ok_here, precise=True),
             ThrowTo(self.cooker, aim_dot=POT_AIM_DOT, strict=True,
                     face_timeout_ms=POT_FACE_TIMEOUT_MS),
             WaitUntil(self.placed, POT_CATCH_WAIT_TICKS),

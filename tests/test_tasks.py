@@ -2283,6 +2283,7 @@ def test_all_spec_tasks_are_registered():
         "ThrowBatch",                                         # 20（批量投掷备料）
         "SendAcross",                                         # 21（跨区通道送件）
         "FetchToCarrier", "PlaceCarrierInCooker",             # 22, 23（可烹饪载体：披萨）
+        "MergePlates",                                        # 盘合并（spec 2026-11-01-plate-merge-design）
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

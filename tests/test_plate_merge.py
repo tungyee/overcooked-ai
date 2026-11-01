@@ -57,3 +57,88 @@ def test_missing_union_only_counts_union():
     seaweed = {"n": "-1", "detail": ["ing:Seaweed"]}
     assert b.missing_union(ORDER_FISH, [seaweed]) == (
         "BoiledSushiRice", "SushiFish")
+
+
+# ---------- Task 2: MergePlates task 契约 ----------
+
+from ai import tasks as T  # noqa: E402
+
+
+class W(object):
+    def __init__(self, plates=(), orders=(), chefs=(), stations=()):
+        self.plates = list(plates)
+        self.orders = list(orders)
+        self.chefs = list(chefs)
+        self.stations = list(stations)
+        self.recipes = RECIPES
+
+
+P2 = {"name": "Player 2", "held": None, "x": 0.0, "z": 0.0}
+P1 = {"name": "Player 1", "held": None, "x": 1.0, "z": 0.0}
+
+
+def make_ctx(plates, orders=(), chefs=(), stations=()):
+    w = W(plates, orders, chefs, stations)
+    return {"w": w, "chef": w.chefs[0] if w.chefs else P2,
+            "book": book()}
+
+
+def plate(n, detail, held_by=None, x=1.0, z=1.0):
+    return {"n": n, "detail": list(detail), "contents": list(detail),
+            "held_by": held_by, "x": x, "z": z}
+
+
+SEAWEED = plate("s1", ["ing:Seaweed"])
+FISH_RICE = plate("d1", ["ing:SushiFish",
+                         "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"])
+
+
+def test_merge_plates_claims_both_plates():
+    t = T.MergePlates("1", ("s1", "d1"))
+    assert t.claims() == (("s1", "merge"), ("d1", "merge"))
+
+
+def test_merge_plates_feasible_when_union_completes_order():
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([SEAWEED, FISH_RICE], orders=[ORDER_FISH],
+                   chefs=[P2, P1])
+    assert t.feasible(ctx) is True
+
+
+def test_merge_plates_feasible_false_on_overlap_no_progress():
+    # src 只有海苔，dst 已有海苔+鱼：并集不减少缺料（饭仍缺），严格进展不成立
+    dst = plate("d1", ["ing:Seaweed", "ing:SushiFish"])
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([SEAWEED, dst], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.feasible(ctx) is False
+
+
+def test_merge_plates_feasible_false_on_union_superset():
+    # 并集多了黄瓜，不是该单子集
+    dst = plate("d1", ["ing:SushiFish", "ing:Cucumber",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"])
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([SEAWEED, dst], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.feasible(ctx) is False
+
+
+def test_merge_plates_feasible_false_when_dst_held_by_p1():
+    dst = plate("d1", ["ing:SushiFish",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"],
+                held_by="Player 1")
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([SEAWEED, dst], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.feasible(ctx) is False
+
+
+def test_merge_plates_done_when_src_empty():
+    src = plate("s1", [], held_by="Player 2")
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([src, FISH_RICE], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.done(ctx) is True
+
+
+def test_merge_plates_done_false_when_src_still_has_contents():
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([SEAWEED, FISH_RICE], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.done(ctx) is False

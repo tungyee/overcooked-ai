@@ -1,4 +1,5 @@
-"""装盘与出餐两 task：FetchToPlate / DeliverPlate（spec §6.1 第 9/10 号）。
+"""装盘与出餐三 task：FetchToPlate / DeliverPlate / MergePlates（spec §6.1
+第 9/10 号 + 盘合并 spec 2026-11-01-plate-merge-design §5.1）。
 
 本模块只放装盘出餐这一组，共享的身份机制与跨组谓词在 base.py。
 外部不直接 import 本模块，一律 `from ai import tasks as T`
@@ -314,3 +315,88 @@ class DeliverPlate(Task):
             PR.InteractWith(serving, "placement",
                             lambda c: P.hands_free(c["chef"])),
         ])), TASK_TIMEOUT_TICKS)
+
+
+@_register
+class MergePlates(Task):
+    """把 src 盘的内容倒进 dst 盘（盘倒盘合并）。
+
+    游戏引擎允许手里 A 盘对台面上 B 盘 placement，A 的内容并进 B、A 变空盘
+    仍在手（trace-20261101-214045 t=851）。本 task 把「互补的两块半成品盘
+    合成一单」纳入行为树：src/dst 由 planner 的 `_gen_merge` 定向——并集
+    ⊆ 某单需求且缺料数严格减少（spec 2026-11-01-plate-merge-design §5.1）。
+    """
+
+    TYPE = "MergePlates"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "把一块盘的内容倒进另一块盘"
+    LABEL = "并盘"
+    HANDS = "empty"       # 要空手去端 src 盘；手里有东西时打分加腾手代价
+
+    @property
+    def src_id(self):
+        return self._resources[0]
+
+    @property
+    def dst_id(self):
+        return self._resources[1]
+
+    def claims(self):
+        return ((self.src_id, "merge"), (self.dst_id, "merge"))
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        src = plate_by_id(ctx, self.src_id)
+        return src is not None and P.plate_count(src) == 0
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        if self.done(ctx):
+            return False
+        src = plate_by_id(ctx, self.src_id)
+        dst = plate_by_id(ctx, self.dst_id)
+        if src is None or dst is None or self.src_id == self.dst_id:
+            return False
+        if P.plate_count(src) == 0 or P.plate_count(dst) == 0:
+            return False
+        order = None
+        for o in ctx["w"].orders:
+            if str(o.get("id")) == str(self.order_id):
+                order = o
+                break
+        if order is None:
+            return False
+        book = ctx["book"]
+        if not (book.plate_tokens(src) | book.plate_tokens(dst)) \
+                <= book.order_want_tokens(order):
+            return False
+        # 严格进展：并集比任一单盘都更接近该单（双方各缺对方有的料，重叠/被
+        # 包含的盘对不算）。用顶层成分计数（missing/missing_union），不用
+        # token 集差——token 集对熟料会重复计（rich+opaque 两个 token）。
+        missing_after = len(book.missing_union(order, [src, dst]))
+        if not (missing_after < len(book.missing(order, src))
+                and missing_after < len(book.missing(order, dst))):
+            return False
+        if _plate_on_serving_hatch(ctx, src) or _plate_on_serving_hatch(ctx, dst):
+            return False
+        p1 = P.chef_by_name(ctx["w"].chefs, P.P1_NAME)
+        return not P.holds_plate(p1, dst)
+
+    def build(self):
+        # type: () -> Node
+        src_id, dst_id = self.src_id, self.dst_id
+
+        def holding_src(c):
+            return P.holds_plate(c["chef"], plate_by_id(c, src_id))
+
+        def merged(c):
+            src = plate_by_id(c, src_id)
+            return src is not None and P.plate_count(src) == 0
+
+        return PR.Timeout(Sequence([
+            PR.EnsureHandsFree(keep=holding_src),
+            PR.InteractWith(lambda c: plate_by_id(c, src_id), "pickup",
+                            holding_src),
+            PR.InteractWith(lambda c: plate_by_id(c, dst_id), "placement",
+                            merged),
+        ]), TASK_TIMEOUT_TICKS)

@@ -213,3 +213,20 @@ def test_gen_merge_equal_tokens_lower_id_as_dst_stable():
     # 平手（各 1 token）→ id 小的 p1 作 dst；连跑两拍定向一致
     assert (got[0].src_id, got[0].dst_id) == ("p2", "p1")
     assert [(t.src_id, t.dst_id) for t in got2] == [("p2", "p1")]
+
+
+# ---------- Task 4: completion_ratio 并集扩展 ----------
+
+def test_order_completion_ratio_merge_union_complete():
+    w = _merge_world([SEAWEED, FISH_RICE], [ORDER_FISH], [P2W, P1W])
+    t = T.MergePlates("1", ("s1", "d1"))
+    got = planner._order_completion_ratio(t, w, Blackboard(), book(), {})
+    assert got == 1.0
+
+
+def test_order_completion_ratio_merge_union_partial():
+    fish = plate("d1", ["ing:SushiFish"])
+    w = _merge_world([SEAWEED, fish], [ORDER_FISH], [P2W, P1W])
+    t = T.MergePlates("1", ("s1", "d1"))
+    got = planner._order_completion_ratio(t, w, Blackboard(), book(), {})
+    assert abs(got - 2.0 / 3.0) < 1e-9

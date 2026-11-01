@@ -2691,14 +2691,25 @@ def _order_completion_ratio(task, world, bb, book=None, plate_match=None,
     if not composition:
         return 0.0
 
+    if book is None:
+        from ai.query.recipes import RecipeBook
+        book = RecipeBook(world.recipes, world.stations)
+
+    # 盘合并：完成度按 src∪dst 并集算（spec 2026-11-01-plate-merge-design §5.3）。
+    # MergePlates 没有 plate_match 里的单盘——它同时动两块盘，走并集口径。
+    if getattr(task, "TYPE", None) == "MergePlates":
+        src = _plate_by_n(world, getattr(task, "src_id", None))
+        dst = _plate_by_n(world, getattr(task, "dst_id", None))
+        if src is None or dst is None:
+            return 0.0
+        union = book.plate_tokens(src) | book.plate_tokens(dst)
+        filled = sum(1 for ing in composition if book.want_tokens(ing) & union)
+        return float(filled) / len(composition)
+
     # 查找该订单对应的盘子
     plate = _find_plate_for_order(oid, world, plate_match)
     if not plate:
         return 0.0
-
-    if book is None:
-        from ai.query.recipes import RecipeBook
-        book = RecipeBook(world.recipes, world.stations)
 
     # 载体候选（FetchToPlate 带内容签名）按「做完这一步之后」算：底料与它
     # 装着的料一起进盘。只对这一个候选这样算，同单其它 task 照旧按盘现状——

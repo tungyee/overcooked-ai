@@ -54,7 +54,8 @@ PRESSURE_RESCUE = 1.0
 # 等熟；一旦 pressure >= 1.0（刚熟）它仍先命中 L1/L2。
 # **不是** planner._COMBO_PREP_TYPES——后者还含 PlaceCleanPlate（分层后在 L4）。
 LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
-                    "FetchToCooker", "FillCooker", "Mix", "PlaceToRelay",
+                    "FetchToCooker", "FillCooker", "Mix",
+                    "FetchToCarrier", "PlaceCarrierInCooker",
                     "TakeCookedToPlate", "ThrowBatch")
 
 
@@ -191,7 +192,7 @@ TERM_WHITELIST = {
         "pressure",
         "urgency", "completion_ratio", "async_resource", "ingredient_reuse",
         "combo_head", "combo_break", "deadline_lookahead", "hands",
-        "move_penalty", "eta", "relay_1_3_bonus",
+        "move_penalty", "eta",
         # 对话偏好（spec §4.5）在备菜层与既有项直接相加：direct 的 +4
         # 改同层先后，claim 的 -8 在层内被截止闸兜底（spec §4.6）。
         "pref",

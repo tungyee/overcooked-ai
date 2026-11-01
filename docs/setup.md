@@ -75,6 +75,6 @@ cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/Oc2AIPlugin.dll"
 
 ## 参考
 
-- 插件协议版本：`0.23.5 / protocol 7`，需同时开放本机状态端口 27411 与执行端口 27412（见 `README.md`）。
+- 插件协议版本：`0.24.3 / protocol 8`，需同时开放本机状态端口 27411 与执行端口 27412（见 `README.md`）。
 - 架构与约定：`docs/agent/architecture.md`、`AGENTS.md`。
 - 语音排障：`docs/dialog_system.md`。

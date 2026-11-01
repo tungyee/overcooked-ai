@@ -46,6 +46,20 @@ def test_plugin_why_recorded_on_failure():
     assert rec["exec_failure"]["why"] == "gate closed"
 
 
+def test_portal_busy_blocks_entry_cell():
+    """推门推满 max_wait 没被传：回传门中心 → motion_failure 按门洞口径（不拉黑资源）。"""
+    class _W(object):
+        def to_grid(self, x, z):
+            return (int(round(x)), int(round(z)))
+
+    ex = FakeExec({"cmd_id": 7, "ok": False, "why": "portal busy",
+                   "held_after": None, "blocked_cell": [8.4, -1.9]})
+    ctx = {"now": 0.0, "w": _W()}
+    p = _issue(ctx, ex)
+    assert p._poll_exec(ctx, ex) == Status.FAILURE
+    assert ctx["motion_failure"] == {"reason": "gate_closed", "blocked_cell": (8, -2)}
+
+
 def test_client_deadline_recorded():
     ex = FakeExec(None)
     ctx = {"now": 0.0}

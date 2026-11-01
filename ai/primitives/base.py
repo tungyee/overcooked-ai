@@ -197,7 +197,7 @@ def target_grid_callbacks(world, target):
 
 
 def handle_desc(target, to_grid=None):
-    # type: (Optional[Dict], Any) -> Dict
+    # type: (Optional[Dict], Any) -> Optional[Dict]
     """目标句柄描述（exec 命令用）。核心是**网格坐标**：放置/拾取句柄按
     「网格位置」匹配（盘放在柜台上时，句柄指向柜台，但盘的 x/z 换算成网格
     跟柜台同格，所以按格匹配才对）。name 只做无网格时的兜底。
@@ -205,7 +205,10 @@ def handle_desc(target, to_grid=None):
     网格优先用 target 自带的 gx/gz；缺失时（盘/散料只有 x/z）用 to_grid
     从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。"""
     if not target:
-        return {"grid": None, "gx": None, "gz": None, "name": None}
+        # 无目标发 None，插件（tap/hold/move）走「不校验句柄」分支。
+        # 旧实现发全 None 的字典，插件当成有目标去校验、必然 handle mismatch
+        # （地板落点盲按 62 次全败，trace-20261101-152446 t=535~716）。
+        return None
     gx, gz = target.get("gx"), target.get("gz")
     if gx is None and to_grid is not None:
         x, z = target.get("x"), target.get("z")
@@ -301,7 +304,9 @@ class Primitive(Node):
             # 下一次寻路绕开这一格——否则同一个 stuck move 会被反复重发。
             # 「gate closed」同理：插件在平台接缝门洞口等到上限门还没开，回传门洞格，
             # 绕开它一阵子；否则插件判关、Python 判通时会在缝口反复重发同一条 move。
-            if not r.get("ok") and r.get("why") in ("stuck", "gate closed") \
+            # 「portal busy」：推门推满 max_wait 都没被传走，回传入口门中心 → 拉黑触发格，
+            # portals.nav_args 不再连这扇门的跳边，一阵子后自然恢复（按门洞口径，不拉黑资源）。
+            if not r.get("ok") and r.get("why") in ("stuck", "gate closed", "portal busy") \
                     and isinstance(r.get("blocked_cell"), (list, tuple)) \
                     and len(r["blocked_cell"]) >= 2:
                 w = ctx.get("w")
@@ -309,7 +314,8 @@ class Primitive(Node):
                     try:
                         cell = w.to_grid(float(r["blocked_cell"][0]),
                                          float(r["blocked_cell"][1]))
-                        reason = "gate_closed" if r.get("why") == "gate closed" else "no_progress"
+                        reason = "gate_closed" if r.get("why") in ("gate closed", "portal busy") \
+                            else "no_progress"
                         ctx.setdefault("motion_failure", {}).update(
                             reason=reason, blocked_cell=cell)
                     except (TypeError, ValueError):

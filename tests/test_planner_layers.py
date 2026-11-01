@@ -439,7 +439,7 @@ _ALL_TERMS = (
     "urgency", "pressure", "eta", "async_resource",
     "completion_ratio", "ingredient_reuse", "combo_head",
     "combo_break", "freshness", "deadline_lookahead", "hands", "move_penalty",
-    "deliver_bonus", "plate_pressure", "relay_1_3_bonus", "cooker_idle",
+    "deliver_bonus", "plate_pressure", "cooker_idle",
     "no_plate_placed", "pref", "batch_bonus",
 )
 

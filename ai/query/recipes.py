@@ -35,8 +35,8 @@ def _is_null(v):
 class RecipeBook(object):
     """一帧的配方视图：成分树（recipes）+ 箱子的加工信息（stations）。"""
 
-    def __init__(self, recipes, stations=None):
-        # type: (Optional[List[Dict]], Optional[List[Dict]]) -> None
+    def __init__(self, recipes, stations=None, items=None):
+        # type: (Optional[List[Dict]], Optional[List[Dict]], Optional[List[Dict]]) -> None
         self._by_name = {}      # type: Dict[str, Dict]
         for r in recipes or ():
             if isinstance(r, dict) and r.get("name"):
@@ -49,6 +49,16 @@ class RecipeBook(object):
             ing = st.get("ing")
             if ing:
                 self._crates[str(ing).lower()] = st
+        # 物品形态 → 烹饪能力（插件协议 8：crate.chop_cookable / items[].cookable，
+        # 见 Oc2AIPlugin.CookableJson）。键是物品名小写（Pizza_Base_Raw）。
+        self._cookable = {}     # type: Dict[str, Dict]
+        for st in stations or ():
+            if isinstance(st, dict) and st.get("t") == "crate" \
+                    and isinstance(st.get("chop_cookable"), dict) and st.get("chop"):
+                self._cookable[str(st["chop"]).lower()] = st["chop_cookable"]
+        for it in items or ():
+            if isinstance(it, dict) and isinstance(it.get("cookable"), dict) and it.get("n"):
+                self._cookable.setdefault(str(it["n"]).lower(), it["cookable"])
         self._branches = None   # type: Optional[Dict[str, str]]
 
     def recipe(self, ing):
@@ -95,10 +105,20 @@ class RecipeBook(object):
         """
         if not order:
             return ()
+        dish = order.get("dish")
+        # 整道菜本身是熟料节点（披萨 = CookedCompositeOrderNode{Dough,Tomato,
+        # Cheese}，整份进炉）：进盘的是**一个**熟料节点，不是三样料。插件给的
+        # composition 是扁平的生料表，按它判「盘里缺什么」会恒报缺三样（盘里
+        # 只有 cooked:cheese+dough+tomato:oventray）。生料由 raws_of(dish) 展开。
+        # 判据：composition 恰好是该熟料节点 comp 的扁平展开（或缺省）。
         comp = order.get("composition")
+        if self.node_kind(dish) == "cook":
+            own = sorted(c.lower() for c in self.components(dish))
+            if not comp or sorted(str(c).lower() for c in comp) == own:
+                return (str(self.recipe(dish).get("name") or dish),)
         if comp:
             return tuple(str(c) for c in comp)
-        r = self.recipe(order.get("dish"))
+        r = self.recipe(dish)
         if not r:
             return ()
         return tuple(str(c) for c in (r.get("comp") or ()))
@@ -197,6 +217,58 @@ class RecipeBook(object):
         if not self.needs_cooking(ing):
             return None
         return str((self.recipe(ing) or {}).get("cook"))
+
+    def cooked_of_raws(self, raws):
+        # type: (Any) -> List[str]
+        """生料集合**恰好**等于其 comp 的熟料（多料同炉的精确反查）。
+
+        cooked_of_raw 只看 comp[0]：面团同时是十几种披萨的 comp[0]，烤箱里的
+        {cheese, dough, tomato} 只该认成 MargheritaPizza。
+        """
+        want = sorted(str(r).lower() for r in raws or ())
+        if not want:
+            return []
+        out = []  # type: List[str]
+        for name, r in self._by_name.items():
+            if not self.needs_cooking(name):
+                continue
+            comp = sorted(str(c).lower() for c in (r.get("comp") or ()))
+            if comp == want:
+                out.append(str(r.get("name") or name))
+        return out
+
+    # ---------- 可烹饪载体（协议 8） ----------
+    def cookable_of(self, form):
+        # type: (Optional[str]) -> Optional[Dict]
+        """物品形态的烹饪能力 {station, step, prep, vessel, time}；不能上灶 None。"""
+        if not form:
+            return None
+        return self._cookable.get(str(form).lower())
+
+    def carrier_base(self, dish):
+        # type: (Optional[str]) -> Optional[Tuple[str, str, str]]
+        """整份进炉的熟料：(底料成分, 载体形态, 要求站型)；不是这种菜返回 None。
+
+        反编译：CookablePreparationContainer = 可放料的载体 + CookingHandler。
+        披萨的面团切成 Pizza_Base_Raw（prep=True, station=Oven），番茄/芝士
+        放在饼上、整份进烤箱。判据只读插件上报的能力，不按菜名。
+        """
+        if self.node_kind(dish) != "cook":
+            return None
+        for comp in self.components(dish):
+            form = self.cook_input_form(comp)
+            cap = self.cookable_of(form)
+            if cap and cap.get("prep") and cap.get("station"):
+                return (comp, str(form), str(cap["station"]))
+        return None
+
+    def carrier_toppings(self, dish):
+        # type: (Optional[str]) -> Tuple[str, ...]
+        """整份进炉菜里放在载体上的料（除底料外的 comp）。"""
+        base = self.carrier_base(dish)
+        if base is None:
+            return ()
+        return tuple(c for c in self.components(dish) if c != base[0])
 
     def cooked_of_raw(self, raw):
         # type: (Optional[str]) -> List[str]

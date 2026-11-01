@@ -74,8 +74,19 @@ def _cross(box, axis):
 
 def find_seams(terrain_by_layer):
     # type: (Dict[int, List[Box]]) -> List[Seam]
-    """Ground 盒两两贴边、且接缝上有墙的地方。没墙的贴边地板本来就通，不算。"""
-    grounds = terrain_by_layer.get(occupancy.LAYER_GROUND) or []
+    """Ground 盒两两贴边、且接缝上有墙的地方。没墙的贴边地板本来就通，不算。
+
+    楼梯（SlopedGround 并入 Ground 的外扩盒）不参与：楼梯与平台是静止接缝，两侧
+    栏杆已按墙栅格化，走 walkable 即可。当成门洞时插件按脚底高度平扫胶囊，在
+    楼梯上会扎进上层地板碰撞体，判门恒关，P2 卡在楼梯顶（Wizard_5_5，
+    trace-20261101-141149 t=580：blocker=Col_Floor/Ground）。
+    """
+    m = occupancy.SLOPE_JOIN_MARGIN
+    stairs = set(
+        (b[0] - m, b[1] + m, b[2] - m, b[3] + m)
+        for b in terrain_by_layer.get(occupancy.LAYER_SLOPED_GROUND) or ())
+    grounds = [b for b in terrain_by_layer.get(occupancy.LAYER_GROUND) or []
+               if b not in stairs]
     blocking = []  # type: List[Box]
     for layer in occupancy.BLOCKING_LAYERS:
         blocking.extend(terrain_by_layer.get(layer) or ())

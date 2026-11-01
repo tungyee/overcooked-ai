@@ -157,3 +157,171 @@ def carrier_is_base_of(carrier, item, fetch_form):
     if not carrier or not item:
         return False
     return carrier["base"] == str(fetch_form or item).strip().lower()
+
+
+# ---------------------------------------------------------------- 可烹饪载体
+# 反编译（Assembly-CSharp）：CookablePreparationContainer = PreparationContainer
+# + CookingHandler。披萨饼（面团切成 Pizza_Base_Raw）就是这种：番茄/芝士放在
+# 饼上（ServerPreparationContainer.HandlePlacement → AddOrderContents），饼要求
+# 的站型是 Oven，装好料整份放进烤箱（CookingStation.CanAddItem 比站型），熟了
+# 端盘去取（Plate 分支 TransferToContainer，整份进盘）。和卷饼的区别只是多了
+# 「能上灶」：卷饼是装好料直接进盘，披萨是装好料先进炉。
+#
+# 实例没有稳定 id（切出来才出现、放进烤箱后挂在灶上），身份按「它此刻在哪」
+# 每拍现算；task 身份只带载体形态名，不带实例。
+
+
+def is_prep_carrier(item, book):
+    # type: (Optional[Dict], Any) -> bool
+    """物品是可在上面放料、又能整份上灶的载体（插件 cookable.prep）。"""
+    if not isinstance(item, dict) or item.get("flying") is True:
+        return False
+    cap = item.get("cookable")
+    if not isinstance(cap, dict):
+        cap = book.cookable_of(item.get("n")) if book is not None else None
+    return bool(cap) and bool(cap.get("prep"))
+
+
+def prep_carriers(world, book):
+    # type: (Any, Any) -> List[Dict]
+    """场上全部可烹饪载体：[{name, item, contents, held_by, cooker}]。
+
+    contents = 饼上的料（不含底料本身，与 item_contents 同口径）；
+    cooker = 放在灶上时的灶名（on_station "cooking:<灶名>"），否则 None。
+    """
+    out = []  # type: List[Dict]
+    for pool in (getattr(world, "items", None) or (),
+                 getattr(world, "held_items", None) or ()):
+        for it in pool:
+            if not is_prep_carrier(it, book):
+                continue
+            os_ = str(it.get("on_station") or "")
+            out.append({"name": str(it.get("n") or ""), "item": it,
+                        "contents": item_contents(it),
+                        "held_by": it.get("held_by") or None,
+                        "cooker": os_[len("cooking:"):] if os_.startswith("cooking:") else None})
+    return out
+
+
+def is_raw_carrier(carrier):
+    # type: (Dict) -> bool
+    """载体还是生的（插件 items[].cooked："Raw"；旧帧无字段按生）。
+
+    烤熟出炉的饼名字仍是 Pizza_Base_Raw、cookable.prep 仍为真，只有 cooked
+    字段变成 "Cooked"/"Burnt"。不按它排除的话，熟饼会被当成「装齐料待进炉」
+    → PlaceCarrierInCooker 把刚端出来的熟披萨塞回烤箱，RescueCooked 再端出，
+    无限拿进拿出（trace-20261101-164146，Wizard_3_2）。"""
+    st = str((carrier.get("item") or {}).get("cooked") or "raw").lower()
+    return st == "raw"
+
+
+def cooked_carrier_tokens(item, book):
+    # type: (Optional[Dict], Any) -> Set[str]
+    """烤熟的载体（出炉的整份披萨）是哪样熟料：rich token 集；不是熟载体返回空集。
+
+    反编译：ServerCookablePreparationContainer.GetAsOrderComposite 把饼报成
+    CookedCompositeAssembledNode（组成 = 饼上的料 + 底料节点 m_ingredientOrderNode），
+    端盘对着它交互走 HandlePlacement 的 Plate 分支 → TransferToContainer 整份进盘；
+    糊了 CanTransferToContainer 拒绝。所以只认 cooked == "Cooked"（不认 Raw / Burnt）。
+
+    生料集 = detail 里的料 + 插件 items[].node 报的底料节点（Dough），与烤箱里
+    pot_contents 反查同一口径（book.cooked_of_raws 精确匹配 comp）。
+    """
+    if not is_prep_carrier(item, book):
+        return set()
+    if str(item.get("cooked") or "").lower() != "cooked":
+        return set()
+    base = item.get("node")
+    if not base:
+        return set()
+    raws = list(item_contents(item)) + [str(base).lower()]
+    out = set()  # type: Set[str]
+    for name in book.cooked_of_raws(raws):
+        t = book.rich_token(name)
+        if t:
+            out.add(t)
+    return out
+
+
+def _topping_tokens(book, dish):
+    # type: (Any, str) -> Set[str]
+    out = set()  # type: Set[str]
+    for c in book.carrier_toppings(dish):
+        out |= book.want_tokens(c)
+    return out
+
+
+def prep_fits(book, carrier, dish):
+    # type: (Any, Dict, str) -> bool
+    """载体能做这道菜：形态对得上底料，饼上的料 ⊆ 这道菜的配料。"""
+    base = book.carrier_base(dish)
+    if base is None or not _same_name(carrier["name"], base[1]):
+        return False
+    return set(carrier["contents"]) <= _topping_tokens(book, dish)
+
+
+def prep_missing(book, carrier, dish):
+    # type: (Any, Optional[Dict], str) -> Tuple[str, ...]
+    """这道菜的配料里饼上还缺的（按订单成分名）。"""
+    have = set(carrier["contents"]) if carrier else set()
+    return tuple(c for c in book.carrier_toppings(dish)
+                 if not (book.want_tokens(c) & have))
+
+
+def _p2_reach(world):
+    # type: (Any) -> Any
+    """载体 → P2 此刻够不够得着（手持的一律算够得着）。
+
+    距离场按 world 缓存（reachability.field_for），每拍多次调用不重算；无地形
+    的旧合成帧 field 为 None，一律算够得着（与 can_interact 同口径）。
+    """
+    from ai.space import reachability
+    ctx = reachability.context(world)
+
+    def reach(c):
+        # type: (Dict) -> bool
+        return bool(c["held_by"]) or reachability.can_interact(ctx, c["item"])
+    return reach
+
+
+def match_prep_carriers(world, book, orders=None, skip=None):
+    # type: (Any, Any, Optional[List[Dict]], Optional[Set[Any]]) -> Dict[Any, Dict]
+    """可烹饪载体↔订单 1:1（每拍重算）。返回 {order_id: carrier}。
+
+    只配**还没上灶、还是生的**载体：上了灶的那份由灶↔单匹配（planner.
+    _match_cookers_to_orders）负责，skip 是已配到灶的单。P1 手里的也算——
+    那份已经在路上，不该再切一张饼。贪心：P2 够得着的优先，其次装料最多的，
+    同数时 P2 手里 > 散落 > P1 手里。
+
+    够得着优先：Wizard_3_2 中线的动墙把一张只放了番茄的饼隔在右半区，它料
+    最多、一直配给最早那单，那单的 FetchToCarrier 恒 infeasible，左边够得着的
+    饼却配给了后面的单（trace-20261101-173006 t=400~2900）。
+    """
+    pool = [c for c in prep_carriers(world, book)
+            if c["cooker"] is None and is_raw_carrier(c)]
+    if not pool:
+        return {}
+    reach = _p2_reach(world)
+    reachable = [reach(c) for c in pool]
+    used = set()  # type: Set[int]
+    out = {}  # type: Dict[Any, Dict]
+    for o in (orders if orders is not None else getattr(world, "orders", None) or ()):
+        oid = o.get("id")
+        if oid is None or (skip and oid in skip):
+            continue
+        dish = o.get("dish")
+        if book.carrier_base(dish) is None:
+            continue
+        best, best_key = None, None
+        for i, c in enumerate(pool):
+            if i in used or not prep_fits(book, c, dish):
+                continue
+            who = 0 if _same_name(c["held_by"], P.P2_NAME) else \
+                1 if not c["held_by"] else 2
+            key = (not reachable[i], -len(c["contents"]), who, i)
+            if best_key is None or key < best_key:
+                best, best_key = i, key
+        if best is not None:
+            used.add(best)
+            out[oid] = pool[best]
+    return out

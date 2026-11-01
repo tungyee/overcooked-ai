@@ -137,8 +137,9 @@ _CAND_META = {
     "TakeCookedToPlate": (["holding_plated_dish"], EST_COOK_OPS),
     "DeliverPlate": (["holding_plated_dish"], EST_SERVE),
     "Mix": (["hands_empty"], EST_COOK_OPS),
-    "PlaceToRelay": (["hands_empty"], EST_FETCH),
     "SendAcross": (["hands_empty"], EST_FETCH),
+    "FetchToCarrier": (["hands_empty"], EST_FETCH),
+    "PlaceCarrierInCooker": (["hands_empty"], EST_COOK_OPS),
 }
 
 
@@ -276,36 +277,31 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         # 第 13 号 StashHeld：手里有无用物（feasible 再判）
         cands.append(Candidate(T.StashHeld(), [], EST_FETCH))
 
-    # 1-3 中转交接候选：仅在配置了中转台的关卡生成（relay_cells 非空）。
-    # 可投掷食材的批量取+投已并入通用 FetchToBoard（见 chop.py）；这里只剩
-    # 传盘（PlaceToRelay）。feasible 再精确判（中转台有空位），这里只做粗枚举。
-    # order_id 一律 None：relay 是协作动作，不绑定特定订单（同 Prefetch）。
     # 跨区送件（SendAcross，ai/revenue/cross_supply.py）：对面区缺、我这边有富余，
-    # 经渡运篮子送过去。每块能用的干净盘一个候选（feasible 再判缺口 / 空格 / 能不能放）。
+    # 经通道（ai/space/channels.py：渡运篮子 / 静态共享台面）送过去。每条通道 ×
+    # 每块能用的干净盘一个候选（feasible 再判缺口 / 空格 / 能不能放）。order_id
+    # 一律 None：送件是协作动作，不绑定特定订单（同 Prefetch）。
     from ai.revenue import cross_supply as XS
-    from ai.space import shuttle as _SH
-    for grid in sorted(_SH.shuttle_grids(world)):
-        if XS.send_deficit(world, XS.KIND_CLEAN_PLATE, book, bb) <= 0:
-            break
-        for p in P.all_plates(world):
-            pid = p.get("n")
-            if (not pid or P.plate_count(p) != 0 or P.plate_buried_in_stack(p)
-                    or p.get("held_by") == P.P1_NAME
-                    or _SH.station_of(world, p) is not None):
-                continue
-            task = T.SendAcross(item=XS.KIND_CLEAN_PLATE, resources=(pid, grid))
-            cands.append(Candidate(task, [], EST_FETCH,
-                                   branch=branch_of_task(task, book)))
-
-    relay_cells = S.relay_cells_for(world)
-    if relay_cells:
-        # 干净盘 → 放中转台（传盘子；feasible 判盘干净 + 中转台有空位）
-        for p in world.plates:
-            pid = p.get("n")
-            if pid and P.plate_count(p) == 0:
-                task = T.PlaceToRelay(item=pid)
+    from ai.space import channels as _CH
+    if XS.send_deficit(world, XS.KIND_CLEAN_PLATE, book, bb) > 0:
+        for key in _CH.channel_keys(world, bb):
+            for p in P.all_plates(world):
+                pid = p.get("n")
+                if (not pid or P.plate_count(p) != 0 or P.plate_buried_in_stack(p)
+                        or p.get("held_by") == P.P1_NAME
+                        or _CH.slot_of(world, p, bb) is not None):
+                    continue
+                task = T.SendAcross(item=XS.KIND_CLEAN_PLATE, resources=(pid, key))
                 cands.append(Candidate(task, [], EST_FETCH,
                                        branch=branch_of_task(task, book)))
+    # 载体（披萨饼）：我这边补不了料、烤箱只在对面 → 经静态通道送过去
+    seen_forms = set()
+    for car in XS.stuck_carriers(world, book, bb):
+        if car["name"].lower() in seen_forms:
+            continue
+        seen_forms.add(car["name"].lower())
+        task = T.SendAcross(item=XS.KIND_CARRIER, resources=(car["name"], _CH.STATIC))
+        cands.append(Candidate(task, [], EST_FETCH, branch=branch_of_task(task, book)))
 
     # 第 18 号 FillCooker：订单无关的填灶（第 1 组 1.1）。
     # 按单发射的 FetchToCooker 受「同单只发一个 + 灶↔单 1:1」限制，无法把
@@ -672,7 +668,8 @@ COMBO_PREP_DISCOUNT = 0.25
 # 哪些备菜 task 吃 combo 偏好：都是「为某一单推进一步」的类型。
 # 不含 FillCooker（订单无关）与清理类。
 _COMBO_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
-                     "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate")
+                     "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate",
+                     "FetchToCarrier", "PlaceCarrierInCooker")
 W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩罚）
 
 # 填灶权重（第 1 组 1.4）：灶空转的机会成本是 12 秒不可压缩的时钟，补不回来。
@@ -744,26 +741,6 @@ W_DELIVER_BONUS = 3.0
 # （pressure 4.17/6.00）让位摆盘，快糊的锅（8.08）仍优先救。
 W_NO_PLATE_PLACED = 3.0
 
-# 1-3 关卡 relay task 的固定加分。
-#
-# **约束机制已变（Ruling 44）**：原注释写「必须低于端熟锅 pressure（≈5.0）和
-# 送餐（W_DELIVER_BONUS≈4.0），否则米熟了 P2 还在传盘、锅烧糊」——那个实机现象
-# 是真的，但分层后这两条「必须低于」都不再由**数值余量**保证，而由**层序**保证：
-#   - 送餐在 L3 兑现、传盘在 L6 备菜 → 送餐结构性优先（且 deliver_bonus 已不
-#     参与打分，不在任何层白名单里）；
-#   - 端熟锅在 L1/L2（pressure >= 1.0 即进救料层）、传盘在 L6 → 同理，且
-#     pressure 不在 L6 的白名单里。
-#
-# 所以这个数现在只需在 **L6 层内**与备菜的其余项可比（urgency / completion_ratio
-# / async_resource / ingredient_reuse / combo_* 等）。原注释的第二句「传盘是协作
-# 支线，低于下锅（W_ASYNC_RESOURCE≈2.0），否则 P2 一直传盘、不下锅煮（实机复现）」
-# **仍然有效**——两者同在 L6，仍靠数值分先后。
-#
-# 传盘（PlaceToRelay）是协作支线，低于下锅（FetchToCooker 的
-# W_ASYNC_RESOURCE≈2.0），否则 P2 一直传盘、不下锅煮（实机复现）。
-_RELAY_BONUS_1_3 = {
-    "PlaceToRelay": 1.5,
-}
 
 # 手部前置的腾手代价（spec §6.1(b)）：task 需要空手但手里有东西时，按
 # "约 EnsureHandsFree 的步数"折算成 ETA 代价。它不是"判不可行"，而是让
@@ -1080,7 +1057,9 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None,
         if not (c.get("isCooking") or c.get("cooked")
                 or c.get("burning") or c.get("onFire")):
             continue
-        names = book.cooked_of_raw(raw[0])
+        # 多料同炉（整份披萨）按生料集精确反查；单料锅沿用 comp[0] 口径
+        names = (book.cooked_of_raws(raw) if len(raw) > 1 else []) \
+            or book.cooked_of_raw(raw[0])
         if not names:
             continue
         toks = set()  # type: Set[str]
@@ -1975,6 +1954,9 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # ⑭ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
     if task.TYPE == "WashPlate":
         terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
+    elif task.TYPE == "SendAcross" and task.item == "carrier":
+        # 料齐 / 补不了料的饼卡在我这边：不送这一单就做不出来，按最缺算
+        terms["plate_pressure"] = W_PLATE_PRESSURE * 2.0
     elif task.TYPE == "SendAcross":
         # 对面缺盘的程度（同一条曲线：0 块=2.0、1 块=1.0），按对面的干净盘数算
         from ai.revenue import cross_supply as XS
@@ -1983,12 +1965,6 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
         terms["plate_pressure"] = W_PLATE_PRESSURE * (2.0 if far <= 0 else 1.0 if far == 1 else 0.5)
     else:
         terms["plate_pressure"] = 0.0
-
-    # ⑮ 1-3 关卡 relay 加分：让 P2 倾向投掷/中转（支线），但不盖过端锅/送餐。
-    if world.level == "Sushi_1_3_2P" and task.TYPE in _RELAY_BONUS_1_3:
-        terms["relay_1_3_bonus"] = _RELAY_BONUS_1_3[task.TYPE]
-    else:
-        terms["relay_1_3_bonus"] = 0.0
 
     # ⑯ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
     # FetchToCooker 已有 async_resource 加分，不重复给。
@@ -2068,24 +2044,43 @@ def _batch_bonus(n):
     return total
 
 
-def _throw_proxy(world, bb, task):
-    # type: (World, Blackboard, Any) -> Any
+def _throw_proxy(world, bb, task, book=None, gap=None):
+    # type: (World, Blackboard, Any, Optional[Any], Optional[int]) -> Any
     """ThrowBatch 等价的取料 task：投过去本质上是在替它跑腿。
 
-    绑定 slack 最小的那一单（需要这份料、最着急的单），让紧迫度/完成度/
-    combo 全部照原口径继承。消费站在对面时这个 proxy 会被判 unreachable——
-    这里只拿它打分，不过可行性，正是「走得过去值多少分」。
+    绑定**这一份料真正服务的那一单**，让紧迫度/完成度/combo 照原口径继承。
+    已越过这一站的料（切好的 / 锅里的 / 盘里的）先按 remaining 从小到大填给
+    最急的单；新投的这份服务的是第一张没被填满的单。
+
+    旧口径直接绑「需要这道菜、最急的单」：地上已有两份切好的肉、盘里一份熟肉，
+    最急的单早被现成的料盖住，ThrowBatch 却继承它的紧迫分，压过把现成料下锅的
+    FillCooker——四口灶全空着，P2 跑去料箱拿新肉切（trace-20261101-163138
+    t=1840~1926：#3 剩 31s 吃满紧迫分 4.23，按边际份数应绑 #6 剩 107s）。
+
+    gap = task.full_gap（未封顶缺口）；book / gap 缺省时退回旧口径。
+    消费站在对面时这个 proxy 会被判 unreachable——这里只拿它打分，不过可行性，
+    正是「走得过去值多少分」。
     """
-    order_id = None
-    best = None
+    want = str(task.product).lower()
+    live = []  # type: List[Tuple[float, Any, int]]
     for o in _dialog_live_orders(world, bb):
-        if not any(str(r).lower() == str(task.product).lower()
-                   for r in (o.get("composition") or ())):
+        reqs = book.requirements(o) if book is not None else (o.get("composition") or ())
+        units = sum(1 for r in reqs if str(r).lower() == want)
+        if units <= 0:
             continue
         rem = o.get("remaining")
         rem = float(rem) if rem is not None else float("inf")
-        if best is None or rem < best:
-            best, order_id = rem, o.get("id")
+        live.append((rem, o.get("id"), units))
+    live.sort(key=lambda e: e[0])
+    order_id = live[0][1] if live else None
+    if gap is not None and gap > 0 and live:
+        # 现成料盖住的份数 = 总需求 − 缺口；跳过被盖住的单
+        covered = max(0, sum(u for _, _, u in live) - gap)
+        for _rem, oid, units in live:
+            if covered < units:
+                order_id = oid
+                break
+            covered -= units
     if task.consumer == TS.CONSUMER_BOARD:
         return T.FetchToBoard(order_id, (task.dest_id,), task.raw)
     return T.FetchToCooker(order_id, (task.dest_id, (task.raw,)), task.product)
@@ -2096,7 +2091,9 @@ def _score_throw_batch(world, bb, candidate, book=None, plate_match=None,
     # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
     """score(ThrowBatch) = score(等价取料 task) + W_BATCH × (N − 1)。"""
     task = candidate.task
-    proxy = _throw_proxy(world, bb, task)
+    ctx = _make_context(world, bb, book) if book is not None else None
+    gap = task.full_gap(ctx) if ctx is not None else None
+    proxy = _throw_proxy(world, bb, task, book, gap)
     pre, est = _CAND_META.get(proxy.TYPE, (["hands_empty"], EST_FETCH))
     # 手上已是要投的料时不罚腾手（proxy 的 hands_empty 前置对投掷不成立）
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
@@ -2107,8 +2104,7 @@ def _score_throw_batch(world, bb, candidate, book=None, plate_match=None,
                                      slack_map, cooker_match, layer)
     terms = dict(terms)
     n = 0
-    if book is not None:
-        ctx = _make_context(world, bb, book)
+    if ctx is not None:
         n = task.batch_size(ctx)
     terms["batch_bonus"] = _batch_bonus(n)
     if layer is not None:
@@ -2231,16 +2227,27 @@ def _cooker_lookup(world, cid):
     return None
 
 
+# 熟散锅的压力：必须 < planner_layers.PRESSURE_RESCUE（1.0），否则进 L2 压过送餐；
+# 又要尽量高，让 L6 里的 pressure 项压过常规备菜。理由见 _loose_pot_pressure。
+LOOSE_COOKED_PRESSURE = 0.9
+
+
 def _loose_pot_pressure(world, source_id):
     # type: (Any, str) -> float
     """散锅（台面/地上的锅）的时间压力。灶上查不到时走这条退路。
 
     散锅不在灶上、不走烹饪进度，帧里没有 cooking_progress，所以这里只能给
-    二元压力——与 `_time_pressure` 里「无连续进度（旧帧/空锅）→ 退回二进制」
-    那条退路同口径：
+    离散压力：
       糊了   → 2.0（L1，还要灭火，比刚熟的更急）
-      熟了   → 1.0（L2，马上去盛）
+      熟了   → LOOSE_COOKED_PRESSURE（< 1.0，落 L6 备菜层）
       生/空  → 0.0
+
+    熟散锅**不进 L2**：L2 的判据是「12 秒不可压缩的烧糊时钟在走」，散锅已离
+    火、不会再烧糊（同 `_cooker_burn_danger` 对散锅给 0 的口径）。放进 L2 会
+    结构性压过 L3 送餐：实机 trace-20261101-180609 t=12480~13457 最后 13 秒，
+    P2 手里端着装好的鸡块盘，被台面上一篮熟薯条的 L2 盛料抢走，把成品盘放到
+    木筏上去拿空盘，到收盘一单没送。落 L6 后 pressure 项（W_PRESSURE×0.9=4.5）
+    仍压过常规备菜，不会重蹈 1979 拍没人盛（L7）的覆辙。
 
     判据与 `TakeCookedToPlate._source` 完全一致（rich token 或 cooked 字段，
     两条任一成立），刻意不另起一套：那边认得源、这边算不出压力，正是实机
@@ -2254,9 +2261,9 @@ def _loose_pot_pressure(world, source_id):
             return 2.0
         toks = parse_plate_detail(it.get("detail") or [])
         if any(str(t).startswith("cooked:") for t in toks):
-            return 1.0
+            return LOOSE_COOKED_PRESSURE
         if str(it.get("cooked") or "").lower() == "cooked":
-            return 1.0
+            return LOOSE_COOKED_PRESSURE
         return 0.0
     return 0.0
 
@@ -2510,7 +2517,7 @@ def _task_is_interruptible(task):
 # ==================== Plan 4 Task 4: 新增打分辅助函数 ====================
 
 # 下锅前的备料环节：料最终会进灶时，与下锅同吃「异步资源优先」。
-_PREP_TO_COOKER_TYPES = ("FetchToBoard", "Chop")
+_PREP_TO_COOKER_TYPES = ("FetchToBoard", "Chop", "FetchToCarrier")
 
 
 def _feeds_cooker(task, world, book=None):
@@ -2531,7 +2538,7 @@ def _feeds_cooker(task, world, book=None):
     Chop），不凭空改无书调用方的语义。
     """
     task_type = getattr(task, "TYPE", "")
-    if task_type == "FetchToCooker":
+    if task_type in ("FetchToCooker", "PlaceCarrierInCooker"):
         return True
     if task_type not in _PREP_TO_COOKER_TYPES:
         return False
@@ -2543,7 +2550,7 @@ def _feeds_cooker(task, world, book=None):
     order = _find_order_by_id(world, getattr(task, "order_id", None))
     if order is None:
         return False
-    for comp in order.get("composition") or ():
+    for comp in book.requirements(order):
         if not book.needs_cooking(comp):
             continue
         if any(str(r).lower() == raw for r in book.raws_of(comp)):

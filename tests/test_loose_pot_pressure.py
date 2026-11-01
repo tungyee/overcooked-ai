@@ -16,7 +16,8 @@
 """
 from ai.core import planner
 from ai import tasks as T
-from ai.core.planner_layers import L_CLEANUP, L_PREP, L_RESCUE, layer_of_task
+from ai.core.planner_layers import (L_CLEANUP, L_PREP, L_RESCUE,
+                                    PRESSURE_RESCUE, layer_of_task)
 from ai.state.world import World
 
 
@@ -40,16 +41,25 @@ def _take(source="utensil_pot_01 (2)"):
                                "BoiledSushiRice")
 
 
-def test_loose_cooked_pot_has_rescue_pressure():
-    """台面上的熟锅压力不能是 0——它和灶上的熟锅一样该马上去盛。"""
+def test_loose_cooked_pot_has_prep_pressure():
+    """台面上的熟锅压力不能是 0（否则掉 L7 没人盛），但也不到 L2 的 1.0——
+    散锅已离火、没有烧糊时钟（trace-20261101-180609 抢走送餐）。"""
     w = _world(items=[_loose_pot()])
-    assert planner._time_pressure(_take(), w) >= 1.0
+    p = planner._time_pressure(_take(), w)
+    assert 0.0 < p < PRESSURE_RESCUE
+    assert p == planner.LOOSE_COOKED_PRESSURE
 
 
-def test_loose_cooked_pot_lands_in_rescue_layer():
-    """压力 >= 1.0 → L2 救料层，结构性压过一切备菜（实机那 184 拍的修复）。"""
+def test_loose_cooked_pot_lands_in_prep_layer():
+    """落 L6 备菜层：不掉 L7（实机那 184 拍的修复），也不进 L2 压过 L3 送餐。"""
     w = _world(items=[_loose_pot()])
-    assert layer_of_task(_take(), w) == L_RESCUE
+    assert layer_of_task(_take(), w) == L_PREP
+    assert layer_of_task(_take(), w) != L_RESCUE
+
+
+def test_loose_cooked_pot_pressure_beats_typical_prep():
+    """L6 内 pressure 项 W_PRESSURE×0.9 仍高于常规备菜合计（~1.5~4）。"""
+    assert planner.W_PRESSURE * planner.LOOSE_COOKED_PRESSURE >= 4.0
 
 
 def test_loose_raw_pot_has_no_pressure():
@@ -63,7 +73,7 @@ def test_loose_pot_with_cooked_token_only():
     """detail 给 rich token 而 cooked 字段缺失时也要认（两条判据任一成立）。"""
     w = _world(items=[_loose_pot(cooked=None,
                                  detail=("cooked:SushiRice:Pot",))])
-    assert planner._time_pressure(_take(), w) >= 1.0
+    assert planner._time_pressure(_take(), w) == planner.LOOSE_COOKED_PRESSURE
 
 
 def test_burning_loose_pot_is_irreversible():

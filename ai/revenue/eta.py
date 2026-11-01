@@ -81,8 +81,9 @@ TASK_COST = {
     "RescueCooked": COST_TAKE_COOKED,
     "RecoverLoosePot": COST_FETCH_TO_COOKER,
     "Discard": COST_TAKE_COOKED,
-    "PlaceToRelay": COST_FETCH_TO_PLATE,
     "Mix": COST_CHOP,
+    "FetchToCarrier": COST_FETCH_TO_PLATE,
+    "PlaceCarrierInCooker": COST_FETCH_TO_COOKER,
 }
 
 # 没登记的 TYPE（新 task / 灭火）按一次取料的代价兜底。

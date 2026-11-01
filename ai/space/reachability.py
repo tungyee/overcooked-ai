@@ -1,5 +1,5 @@
 """规划与食材查询共用当前帧的可达性；未知拓扑保留离线兼容。"""
-from ai.space import navigation, occupancy, seams, shuttle
+from ai.space import navigation, occupancy, portals, seams, shuttle
 from ai.query import predicates as P
 
 
@@ -33,11 +33,10 @@ def field_for(world, bb=None, name=P.P2_NAME, soft_cost=None):
     key = (start, frozenset(blocked), tuple(sorted((soft_cost or {}).items())),
            getattr(clock, 'now', None))
     if key not in cache:
-        # 寻路谓词叠了平台接缝门洞（ai/space/seams.py），站位判定仍用 world.walkable。
-        walkable, edge_blocked = seams.nav_predicates(world, bb)
-        cache[key] = navigation.distance_field(start, walkable, world.belt_dir,
-            blocked, soft_cost=soft_cost, edge_blocked=edge_blocked,
-            wait_cost=seams.wait_cost_of(world, bb), jumps=seams.nav_jumps(world, bb)[0])
+        # 寻路谓词叠了平台接缝门洞（ai/space/seams.py）与传送门（ai/space/portals.py），
+        # 站位判定仍用 world.walkable。
+        cache[key] = navigation.distance_field(start, belt_dir=world.belt_dir,
+            blocked=blocked, soft_cost=soft_cost, **portals.nav_args(world, bb, blocked))
     return cache[key]
 
 
@@ -116,7 +115,7 @@ def task_shuttle_wait_seconds(task, ctx):
     for rid in _task_resource_ids(task):
         if rid == 'bin':
             continue
-        target = resource(world, rid)
+        target = _task_target(task, rid, ctx)
         if target is not None:
             worst = max(worst, shuttle_wait(ctx, target) or 0.0)
     for target in _extra_wait_targets(task, ctx):
@@ -141,7 +140,7 @@ def task_wait_seconds(task, ctx):
     for rid in _task_resource_ids(task):
         if rid == 'bin':
             continue
-        target = resource(ctx['w'], rid)
+        target = _task_target(task, rid, ctx)
         if target is not None:
             worst = max(worst, interact_wait(ctx, target))
     for target in _extra_wait_targets(task, ctx):
@@ -169,8 +168,12 @@ def _interact_goals(ctx, entry):
     if cell is None:
         return set()
     cells = {cell}
+    extra = set()
     if entry.get('t') == 'plate_station' and hasattr(world, 'mapping'):
         cells = occupancy.station_block_cells(entry, world.terrain, world.mapping)
+        # 漂移出餐口量化到「紧邻是水面」的那一行时，格内交互位为空；
+        # 补格外站位（与 move.Approach 同一判据，见 shuttle.hatch_fallback）。
+        extra = {s['cell'] for s in shuttle.hatch_fallback(world, entry)}
     elif entry.get('t') == 'washing':
         from ai.query.stations import sink_place_cells
         cells = sink_place_cells(entry, world.stations, world.to_grid)
@@ -181,6 +184,7 @@ def _interact_goals(ctx, entry):
                                                 world.to_grid, world.to_world,
                                                 world.walkable)
     goals = set(navigation.interact_cells_multi(cells, world.walkable, world.belt_cells, include_belts=True))
+    goals |= extra
     if world.walkable(*cell):
         goals.add(cell)
     # 渡运台面（人上不去、隔着围栏够）：常规四邻交互位没有，用格外站位的落脚格。
@@ -221,6 +225,22 @@ def resource(world, rid):
     return None
 
 
+def _task_target(task, rid, ctx):
+    # type: (object, object, dict) -> object
+    """rid 对应的实体：task 自己能精确解析的（resource_target）优先，否则按 id 查。
+
+    按名字查只取第一件同名物：Pizza_Base_Raw 生饼和出炉熟饼同名，熟饼在 P2
+    区、生饼在 P1 区的砧板上时，端盘候选被判 unreachable，熟披萨晾在台面上
+    没人装盘（trace-20261101-170754 t=6630~8005）。
+    """
+    fn = getattr(task, 'resource_target', None)
+    if callable(fn):
+        target = fn(rid, ctx)
+        if target is not None:
+            return target
+    return resource(ctx['w'], rid)
+
+
 _DESTINATIONS = {'DeliverPlate': 'plate_station', 'ResetPlate': 'bin', 'Discard': 'bin'}
 
 
@@ -244,7 +264,7 @@ def task_veto(task, ctx):
     for rid in _task_resource_ids(task):
         if rid == 'bin' and task.TYPE == 'Discard':
             continue  # 逻辑共享资源，下面按站点类型解析真实垃圾桶。
-        target = resource(ctx['w'], rid)
+        target = _task_target(task, rid, ctx)
         if target is None:
             return 'missing_resource'
         if not can_interact(ctx, target):

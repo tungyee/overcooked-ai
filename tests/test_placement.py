@@ -276,19 +276,3 @@ def test_occupied_cells_includes_plates():
     occupied = placement.occupied_cells(w)
     assert (1, 0) in occupied
     assert (3, 0) not in occupied
-
-
-def test_find_drop_at_returns_station_when_free():
-    w = FakeWorld(stations=[], walkable=lambda gx, gz: gz == 0)
-    field = distance_field((0, 0), w.walkable, {})
-    st = placement.find_drop_at(w, field, (1, 0))
-    assert st is not None
-    assert st["gx"] == 1 and st["gz"] == 0
-    assert st["t"] == "counter"
-
-
-def test_find_drop_at_returns_none_when_occupied():
-    w = FakeWorld(plates=[{"n": "p1", "x": 1.2, "z": 0.0, "count": 2}],
-                  walkable=lambda gx, gz: gz == 0)
-    field = distance_field((0, 0), w.walkable, {})
-    assert placement.find_drop_at(w, field, (1, 0)) is None

@@ -5,7 +5,7 @@ Face：转向 target（委托后端下为 no-op，转向已并入 move/tap 的�
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai.space import navigation, seams, shuttle
+from ai.space import navigation, portals, seams, shuttle
 from ai.space import occupancy as O
 from ai.query import predicates as P
 from ai.query import placement
@@ -20,6 +20,26 @@ FACE_MAX_TICKS = 40
 
 # move 命令超时（毫秒）：委托后端下一趟走位最多 8 秒。
 MOVE_TIMEOUT_MS = 8000
+
+
+def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
+    # type: (object, List[Tuple[int, int]], Any, Any, List[float], Any, Optional[str], int, Optional[List[float]]) -> Dict
+    """格子路径 → 插件 move 命令（门洞 gates + 传送门 portals 段 + 放宽超时）。
+
+    tail：路点末尾追加的世界点（渡运站位朝台面推一点）。
+    """
+    points, gates, hops, extra_s = portals.route(w, path, field, bb)
+    if tail is not None:
+        points = list(points) + [tail]
+    cmd = build_command("move", goal=goal, path=points, target=target, kind=kind,
+                        dash=False,
+                        # 门洞口等门 / 过传送门时放宽超时（插件按 max_wait 等）
+                        timeout_ms=timeout_ms + int(1000 * extra_s))
+    if gates:
+        cmd["gates"] = gates
+    if hops:
+        cmd["portals"] = hops
+    return cmd
 
 
 def _station_interact_cells(st, cell, w, kind, include_belts=False):
@@ -79,6 +99,11 @@ class Approach(Primitive):
         if shuttle_st is not None:
             # 渡运台面：站位是格外的世界点，不按格判
             return not shuttle.at_stance(chef, shuttle.stances(w, shuttle_st))
+        hatch = shuttle.hatch_fallback(w, st)
+        if hatch:
+            # 漂移出餐口此刻没有格内交互位：在格外站位旁（或其落脚格）即算到位
+            return not (shuttle.at_stance(chef, hatch)
+                        or cur in {s["cell"] for s in hatch})
         if cur == cell and (w.walkable(*cell) or P.interact_ready(chef, st, self.kind, w.to_grid)):
             return False
         footprint = {cell}
@@ -136,6 +161,10 @@ class Approach(Primitive):
         if cur == cell and w.walkable(cell[0], cell[1]):
             return Status.SUCCESS
 
+        hatch = shuttle.hatch_fallback(w, st)
+        if hatch:
+            return self._tick_hatch(ctx, ex, st, hatch)
+
         blocked = _blocked_cells(ctx, P.resource_id(st))
         goals = _station_interact_cells(st, cell, w, self.kind)
         if self.allow_target:
@@ -162,19 +191,9 @@ class Approach(Primitive):
             return Status.FAILURE
 
         if self._pending_cmd is None:
-            points, gates = seams.path_points(w, path, field, ctx.get("bb"))
-            cmd = build_command(
-                "move",
-                goal=list(w.to_world(*goal)),
-                path=points,
-                target=handle_desc(st, target_grid_callbacks(w, st)[0]),
-                kind=self.kind,
-                dash=False,
-                # 路上要在门洞口等门时放宽超时（插件按 gates[].max_wait 等）
-                timeout_ms=MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)),
-            )
-            if gates:
-                cmd["gates"] = gates
+            cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*goal)),
+                            handle_desc(st, target_grid_callbacks(w, st)[0]), self.kind,
+                            MOVE_TIMEOUT_MS)
             return self._begin_exec(ctx, ex, cmd)
         return self._poll_exec(ctx, ex)
 
@@ -189,7 +208,7 @@ class Approach(Primitive):
         先走到上一轮的落脚格（_await_shuttle）。等待在原语层做，所有 task 拿篮子上的
         东西都一样，不用各自写等篮子分支。预测不了 → FAILURE 交还 Planner。
         """
-        w, chef = ctx["w"], ctx["chef"]
+        w = ctx["w"]
         field = ctx["field"]
         if self._pending_cmd is not None:
             s = self._poll_exec(ctx, ex)
@@ -203,6 +222,24 @@ class Approach(Primitive):
         if not options:
             return self._await_shuttle(ctx, ex, st)
         self._shuttle_wait_ticks = 0
+        return self._go_stance(ctx, ex, st, options)
+
+    def _tick_hatch(self, ctx, ex, st, stances):
+        # type: (Dict, Any, Dict, List[Dict]) -> str
+        """漂移出餐口格内交互位为空（shuttle.hatch_fallback）：走到格外站位。"""
+        if self._pending_cmd is not None:
+            return self._poll_exec(ctx, ex)
+        field = ctx["field"]
+        options = stances if field is None else [s for s in stances if s["cell"] in field]
+        if not options:
+            return Status.FAILURE
+        return self._go_stance(ctx, ex, st, options)
+
+    def _go_stance(self, ctx, ex, st, options):
+        # type: (Dict, Any, Dict, List[Dict]) -> str
+        """走到最近的格外站位：寻路到落脚格，路径末尾追加站位点作 move 终点。"""
+        w, chef = ctx["w"], ctx["chef"]
+        field = ctx["field"]
         if shuttle.at_stance(chef, options):
             return Status.SUCCESS
         if field is None:
@@ -214,20 +251,10 @@ class Approach(Primitive):
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             return Status.FAILURE
-        points, gates = seams.path_points(w, path, field, ctx.get("bb"))
         goal = shuttle.goal_point(best)
-        points = list(points) + [goal]
-        cmd = build_command(
-            "move",
-            goal=goal,
-            path=points,
-            target=handle_desc(st, target_grid_callbacks(w, st)[0]),
-            kind=self.kind,
-            dash=False,
-            timeout_ms=MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)),
-        )
-        if gates:
-            cmd["gates"] = gates
+        cmd = _move_cmd(w, path, field, ctx.get("bb"), goal,
+                        handle_desc(st, target_grid_callbacks(w, st)[0]), self.kind,
+                        MOVE_TIMEOUT_MS, tail=goal)
         return self._begin_exec(ctx, ex, cmd)
 
     def _await_shuttle(self, ctx, ex, st):
@@ -255,12 +282,8 @@ class Approach(Primitive):
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             return Status.RUNNING
-        points, gates = seams.path_points(w, path, field, ctx.get("bb"))
-        cmd = build_command("move", goal=list(w.to_world(*cell)), path=points,
-                            target=None, kind=None, dash=False,
-                            timeout_ms=MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)))
-        if gates:
-            cmd["gates"] = gates
+        cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*cell)),
+                        None, None, MOVE_TIMEOUT_MS)
         s = self._begin_exec(ctx, ex, cmd)
         if s == Status.RUNNING:
             self._staging = True
@@ -400,18 +423,8 @@ class GoToCell(Primitive):
         if not path:
             return Status.FAILURE
         self._goal = tuple(goal)
-        points, gates = seams.path_points(w, path, field, ctx.get("bb"))
-        cmd = build_command(
-            "move",
-            goal=list(w.to_world(*self._goal)),
-            path=points,
-            target=None,
-            kind=None,
-            dash=False,
-            timeout_ms=GOTO_MOVE_TIMEOUT_MS + int(1000 * seams.gates_wait_seconds(gates)),
-        )
-        if gates:
-            cmd["gates"] = gates
+        cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*self._goal)),
+                        None, None, GOTO_MOVE_TIMEOUT_MS)
         return self._begin_exec(ctx, ctx["exec"], cmd)
 
 

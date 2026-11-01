@@ -154,6 +154,9 @@ def _map(world):
         "walk_probe": raw.get('walk_probe'),
         "belts": raw.get('belts') or [],
         "wind_zones": raw.get('wind_zones') or [],
+        # 传送门参数/动态态 + 最近传送事件（插件 Oc2Portals.cs），原样透传
+        "portals": raw.get('portals') or [],
+        "teleports": raw.get('teleports') or [],
         "belt_cells": sorted([list(c) for c in belt_cells]),
         "belt_dir": _belt_dir(belt_dir),
         "p2_cell": _chef_cell(world, p2) if p2 else None,

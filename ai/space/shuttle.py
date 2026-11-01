@@ -38,6 +38,9 @@ STANCE_REACH = 1.25
 STANCE_ALONG = (0.0, -0.3, 0.3)
 # 站点挂到可走格的最远距离（m）：格心离站点超过它就不算「走到这格再挪一步」。
 LINK_DIST = 1.0
+# 出餐口格外站位的挂格距离（m）：站点常落在两行格心之间（离格心最多 ≈0.85m
+# 斜向），再加沿边偏移，1.0 会漏；不超过一格（1.2m）+ 余量，不会挂到隔一格的地方。
+HATCH_LINK_DIST = 1.3
 # move 终点比站点再往台面推多少（m）：插件 0.5m 内判到达，推一点让人贴到墙边停住，
 # 交互句柄才稳定命中；推进墙里也没关系，人被 collider 挡住、停在站点附近。
 GOAL_PUSH = 0.3
@@ -159,9 +162,9 @@ def _standable(world, x, z):
     return not O._point_in_any_box(x, z, _blockers(world), margin=STANCE_CLEARANCE)
 
 
-def _link_cell(world, x, z):
-    # type: (object, float, float) -> Optional[Tuple[int, int]]
-    """站点挂到最近的可走格（站点所在格及八邻，格心距 ≤ LINK_DIST）。"""
+def _link_cell(world, x, z, link_dist=LINK_DIST):
+    # type: (object, float, float, float) -> Optional[Tuple[int, int]]
+    """站点挂到最近的可走格（站点所在格及八邻，格心距 ≤ link_dist）。"""
     c = world.to_grid(x, z)
     best, best_d = None, None
     for dx in (-1, 0, 1):
@@ -171,7 +174,7 @@ def _link_cell(world, x, z):
                 continue
             cx, cz = world.to_world(*cell)
             d = math.hypot(cx - x, cz - z)
-            if d <= LINK_DIST and (best_d is None or d < best_d):
+            if d <= link_dist and (best_d is None or d < best_d):
                 best, best_d = cell, d
     return best
 
@@ -184,13 +187,65 @@ def stances(world, st):
     每 STANCE_STEP 找第一个能站的点，超过 STANCE_REACH 没找到就这个方向没有。
     每帧按台面名缓存。
     """
+    return _edge_stances(world, st, O._box_of(st), LINK_DIST)
+
+
+def hatch_stances(world, st):
+    # type: (object, Dict) -> List[Dict]
+    """出餐口的格外站位：格内交互位一个都没有时的兜底（同 stances 的形状）。
+
+    会漂的出餐口（Rapids_3_5 的出餐船）不在任何网格上，占地按静态主网格量化。
+    船身上下晃 0.1~0.2m，阻挡 box 就在两行之间跳；跳到外侧那行时，紧挨着它
+    的那行恰是船舷外的水面（不可走），四邻交互位一个都没有，DeliverPlate 判
+    unreachable_destination——但站在原来那格隔着 0.5m 照样送得到。
+    trace-20261101-180609 t=12480~12520：P2 端着装好的鸡块盘，出餐口每隔几秒
+    「消失」一次，P2 把成品盘放到木筏上去干别的，到收盘没送出去。
+
+    按 PLATEBLOCK 阻挡 box（真实占地）从外沿找站点；落脚格可能离站点稍远
+    （站点在两行格心之间），挂格距离放宽到 HATCH_LINK_DIST。
+    """
+    if not isinstance(st, dict) or st.get("t") != "plate_station":
+        return []
+    return _edge_stances(world, st, _hatch_box(world, st), HATCH_LINK_DIST)
+
+
+def hatch_fallback(world, st):
+    # type: (object, Optional[Dict]) -> List[Dict]
+    """出餐口格内交互位为空时的格外站位；有格内交互位 / 不是出餐口 → []。
+
+    规划层（reachability._interact_goals）与执行层（move.Approach）共用这一个
+    判据：只在常规交互位一个都没有时启用，不改动静态出餐口的既有站位选择。
+    """
+    if not isinstance(st, dict) or st.get("t") != "plate_station":
+        return []
+    if not hasattr(world, "mapping") or not getattr(world, "terrain", None):
+        return []
+    from ai.space import navigation
+    fp = O.station_block_cells(st, world.terrain, world.mapping)
+    if navigation.serving_hatch_interact_cells(fp, world.walkable, world.belt_cells):
+        return []
+    return hatch_stances(world, st)
+
+
+def _hatch_box(world, st):
+    # type: (object, Dict) -> Optional[Tuple[float, float, float, float]]
+    """出餐口的 PLATEBLOCK 阻挡 box（含站点中心那个）；没有则退回站点 AABB。"""
+    sx, sz = st.get("x"), st.get("z")
+    if sx is not None and sz is not None:
+        for box in world.terrain.get(O.LAYER_PLATEBLOCK) or ():
+            if box[0] <= sx <= box[1] and box[2] <= sz <= box[3]:
+                return tuple(box[:4])
+    return O._box_of(st)
+
+
+def _edge_stances(world, st, box, link_dist):
+    # type: (object, Dict, Optional[Tuple[float, float, float, float]], float) -> List[Dict]
     cache = getattr(world, "_shuttle_stances", None)
     if cache is None:
         cache = world._shuttle_stances = {}
-    key = (st.get("grid"), st.get("n"))
+    key = (st.get("t"), st.get("grid"), st.get("n"), link_dist)
     if key in cache:
         return cache[key]
-    box = O._box_of(st)
     out = []  # type: List[Dict]
     if box is not None:
         cx, cz = (box[0] + box[1]) / 2.0, (box[2] + box[3]) / 2.0
@@ -210,7 +265,7 @@ def stances(world, st):
                     d += STANCE_STEP
             if best is None:
                 continue
-            cell = _link_cell(world, best[1], best[2])
+            cell = _link_cell(world, best[1], best[2], link_dist)
             if cell is None:
                 continue
             out.append({"x": best[1], "z": best[2], "face": (-dx, -dz), "cell": cell})

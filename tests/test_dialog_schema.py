@@ -61,8 +61,7 @@ def test_rescue_and_relay_types_have_no_branch():
     from ai.query.recipes import RecipeBook
 
     book = RecipeBook([{"name": "pot", "comp": []}], [])
-    for task in (T.RecoverLoosePot(resources=("cooker_1",), item="pot"),
-                 T.PlaceToRelay(item="pot")):
+    for task in (T.RecoverLoosePot(resources=("cooker_1",), item="pot"),):
         assert task.TYPE in NO_BRANCH_TYPES
         assert planner.branch_of_task(task, book) is None
     # 对照：普通取料动作仍按生料归一。

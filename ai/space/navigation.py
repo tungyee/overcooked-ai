@@ -74,7 +74,7 @@ class Field(dict):
 
 def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
                    soft_cost=None, bridges=None, edge_blocked=None, wait_cost=None,
-                   jumps=None):
+                   jumps=None, jump_cost=None):
     # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]], Optional[Callable]) -> Dict[Tuple[int, int], int]
     """从 start 做 Dijkstra，返回 {格子: 最小代价}。
 
@@ -83,6 +83,8 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
     只要「早到不会晚走」（等门时刻表满足 FIFO），Dijkstra 照样最短。
     jumps：{格: [格]} 额外的非相邻边（同样收 1 步 + 等门代价），到达方式记在
     返回 Field 的 via 里，trace_back 据此回溯。
+    jump_cost：{(格, 格): 步数} 跳边的基础代价，缺省 1（门洞跳边）；传送门
+    跳边按进门 + 传送 + 出门折步数（ai/space/portals.py）。
 
     start 本身总在结果里（代价 0），即使它被判为不可走——厨师可能正站在
     被站点占用兜底误判的格子上，直接返回空会让所有 ETA 失效。
@@ -106,6 +108,7 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
     waits = dist.waits
     via = dist.via
     jumps = jumps or {}
+    jump_cost = jump_cost or {}
     pq = [(0, start)]
     while pq:
         if len(dist) > max_cells:
@@ -128,7 +131,8 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
                 if wait is None:
                     continue
             # 基础代价 + P1 软代价 + 等门
-            ncost = cost + (1 if jumped else step_cost(belt_dir, cur, nxt)) + soft_cost.get(nxt, 0) + wait
+            base = jump_cost.get((cur, nxt), 1) if jumped else step_cost(belt_dir, cur, nxt)
+            ncost = cost + base + soft_cost.get(nxt, 0) + wait
             if ncost < dist.get(nxt, 1 << 60):
                 dist[nxt] = ncost
                 if jumped:

@@ -67,10 +67,16 @@ def stages(book, product):
     """product 的加工链：[(形态, 消费站类型, 生料)]，按上游到下游排列。"""
     out = []  # type: List[Tuple[str, str, str]]
     if book.needs_cooking(product):
+        # 整份进炉的菜（披萨）：料放在载体上、载体整份进炉，没有「生料投进灶」
+        # 这一站。装了料的饼游戏不让扔（ServerPreparationContainer.AllowThrowing
+        # = 内容为空），烤箱是普通挂载站、只接停稳的物品（ServerAttachStation.
+        # CanHandleCatch 要 !IsFlying）——投不进去。只留切这一站。
+        carrier = book.carrier_base(product) is not None
         for raw in book.raws_of(product):
             if book.needs_chopping(raw):
                 out.append((raw, CONSUMER_BOARD, raw))
-            out.append((book.cook_input_form(raw), CONSUMER_COOKER, raw))
+            if not carrier:
+                out.append((book.cook_input_form(raw), CONSUMER_COOKER, raw))
     elif book.needs_chopping(product):
         out.append((product, CONSUMER_BOARD, product))
     return out
@@ -114,6 +120,12 @@ def downstream(world, book, product, form, consumer):
     # 切：切好的（不论在哪）+ 已在锅里/盘里的
     chopped = book.chop_target(form)
     n = len(_items_named(world, chopped)) if chopped else 0
+    # 整份进炉的菜：已放到饼上的配料也越过了切这一站
+    if book.carrier_base(product) is not None:
+        from ai.query import carriers as CR
+        want = book.want_tokens(form)
+        n += sum(1 for c in CR.prep_carriers(world, book)
+                 if c["cooker"] is None and want & set(c["contents"]))
     if not book.needs_cooking(product):
         n += sum(1 for p in getattr(world, "plates", None) or ()
                  if book.plate_has(p, product))
@@ -175,11 +187,14 @@ def sources(world, form, raw, dest, mode, bb=None, dests=None):
     """
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
     if chef is not None and _lower(chef.get("held")) == _lower(form):
-        return [dict(kind="held")]
+        # 手上这份此刻扔不出去（插件按游戏 CanHandleThrow 报）就不算来源
+        return [] if chef.get("held_throwable") is False else [dict(kind="held")]
     out = []  # type: List[Dict]
     for it in getattr(world, "items", None) or ():
         if _lower(it.get("n")) != _lower(form) or it.get("flying") is True:
             continue
+        if it.get("throwable") is False:
+            continue   # 扔不出去的（装了料的饼）拿起来也投不了
         if any(near_dest(world, it, d, mode, bb) for d in (dests or [dest])):
             continue   # 已投到（这一站任一消费站旁）的料不再捡起来重投
         if RG.reachable_by(world, it, P.P2_NAME, bb):
@@ -228,32 +243,57 @@ def _station_cells(world):
     return cells
 
 
-def _landing_test(world, target, mode, bb=None):
-    # type: (Any, Tuple[float, float], str, Any) -> Optional[Any]
+def _landing_test(world, target, mode, bb=None, floor_y=None):
+    # type: (Any, Tuple[float, float], str, Any, Optional[float]) -> Optional[Any]
+    """落点判定；floor_y 是出手点脚下高度（缺省 P2 此刻脚下）。"""
     f2 = RG.field_of(world, bb, P.P2_NAME)
     if not f2:
         return None
+    if floor_y is None:
+        floor_y = _p2_floor_y(world)
+    floor_ok = TH.floor_reachable(getattr(world, "terrain_y", None), floor_y)
     if mode == MODE_SPLIT:
         f1 = RG.field_of(world, bb, P.P1_NAME) or {}
-        return TH.region_test(world.to_grid, set(f1), set(f2), _station_cells(world))
+        return TH.region_test(world.to_grid, set(f1), set(f2), _station_cells(world),
+                              floor_ok=floor_ok)
     near = {c for c in f2
             if math.hypot(*(_d(world.to_world(*c), target))) <= NEAR_DEST_RADIUS}
-    return TH.region_test(world.to_grid, near, None, _station_cells(world))
+    return TH.region_test(world.to_grid, near, None, _station_cells(world),
+                          floor_ok=floor_ok)
 
 
-def walls_of(world):
-    # type: (Any) -> List[Tuple[float, float, float, float]]
-    """当前帧挡飞行料的高墙（每帧缓存）。移动篮子的墙随帧更新。
+def _p2_floor_y(world):
+    # type: (Any) -> float
+    """P2 脚下高度（插件 0.23.5+ 报 chefs[].y；缺省 0）。"""
+    chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME) or {}
+    y = chef.get("y")
+    return float(y) if isinstance(y, (int, float)) else 0.0
 
-    墙高按 P2 脚下高度算（插件 0.23.5+ 报 chefs[].y；缺省 0）。旧帧没有墙高
-    时返回空列表，不做墙判定。
+
+def _cell_floor_y(world, cell):
+    # type: (Any, Tuple[int, int]) -> float
+    """出手格脚下高度：格心处地面盒顶；查不到（旧帧 / 台阶盒缝）用 P2 此刻脚下。"""
+    wx, wz = world.to_world(*cell)
+    top = TH.ground_top(getattr(world, "terrain_y", None), wx, wz)
+    return _p2_floor_y(world) if top is None else top
+
+
+def walls_of(world, floor_y=None):
+    # type: (Any, Optional[float]) -> List[Tuple[float, ...]]
+    """当前帧挡飞行料的障碍（每帧按出手高度缓存）：高墙 + 比出手点脚下高的
+    地面盒（楼梯台阶、高台地板）。移动篮子的墙随帧更新。
+
+    floor_y 缺省为 P2 此刻脚下（插件 0.23.5+ 报 chefs[].y）。规划别的出手格时
+    按那格的地面高度给——高度不同，挡不挡也不同。旧帧没有高度时返回空列表。
     """
+    if floor_y is None:
+        floor_y = _p2_floor_y(world)
+    floor_y = round(floor_y, 2)
+
     def compute():
-        chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME) or {}
-        floor_y = chef.get("y")
-        floor_y = float(floor_y) if isinstance(floor_y, (int, float)) else 0.0
-        return TH.throw_walls(getattr(world, "terrain_y", None), floor_y)
-    return _cached(world, ("walls",), compute)
+        terrain_y = getattr(world, "terrain_y", None)
+        return TH.throw_walls(terrain_y, floor_y) + TH.raised_ground(terrain_y, floor_y)
+    return _cached(world, ("walls", floor_y), compute)
 
 
 def _cached(world, key, fn):
@@ -285,19 +325,33 @@ def launch_plan(world, dest, mode, bb=None):
     def compute():
         target = _point(world, dest)
         f2 = RG.field_of(world, bb, P.P2_NAME)
-        ok = _landing_test(world, target, mode, bb) if target is not None else None
-        if ok is None or not f2:
+        if target is None or not f2:
             return None
-        walls = walls_of(world)
+        # 出手格按脚下高度分组：障碍与落点能否够着都相对出手点算（一楼格与
+        # 楼上格看到的「高出脚下的地面」不同）
+        by_floor = {}  # type: Dict[float, List[Tuple[int, int]]]
+        for c in f2:
+            by_floor.setdefault(round(_cell_floor_y(world, c), 2), []).append(c)
+        tests = {}
         for max_land in _max_lands(mode):
             lo = TH.THROW_RANGE - 2 * TH.THROW_RANGE_TOL - max_land
             hi = TH.THROW_RANGE + max_land
-            cells = [c for c in f2
-                     if lo <= math.hypot(*_d(world.to_world(*c), target)) <= hi]
-            plan = TH.plan_launch(cells, f2.get, world.to_world, target, ok,
-                                  max_land, walls=walls)
-            if plan is not None:
-                return dict(plan, max_land=max_land)
+            best = None
+            for fy, group in by_floor.items():
+                cells = [c for c in group
+                         if lo <= math.hypot(*_d(world.to_world(*c), target)) <= hi]
+                if not cells:
+                    continue
+                if fy not in tests:
+                    tests[fy] = _landing_test(world, target, mode, bb, floor_y=fy)
+                if tests[fy] is None:
+                    continue
+                plan = TH.plan_launch(cells, f2.get, world.to_world, target, tests[fy],
+                                      max_land, walls=walls_of(world, fy))
+                if plan is not None and (best is None or plan["score"] < best["score"]):
+                    best = plan
+            if best is not None:
+                return dict(best, max_land=max_land)
         return None
     return _cached(world, ("plan", str(dest.get("n")), str(dest.get("grid")), mode), compute)
 

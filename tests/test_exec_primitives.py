@@ -183,3 +183,10 @@ def test_handle_desc_computes_grid_from_xz():
     d = handle_desc({"name": "equipment_plate_01 (2)", "x": 3.6, "z": -4.8},
                     to_grid=lambda x, z: (int(round(x / 1.2)), int(round(z / 1.2))))
     assert d["gx"] == 3 and d["gz"] == -4
+
+
+def test_handle_desc_none_is_none():
+    """无目标发 None：插件 tap/hold/move 对 target==null 走不校验句柄分支。
+    旧实现发全 None 的字典，插件当成有目标校验、必然 handle mismatch。"""
+    assert handle_desc(None) is None
+    assert handle_desc({}) is None

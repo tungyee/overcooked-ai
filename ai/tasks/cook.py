@@ -11,7 +11,7 @@ from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
 from ai.exec.bt import Condition, Node, Selector, Sequence
-from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
+from ai.query.plate_tokens import parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
@@ -509,6 +509,15 @@ class TakeCookedToPlate(Task):
             return True                        # 执行中：目标盘已在手上
         return self._source(ctx) is not None
 
+    def resource_target(self, rid, ctx):
+        # type: (Any, Dict) -> Optional[Dict]
+        """可达性层解析资源用（reachability._task_target）：散熟料源按 _source
+        精确取那一件，避免同名生饼顶替熟饼；其余资源走默认按 id 查。"""
+        if rid != self.cooker_id or cooker_state(ctx, rid) is not None:
+            return None
+        s = self._source(ctx)
+        return s["target"] if s else None
+
     def _source(self, ctx):
         # type: (Dict) -> Optional[Dict]
         """按 source id 解析熟料源（灶上煮中/熟锅 / 台面散熟锅）。
@@ -524,18 +533,16 @@ class TakeCookedToPlate(Task):
             if P.cooker_started(c) and not P.cooker_burning(c):
                 return {"kind": "cooker", "target": cooker_station(ctx, sid)}
             return None
-        for it in ctx["w"].items:
-            if str(it.get("n")) != str(sid):
+        # 散熟料源（散熟锅 / 出炉的熟披萨）与 cooked_sources 同一口径，并且要
+        # 装着本 task 这样熟料：同名物品可能有多件（Pizza_Base_Raw 生饼和熟饼
+        # 同名），只看第一件同名物会撞上生饼 → 有熟披萨却判不可行。
+        token = ctx["book"].rich_token(self.item)
+        for src in cooked_sources(ctx["w"], ctx["book"]):
+            if src["kind"] != "loose" or str(src["id"]) != str(sid):
                 continue
-            toks = parse_plate_detail(it.get("detail") or [])
-            if any(t.startswith("cooked:") for t in toks):
-                return {"kind": "loose", "target": it}
-            # 与 cooked_sources 同款兜底：detail 只报原始料名（ing:SushiRice）、
-            # 没有 cooked: token 时，cooked 字段才是熟的权威信号。漏掉会把熟锅
-            # 当生锅 → feasible 恒 False → 有熟饭却取不动（AI 卡死）。
-            if str(it.get("cooked") or "").lower() == "cooked":
-                return {"kind": "loose", "target": it}
-            return None
+            if token and token not in src["tokens"]:
+                continue
+            return {"kind": "loose", "target": src["item"]}
         return None
 
     def build(self):

@@ -22,7 +22,7 @@
 | `core/` 主循环 | `arbiter.py` 模式仲裁 · `planner.py` 候选→可行性→协作过滤→打分→承诺惯性（最大文件，约 1800 行）· `planner_layers.py` 分层过滤 · `executor.py` task 树生命周期 |
 | `state/` 状态 | `blackboard.py` 唯一可变状态容器 · `bb_factory.py` 其构造 · `world.py` StateClient 分帧 + World 只读视图 · `reconcile.py` 每拍认领对账 · `p1model.py` P1 事实（holding）+ 站位软代价 |
 | `query/` 查询 | `predicates.py` 纯谓词（无副作用、不依赖 World 类）· `recipes.py` RecipeBook 配方语义 · `recipe_graph.py` 配方 DAG 编译 + 候选发射 · `plate_tokens.py` 盘/锅内容 token 解析 · `stations.py` 站点检索 · `placement.py` 落点约束 |
-| `space/` 空间 | `navigation.py` Dijkstra 距离场 · `occupancy.py` 可走性 + 实体去重 · `geometry.py` 网格↔世界坐标 · `seams.py`/`seam_clock.py` 平台接缝门洞与开关时间表 · `shuttle.py` 渡运台面（隔围栏够的移动台面：格外站位 + 可交互窗口） |
+| `space/` 空间 | `navigation.py` Dijkstra 距离场 · `occupancy.py` 可走性 + 实体去重 · `geometry.py` 网格↔世界坐标 · `seams.py`/`seam_clock.py` 平台接缝门洞与开关时间表 · `shuttle.py` 渡运台面（隔围栏够的移动台面：格外站位 + 可交互窗口） · `channels.py` 跨区通道（渡运台面 + 两边都够得着的静态共享台面） · `portals.py` 传送门（触发格对寻路不可走 + 过门跳边 + move 过门段；寻路参数统一走 `portals.nav_args`） · `lanes.py` 半格走廊（通道夹在两排格中心之间时的寻路跳边 + move 拐点） |
 | `revenue/` 收益 | `economy.py` 小费/连击 · `eta.py` 订单 ETA/slack/必死 · `cook_supply.py` 熟料供需（见下） |
 | `output/` 输出 | `trace.py` 决策日志 · `state_dump.py` 快照压成可序列化 dict |
 | `exec/` 执行/回放 | `client.py` ExecClient/NullExec · `commands.py` 命令 schema · `bt.py` 行为树引擎（有记忆的 Sequence/Selector + RepeatUntil/Guard）· `record.py`/`replay.py` 录帧回放 |

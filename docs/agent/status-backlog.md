@@ -1,5 +1,38 @@
 # 已知限制、当前状态与待办
 
+## 半格走廊（2026-11-01，3_6_Dynamic_Lvl_02，未实机验证）
+
+- **现象**（`trace-20261101-184314`）：上层木筏 Raft One（带出餐口）停在中间平台正上方时，P2 只到得了平台下半截，鸡肉卷做好了也被判 `unreachable_destination`；Raft One 停在平台右侧（同一行横接）时正常。P1 实际走得过去。
+- **根因**：平台上两只料箱错开半格，中间 z∈(-8.4,-7.2) 全开一行；主网格格中心压在料箱边上，上下两排可走格错开不相邻，S 弯在格图上断开。
+- **修复**：`ai/space/lanes.py`。A、B 跨一排（或一列）、横向错开 1~2 格，**普通单调格路走不通**时，沿「A → 中线拐点 ×2 → B」三段直线每 0.1m 采样，按 walkable 同口径（阻挡外扩 `CHEF_CLEARANCE`、落火/KillPlane、运行时占用格）判净空，且离地板边 ≥ `SUPPORT_MARGIN`(0.1m) 才算脚下有地，通了就加跳边（代价 = 等价格路步数）。门洞格 / 传送门触发格不参与。`portals.nav_args` 统一叠上，`portals.route` 在两格间插两个拐点。fixture 全量比对：只有本关可达场变化，且都是超集。
+- **掉落机制**（反编译 `GroundCast` / `ApplyGravityForce` / `RespawnCollider`）：死亡只经 RespawnCollider；脚下检测落空才加重力，中心离开地板边就会滑下去，故走廊点要求离地板边有余量。
+- **待办**：实机验证 P2 沿拐点过 S 弯；`t=9700` P2 站在 Raft Two 边缘（x=15.8，格中心 16.0 越出地板 15.98），起点格四邻全不可走、可达场只剩自身（另一问题，未修）。
+
+## 传送门寻路（2026-11-01，插件 0.24.3 / 协议 8，未实机验证 P2 过门）
+
+- **机制**（反编译 `ServerTeleportal` / `*TeleportalPlayer*` / `*TeleportalAttachment*`）：进触发盒且位置在门正面 `arc_dir ± arc_deg` 扇区内就被强制传走，约 1.2s 不受控，落在出口门接收点、手持物随人；刚传过的人离开触发区或面朝门（±45°）前不会再传。扔进门的料从出口沿接收点 forward 重新抛出（`trace-20261101-160703`：奶酪 16.7s 入左门… 落左台 (8.4,-5.8)，出口前约 3.4m）。
+- **插件**：帧带 `portals[]`（门参数 + 动态态）与 `teleports[]`（最近 24 条传送事件，物品带 `thrown`），关卡加载打 `[PORTALS]`、每次传送打 `[TELEPORT]`。move 命令可选 `portals[]` 过门段：走到推门点一直朝门推、传送中停摇杆、落地后续走；推满 `max_wait` 没传走回 `portal busy`（回传门中心，Python 按门洞口径拉黑触发格）；没有过门段却被传走回 `teleported`。
+- **Python**：`ai/space/portals.py`。触发格对寻路不可走（防误踩，`trace-20261101-152446` t=19341/19490）；入口扇区内邻格 → 出口落地格加跳边，代价 2 + `TELEPORT_STEPS`(6)；`distance_field` 新增 `jump_cost`。`portals.nav_args` 统一给 agent / reachability 建场，`portals.route` 给 move 原语插推门/落地点。
+- **待办**：P2 过门未实机验证（推门方向、落地判定容差 1.5m、落地后转身别面朝门）；投掷规划还没用「扔进门 → 对面门前 3.4m」这种落点；P1 模型 / ETA 已经自动按跳边算。
+
+## Wizard_5_5：面包身份 / 升降楼梯 / 高度差投掷（2026-11-01，插件 0.24.2 / 协议 8，未实机验证）
+
+- **面包**：面包箱 prefab 叫 `ChoppedBun`，配方叶子是 `Bun`。反编译：面包是载体，配方身份在 `PreparationContainer.m_ingredientOrderNode`（`GetAsOrderComposite` 补在组成最后）。0.24.1 插件 `IngredientNode` 不读它、`RawNames` 只在切配索引里登记，P2 永远取不到面包（Mine_2_6 `trace-20261026-214120` 同样，面包全靠 P1）。0.24.2：`IngredientNode` 认 `PreparationContainer`；刷出器 prefab 节点名与 prefab 名不同就登记改名，帧里统一报 `Bun`。
+- **升降楼梯**：两座楼梯会整体沉到地下再升起（`trace-20261101-145921`）。`parse_terrain` 只并入两端贴着地板顶面（±0.3m）的楼梯；P2 正走在楼梯上时楼梯下沉仍会掉下去（未做下沉预测）。
+- **地板落点（插件 0.24.3）**：`trace-20261101-152446` t=535~716 P2 困在左平台（无普通台面）拿着生菜，`StashHeld` 每拍 `handle mismatch`。根因：无目标 tap 发了全 None 的 target 字典，插件当成有目标校验、必败（日志 62 次全败，地板落点自 exec 后端上线大概率一直坏）。反编译 `PlaceHeldItem_Client/Server`：拿着东西按键，面前有 placement 句柄就往上放（放不下留手里），没有才落地。修复：`handle_desc(None)` 返回 None；地板落点 = 面朝的那格（`placement.find_floor_drop`），站邻格发 `tap kind=floor` + `target_world`，插件小推杆转身、对准且无句柄才按，转不开回 `no clear floor`，`EnsureHandsFree` 换下一格。待实机：小推杆转身是否基本不挪位。另：`Prefetch` 不看切好形态是否已够，会拿多余生料（本局起因，未修）。
+- **高度差投掷**：比出手点高的地面（台阶、高台）当飞行障碍，落点地面比出手点高 >0.6m 判投不到；出手格按其地面高度分组算（`trace-20261101-142950`）。投锅路径（`plan_pot_throw`）未按出手格分高度，靠出手前真实位置复核兜住。投后落点校验未做。
+
+## 静态通道 / 披萨载体 / 站点重名（2026-11-01，插件 0.24.0 / 协议 8，未实机验证）
+
+`trace-20261101-002050`（Wizard_3_1 = 游戏内 3-1）：P2 被关在左边小区，盘子全在 P2 这边、烤箱在 P1 那边，52s 零出餐。
+
+- **站点重名**：关卡里两块砧板 GameObject 同名，`_board_items` 只认出两块、认领互撞。插件 `ObjNames`（`Oc2Executor.cs`）按名字分组，只给重名的那组加 `#<InstanceID>`；stations / workstations / cookers / `on_station` / chefs.interactions / exec 句柄同源。不重名的关 id 不变。
+- **静态通道**：`ai/space/channels.py` 把「两个可达场都能交互的普通台面」当通道，与渡运篮子并列；`SendAcross` 资源第二位改成通道 key。砧板列滑走（t≈44s）后通道自动消失。`far_plate_need` 的「要过灶」也认整道菜本身要烤。
+- **披萨**：反编译确认面团切成的饼是可烹饪载体（见 `tasks-primitives.md` carrier 一节）。插件新报 `cookers[].station_type`、`items[].cookable`、`crate.chop_cookable`；灶上是载体时 `pot_contents` 报整份组成（含底料）。`RecipeBook.requirements` 对整份进炉的菜返回菜名本身（进盘是一个熟料节点），`cooked_of_raws` 按生料集精确反查。
+- `trace-20261101-130851`（0.24.0 首局）：字段如预期（`cookable` prep/Oven/OvenTray、砧板 `#` 后缀），P2 往饼上放了番茄芝士；但 `ThrowBatch` 把饼从共享砧板拿走想投进烤箱，扔不出去、超时被放到 P2 台面，之后没有 task 能交出去，零出餐。修复：整份进炉的菜不生成「投进灶」阶段（反编译：有料的饼 `AllowThrowing` 为 false，烤箱是挂载站、只接停稳的物品）；插件 `throwable` 改按 `ServerThrowableItem.CanHandleThrow`，Python 投掷来源跳过不可投的；`SendAcross` 增加 `carrier` kind，共享空砧板作载体通道格。
+- 待实机：端盘对烤箱取披萨走 `TakeCookedToPlate` 的通用朝向句柄，未实测；阶段 B（砧板滑走后 P2 有烤箱/砧板/盘、P1 只剩面团/芝士箱）靠每拍重算自适应：P2 够不着面团/芝士就等 P1 放上共享砧板，饼一出现就放料、进炉、端盘（`tests/test_wizard31.py` 已覆盖饼在台面 / 砧板上两种）；台面上的散熟披萨不算熟料源。
+- 楼梯（插件 0.24.1）：同局 t=13767 P2 端着烤好的披萨不送，`DeliverPlate` 恒 `unreachable_destination`——出餐口在二楼，`Left Side Stairs` 在 SlopedGround(28) 层，插件没收。插件 `TERRAIN_LAYERS` 加 28；`parse_terrain` 把 28 层外扩 0.3m 并入 Ground（顶阶与二楼地板有 0.17m 接缝）。插件每场景一次在 BepInEx 日志打 `[TERRAIN-DIAG]`（非地形层碰撞体清单），新关卡走不通时先查它。待实机：P2 走楼梯送餐。
+
 ## 渡运台面：隔着围栏取 / 送篮子上的东西（2026-10-31，未实机验证）
 
 2-3（Balloon_2_2）`trace-20261031-185032`：0 出餐。P1 t≈45s 把两盘成品放上下方 `Server_Balloon` 篮子台面，篮子 t≈57.7~64.1s 停在左口，P2 全程 `DeliverPlate … unreachable`，原地空站，菜又被运回右边。根因：台面在 gz=-6，正前一排格心 z=6.0 落在固定地板外 3cm（Ground minz=6.03），四邻交互位一个都没有；P1 实际站在 z≈6.44（两排格心之间）。人上不了篮子（篮子地板 0.63m），不是门洞问题，`seam_clock` z=6.0 恒 `known: False`。篮子：右停 bx≈18、左停 bx≈3.6，各停 ≈6.4s、单程 ≈11.6s、周期 ≈36.2s（`anim.len=13` 只是单程，不能当周期）。
@@ -14,7 +47,7 @@
 - 拼装格排除渡运台面（`_assembly_cells`），空盘不摆到会被运走的地方。
 - fixture `balloon22-20261031-185032-shuttle` / `balloon22-20261031-204801-send-plates` / `balloon22-20261031-201659-throw-offcenter`，测试 `tests/test_shuttle.py`、`tests/test_throw_batch.py`（投掷站位离格心 0.48m 投不出：`GoToCell(precise=True)` 到格后再朝格心挪一次）。
 
-未做 / 待实机：第一圈时间表还没学会时，篮子到口那几秒照样能取（可达），但不会提前就位；站位贴墙 0.45m，句柄若够不着需调 `GOAL_PUSH`；`SendAcross` 只认干净盘、灶「全在对面」才算对面装盘（未按灶具类型细分）；地板兜底盲按 tap 发全 None target 必 handle mismatch（手里东西放不下时仍会卡）；门洞 / 投掷 / 中转台统一成通道、传送带与人控平台都留到下一轮。
+未做 / 待实机：第一圈时间表还没学会时，篮子到口那几秒照样能取（可达），但不会提前就位；站位贴墙 0.45m，句柄若够不着需调 `GOAL_PUSH`；`SendAcross` 只认干净盘、灶「全在对面」才算对面装盘（未按灶具类型细分）；地板兜底盲按 tap 发全 None target 必 handle mismatch（手里东西放不下时仍会卡）；门洞 / 投掷统一成通道、传送带与人控平台都留到下一轮。
 
 ## 盘匹配优先给「能立刻装熟料」的单（2026-10-31，未实机验证）
 

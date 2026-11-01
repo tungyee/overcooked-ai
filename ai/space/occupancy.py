@@ -367,6 +367,8 @@ LAYER_WALLS = 10
 LAYER_PLATEBLOCK = 20
 LAYER_COOKINGBLOCK = 22
 LAYER_TABLEBLOCK = 26
+LAYER_SLOPED_GROUND = 28
+SLOPE_JOIN_MARGIN = 0.3   # 楼梯并入 Ground 时的外扩（米），补台阶与地板间接缝
 LAYER_KILLPLANE = 30
 BLOCKING_LAYERS = (LAYER_WALLS, LAYER_TABLEBLOCK, LAYER_COOKINGBLOCK, LAYER_PLATEBLOCK)
 
@@ -403,11 +405,79 @@ def parse_terrain(terrain_list):
 
     层号跨关稳定（Unity 工程配置，不是场景实例名），取代 Col_* 名字前缀。
     6 元素盒（带高度）也只取平面 4 元素，高度见 parse_terrain_y。
+
+    SlopedGround(28)（楼梯/坡道）并入 Ground(9)：角色能走上去，可走性与
+    Ground 同一口径。Wizard_3_1 一楼↔二楼只靠 Left Side Stairs 连通，漏收
+    时出餐口判不可达（trace-20261101-130851）。原层号也保留一份。
+
+    只并入「在位」的楼梯（stairs_in_place）：Wizard_5_5 两座楼梯会沉到地下
+    再升起来（y 到 -7.5），沉下去的台阶盒平面位置不变，不看高度就当成能走，
+    P2 走上去掉进虚空反复重生（trace-20261101-145921 t=460~622）。
     """
     out = {}  # type: Dict[int, List[Tuple[float, float, float, float]]]
-    for layer, box, _y in _iter_terrain(terrain_list):
+    slopes = []  # type: List[Tuple[Tuple[float, float, float, float], Optional[Tuple[float, float]]]]
+    ground_tops = []  # type: List[float]
+    for layer, box, y in _iter_terrain(terrain_list):
         out.setdefault(layer, []).append(box)
+        if layer == LAYER_SLOPED_GROUND:
+            slopes.append((box, y))
+        elif layer == LAYER_GROUND and y is not None:
+            ground_tops.append(y[1])
+    m = SLOPE_JOIN_MARGIN
+    for group in _slope_groups(slopes):
+        if not stairs_in_place([y for _b, y in group], ground_tops):
+            continue
+        for box, _y in group:
+            # 楼梯盒只包台阶本身，与上下层地板之间留有接缝（3-1 顶阶 maxz=-1.22、
+            # 二楼地板 minz=-1.05），格中心 z=-1.2 正落在缝里。并入时外扩补缝；
+            # 楼梯两侧有墙（阻挡层），外扩不会放出悬空格。
+            out.setdefault(LAYER_GROUND, []).append(
+                (box[0] - m, box[1] + m, box[2] - m, box[3] + m))
     return out
+
+
+# 楼梯两端离地板顶面这么近（m）算接上：一级台阶高 ≈0.5，升降中的楼梯差得更多。
+STAIRS_JOIN_TOL = 0.3
+
+
+def _slope_groups(slopes):
+    """SlopedGround 盒按平面相邻（外扩 SLOPE_JOIN_MARGIN 后相交）分组，一组 = 一座楼梯。"""
+    m = SLOPE_JOIN_MARGIN
+    n = len(slopes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        a = slopes[i][0]
+        for j in range(i + 1, n):
+            b = slopes[j][0]
+            if a[0] - m <= b[1] and b[0] - m <= a[1] and a[2] - m <= b[3] and b[2] - m <= a[3]:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(slopes[i])
+    return list(groups.values())
+
+
+def stairs_in_place(heights, ground_tops):
+    # type: (List[Optional[Tuple[float, float]]], List[float]) -> bool
+    """一座楼梯（各台阶盒 (miny,maxy)）是否在位：最低台阶顶、最高台阶顶都贴着
+    某块地板顶面（±STAIRS_JOIN_TOL）。没有高度（旧帧）或没有地板高度时视为在位。"""
+    tops = [y[1] for y in heights if y is not None]
+    if not tops or not ground_tops:
+        return True
+
+    def near(v):
+        return any(abs(v - g) <= STAIRS_JOIN_TOL for g in ground_tops)
+
+    # 最低台阶顶比它接的下层地板高半级台阶：按下沿判
+    lows = [y[0] for y in heights if y is not None]
+    return near(min(lows)) and near(max(tops))
 
 
 def parse_terrain_y(terrain_list):

@@ -171,6 +171,7 @@ namespace Oc2AI
             switch (_phase)
             {
                 case Phase.Reaim:
+                    if (_kind == "floor") { ReaimFloor(f, now); break; }
                     if (_target == null || PadButtons.HandleMatches(f, _target, _kind))
                     {
                         PadEngagement.Pad.Stop();
@@ -220,6 +221,44 @@ namespace Oc2AI
             }
         }
 
+        // kind=floor：放到地上（0.24.3）。反编译 PlaceHeldItem_Client/Server：拿着东西按键时
+        // 面前有 placement 句柄就往句柄上放（放不下 OnFailedToPlace，东西留手里），没有句柄
+        // 才 TakeItem 落在面前。句柄按朝向扇形扫，只要求对象有 placement handler（满砧板 /
+        // 箱子 / 地上的盘都算），Python 的格子快照判不准，所以在这里逐帧确认：
+        //   朝 target_world（Python 选的空地格心）小推杆原地转身（同 ThrowCommand），
+        //   朝向对准且此刻没有 placement 句柄才按；FLOOR_FACE_TIMEOUT 内做不到回
+        //   no clear floor，交 Python 换一格。不带 target_world 不盲按（落点不可控）。
+        private const float FLOOR_FACE_DOT = 0.9f;        // ≈25°：扇形扫描够用，转得快
+        private const float FLOOR_FACE_STICK = 0.25f;     // 小推杆：只转身不怎么走
+        private const float FLOOR_FACE_TIMEOUT = 0.8f;
+
+        private void ReaimFloor(ChefFrame f, float now)
+        {
+            if (f.HeldName == null) { Finish(false, "hands empty"); return; }
+            if (!_hasTargetWorld) { LogHandleMismatch(f); Finish(false, "no clear floor"); return; }
+            Vector2 pos = new Vector2(f.PosX, f.PosZ);
+            Vector2 dir = (_targetWorld - pos).normalized;
+            Vector3 fw = f.Chef.transform.forward;
+            Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+            bool aligned = Vector2.Dot(fwd, dir) > FLOOR_FACE_DOT;
+            if (aligned && f.PlacementId == 0)
+            {
+                PadEngagement.Pad.Stop();
+                _phase = Phase.Press;
+                _phaseStart = now;
+                _heldBefore = f.HeldName;
+                return;
+            }
+            if (now - _phaseStart > FLOOR_FACE_TIMEOUT)
+            {
+                LogHandleMismatch(f);
+                Finish(false, "no clear floor");
+                return;
+            }
+            if (aligned) PadEngagement.Pad.Stop();   // 已对准但还扫到句柄：别再往前挪，等超时
+            else PadEngagement.Pad.Move(f.Chef, dir.x * FLOOR_FACE_STICK, dir.y * FLOOR_FACE_STICK);
+        }
+
         private void Finish(bool ok, string why)
         {
             PadEngagement.Pad.Stop();
@@ -236,8 +275,10 @@ namespace Oc2AI
                 + " gx=" + f.PickupGx + "," + f.PickupGz + "]"
                 + " placement[name=" + f.PlacementName + " id=" + f.PlacementId
                 + " gx=" + f.PlacementGx + "," + f.PlacementGz + "]"
-                + " target[name=" + Req.Str(_target, "name")
-                + " gx=" + Req.Num(_target, "gx") + "," + Req.Num(_target, "gz") + "]");
+                + (_target == null ? " target=null" :
+                   " target[name=" + Req.Str(_target, "name")
+                   + " gx=" + Req.Num(_target, "gx") + "," + Req.Num(_target, "gz") + "]")
+                + (_hasTargetWorld ? " aim=(" + _targetWorld.x + "," + _targetWorld.y + ")" : ""));
         }
     }
 

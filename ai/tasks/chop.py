@@ -45,12 +45,65 @@ def board_station(ctx, board_id):
     return None
 
 
+def _workstation(world, board_name):
+    # type: (Any, str) -> Optional[Dict]
+    for ws in getattr(world, "workstations", None) or ():
+        if P.station_name_matches(str(ws.get("n") or ""), board_name):
+            return ws
+    return None
+
+
+def board_clearable(world, book, bb, board_id):
+    # type: (Any, Any, Any, Any) -> bool
+    """砧板上的东西能不能先挪走、腾出板来切别的。
+
+    通用判据，不按物料特判：板上有东西、没人在切、且它**不再需要在这块板上
+    切**（book.needs_chopping 为假：切好的料、切出来的饼等产物）。还没切的
+    生料是 Chop 的输入，不动。
+
+    不腾：P2 够不着的板（拿不起来）、分割地图两边共享的砧板（上面的东西
+    可能是送给对面的，挪到 P2 这边等于截走，且会与 SendAcross 来回拉扯）。
+
+    实机：Wizard_3_2 两块板一块被切好的饼（在上面放了番茄）占着、一块被切好
+    的意式香肠占着，芝士再没有板可切，饼也补不齐料（trace-20261101-173006）。
+    """
+    from ai.space import channels as CH
+    from ai.space import reachability
+    from ai.tasks.base import _unpack_resource_id
+    name = str(_unpack_resource_id(board_id)[1])
+    ws = _workstation(world, name)
+    item = (ws or {}).get("item")
+    if not item or (ws or {}).get("interacting"):
+        return False
+    if book is None or book.needs_chopping(item):
+        return False
+    ctx = reachability.context(world, bb)
+    st = board_station(ctx, board_id)
+    if st is None or not reachability.can_interact(ctx, st):
+        return False
+    return not any(P.station_name_matches(str(s.get("n") or ""), name)
+                   for s in CH.shared_boards(world, bb))
+
+
+def board_drop_station(ctx):
+    # type: (Dict) -> Optional[Dict]
+    """板上挪下来的东西放哪：P2 就近的合法空台面；无可达场（旧合成帧）不腾。"""
+    from ai.query import placement
+    field = ctx.get("field")
+    if not field:
+        return None
+    return placement.find_drop_station(ctx["w"], field)
+
+
 @_register
 class FetchToBoard(Task):
     """第 7 号：把生料放到切菜板上。
 
     item 是**生料名**（Cucumber），与 Chop 同口径——本 task 的 done
     （板上是生料）正是 Chop 的 feasible（spec §6.1 上下游咬合）。
+
+    板上已有可挪走的东西（board_clearable）时先腾板：空手拿起板上的东西放到
+    就近空台面，再去取料。腾板必须在取料之前——手里拿着生料腾不了板。
     """
 
     TYPE = "FetchToBoard"
@@ -79,7 +132,11 @@ class FetchToBoard(Task):
         if self.done(ctx):
             return False
         if P.board_item(ctx["w"].workstations, str(self.board_id)):
-            return False       # 板上已有东西，放不下
+            # 板上已有东西：能挪走、且有地方放才行（先腾板，见 build）
+            if not board_clearable(ctx["w"], ctx["book"], ctx.get("bb"), self.board_id):
+                return False
+            if board_drop_station(ctx) is None:
+                return False
         return ingredient_available(ctx, self.item)
 
     def build(self):
@@ -119,7 +176,26 @@ class FetchToBoard(Task):
         def drop():
             return PR.InteractWith(board, "placement", placed)
 
-        return PR.Timeout(Selector([
+        def board_empty(c):
+            return not P.board_item(c["w"].workstations, str(board_id))
+
+        def took_board_item(c):
+            # 手里拿到了板上的东西、板空了
+            return not P.hands_free(c["chef"]) and board_empty(c)
+
+        # 腾板：板空直接过；否则空手 → 拿起板上的东西 → 放到就近空台面。
+        # 第一步的 EnsureHandsFree 不 keep 生料：手里有生料时对着有东西的板
+        # 交互是「放上去」而不是「拿起来」，必须先放下。
+        clear = Selector([
+            Condition(board_empty),
+            Sequence([
+                PR.EnsureHandsFree(),
+                PR.InteractWith(board, "pickup", took_board_item),
+                PR.EnsureHandsFree(pick=board_drop_station),
+            ]),
+        ])
+
+        return PR.Timeout(Sequence([clear, Selector([
             # 分支1：地上有散落生料 → 直接捡散落放上砧板（不投、不碰箱子）
             Sequence([
                 Condition(has_loose),
@@ -146,7 +222,7 @@ class FetchToBoard(Task):
                 pickup(),
                 drop(),
             ]),
-        ]), TASK_TIMEOUT_TICKS)
+        ])]), TASK_TIMEOUT_TICKS)
 
 
 @_register

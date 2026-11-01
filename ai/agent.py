@@ -16,7 +16,7 @@ from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
-from ai.space import navigation, reachability, seam_clock, seams, shuttle
+from ai.space import navigation, portals, reachability, seam_clock, seams, shuttle
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
@@ -1233,12 +1233,9 @@ class Agent:
                 soft = p1model.p1_soft_cost_map(world, self.bb.p1_model)
                 field = reachability.field_for(world, self.bb, soft_cost=soft)
                 if field is None:  # 缺地形的历史测试仍使用旧距离场。
-                    walkable, edge_blocked = seams.nav_predicates(world, self.bb)
                     field = navigation.distance_field(
-                        cell, walkable, world.belt_dir, blocked, soft_cost=soft,
-                        edge_blocked=edge_blocked,
-                        wait_cost=seams.wait_cost_of(world, self.bb),
-                        jumps=seams.nav_jumps(world, self.bb)[0])
+                        cell, belt_dir=world.belt_dir, blocked=blocked, soft_cost=soft,
+                        **portals.nav_args(world, self.bb, blocked))
         ctx = {
             "w": world,
             "chef": chef,

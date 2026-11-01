@@ -18,7 +18,7 @@ RESCUE_TYPES = {"RescueCooked", "ReturnPot", "RecoverLoosePot"}
 NO_BRANCH_TYPES = {
     "WashPlate", "PlaceCleanPlate", "DeliverPlate",
     "Discard", "ResetPlate", "StashHeld", "Extinguish",
-    "PlaceToRelay", "RecoverLoosePot",
+    "RecoverLoosePot",
 }
 
 

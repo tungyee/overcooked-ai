@@ -20,19 +20,6 @@ from ai.state.world import World
 PLATE_STATION = "plate_station"
 
 
-def relay_cells_for(world):
-    # type: (World) -> List[Tuple[int, int]]
-    """当前关卡的中转台 counter 格。
-
-    §7/Task 15：原按关卡名键的 RELAY_CELLS 硬编码表已删除——中转台没有
-    数据驱动的替代来源（不同于 belts/plate 已有协议字段）。PlaceToRelay
-    这条路径本来就已经停用（1-3 的实测数据早被注释掉），这里改成直接
-    返回空集，行为与删表前完全一致（RELAY_CELLS 一直是空字典）。
-    需要恢复中转台功能时，这里需要插件输出中转台站点或重新引入数据表。
-    """
-    return []
-
-
 def _pos(st):
     # type: (Dict) -> Optional[Tuple[float, float]]
     """读站点世界坐标，缺任一轴返回 None。"""

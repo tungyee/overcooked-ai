@@ -1333,7 +1333,12 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     """
     tree = T.FetchToBoard("9", ("board_01",), "Cucumber").build()
     assert isinstance(tree, PR.Timeout)
-    sel = tree.child
+    # 树首是「腾板」（板空直接过），之后才是取料三分支
+    top = tree.child
+    assert isinstance(top, Sequence) and len(top.children) == 2
+    clear, sel = top.children
+    assert isinstance(clear, Selector)
+    assert isinstance(clear.children[0], Condition)
     assert isinstance(sel, Selector)
     assert len(sel.children) == 3
 
@@ -2274,10 +2279,10 @@ def test_all_spec_tasks_are_registered():
         "ResetPlate",                                         # 14
         "Prefetch",                                           # 15
         "Mix",                                                # 16（拌合，阶段 4）
-        "PlaceToRelay",                                       # 17（1-3 中转传盘）
         "FillCooker",                                         # 18（订单无关填灶）
         "ThrowBatch",                                         # 20（批量投掷备料）
-        "SendAcross",                                         # 21（渡运篮子跨区送件）
+        "SendAcross",                                         # 21（跨区通道送件）
+        "FetchToCarrier", "PlaceCarrierInCooker",             # 22, 23（可烹饪载体：披萨）
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

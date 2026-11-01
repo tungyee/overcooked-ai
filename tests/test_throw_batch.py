@@ -809,3 +809,61 @@ def test_throw_trees_use_precise_goto():
     assert goto.precise is True
     pot = ThrowIntoCooker(lambda c: None, lambda c: True, lambda c: False, "k")._build_child()
     assert next(ch for ch in pot.children if isinstance(ch, PR.GoToCell)).precise is True
+
+
+# ---------------------------------------------------------------- 高度差（Wizard_5_5）
+
+# trace-20261101-142950（Wizard_5_5，插件 0.24.1）：P2 在一楼楼梯口 (14,-6) y=0
+# 往二楼（地板顶 y=2.0）左侧砧板投肉，料撞楼梯台阶弹回一楼，连投 5 次。
+# 帧取 P2 拿着肉准备出手的 7 拍（t=240~338）。
+FIXTURE_UPSTAIRS = os.path.join(os.path.dirname(__file__), "fixtures", "wizard",
+                                "wizard55-20261101-142950-throw-upstairs.ndjson.gz")
+# 楼梯台阶（SlopedGround 28）顶面：x 越小越高
+STAIRS = [((13.49, 13.82, -6.73, -4.21), 0.01, 0.39), ((12.69, 13.02, -6.73, -4.21), 0.51, 0.89),
+          ((11.89, 12.22, -6.73, -4.21), 1.01, 1.39), ((11.09, 11.42, -6.73, -4.21), 1.51, 1.89)]
+UPPER = ((5.4, 10.2, -9.6, -1.2), 1.5, 2.0)
+LOWER = ((13.8, 23.4, -10.2, -0.6), -1.0, 0.0)
+
+
+@pytest.fixture(scope="module")
+def frames_upstairs():
+    with gzip.open(FIXTURE_UPSTAIRS, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_raised_ground_blocks_throw_into_stairs():
+    """一楼 (14.04,-5.96) 朝二楼投：弧线 1.0m 平飞，撞上顶 1.39 的台阶立面。"""
+    terrain_y = {9: [UPPER, LOWER], 28: STAIRS}
+    obs = TH.raised_ground(terrain_y, floor_y=0.0)
+    assert all(b[4] == float("-inf") for b in obs)
+    assert not any(b[:4] == LOWER[0] for b in obs)       # 脚下这层不算
+    d = TH.wall_hit((14.04, -5.96), -1.0, 0.0, 7.9, obs)
+    assert d == pytest.approx(14.04 - 12.22)
+    # 站在楼梯顶 (10.8,-6) y=1.88：二楼地板只高 0.12，不当挡板
+    top = TH.raised_ground(terrain_y, floor_y=1.88)
+    assert TH.wall_hit((10.8, -6.0), -1.0, 0.0, 7.9, top) is None
+
+
+def test_floor_reachable_by_height():
+    terrain_y = {9: [UPPER, LOWER], 28: STAIRS}
+    assert TH.ground_top(terrain_y, 6.0, -3.6) == 2.0
+    assert TH.ground_top(terrain_y, 30.0, -3.6) is None
+    assert not TH.floor_reachable(terrain_y, 0.0)(6.0, -3.6)
+    assert TH.floor_reachable(terrain_y, 1.88)(6.0, -3.6)
+    assert TH.floor_reachable(terrain_y, 0.0)(16.0, -3.6)
+    # 查不到地面高度（旧帧 / 盒缝）不拦
+    assert TH.floor_reachable({}, 0.0)(6.0, -3.6)
+
+
+@pytest.mark.parametrize("idx", range(7))
+def test_no_throw_upstairs_from_ground_floor(frames_upstairs, idx):
+    """一楼任何格都投不上二楼；方案（若有）的出手格必须在楼梯顶/二楼。"""
+    w = W.World(frames_upstairs[idx])
+    p2 = P.chef_by_name(w.chefs, P.P2_NAME)
+    assert p2["held"] == "Meat" and p2["y"] < 0.1
+    for board in (s for s in w.stations if s.get("t") == "chopping"):
+        assert TS.aim_here(w, board, TS.MODE_FAR) is None
+        plan = TS.launch_plan(w, board, TS.MODE_FAR)
+        if plan is not None:
+            top = TH.ground_top(w.terrain_y, *plan["world"])
+            assert top is not None and top > 1.4

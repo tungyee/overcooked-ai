@@ -532,7 +532,20 @@ def cooked_sources(world, book):
                         toks.add(t)
         toks = _only_cookware(toks, it.get("n"), world.recipes)
         if any(t.startswith("cooked:") for t in toks):
-            out.append({"kind": "loose", "id": it.get("n"), "tokens": toks})
+            out.append({"kind": "loose", "id": it.get("n"), "tokens": toks,
+                        "item": it})
+
+    # 出炉的熟载体（整份披萨，RescueCooked 端离烤箱后放在台面/地上）：它不是
+    # 锅具，上面的循环看不到；端盘对着它交互照样整份进盘（反编译见
+    # carriers.cooked_carrier_tokens）。生饼/糊饼不产出源。
+    from ai.query import carriers as CR
+    for it in world.items:
+        if P.item_on_cooker(it):
+            continue                       # 还在烤箱里：由上面的灶分支负责
+        toks = CR.cooked_carrier_tokens(it, book)
+        if toks:
+            out.append({"kind": "loose", "id": it.get("n"), "tokens": toks,
+                        "item": it})
     return out
 
 
@@ -558,16 +571,20 @@ def _cooker_cooked_tokens(c, book):
     """灶上熟锅的 rich token 集：pot_contents 生料名 → cooked_of_raw → rich_token。"""
     raw_names = parse_pot_contents(c.get("pot_contents") or [])
     toks = set()  # type: Set[str]
+    # 多料同炉（烤箱里整份披萨 {cheese,dough,tomato}）：生料集恰好等于某熟料
+    # comp 的，只认它；否则逐料反查（单料锅的旧口径）。
+    for cooked in book.cooked_of_raws(raw_names) if len(raw_names) > 1 else ():
+        t = book.rich_token(cooked)
+        if t:
+            toks.add(t)
+    if toks:
+        return toks
     for raw in raw_names:
         for cooked in book.cooked_of_raw(raw):
             t = book.rich_token(cooked)
             if t:
                 toks.add(t)
     return toks
-
-
-# 批量取+投的 buffer：散落料够「订单数 + buffer」就停（实机调）。
-RELAY_BUFFER = 1
 
 
 def loose_count(world, raw):

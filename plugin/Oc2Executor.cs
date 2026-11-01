@@ -97,6 +97,66 @@ namespace Oc2AI
         }
     }
 
+    /// <summary>
+    /// 快照与 exec 句柄共用的对象命名：站点名全局唯一 + 生料改名（RawNames）。
+    ///
+    /// 游戏里有关卡把两个站点做成同名 GameObject（Wizard_3_1 两块砧板都叫
+    /// countertop_01_chopping_board_gold）。Python 侧所有站点资源 id 都是
+    /// (网格名, 站点名)、物品的 on_station 也是名字，同名会让两块板合成一块、
+    /// 认领互撞。这里按 GameObject 名分组，**只给重名的那组**加 "#&lt;InstanceID&gt;"
+    /// 后缀，不重名的站点名字不变（旧帧 / fixture / 测试不受影响）。
+    ///
+    /// 站点 = 挂了下列任一组件的 GameObject；每拍快照开头 Rebuild 一次（站点
+    /// 会随阶段切换出现/消失，开销只是一遍 _all）。只在主线程读写。
+    /// </summary>
+    internal static class ObjNames
+    {
+        private static readonly HashSet<string> _stationTypes = new HashSet<string>
+        {
+            "StaticGridLocation", "DynamicGridLocation", "ServerAttachStation",
+            "ServerWorkstation", "ServerCookingStation", "ServerHeatedCookingStation",
+            "ServerPlateStation", "ServerWashingStation", "ConveyorStation",
+        };
+
+        private static readonly Dictionary<int, string> _unique = new Dictionary<int, string>();
+
+        public static void Rebuild(MonoBehaviour[] all)
+        {
+            _unique.Clear();
+            if (all == null) return;
+            var byName = new Dictionary<string, List<GameObject>>();
+            var seen = new HashSet<int>();
+            foreach (MonoBehaviour mb in all)
+            {
+                if (mb == null || !_stationTypes.Contains(mb.GetType().Name)) continue;
+                GameObject go = mb.gameObject;
+                if (!seen.Add(go.GetInstanceID())) continue;
+                List<GameObject> list;
+                if (!byName.TryGetValue(go.name, out list))
+                    byName[go.name] = list = new List<GameObject>();
+                list.Add(go);
+            }
+            foreach (var kv in byName)
+            {
+                if (kv.Value.Count < 2) continue;
+                foreach (GameObject go in kv.Value)
+                    _unique[go.GetInstanceID()] = go.name + "#" + go.GetInstanceID();
+            }
+        }
+
+        /// <summary>对象（GameObject / Component）的对外名字；null 返回 null。</summary>
+        public static string Of(object o)
+        {
+            GameObject go = o as GameObject;
+            if (go == null && o is Component c && c != null) go = c.gameObject;
+            if (go == null)
+                return o is UnityEngine.Object uo && uo != null ? RawNames.Map(uo.name) : null;
+            string n;
+            if (_unique.TryGetValue(go.GetInstanceID(), out n)) return n;
+            return RawNames.Map(go.name);
+        }
+    }
+
     public interface IExecCommand
     {
         bool Done { get; }
@@ -247,8 +307,7 @@ namespace Oc2AI
         // 句柄名/手持名与快照同一套命名（生料改成配方节点名，见 RawNames）。
         private static string NameOf(object o)
         {
-            if (o is UnityEngine.Object uo && uo != null) return RawNames.Map(uo.name);
-            return null;
+            return ObjNames.Of(o);
         }
 
         private static int IdOf(object o)
@@ -359,6 +418,16 @@ namespace Oc2AI
         private Collider _body;
         private float _gateWaitSince = -1f;
 
+        // 传送门过门段（Oc2Portals.cs PortalHop）：portals 字段可选，旧 Python 不发则不变。
+        // 走到推门点附近就一直朝门推，被传走后停摇杆等落地，落地后从 exit 后的路点续走。
+        // 推门推了 MaxWait 秒还没被传（门在传别人 / 冷却）→ portal busy。
+        // 没有过门段时被传走（误踩）→ teleported，交回 Python 按新位置重算。
+        private const float PORTAL_NEAR = 1.0f;     // 离推门点多近开始算「在推门」
+        private const float PORTAL_LAND_EPS = 1.5f; // 落地点与预期出口落点的容差
+        private readonly List<PortalHop> _hops = new List<PortalHop>();
+        private bool _teleportSeen;
+        private float _portalPushSince = -1f;
+
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
         public string Why { get; private set; }
@@ -393,6 +462,62 @@ namespace Oc2AI
                     var gate = new Gate(d);
                     if (gate.Valid && gate.Exit < _path.Count) _gates.Add(gate);
                 }
+            var hops = Req.List(cmd, "portals");
+            if (hops != null)
+                foreach (var h in hops)
+                {
+                    var d = h as Dictionary<string, object>;
+                    if (d == null) continue;
+                    var hop = new PortalHop(d);
+                    if (hop.Valid(_path.Count)) _hops.Add(hop);
+                }
+        }
+
+        // 下标 i 是哪段过门的推门点 / 落地点；不是返回 null。
+        private PortalHop HopAt(int i, out bool isExit)
+        {
+            isExit = false;
+            foreach (var h in _hops)
+            {
+                if (h.Enter == i) return h;
+                if (h.Exit == i) { isExit = true; return h; }
+            }
+            return null;
+        }
+
+        // 传送中 / 刚落地的处理。返回 true = 本拍已处理完（调用方直接 return）。
+        private bool TickTeleport(ChefFrame f, Vector2 pos, float now)
+        {
+            if (Oc2AIPlugin.ChefTeleporting(f.Chef))
+            {
+                if (!_teleportSeen)
+                {
+                    _teleportSeen = true;
+                    UnityEngine.Debug.Log("[EXEC] move teleporting pos=(" + f.PosX + "," + f.PosZ + ") idx=" + _idx);
+                }
+                PadEngagement.Pad.Stop();
+                _lastProgress = now;          // 传送动画不算 stuck
+                _hasRel = false;
+                return true;
+            }
+            if (!_teleportSeen) return false;
+            _teleportSeen = false;
+            _portalPushSince = -1f;
+            bool isExit;
+            PortalHop hop = HopAt(_idx, out isExit);
+            if (hop != null && !isExit && Vector2.Distance(pos, hop.Land) <= PORTAL_LAND_EPS)
+            {
+                // 计划内过门：跳过落地点，朝下一个路点走
+                _idx = hop.Exit + 1;
+                _lastProgress = now;
+                UnityEngine.Debug.Log("[EXEC] move portal landed pos=(" + f.PosX + "," + f.PosZ + ") portal=" + hop.Portal);
+                return false;
+            }
+            // 计划外被传走（误踩 / 落点不对）：路点全部作废，交回 Python 重算
+            UnityEngine.Debug.Log("[EXEC] move teleported (unplanned) pos=(" + f.PosX + "," + f.PosZ + ") idx=" + _idx);
+            PadEngagement.Pad.Stop();
+            Finish(false, "teleported");
+            return true;
         }
 
         // 下标 i 是哪道门洞的入点/出点；不是返回 null。
@@ -442,6 +567,8 @@ namespace Oc2AI
         private Vector2 PointAt(int i)
         {
             bool isExit;
+            PortalHop hop = HopAt(i, out isExit);
+            if (hop != null) return isExit ? hop.Land : hop.Push;
             Gate g = GateAt(i, out isExit);
             if (g != null) return isExit ? g.ExitPoint : g.EnterPoint;
             return i < _anchors.Count ? Now(_anchors[i]) : Now(_goalAnchor);
@@ -498,6 +625,9 @@ namespace Oc2AI
 
             Vector2 pos = new Vector2(f.PosX, f.PosZ);
 
+            // 传送门：传送中停摇杆等落地；落地后续走或（计划外）交回 Python
+            if (TickTeleport(f, pos, now)) return;
+
             // 到达：以游戏交互句柄为准（权威信号）——句柄命中即「到了」，
             // 不再用距离卡最后一步。goalDist 只做两件事：性能闸（离 goal 太远
             // 先不查句柄，省 FindNearbyObjects）+ 无句柄目标时的距离兜底。
@@ -515,6 +645,35 @@ namespace Oc2AI
             {
                 PadEngagement.Pad.Stop();
                 Finish(true, null);
+                return;
+            }
+
+            // 过门段：当前路点是推门点 → 一直朝门推（不按距离推进），等门把人传走
+            bool hopIsExit;
+            PortalHop hopNow = HopAt(_idx, out hopIsExit);
+            if (hopNow != null && !hopIsExit)
+            {
+                if (Vector2.Distance(pos, hopNow.Push) <= PORTAL_NEAR)
+                {
+                    if (_portalPushSince < 0f)
+                    {
+                        _portalPushSince = now;
+                        UnityEngine.Debug.Log("[EXEC] move portal push pos=(" + f.PosX + "," + f.PosZ
+                            + ") portal=" + hopNow.Portal + " max_wait=" + hopNow.MaxWait);
+                    }
+                    _lastProgress = now;      // 顶着门等不算 stuck
+                    _hasRel = false;
+                    if (now - _portalPushSince > hopNow.MaxWait)
+                    {
+                        UnityEngine.Debug.Log("[EXEC] move portal busy after "
+                            + (now - _portalPushSince).ToString("0.0") + "s portal=" + hopNow.Portal);
+                        PadEngagement.Pad.Stop();
+                        Finish(false, "portal busy", new double[] { hopNow.Push.x, hopNow.Push.y });
+                        return;
+                    }
+                }
+                Vector2 pd = (hopNow.Push - pos).normalized;
+                PadEngagement.Pad.Move(f.Chef, pd.x, pd.y);
                 return;
             }
 
@@ -634,6 +793,7 @@ namespace Oc2AI
             if (_idx + 1 >= _path.Count || dist > SKIP_MAX_DIST) return false;
             bool isExit;
             if (GateAt(_idx, out isExit) != null || GateAt(_idx + 1, out isExit) != null) return false;
+            if (HopAt(_idx, out isExit) != null || HopAt(_idx + 1, out isExit) != null) return false;
             Rigidbody rb = f.Chef.GetComponent<Rigidbody>();
             if (rb == null) return false;
             Vector2 next = PointAt(_idx + 1);

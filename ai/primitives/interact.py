@@ -69,8 +69,10 @@ class EnsureHandsFree(Primitive):
 
     落点优先级（spec §6.1）：就近合法空台面 > 地板格。台面有交互句柄，
     走 Approach（以 placement 句柄到位）→ Face → Tap（按键前复核）→
-    Confirm；地板格插件不给 facing/placement 信号，退化成"走到那格上或
-    它旁边 → 原地按下 → Confirm"（只校验"手真的空了"，核不了落点）。
+    Confirm；地板格是「面朝的那格」（东西落在厨师面前，不是脚下）：走到
+    它的邻格 → tap kind=floor（插件朝格心转身，面前没有 placement 句柄才按；
+    有句柄按键会往句柄上放、放不下就留在手里）→ Confirm 手空。插件转身后
+    仍有句柄回 no clear floor，换下一格。
 
     放下的东西不需要专门回收（spec §7.4）：火灭后回 Normal，Planner 看
     当前世界"黄瓜在台面上、没切、盘里缺黄瓜"自然重新规划。这是无状态
@@ -82,18 +84,18 @@ class EnsureHandsFree(Primitive):
     见 ai/tasks/fire.py。
     """
 
-    def __init__(self, pick=None, keep=None, home_cooker=True, strict=False):
-        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]], bool, bool) -> None
+    def __init__(self, pick=None, keep=None, home_cooker=True):
+        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]], bool) -> None
         Primitive.__init__(self)
         self._pick = pick
         self._keep = keep
         self._home_cooker = home_cooker
-        self._strict = strict
         self._tgt = None          # 锁定的落点：台面站点 dict 或合成的格子 dict
         self._on_station = False
         self._phase = _P_APPROACH
         self._approach = Approach(lambda c: self._tgt, "placement")
-        self._floor_approach = Approach(lambda c: self._tgt, allow_target=True)
+        # 地板落点站在落点格的邻格上（东西落在面前），不站上去
+        self._floor_approach = Approach(lambda c: self._tgt)
         self._face = Face(lambda c: self._tgt)
         # 台面落点按键前复核交互句柄（瞎按会把东西放到错误的格子上）；
         # 地板格没有句柄可复核——插件对裸地板格不给 placement/facing 信号，
@@ -105,7 +107,11 @@ class EnsureHandsFree(Primitive):
         self._reface_station = Face(lambda c: self._tgt)
         self._tap_station = TapWhileHolding(
             "pickup", _belt_hold_key, lambda c: self._tgt, "placement")
-        self._tap_floor = Tap("pickup")
+        # 地板落点：东西落在厨师面前那格（锁定的 _tgt 是那一格，站在它邻格上）。
+        # kind=floor 由插件逐帧确认「面朝它且面前没有 placement 句柄」才按
+        # （反编译 PlaceHeldItem：有句柄就往句柄上放、放不下留手里）。
+        self._tap_floor = Tap("pickup", kind="floor", aim=self._floor_aim)
+        self._floor_skip = set()  # 本次激活里插件回 no clear floor 的落点格，换下一格
         self._confirm = Confirm(lambda c: P.hands_free(c["chef"]),
                                 PUT_DOWN_RETRIES)
         self._recovery = InteractionRecovery()
@@ -124,8 +130,22 @@ class EnsureHandsFree(Primitive):
         self._phase = _P_APPROACH
         self._recovery = InteractionRecovery()
         self._drop_held = None
+        self._floor_skip = set()
         for n in self._nodes():
             n.reset()
+
+    def _floor_aim(self, ctx):
+        # type: (Dict) -> Optional[list]
+        """地板落点格心（世界坐标）：插件朝它转身后按键。厨师站在落点格上时
+        不给（面前不是那格，落点不可控）。"""
+        tgt = self._tgt
+        if not tgt or self._on_station:
+            return None
+        w = ctx["w"]
+        cell = (tgt["gx"], tgt["gz"])
+        if P.chef_cell(ctx["chef"], w.to_grid) == cell:
+            return None
+        return list(w.to_world(*cell))
 
     def halt(self):
         # type: () -> None
@@ -155,6 +175,15 @@ class EnsureHandsFree(Primitive):
         if s == Status.FAILURE:
             # 给 agent 的失败归因：这一拍失败的是「清手」，不是 task 本身的动作
             ctx['hands_clear_failed'] = True
+            # 地板落点按不下去（插件 no clear floor：转身后面前仍有句柄；或厨师
+            # 挪到了落点格上没法面朝它）：这格不行，换下一格重来，不盲按。
+            # 候选格有限、每次排除一格，换完 _lock_target 找不到就真 FAILURE。
+            if not self._on_station and self._tgt is not None and self._phase == _P_TAP \
+                    and not P.hands_free(ctx['chef']):
+                self._floor_skip.add((self._tgt['gx'], self._tgt['gz']))
+                self._tgt = None
+                self._restart_movement()
+                return Status.RUNNING
             phase = (ctx.get('interaction') or {}).get('phase', '')
             if (self._on_station and phase != 'approach'
                     and P.held_name(ctx['chef']) == self._drop_held
@@ -260,11 +289,13 @@ class EnsureHandsFree(Primitive):
         if st is not None:
             self._tgt, self._on_station = st, True
             return
-        # strict：指定落点（中转台等）满/不可达就 FAILURE 交还 Planner，
-        # 不 fallback 到地板乱放（PlaceToRelay 用）。
-        if self._strict:
-            return
-        cell = placement.find_drop_cell(w, ctx["field"])
+        # 地板：落点 = 面朝的那格（不是脚下）。厨师此刻站的格与本次激活里
+        # 插件判过「转身后面前仍有句柄」的格不选。
+        skip = set(self._floor_skip)
+        cur = P.chef_cell(ctx["chef"], w.to_grid)
+        if cur is not None:
+            skip.add(cur)
+        cell = placement.find_floor_drop(w, ctx["field"], skip)
         if cell is not None:
             self._tgt = {"gx": int(cell[0]), "gz": int(cell[1])}
             self._on_station = False

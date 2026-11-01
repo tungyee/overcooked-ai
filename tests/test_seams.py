@@ -104,3 +104,49 @@ def test_no_seam_walls_no_gates():
     assert w.seam_gates is None
     points, gates = seams.path_points(w, [(2, 1), (3, 1)])
     assert gates == [] and points == [list(w.to_world(2, 1)), list(w.to_world(3, 1))]
+
+
+def test_stairs_meeting_platform_is_not_a_gate():
+    """Wizard_5_5（trace-20261101-141149 t=580）：左侧二楼平台右沿 x=10.2 有栏杆开口，
+    楼梯（SlopedGround）外扩并入 Ground 后与平台贴边。旧逻辑当成门洞发给插件，
+    插件在楼梯上按脚底高度测胶囊扎进二楼地板，判门恒关，P2 卡在楼梯顶。"""
+    from ai.space import occupancy
+    terrain = [
+        {"layer": 9, "boxes": [[5.4, 10.2, -9.6, -1.2], [13.8, 23.4, -10.2, -0.6]]},
+        {"layer": 10, "boxes": [[9.6, 10.2, -4.2, -1.2], [9.6, 10.2, -9.0, -6.6]]},
+        {"layer": 28, "boxes": [[10.51, 11.14, -6.73, -4.21], [11.31, 11.94, -6.73, -4.21],
+                                [12.11, 12.74, -6.73, -4.21], [12.91, 13.54, -6.73, -4.21]]},
+    ]
+    by_layer = occupancy.parse_terrain(terrain)
+    assert seams.find_seams(by_layer) == []
+    # 两块真地板之间有墙的接缝仍照常识别
+    f = _frame()
+    assert len(seams.find_seams(occupancy.parse_terrain(f["terrain"]))) == 1
+
+
+# Wizard_5_5（trace-20261101-145921）：楼梯会沉到地下再升起，平面位置不变。
+_LEFT_STAIRS = [(10.51, 11.14), (11.31, 11.94), (12.11, 12.74), (12.91, 13.54)]
+
+
+def _stairs_terrain(dy):
+    """左楼梯四级台阶整体下沉 dy（0 = 在位：底阶 0.01~0.39，顶阶 1.56~1.88）。"""
+    steps = [[x0, x1, -6.73, -4.21, 1.56 - 0.5 * i - dy, 1.88 - 0.5 * i - dy]
+             for i, (x0, x1) in enumerate(_LEFT_STAIRS)]
+    steps[-1][4:] = [0.01 - dy, 0.39 - dy]
+    return [
+        {"layer": 9, "boxes": [[5.4, 10.2, -9.6, -1.2, 1.5, 2.0], [13.8, 23.4, -10.2, -0.6, -1.0, 0.0]]},
+        {"layer": 28, "boxes": steps},
+    ]
+
+
+def test_sunk_stairs_not_merged_into_ground():
+    from ai.space import occupancy
+    n_ground = 2
+    assert len(occupancy.parse_terrain(_stairs_terrain(0.0))[9]) == n_ground + 4
+    for dy in (0.5, 3.0, 7.5):          # 下沉中 / 沉到底
+        out = occupancy.parse_terrain(_stairs_terrain(dy))
+        assert len(out[9]) == n_ground
+        assert len(out[28]) == 4         # 原层号照留
+    # 旧帧（无高度）照旧并入
+    flat = [{"layer": 9, "boxes": [[0, 1, 0, 1]]}, {"layer": 28, "boxes": [[1, 2, 0, 1]]}]
+    assert len(occupancy.parse_terrain(flat)[9]) == 2

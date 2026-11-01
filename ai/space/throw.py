@@ -16,6 +16,11 @@ ServerAttachStation.HandleCatch：站点接住飞来的料）。这里不建弹�
 [13.21,13.81]×[12.44,15.03]（门洞在 z 8.03~12.44），旧实现只看落点，判
 「落在炸锅旁」，实际两份都撞墙掉进缝里。TableBlock 层的矮栏料能飞过去
 （同一 trace 料飞越左地板 x≈8 的矮栏），不当挡板。
+
+高度差：弧线按投掷者脚下算、只会下落。比脚下高的地面（楼梯台阶、高台
+地板）在飞行路径上当挡板（raised_ground），落点地面比脚下高太多也判投不到
+（floor_reachable）。Wizard_5_5 一楼往二楼砧板投肉，料撞楼梯弹回
+（trace-20261101-142950）。
 """
 import math
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -62,6 +67,17 @@ THROW_FLAT_D = 5.4
 WALL_STOP_MARGIN = 0.3
 # 墙盒外扩（m）：飞行料自身半径的近似。
 WALL_PAD = 0.15
+# 地面高度剖面（Wizard_5_5，trace-20261101-142950 t=262/307）：P2 在一楼楼梯口
+# 往二楼（地板顶 y=2.0）砧板投肉，料出手不到 2m 就撞上楼梯台阶立面（顶 1.39）
+# 弹回一楼，连投 5 次。弧线只会下落，比它高的地面（Ground/SlopedGround 盒顶）
+# 就是挡板；比出手点高太多的落点本身也够不着。
+GROUND_LAYERS = (9, 28)
+# 地面盒顶比投掷者脚下高出这么多（m）才当挡板：滤掉同层地板的浮点噪声。
+RAISED_MIN = 0.05
+# 落点地面比投掷者脚下最多高这么多（m）还算投得上去：Balloon_2_2 篮子地板
+# 高 0.51 实测能投进；Wizard_3_1 二楼高 1.21、Wizard_5_5 二楼高 2.0 都超过
+# 出手高度 THROW_RELEASE_H，投不上去。
+LAND_RISE_MAX = 0.6
 
 
 Vec = Tuple[float, float]
@@ -100,6 +116,44 @@ def throw_walls(terrain_y, floor_y=0.0):
     return out
 
 
+def raised_ground(terrain_y, floor_y=0.0):
+    # type: (Optional[Dict[int, List[Tuple[Box, float, float]]]], float) -> List[Tuple[float, ...]]
+    """比投掷者脚下高的地面盒（楼梯台阶、高台地板）当挡板：
+    [(minx,maxx,minz,maxz,-inf,top)]，top 相对 floor_y。
+
+    下沿记 -inf：地面盒下面是实心的，不存在「从下面穿过」。wall_hit 对这种盒
+    只看料飞到盒边时够不够高——够高就是落在上面（落点由 region_test 判），
+    不够高就撞侧面。不受 WALL_MAX_THICK 限制（高台地板很大）。
+    """
+    out = []  # type: List[Tuple[float, ...]]
+    for layer in GROUND_LAYERS:
+        for b, _miny, maxy in (terrain_y or {}).get(layer) or ():
+            if maxy - floor_y > RAISED_MIN:
+                out.append(tuple(b[:4]) + (float("-inf"), maxy - floor_y))
+    return out
+
+
+def ground_top(terrain_y, x, z):
+    # type: (Optional[Dict[int, List[Tuple[Box, float, float]]]], float, float) -> Optional[float]
+    """(x,z) 处地面顶面高度（Ground/SlopedGround 盒顶取最高）；没有地面盒 None。"""
+    best = None  # type: Optional[float]
+    for layer in GROUND_LAYERS:
+        for b, _miny, maxy in (terrain_y or {}).get(layer) or ():
+            if b[0] <= x <= b[1] and b[2] <= z <= b[3] and (best is None or maxy > best):
+                best = maxy
+    return best
+
+
+def floor_reachable(terrain_y, floor_y=0.0):
+    # type: (Optional[Dict[int, List[Tuple[Box, float, float]]]], float) -> Callable[[float, float], bool]
+    """落点 (x,z) 的地面是否不比投掷者脚下高太多（LAND_RISE_MAX）。
+    查不到地面高度（旧帧 / 盒缝）时不拦，保持旧行为。"""
+    def ok(x, z):
+        top = ground_top(terrain_y, x, z)
+        return top is None or top - floor_y <= LAND_RISE_MAX
+    return ok
+
+
 def _seg_box_span(a, b, box):
     # type: (Vec, Vec, Tuple[float, ...]) -> Optional[Tuple[float, float]]
     """线段 a→b 穿过 box 平面范围的参数区间 [t0,t1]⊆[0,1]（slab 法）；不相交 None。"""
@@ -126,6 +180,8 @@ def wall_hit(start, ux, uz, length, walls, rng=THROW_RANGE):
     墙是 (minx,maxx,minz,maxz) 或带高度的 (…, lo, hi)（throw_walls）。带高度
     时，料穿过墙平面范围那段的弧线高度 [h(出), h(入)] 与 [lo,hi] 有交集才算
     撞；不带高度一律算撞。出手点已在墙盒里（贴墙站、碰撞盒溢出）的墙跳过。
+    lo=-inf 的是高出脚下的地面盒（raised_ground）：料到盒边时高度 ≤ 盒顶才
+    撞侧面，高于盒顶就是飞过或落在上面。
     """
     end = (start[0] + ux * length, start[1] + uz * length)
     best = None  # type: Optional[float]
@@ -138,7 +194,10 @@ def wall_hit(start, ux, uz, length, walls, rng=THROW_RANGE):
         d0, d1 = span[0] * length, span[1] * length
         if len(box) >= 6:
             h_hi, h_lo = arc_height(d0, rng), arc_height(d1, rng)
-            if h_lo > box[5] or h_hi < box[4]:
+            if box[4] == float("-inf"):
+                if h_hi > box[5]:
+                    continue  # 到盒边时比地面高：飞过 / 落在上面
+            elif h_lo > box[5] or h_hi < box[4]:
                 continue      # 从墙上飞过 / 从墙下（悬空栏杆）穿过
         if best is None or d0 < best:
             best = d0
@@ -283,7 +342,7 @@ def plan_launch(cells, cost, to_world, target, ok, max_land=MAX_LAND_DIST, walls
     代价 + 落点离目标的距离」最小。
 
     cells: 投掷方可站的格（P2 可达场的键）；cost(cell) 是走到该格的代价（拍
-    数量级），None = 不可达。返回 {cell, world, aim, landing, land_dist} 或
+    数量级），None = 不可达。返回 {cell, world, aim, landing, land_dist, score} 或
     None；aim 是瞄准点（无墙时 = target）。
     """
     walls = list(walls or ())
@@ -305,7 +364,7 @@ def plan_launch(cells, cost, to_world, target, ok, max_land=MAX_LAND_DIST, walls
             continue
         score = c + got["land_dist"] * 2.0
         if best is None or score < best[0]:
-            best = (score, dict(got, cell=cell, world=(wx, wz)))
+            best = (score, dict(got, cell=cell, world=(wx, wz), score=score))
     return best[1] if best else None
 
 
@@ -380,16 +439,19 @@ def plan_pot_throw(cells, cost, to_world, to_grid, target, passable, walls=None)
     return best
 
 
-def region_test(to_grid, dest_cells, src_cells=None, station_cells=None):
-    # type: (Callable[[float, float], Cell], Set[Cell], Optional[Set[Cell]], Optional[Set[Cell]]) -> Callable[[float, float], bool]
+def region_test(to_grid, dest_cells, src_cells=None, station_cells=None, floor_ok=None):
+    # type: (Callable[[float, float], Cell], Set[Cell], Optional[Set[Cell]], Optional[Set[Cell]], Optional[Callable[[float, float], bool]]) -> Callable[[float, float], bool]
     """点 (x,z) 是否落在目标区域：落在接收方可达格上，或落在紧邻可达格的
     站点格上（台面/砧板/灶接住）。src_cells 非空时排除投掷方自己能走到的
-    格——分割地图上落回本侧等于没投。"""
+    格——分割地图上落回本侧等于没投。floor_ok(x,z) 非空时还要落点地面
+    够得着（floor_reachable：不比投掷者脚下高太多）。"""
     dest = set(dest_cells or ())
     src = set(src_cells or ())
     stations = set(station_cells or ())
 
     def ok(x, z):
+        if floor_ok is not None and not floor_ok(x, z):
+            return False
         cell = to_grid(x, z)
         if cell in src:
             return False

@@ -381,7 +381,7 @@ def test_planner_sends_clean_plate(send_frames, idx, pid):
     from tests.test_exec_primitives import FakeExec
     w, book, bb, ctx = _ctx(send_frames[idx])
     task, _rec = planner.plan(w, bb, None, book)
-    assert task.TYPE == "SendAcross" and task.grid == GRID
+    assert task.TYPE == "SendAcross" and task.channel == GRID
     if pid:
         assert task.source_id == pid
     ctx = dict(ctx, exec=FakeExec(), tick=0)

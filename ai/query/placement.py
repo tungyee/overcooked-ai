@@ -263,6 +263,48 @@ def find_drop_cell(world, field, extra_forbidden=None):
     return best
 
 
+def floor_drop_cells(world, field, extra_forbidden=None):
+    # type: (object, Dict, Optional[Set[Tuple[int, int]]]) -> Set[Tuple[int, int]]
+    """能把手里东西放上去的地板格（「面朝的那格」，东西落在厨师面前）。
+
+    反编译 PlaceHeldItem_Client/Server：拿着东西按键，面前有 placement 句柄
+    就往句柄上放，没有才落地。所以落地格要在可达场里、不是站点、上面没东西、
+    不在传送带 / 出餐口禁区——面朝它时扇形扫描才大概率扫不到句柄
+    （最终由插件 tap kind=floor 按此刻句柄确认）。
+    """
+    forbidden = set(extra_forbidden or ())
+    forbidden |= forbidden_adjacent_cells(getattr(world, "stations", None))
+    forbidden |= _occupied_station_cells(world)
+    belt_dir = getattr(world, "belt_dir", None) or {}
+    belt_cells = getattr(world, "belt_cells", None) or set()
+    stations = set()  # type: Set[Tuple[int, int]]
+    for st in getattr(world, "stations", None) or ():
+        if isinstance(st, dict):
+            cell = _station_cell(world, st)
+            if cell is not None:
+                stations.add(cell)
+    return {c for c in field
+            if c not in forbidden and c not in stations
+            and c not in belt_cells and c not in belt_dir}
+
+
+def find_floor_drop(world, field, extra_forbidden=None):
+    # type: (object, Dict, Optional[Set[Tuple[int, int]]]) -> Optional[Tuple[int, int]]
+    """地板落点（面朝的那格）：floor_drop_cells 里、有可达邻格可站的，按站位
+    代价取最近。None = 没有合法落点，调用方 FAILURE 交还 Planner。"""
+    cells = floor_drop_cells(world, field, extra_forbidden)
+    best, best_cost = None, None
+    for cell in cells:
+        for dx, dz in _NEIGHBORS:
+            stand = (cell[0] + dx, cell[1] + dz)
+            cost = field.get(stand)
+            if cost is None:
+                continue
+            if best_cost is None or cost < best_cost:
+                best, best_cost = cell, cost
+    return best
+
+
 def occupied_cells(world):
     # type: (object) -> Set[Tuple[int, int]]
     """格子上已有东西的站点格（公开封装 _occupied_station_cells，供 task 的 feasible 判定）。"""
@@ -304,29 +346,3 @@ def counter_occupied(world, key, ignore_plate=None):
             if c is not None and (int(round(c[0])), int(round(c[1]))) == cell:
                 return True
     return False
-
-
-def find_drop_at(world, field, target_cell):
-    # type: (object, Dict, Optional[Tuple[int, int]]) -> Optional[Dict]
-    """指定 counter 格可放置则返回合成站点 dict，否则 None。
-
-    用于中转台等指定落点：cell 必须空（未被盘/散落物/板占用）、非禁区、
-    可达（field 里有路径代价）。找不到 → None，调用方（PlaceToRelay 的
-    EnsureHandsFree(strict=True)）据此 FAILURE 交还 Planner，不 fallback
-    到别处（中转台满时不能乱放）。
-    """
-    if target_cell is None:
-        return None
-    cell = (int(target_cell[0]), int(target_cell[1]))
-    forbidden = forbidden_adjacent_cells(getattr(world, "stations", None))
-    if cell in forbidden or cell in _occupied_station_cells(world):
-        return None
-    belt_cells = getattr(world, "belt_cells", None) or set()
-    cells = navigation.interact_cells(
-        cell[0], cell[1], world.walkable, belt_cells)
-    got = navigation.nearest_cost(field, cells)
-    if got is None:
-        return None
-    x, z = world.to_world(cell[0], cell[1])
-    return {"t": "counter", "n": "", "gx": cell[0], "gz": cell[1],
-            "x": x, "z": z}

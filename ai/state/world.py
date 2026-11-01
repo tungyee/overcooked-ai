@@ -14,7 +14,7 @@ import socket
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ai.space import occupancy, seams
+from ai.space import lanes, occupancy, portals, seams
 from ai.space.geometry import GridMapping, GridSet
 
 # 旧帧（无 grids[].main）里关卡主网格的约定名：已录关卡里静态厨房都叫它。
@@ -263,6 +263,11 @@ class World(object):
         # 盖不住任何格中心，点判漏掉它，交给 distance_field 的边检查。
         self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping)
 
+        # 半格走廊（ai/space/lanes.py）：通道夹在两排格中心之间时的寻路跳边，
+        # 与 walkable 同一套阻挡/占用口径。寻路方取用走 portals.nav_args。
+        self.lane_map = lanes.build(self.terrain, hazard_boxes, occ_cells,
+                                    self.mapping, belt_cells=self.belt_cells)
+
         # 平台接缝门洞（ai/space/seams.py）：寻路专用的 walkable / edge_blocked，
         # 门洞开在两排格中心之间时也能穿缝。站位/交互位仍用 self.walkable。
         killplane = self.terrain.get(occupancy.LAYER_KILLPLANE) or []
@@ -274,6 +279,10 @@ class World(object):
 
         # 寻路方取用走 seams.nav_predicates(world)：现取 walkable，测试替换后不失同步。
         self.seam_gates = seams.build(self.terrain, self.mapping, clear=_clear)
+
+        # 传送门（插件 portals[]，ai/space/portals.py）：触发格对寻路不可走 +
+        # 过门跳边。没有门的关卡 / 旧帧为 None。寻路方取用走 portals.nav_args。
+        self.portal_map = portals.build(state.get("portals"), self.mapping, self.walkable)
 
     @property
     def all_plates(self):

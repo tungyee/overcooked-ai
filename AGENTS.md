@@ -14,7 +14,7 @@
 - **`ai/` 目录结构**：根级只有入口 `agent.py` 和 `primitives/`、`tasks/` 两个子包（对外只认 `from ai import tasks as T` / `from ai import primitives as PR`）。其余模块按职责分到子目录：`core/`（arbiter/planner/planner_layers/executor）、`state/`（blackboard/bb_factory/world/reconcile/p1model）、`query/`（predicates/recipes/recipe_graph/plate_tokens/carriers/stations/placement）、`space/`（navigation/occupancy/geometry）、`revenue/`（economy/eta/cook_supply）、`output/`（trace/state_dump）、`exec/`（client/commands/bt/record/replay）、`dialog/`（schema/policy/worker/audio/ptt/asr/tts/llm/env）。跨目录 import 用 `from ai.<子目录> import X` 或 `from ai.<子目录>.<模块> import ...`。
 - **对话层线程边界**：主循环（20 Hz）仍是唯一碰 `World` / `Blackboard` 的地方；`ai/dialog/worker.py` 跑独立 daemon 线程（内部可 asyncio），只在 2 Hz 上下文快照、事件队列、命令/ack 队列之间通信，**不读 World、不写 Blackboard**。缺语音 key 或初始化失败时整个对话层可缺席，主循环照常跑。
 - **频率**：插件推帧 **5 Hz**，Python 主循环 **20 Hz**。代码里「拍」（tick）= Python 循环拍 = **50 ms**，按拍计的阈值都按 20 Hz 理解。主循环用 `StateClient.read_latest()` **非阻塞读**，中间 4 拍复用最新帧重 tick（不能用阻塞 `read()`，否则被拖成 5 Hz）。
-- **task 契约**：`ai/tasks/base.py` 定义 `Task` 基类。task = 四元身份 `(TYPE, order_id, bound_resources, bound_item)`，不可变值对象。四个契约 `claims()`/`feasible(ctx)`/`done(ctx)`/`build()`。对外入口只有 `from ai import tasks as T`（不要 import 子模块），`T.TASK_TYPES` 登记全部 21 个类型。
+- **task 契约**：`ai/tasks/base.py` 定义 `Task` 基类。task = 四元身份 `(TYPE, order_id, bound_resources, bound_item)`，不可变值对象。四个契约 `claims()`/`feasible(ctx)`/`done(ctx)`/`build()`。对外入口只有 `from ai import tasks as T`（不要 import 子模块），`T.TASK_TYPES` 登记全部 22 个类型。
 - **资源 id 与认领**：灶/板/洗碗池 → `(网格名, 站点实例名)`；拼装格 → 主网格坐标 `(gx, gz)`，移动网格（气球篮/木筏）台面 → `(网格名, 站点实例名)`（`placement.counter_key`）；盘 → 实例名 `n`。认领是 **`(资源, 动作)` 动作级**粒度，owner 常量 `OWNER = "P2"`。
 - **代码风格**：注释/文档中文、标识符英文；类型注解用 `# type: (...) -> ...` 注释形式；谓词一律无副作用、只读入参不依赖 `World` 类；执行出口统一是 `ctx["exec"]`（ExecClient/NullExec），叶子原语发命令而非按键。
 - **测试**：pytest 7.4.4，配置见 `pytest.ini`。写新功能先加测试；真实帧 fixture 以 `.ndjson.gz` 入库（`tests/fixtures/`）。
@@ -27,7 +27,7 @@ Python 侧无构建步骤；C# 插件需单独编译。命令在仓库根执行�
 
 Windows 语音 PTT 使用只读 GetAsyncKeyState，建议 `caps_lock`，不依赖 Quartz/UAC、不注入按键；macOS PTT 仍用 Quartz，需要安装 pyobjc 并授权。`.env` 支持 UTF-8 BOM，已有环境变量优先。ASR/TTS 的异步队列读取必须可取消，不把无限期 queue.get 留在 executor 中，否则解释器退出会卡住并占住启动锁。
 
-macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.23.5 / 状态协议 7，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
+macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.24.3 / 状态协议 8，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
 
 ```bash
 G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"

@@ -155,6 +155,20 @@ def test_snapshot_map_passes_walk_probe_through():
     assert snapshot(World({"grid": {"nodeMap": None}}))["map"]["walk_probe"] is None
 
 
+def test_snapshot_map_passes_portals_and_teleports_through():
+    """传送门参数与传送事件原样落进 map（Wizard_5_5 复盘「料有没有过门」），旧帧为空表。"""
+    portals = [{"id": "Portal#1", "exit": "Portal#2", "arc_deg": 90,
+                "center": [8.4, -1.9, 2.5], "item_sender": True}]
+    teleports = [{"seq": 1, "phase": "start", "kind": "item", "obj": "Meat",
+                  "pos": [8.4, -2.4, 2.6], "portal": "Portal#1", "was_flying": True}]
+    snap = snapshot(World({"grid": {"nodeMap": None},
+                           "portals": portals, "teleports": teleports}))
+    assert snap["map"]["portals"] == portals
+    assert snap["map"]["teleports"] == teleports
+    old = snapshot(World({"grid": {"nodeMap": None}}))["map"]
+    assert old["portals"] == [] and old["teleports"] == []
+
+
 def test_snapshot_keeps_recipe_chop_fields():
     """配方自带的切配信息要进 trace：回放从 trace 重建 RecipeBook 时，传送带
     供料、无箱子的食材（1-6 的鱼）才不会被当成不用切。旧帧没有就不写。"""

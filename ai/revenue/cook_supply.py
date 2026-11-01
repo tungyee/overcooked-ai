@@ -117,6 +117,18 @@ def cooked_supply(world, book, item):
         if want & c["contents"]:
             n += 1
 
+    # ⑥ 出炉的熟载体（整份披萨，散落或手持）：已经是一份熟料，端盘取就行。
+    # 在烤箱里的那份由 ① 灶上计数，这里跳过免得重复。
+    if token:
+        from ai.query.carriers import cooked_carrier_tokens
+        for pool in (getattr(world, "items", None) or (),
+                     getattr(world, "held_items", None) or ()):
+            for it in pool:
+                if P.item_on_cooker(it):
+                    continue
+                if token in cooked_carrier_tokens(it, book):
+                    n += 1
+
     return n
 
 
@@ -210,6 +222,9 @@ def cooked_items_wanted(world, book):
     for o in (getattr(world, "orders", None) or ()):
         for ing in book.requirements(o):
             if not book.needs_cooking(ing):
+                continue
+            # 整份进炉的菜（披萨）不是往灶上的锅里倒料：走载体链，不填灶
+            if book.carrier_base(ing) is not None:
                 continue
             key = str(ing).lower()
             if key not in lower:

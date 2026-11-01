@@ -6,12 +6,19 @@
 交给对话 worker 措辞。与投掷机制的区别：这里只算「谁去更划算」，真正发令
 （扔/取/切/煮/盛/装）仍是 P1（人类）或 P2 自己的规划，不由本模块控制。
 """
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from ai.dialog.schema import RESCUE_TYPES
+from ai.query import predicates as P
+from ai.query import recipe_graph
 from ai.space import reachability
 
 # P1 比 P2 省多少步才值得开口求助（≈0.3 秒/步，8 步 ≈ 2.4 秒 ≈ 半张图）。
 HELP_THRESHOLD_STEPS = 8
+
+# 料源定位时故意不过滤 P2 可达性：p1/p2 谁更划算由 cost_to 另行比较。
+_SOURCE_ANY = lambda st: True  # noqa: E731
 
 
 def cost_to(world, bb, name, source):
@@ -44,3 +51,85 @@ def p1_saves_enough(p1_cost, p2_cost, threshold=HELP_THRESHOLD_STEPS):
     if p2_cost is None:
         return True
     return p2_cost - p1_cost >= threshold
+
+
+@dataclass
+class FrontierStep(object):
+    """订单 DAG 前沿里、仍需做的一步及其料源/站与两侧成本。"""
+    task_type: str
+    item: Optional[str]
+    source: Dict
+    p1_cost: Optional[int]
+    p2_cost: Optional[int]
+
+
+def _source_for(world, item):
+    # type: (Any, str) -> Optional[Dict]
+    """料源（crate / 散落 / 砧板），不过滤 P2 可达性。"""
+    from ai.query import recipes as R
+    loc = R.find_ingredient(world, item, exclude_plate=True,
+                            can_access=_SOURCE_ANY)
+    if loc is None or loc.get("kind") == "held":
+        return None
+    return loc.get("st")
+
+
+def _rescue_for_help(task, source):
+    # type: (Any, Dict) -> bool
+    """该步是否永不求助：救援类恒跳过；盛盘在锅快糊/起火时跳过。"""
+    t = getattr(task, "TYPE", None)
+    if t in RESCUE_TYPES or t == "Extinguish":
+        return True
+    if t == "TakeCookedToPlate":
+        return bool((source or {}).get("burning") or (source or {}).get("onFire"))
+    return False
+
+
+def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
+    # type: (Any, Any, Any, List[Dict], Dict, Dict) -> List[FrontierStep]
+    """订单 DAG 前沿里「上游就绪但仍未完成」的步骤 + 料源 + P1/P2 成本。
+
+    复用 `recipe_graph.emit`（不做 P2 feasible 过滤）；`task.feasible` 在
+    `field=None` 下求值——`can_interact` 对 None 场恒 True，于是
+    `ingredient_available` 变成「料是否存在」而非「P2 够得着」，正好保留
+    P2 够不着的料源（Rapids 土豆）。料源用 `_source_for`（同样不过滤可达性）。
+    """
+    ctx = {
+        "w": world,
+        "chef": P.chef_by_name(world.chefs, P.P2_NAME),
+        "bb": bb,
+        "tick": getattr(bb, "tick", 0) or 0,
+        "book": book,
+        "field": None,
+    }
+    out = []  # type: List[FrontierStep]
+    seen = set()
+    for order in (orders or getattr(world, "orders", None) or []):
+        for task in recipe_graph.emit(world, bb, book, order,
+                                      plate_match, cooker_match):
+            if getattr(task, "SHARED", False):
+                continue
+            if not task.feasible(ctx):
+                continue
+            if task.done(ctx):
+                continue
+            item = getattr(task, "item", None)
+            if not item:
+                continue
+            source = _source_for(world, str(item))
+            if source is None:
+                continue
+            if _rescue_for_help(task, source):
+                continue
+            key = (task.TYPE, str(item).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(FrontierStep(
+                task_type=task.TYPE,
+                item=str(item).lower(),
+                source=source,
+                p1_cost=cost_to(world, bb, P.P1_NAME, source),
+                p2_cost=cost_to(world, bb, P.P2_NAME, source),
+            ))
+    return out

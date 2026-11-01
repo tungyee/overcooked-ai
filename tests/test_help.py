@@ -1,10 +1,13 @@
-"""P1 求助触发：P1/P2 成本比较与阈值（spec §5.1）。"""
+"""P1 求助触发：P1/P2 成本比较、阈值与订单 DAG 前沿枚举（spec §5.1）。"""
 import gzip
 import json
 import os
 
-from ai.dialog.help import HELP_THRESHOLD_STEPS, cost_to, p1_saves_enough
+from ai.dialog.help import (HELP_THRESHOLD_STEPS, FrontierStep, _rescue_for_help,
+                            cost_to, frontier_steps, p1_saves_enough)
 from ai.query import predicates as P
+from ai.query.recipes import RecipeBook
+from ai.state import blackboard as BB
 from ai.state import world as W
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
@@ -18,6 +21,8 @@ def _rapids_frame():
                 return json.loads(line)
     raise AssertionError("empty fixture")
 
+
+# ---------- Task 1 ----------
 
 def test_p1_saves_enough_p1_unreachable():
     assert p1_saves_enough(None, 5) is False
@@ -38,3 +43,42 @@ def test_cost_to_rapids_p2_cannot_reach_potato():
     crate = next(s for s in w.stations if s.get("ing") == "Potato")
     assert cost_to(w, None, P.P2_NAME, crate) is None
     assert isinstance(cost_to(w, None, P.P1_NAME, crate), int)
+
+
+# ---------- Task 2 ----------
+
+def _rapids_frontier():
+    w = W.World(_rapids_frame())
+    book = RecipeBook(w.recipes, w.stations)
+    bb = BB.Blackboard()
+    return w, book, bb, frontier_steps(w, bb, book, w.orders, {}, {})
+
+
+def test_frontier_rapids_includes_unreachable_potato_fetch():
+    _, _, _, steps = _rapids_frontier()
+    by = {(s.task_type, s.item): s for s in steps}
+    assert ("FetchToBoard", "potato") in by
+    assert by[("FetchToBoard", "potato")].p2_cost is None
+    assert isinstance(by[("FetchToBoard", "potato")].p1_cost, int)
+
+
+def test_frontier_only_upstream_ready():
+    # 土豆还没上板时，Chop(Potato) 不进前沿；取料是前沿。
+    _, _, _, steps = _rapids_frontier()
+    assert not any(s.task_type == "Chop" and s.item == "potato" for s in steps)
+
+
+def test_rescue_for_help_skips_rescue_types():
+    class _T(object):
+        TYPE = "RescueCooked"
+    assert _rescue_for_help(_T(), {}) is True
+    class _E(object):
+        TYPE = "Extinguish"
+    assert _rescue_for_help(_E(), {}) is True
+
+
+def test_rescue_for_help_take_cooked_only_when_burning():
+    class _T(object):
+        TYPE = "TakeCookedToPlate"
+    assert _rescue_for_help(_T(), {"burning": True}) is True
+    assert _rescue_for_help(_T(), {"burning": False, "onFire": False}) is False

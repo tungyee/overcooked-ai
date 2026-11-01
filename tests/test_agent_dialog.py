@@ -784,3 +784,23 @@ def test_build_dialog_context_marks_round_finished(dagent, world):
     assert dagent._build_dialog_context(world).get("round_finished") is False
 
 
+def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
+                                                           fake_worker):
+    import gzip
+    import json
+    import os
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                           "rapids21-20261028.ndjson.gz")
+    with gzip.open(fixture, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    w = World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    a = Agent(dialog_worker=fake_worker)
+    a.bb.tick = 100
+    a.book = book
+    a._service_dialog(w)
+    assert any(e[0] == "help_request" for e in fake_worker.events)
+    assert a.ledger.help_request_ids()
+
+

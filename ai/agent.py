@@ -14,6 +14,7 @@ from ai import tasks as T
 from ai.core import arbiter, executor, planner
 from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
+from ai.dialog.help import top_help_request
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
 from ai.space import navigation, portals, reachability, seam_clock, seams, shuttle
@@ -569,6 +570,25 @@ class Agent:
             world, self.bb, book, plate_match, orders=live_orders)
         return live_orders, plate_match, cooker_match
 
+    def _maybe_request_help(self, world, book):
+        # type: (World, RecipeBook) -> Optional[Dict]
+        """P1 做某步明显更划算 → 落挪走 duty，返回 help_request 事件 payload。
+
+        4 秒冷却（每次最多一条）；top_help_request 已按账本里 help_request
+        duty 去重，所以同 (料/站) 不重复喊。
+        """
+        tick = self.bb.tick or 0
+        if tick - getattr(self, "_last_help_request_tick", 0) < 80:
+            return None
+        live_orders, plate_match, cooker_match = self._dialog_matches(world, book)
+        step = top_help_request(world, self.bb, book, live_orders,
+                                plate_match, cooker_match, self.ledger)
+        if step is None:
+            return None
+        self.ledger.add_help_request(step.task_type, step.item, tick)
+        self._last_help_request_tick = tick
+        return {"task_type": step.task_type, "item": step.item}
+
     def _maybe_reset_dialog_level(self, world):
         # type: (World) -> None
         """换关卡时清空账本与对话历史（spec §4.7 / §6.3）。
@@ -707,6 +727,13 @@ class Agent:
                 and time_left <= LAST_SECONDS_WARN_S * 20):
             self._last_seconds_fired = True
             event = ("last_seconds", None)
+            self._put_event(event)
+            events.append(event)
+
+        # ④.6 求助：P1 做某步明显更划算 → 开口 + 挪走（spec §5.2）。
+        help_payload = self._maybe_request_help(world, book)
+        if help_payload is not None:
+            event = ("help_request", help_payload)
             self._put_event(event)
             events.append(event)
 

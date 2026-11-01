@@ -603,6 +603,20 @@ def test_unknown_event_is_ignored():
     assert worker.clients.llm.calls == []
 
 
+def test_help_request_event_speaks_without_tool():
+    llm = FakeLLM(reply("帮我扔个土豆过来？"))
+    worker, bundle = make_worker(llm=llm)
+    context = {"tick": 1000, "orders": [], "dish_dags": {}, "tools": TOOLS}
+
+    worker._handle_event(("help_request", {"task_type": "FetchToBoard",
+                                           "item": "potato"}), context)
+
+    assert llm.choices == ["none"]
+    messages, tools = llm.calls[0]
+    assert "FetchToBoard" in messages[-2]["content"]      # 事件详情进 system 消息
+    assert bundle.tts.spoken == ["帮我扔个土豆过来？"]
+
+
 # ------------------------------------------------------- thread lifecycle
 
 def test_start_stop_with_blocking_capture():

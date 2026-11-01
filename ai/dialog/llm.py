@@ -218,6 +218,8 @@ _EVENT_TEXT = {
     "checkin": ("按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。"),
     "last_seconds": ("事件：本关只剩最后几秒了。用一两句话提醒或鼓励 P1（如「最后十秒，稳住」），"
                      "也可以说下现在该干嘛。不调用工具。"),
+    "help_request": ("事件：你想请 P1 帮忙做一步（系统判断 P1 做这一步明显更划算）。"
+                     "用一句大白话把要 P1 做的这一步说出来，不调用工具。"),
     "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费-漏单扣分）、"
                       "送达数、漏单扣分、连击，用一两句话总结这局，可以鼓励、也可以吐槽，"
                       "语气自然。不调用工具。"),
@@ -297,14 +299,16 @@ def render_state(context):
     return "\n".join(lines)
 
 
-def state_message(event, context, new_dishes_dag=""):
-    # type: (str, dict, str) -> dict
+def state_message(event, context, new_dishes_dag="", event_detail=""):
+    # type: (str, dict, str, str) -> dict
     """本轮末尾的 system 消息：世界状态 + 事件说明（不进历史）。"""
     parts = [render_state(context)]
     if event == "new_order" and new_dishes_dag:
         parts.append("【新菜】\n" + new_dishes_dag)
     if event in _EVENT_TEXT:
         parts.append(_EVENT_TEXT[event])
+    if event_detail:
+        parts.append(event_detail)
     return {"role": "system", "content": "\n\n".join(parts)}
 
 

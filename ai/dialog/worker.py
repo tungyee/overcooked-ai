@@ -1044,6 +1044,14 @@ class DialogWorker(object):
             self._run_llm(context, name, "", new_orders=batch,
                           timing=timing)
             return
+        if name == "help_request":
+            detail = "要请 P1 帮忙的这一步：%s（%s）" % (
+                payload.get("task_type"), payload.get("item") or "")
+            self.last_proactive_tick = tick
+            timing = TurnTiming(source="event", event=name,
+                                started=time.monotonic())
+            self._run_llm(context, name, "", timing=timing, event_detail=detail)
+            return
         if name in ("last_seconds", "round_summary"):
             # 主循环一次性触发（各只发一次），直接说，不调工具、不再套限频闸。
             self.last_proactive_tick = tick
@@ -1054,8 +1062,8 @@ class DialogWorker(object):
         log.debug("忽略未知事件: %r", name)
 
     def _run_llm(self, context, event, transcript, new_orders=None,
-                 timing=None):
-        # type: (dict, str, str, Any, Any) -> None
+                 timing=None, event_detail=""):
+        # type: (dict, str, str, Any, Any, str) -> None
         """一次对话回合（标准两段式 function calling）。
 
         1. 第一段：speech / new_order 回合 `tool_choice="auto"`，模型决定调不调用
@@ -1083,7 +1091,7 @@ class DialogWorker(object):
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)
-        world = state_message(event, context, new_dag)
+        world = state_message(event, context, new_dag, event_detail)
         opener = speech_message(transcript) if event == "speech" \
             else event_note(event)
         # 世界状态放在本轮开口之前：它描述「此刻」，模型读完状态再看 P1 的话。

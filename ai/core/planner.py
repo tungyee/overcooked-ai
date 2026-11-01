@@ -110,6 +110,9 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
             candidates.append(Candidate(task, list(pre), est,
                                         branch=branch_of_task(task, book)))
 
+    # 盘合并：互补盘对 → MergePlates（spec 2026-11-01-plate-merge-design §5.2）
+    candidates.extend(_gen_merge(world, bb, book))
+
     # 与订单无关的清理 / 回收 / 待命 task（第 2/5/6/11/12/13/14/15 号）
     candidates.extend(_gen_misc(world, bb, book, chef, hands_empty))
 
@@ -140,6 +143,7 @@ _CAND_META = {
     "SendAcross": (["hands_empty"], EST_FETCH),
     "FetchToCarrier": (["hands_empty"], EST_FETCH),
     "PlaceCarrierInCooker": (["hands_empty"], EST_COOK_OPS),
+    "MergePlates": (["hands_empty"], EST_FETCH),
 }
 
 
@@ -203,6 +207,79 @@ def _has_dirty_plate(world, sink):
     """
     from ai.tasks.plate import dirty_plate_exists
     return dirty_plate_exists({"w": world}, (sink or {}).get("n"))
+
+
+def _gen_merge(world, bb, book):
+    # type: (World, Blackboard, RecipeBook) -> List[Candidate]
+    """互补盘对 → MergePlates 候选（盘合并，spec 2026-11-01-plate-merge-design §5.2）。
+
+    只扫描「并集 ⊆ 某单需求 且 缺料数严格减少」的盘对；src/dst 定向匹配无关
+    （dst = token 多的盘、平手 id 小者），逐拍稳定。目标订单取并集缺料最少的
+    单，同分取队首。盘过滤口径与 `_match_plates_to_orders` 一致。
+    """
+    orders = _dialog_live_orders(world, bb)
+    if not orders:
+        return []
+    from ai.query.recipe_graph import _counter_cells
+    counter_cells = set(_counter_cells(world))
+    p2 = P.chef_by_name(world.chefs, P.P2_NAME)
+    p1 = P.chef_by_name(world.chefs, P.P1_NAME)
+    head = _combo_head_id(orders)
+
+    eligible = []  # type: List[Tuple[Dict, Set[str]]]
+    for p in P.all_plates(world):
+        pid = p.get("n")
+        if not pid:
+            continue
+        on_counter = _plate_cell(world, p) in counter_cells
+        held_by_p2 = P.holds_plate(p2, p)
+        held_by_p1 = P.holds_plate(p1, p)
+        buried = P.plate_buried_in_stack(p)
+        loose_with_contents = (not on_counter and not held_by_p2
+                               and not held_by_p1 and not buried
+                               and P.plate_count(p) > 0)
+        stack_top = not held_by_p1 and P.plate_stack_top(p)
+        if not (on_counter or held_by_p2 or loose_with_contents or stack_top):
+            continue
+        toks = book.plate_tokens(p)
+        if not toks:
+            continue
+        eligible.append((p, toks))
+
+    cands = []  # type: List[Candidate]
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            pa, ta = eligible[i]
+            pb, tb = eligible[j]
+            union = ta | tb
+            best_oid, best_key = None, None
+            for o in orders:
+                oid = o.get("id")
+                if not (union <= book.order_want_tokens(o)):
+                    continue
+                missing_after = len(book.missing_union(o, [pa, pb]))
+                if not (missing_after < len(book.missing(o, pa))
+                        and missing_after < len(book.missing(o, pb))):
+                    continue
+                key = (missing_after, 0 if oid == head else 1)
+                if best_key is None or key < best_key:
+                    best_key, best_oid = key, oid
+            if best_oid is None:
+                continue
+            if len(tb) > len(ta):
+                src_p, dst_p = pa, pb
+            elif len(ta) > len(tb):
+                src_p, dst_p = pb, pa
+            else:
+                # dst = id 小者（平手 tiebreak，逐拍稳定）
+                if str(pa.get("n")) < str(pb.get("n")):
+                    src_p, dst_p = pb, pa
+                else:
+                    src_p, dst_p = pa, pb
+            cands.append(Candidate(
+                T.MergePlates(best_oid, (src_p.get("n"), dst_p.get("n"))),
+                ["hands_empty"], EST_FETCH))
+    return cands
 
 
 def _gen_misc(world, bb, book, chef, hands_empty):
@@ -669,7 +746,7 @@ COMBO_PREP_DISCOUNT = 0.25
 # 不含 FillCooker（订单无关）与清理类。
 _COMBO_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                      "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate",
-                     "FetchToCarrier", "PlaceCarrierInCooker")
+                     "FetchToCarrier", "PlaceCarrierInCooker", "MergePlates")
 W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩罚）
 
 # 填灶权重（第 1 组 1.4）：灶空转的机会成本是 12 秒不可压缩的时钟，补不回来。

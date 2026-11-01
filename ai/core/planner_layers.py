@@ -56,7 +56,7 @@ PRESSURE_RESCUE = 1.0
 LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                     "FetchToCooker", "FillCooker", "Mix",
                     "FetchToCarrier", "PlaceCarrierInCooker",
-                    "TakeCookedToPlate", "ThrowBatch")
+                    "TakeCookedToPlate", "ThrowBatch", "MergePlates")
 
 
 def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):

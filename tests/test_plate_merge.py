@@ -142,3 +142,74 @@ def test_merge_plates_done_false_when_src_still_has_contents():
     t = T.MergePlates("1", ("s1", "d1"))
     ctx = make_ctx([SEAWEED, FISH_RICE], orders=[ORDER_FISH], chefs=[P2, P1])
     assert t.done(ctx) is False
+
+
+# ---------- Task 3: _gen_merge 候选生成 ----------
+
+from ai.state.world import World  # noqa: E402
+from ai.state.blackboard import Blackboard  # noqa: E402
+from ai.core import planner  # noqa: E402
+
+
+def _merge_world(plates, orders, chefs):
+    return World({
+        "orders": orders,
+        "stations": [],
+        "recipes": RECIPES,
+        "chefs": chefs,
+        "plates": plates,
+        "workstations": [], "cookers": [],
+        "items": [], "extinguishers": [], "grid": {"nodeMap": None},
+    })
+
+
+P2W = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": None}
+P1W = {"name": "Player 1", "x": 1.0, "z": 0.0, "held": None}
+
+
+def _merge_tasks(cands):
+    return [c.task for c in cands if c.task.TYPE == "MergePlates"]
+
+
+def test_gen_merge_emits_complementary_pair_more_tokens_as_dst():
+    w = _merge_world([SEAWEED, FISH_RICE], [ORDER_FISH], [P2W, P1W])
+    cands = planner._gen_merge(w, Blackboard(), book())
+    tasks = _merge_tasks(cands)
+    assert len(tasks) == 1
+    # d1 有 2 token、s1 只有 1 token → d1 作 dst
+    assert (tasks[0].src_id, tasks[0].dst_id) == ("s1", "d1")
+    assert tasks[0].order_id == "1"
+
+
+def test_gen_merge_skips_overlap_pair():
+    dst = plate("d1", ["ing:Seaweed", "ing:SushiFish"])
+    w = _merge_world([SEAWEED, dst], [ORDER_FISH], [P2W, P1W])
+    assert _merge_tasks(planner._gen_merge(w, Blackboard(), book())) == []
+
+
+def test_gen_merge_skips_union_superset():
+    dst = plate("d1", ["ing:SushiFish", "ing:Cucumber",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"])
+    w = _merge_world([SEAWEED, dst], [ORDER_FISH], [P2W, P1W])
+    assert _merge_tasks(planner._gen_merge(w, Blackboard(), book())) == []
+
+
+def test_gen_merge_skips_p1_held_plate():
+    dst = plate("d1", ["ing:SushiFish",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"],
+                held_by="Player 1")
+    w = _merge_world([SEAWEED, dst], [ORDER_FISH], [P2W, P1W])
+    assert _merge_tasks(planner._gen_merge(w, Blackboard(), book())) == []
+
+
+def test_gen_merge_equal_tokens_lower_id_as_dst_stable():
+    a = plate("p1", ["ing:Seaweed"])
+    b = plate("p2", ["ing:SushiFish"])
+    w = _merge_world([a, b], [ORDER_FISH], [P2W, P1W])
+    bb = Blackboard()
+    got = _merge_tasks(planner._gen_merge(w, bb, book()))
+    got2 = _merge_tasks(planner._gen_merge(w, bb, book()))
+    assert len(got) == 1
+    # 平手（各 1 token）→ id 小的 p1 作 dst；连跑两拍定向一致
+    assert (got[0].src_id, got[0].dst_id) == ("p2", "p1")
+    assert [(t.src_id, t.dst_id) for t in got2] == [("p2", "p1")]

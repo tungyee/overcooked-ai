@@ -80,10 +80,14 @@ def _add(ledger, kitchen, mode, target, tick=0):
 # ------------------------------------------------------------ 目录
 
 
-def test_targets_are_materials_then_shared_actions(kitchen):
-    assert kitchen.targets()[:4] == MATERIALS
-    assert set(kitchen.targets()[4:]) == {"WashPlate", "PlaceCleanPlate",
-                                          "DeliverPlate"}
+def test_targets_are_materials_then_steps_then_shared_actions(kitchen):
+    t = kitchen.targets()
+    assert t[:4] == MATERIALS
+    assert set(t[-3:]) == {"WashPlate", "PlaceCleanPlate", "DeliverPlate"}
+    steps = t[4:-3]
+    assert all(":" in s for s in steps)
+    assert "Chop:Cucumber" in steps
+    assert "FetchToCooker:BoiledSushiRice" in steps
 
 
 def test_render_lists_dishes_materials_steps_and_legend(kitchen):
@@ -428,3 +432,23 @@ def test_ledger_help_request_no_duplicate():
     a = ledger.add_help_request("Chop", "Cucumber", tick=0)
     b = ledger.add_help_request("Chop", "Cucumber", tick=0)
     assert a == b and len(ledger.help_request_ids()) == 1
+
+
+def test_step_target_expand(kitchen):
+    scope, err = kitchen.expand("Chop:Cucumber")
+    assert err == ""
+    assert scope == frozenset({("Chop", "cucumber")})
+
+
+def test_step_target_rejects_unknown_task(kitchen):
+    _, err = kitchen.expand("NotATask:Cucumber")
+    assert err != ""
+
+
+def test_step_and_material_overlap(kitchen):
+    ledger = Ledger()
+    ledger.apply({"op": "add", "mode": "do", "target": "Chop:Cucumber"}, kitchen, 0)
+    ledger.apply({"op": "add", "mode": "do", "target": "Cucumber"}, kitchen, 0)
+    prefs = ledger.preferences()
+    chop = [p for p in prefs if p.duty_id == "a1"][0]
+    assert (None, "cucumber") in chop.exclude

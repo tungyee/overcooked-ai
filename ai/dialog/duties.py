@@ -189,13 +189,50 @@ class Kitchen(object):
 
     def targets(self):
         # type: () -> List[str]
-        """工具 `target` 的 enum：物料（按首次出现顺序）+ 共享动作。"""
-        return list(self.materials) + self.shared_keys()
+        """工具 `target` 的 enum：物料 + 步骤 + 共享动作。"""
+        return list(self.materials) + self.step_targets() + self.shared_keys()
+
+    def step_targets(self):
+        # type: () -> List[str]
+        """步骤级 target 的枚举：`TaskType:物料名`（只认领这一步，非共享、item 非空）。"""
+        out = []  # type: List[str]
+        seen = set()
+        for name, mat in self.materials.items():
+            for task_type, item in mat.steps:
+                if self._meta(task_type).shared or not item:
+                    continue
+                key = "%s:%s" % (task_type, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(key)
+        return out
 
     def expand(self, target):
         # type: (Any) -> Tuple[Optional[Scope], str]
-        """target → 作用域；不在目录里返回 (None, 原因)。"""
+        """target → 作用域；不在目录里返回 (None, 原因)。
+
+        步骤级 target 形如 `TaskType:物料名`：按物料名找该链上这个 task 类型
+        实际用到的 item（生/熟形态），作用域精确到 `(task_type, item)`。
+        """
         name = str(target or "").strip()
+        if ":" in name:
+            task_type, mat_name = name.split(":", 1)
+            task_type = task_type.strip()
+            mat_name = mat_name.strip()
+            mat = self.materials.get(mat_name)
+            if mat is None:
+                return None, "本关没有 %s（可选：%s）" % (
+                    mat_name, "、".join(self.targets()))
+            if task_type not in self.meta:
+                return None, "没有 %s 这一步" % (task_type,)
+            if self._meta(task_type).shared:
+                return None, "%s 是共享动作，直接用不带物料" % (task_type,)
+            items = {str(item).lower() for t, item in mat.steps
+                     if t == task_type and item}
+            if not items:
+                return None, "%s 里没有 %s 这一步" % (mat_name, task_type)
+            return frozenset((task_type, it) for it in items), ""
         mat = self.materials.get(name)
         if mat is not None:
             return frozenset((None, item) for item in mat.items), ""

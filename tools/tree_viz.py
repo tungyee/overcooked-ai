@@ -192,6 +192,9 @@ def enumerate_tasks(ctx):
         out.append(T.DeliverPlate(oid, (plate_id,)))
         for ing in reqs:
             out.append(T.FetchToPlate(oid, (plate_id,), ing))
+    plates = [p for p in w.plates if p.get("n")]
+    if len(plates) >= 2 and oid is not None:
+        out.append(T.MergePlates(oid, (plates[0]["n"], plates[1]["n"])))
     if sink_id is not None:
         out.append(T.WashPlate(resources=(sink_id,)))
     if cooker_id is not None:

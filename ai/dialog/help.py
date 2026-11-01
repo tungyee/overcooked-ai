@@ -133,3 +133,31 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
                 p2_cost=cost_to(world, bb, P.P2_NAME, source),
             ))
     return out
+
+
+def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger):
+    # type: (Any, Any, Any, List[Dict], Dict, Dict, Any) -> Optional[FrontierStep]
+    """P1 更划算的前沿步骤里价值最高的一个；无则 None。
+
+    排除已存在 help_request duty 的 (task_type, item)；排序：P2 够不着（blocking）
+    优先、P1 优势（P2−P1）降序、再按 (task_type, item) 稳定兜底。
+    """
+    steps = frontier_steps(world, bb, book, orders, plate_match, cooker_match)
+    requested = set()  # type: set
+    for duty in getattr(ledger, "duties", None) or ():
+        if getattr(duty, "source", "") == "help_request":
+            requested |= set(getattr(duty, "scope", None) or ())
+    candidates = [s for s in steps
+                  if p1_saves_enough(s.p1_cost, s.p2_cost)
+                  and (s.task_type, s.item) not in requested]
+    if not candidates:
+        return None
+
+    def key(s):
+        blocking = 0 if s.p2_cost is None else 1
+        adv = (s.p2_cost - s.p1_cost) if (s.p1_cost is not None
+                                          and s.p2_cost is not None) else 0
+        return (blocking, -adv, s.task_type, s.item or "")
+
+    candidates.sort(key=key)
+    return candidates[0]

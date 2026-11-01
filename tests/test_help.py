@@ -1,10 +1,12 @@
-"""P1 求助触发：P1/P2 成本比较、阈值与订单 DAG 前沿枚举（spec §5.1）。"""
+"""P1 求助触发：P1/P2 成本比较、阈值、订单 DAG 前沿枚举与排名（spec §5.1–§5.2）。"""
 import gzip
 import json
 import os
 
+from ai.dialog.duties import Ledger
 from ai.dialog.help import (HELP_THRESHOLD_STEPS, FrontierStep, _rescue_for_help,
-                            cost_to, frontier_steps, p1_saves_enough)
+                            cost_to, frontier_steps, p1_saves_enough,
+                            top_help_request)
 from ai.query import predicates as P
 from ai.query.recipes import RecipeBook
 from ai.state import blackboard as BB
@@ -20,6 +22,12 @@ def _rapids_frame():
             if line.strip():
                 return json.loads(line)
     raise AssertionError("empty fixture")
+
+
+def _rapids_world_book_ledger():
+    w = W.World(_rapids_frame())
+    book = RecipeBook(w.recipes, w.stations)
+    return w, book, BB.Blackboard(), Ledger()
 
 
 # ---------- Task 1 ----------
@@ -48,9 +56,7 @@ def test_cost_to_rapids_p2_cannot_reach_potato():
 # ---------- Task 2 ----------
 
 def _rapids_frontier():
-    w = W.World(_rapids_frame())
-    book = RecipeBook(w.recipes, w.stations)
-    bb = BB.Blackboard()
+    w, book, bb, _ = _rapids_world_book_ledger()
     return w, book, bb, frontier_steps(w, bb, book, w.orders, {}, {})
 
 
@@ -82,3 +88,18 @@ def test_rescue_for_help_take_cooked_only_when_burning():
         TYPE = "TakeCookedToPlate"
     assert _rescue_for_help(_T(), {"burning": True}) is True
     assert _rescue_for_help(_T(), {"burning": False, "onFire": False}) is False
+
+
+# ---------- Task 4 ----------
+
+def test_top_help_request_returns_blocking_step():
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is not None and got.p2_cost is None
+
+
+def test_top_help_request_skips_already_requested():
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    ledger.add_help_request("FetchToBoard", "Potato", tick=0)
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is None or (got.task_type, got.item) != ("FetchToBoard", "potato")

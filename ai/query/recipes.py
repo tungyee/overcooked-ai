@@ -137,6 +137,20 @@ class RecipeBook(object):
         return tuple(ing for ing in self.requirements(order)
                      if not (self.want_tokens(ing) & have))
 
+    def missing_union(self, order, plates):
+        # type: (Optional[Dict], List[Dict]) -> Tuple[str, ...]
+        """多盘并集口径的 `missing`：还缺哪些顶层成分（盘合并用）。
+
+        与 `missing` 同一套装盘态词汇判断，只是把 `have` 换成 `plates`
+        里所有盘的 token 并集。用于 MergePlates 判「两块盘合起来离订单还差
+        几样料」——单盘口径的 `missing` 永远看不到 src 盘上的料。
+        """
+        have = set()  # type: Set[str]
+        for p in plates or ():
+            have |= self.plate_tokens(p)
+        return tuple(ing for ing in self.requirements(order)
+                     if not (self.want_tokens(ing) & have))
+
     # ---------- 分支归一（dialog 分支作用域，spec §4.5）----------
     def ingredient_branch(self, item):
         # type: (Optional[str]) -> Optional[str]

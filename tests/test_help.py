@@ -103,3 +103,44 @@ def test_top_help_request_skips_already_requested():
     ledger.add_help_request("FetchToBoard", "Potato", tick=0)
     got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
     assert got is None or (got.task_type, got.item) != ("FetchToBoard", "potato")
+
+
+def test_source_for_take_cooked_uses_cooker():
+    from ai.dialog.help import _source_for
+    class _T(object):
+        TYPE = "TakeCookedToPlate"
+        def _source(self, ctx):
+            return {"kind": "cooker", "target": {"t": "cooking", "n": "cooker_x"}}
+    assert _source_for(None, None, _T(), {}) == {"t": "cooking", "n": "cooker_x"}
+
+
+def test_source_for_fetch_to_cooker_uses_raws():
+    from ai.dialog.help import _source_for
+    class _T(object):
+        TYPE = "FetchToCooker"
+        def _raws(self, ctx):
+            return ("Potato",)
+    w = W.World(_rapids_frame())
+    src = _source_for(w, None, _T(), {})
+    assert src is not None and src.get("t") == "crate"
+
+
+def test_top_help_request_prunes_resolved_duty():
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    # Chop 不是当前 P1 更划算的前沿步骤（板空、不上前沿）→ 该被清掉
+    ledger.add_help_request("Chop", "Potato", tick=0)
+    assert ledger.help_request_ids()
+    top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert ledger.help_request_ids() == []
+
+
+def test_top_help_request_silent_in_mine24_spawn():
+    # Mine_2_4 出生帧：肉/饭 P1 只近 3~5 步（<8），连通图不喊
+    fp = os.path.join(os.path.dirname(__file__), "fixtures", "mine",
+                      "mine24-20261031-230344-burrito.ndjson.gz")
+    with gzip.open(fp, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    w = W.World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    assert top_help_request(w, BB.Blackboard(), book, w.orders, {}, {},
+                            Ledger()) is None

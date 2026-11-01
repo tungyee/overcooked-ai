@@ -63,11 +63,31 @@ class FrontierStep(object):
     p2_cost: Optional[int]
 
 
-def _source_for(world, item):
-    # type: (Any, str) -> Optional[Dict]
-    """料源（crate / 散落 / 砧板），不过滤 P2 可达性。"""
+def _source_for(world, book, task, ctx):
+    # type: (Any, Any, Any, Dict) -> Optional[Dict]
+    """料源/站（不过滤 P2 可达性）：盛盘取熟料所在灶、下锅反查生料、其余按 item 名定位。"""
     from ai.query import recipes as R
-    loc = R.find_ingredient(world, item, exclude_plate=True,
+    t = getattr(task, "TYPE", None)
+    if t == "TakeCookedToPlate":
+        fn = getattr(task, "_source", None)
+        if callable(fn):
+            s = fn(ctx)
+            if s:
+                return s.get("target")
+        return None
+    if t in ("FetchToCooker", "FillCooker"):
+        fn = getattr(task, "_raws", None)
+        raws = fn(ctx) if callable(fn) else ()
+        for raw in raws:
+            loc = R.find_ingredient(world, raw, exclude_plate=True,
+                                    can_access=_SOURCE_ANY)
+            if loc is not None and loc.get("st") is not None:
+                return loc.get("st")
+        return None
+    item = getattr(task, "item", None)
+    if not item:
+        return None
+    loc = R.find_ingredient(world, str(item), exclude_plate=True,
                             can_access=_SOURCE_ANY)
     if loc is None or loc.get("kind") == "held":
         return None
@@ -116,7 +136,7 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
             item = getattr(task, "item", None)
             if not item:
                 continue
-            source = _source_for(world, str(item))
+            source = _source_for(world, book, task, ctx)
             if source is None:
                 continue
             if _rescue_for_help(task, source):
@@ -143,6 +163,11 @@ def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger)
     优先、P1 优势（P2−P1）降序、再按 (task_type, item) 稳定兜底。
     """
     steps = frontier_steps(world, bb, book, orders, plate_match, cooker_match)
+    p1_cheaper = {(s.task_type, s.item) for s in steps
+                  if p1_saves_enough(s.p1_cost, s.p2_cost)}
+    prune = getattr(ledger, "prune_help_requests", None)
+    if callable(prune):
+        prune(p1_cheaper)
     requested = set()  # type: set
     for duty in getattr(ledger, "duties", None) or ():
         if getattr(duty, "source", "") == "help_request":

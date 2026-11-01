@@ -586,6 +586,7 @@ class Agent:
         if step is None:
             return None
         self.ledger.add_help_request(step.task_type, step.item, tick)
+        self._sync_duty_preferences()      # 挪走立刻落成 claim 偏好，本拍规划可见
         self._last_help_request_tick = tick
         return {"task_type": step.task_type, "item": step.item}
 

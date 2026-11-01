@@ -802,6 +802,7 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     a._service_dialog(w)
     assert any(e[0] == "help_request" for e in fake_worker.events)
     assert a.ledger.help_request_ids()
+    assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
 
 
 def test_task_switch_event_on_commitment_change(dagent, fake_worker):

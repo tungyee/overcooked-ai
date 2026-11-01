@@ -473,6 +473,23 @@ class Ledger(object):
         # type: () -> List[str]
         return [d.id for d in self.duties if d.source == "help_request"]
 
+    def prune_help_requests(self, active_scopes):
+        # type: (set) -> List[Duty]
+        """删掉 scope 已不在 active_scopes 里的 help_request duty（该步已解决/
+        不再 P1 更划算）；返回被删的。TTL 只是兜底，主清除路径走这里。"""
+        removed = []
+        kept = []
+        for d in self.duties:
+            if d.source == "help_request":
+                if d.scope and d.scope <= active_scopes:
+                    kept.append(d)
+                else:
+                    removed.append(d)
+            else:
+                kept.append(d)
+        self.duties = kept
+        return removed
+
     def prune(self, tick):
         # type: (int) -> List[Duty]
         """删掉到期条目（stop 到期），返回被删的。"""

@@ -589,6 +589,19 @@ class Agent:
         self._last_help_request_tick = tick
         return {"task_type": step.task_type, "item": step.item}
 
+    def _maybe_emit_task_switch(self, old_key, new_key, tick=None):
+        # type: (Optional[tuple], tuple, Optional[int]) -> Optional[tuple]
+        """承诺换到显著不同的事（跨 task 类型/物料）→ 发 task_switch 事件。"""
+        if old_key is None or old_key == new_key:
+            return None
+        tick = tick if tick is not None else (self.bb.tick or 0)
+        if tick - getattr(self, "_last_task_switch_tick", 0) < 80:
+            return None
+        self._last_task_switch_tick = tick
+        event = ("task_switch", {"task_type": new_key[0], "item": new_key[1]})
+        self._put_event(event)
+        return event
+
     def _maybe_reset_dialog_level(self, world):
         # type: (World) -> None
         """换关卡时清空账本与对话历史（spec §4.7 / §6.3）。
@@ -1038,6 +1051,13 @@ class Agent:
         # ⑪ 登记 commitment（存 Task 对象本身：承诺惯性按四元身份比较）
         if chosen_task:
             if not self.bb.commitment or self.bb.commitment.active_task != chosen_task:
+                old = self.bb.commitment.active_task if self.bb.commitment else None
+                old_key = ((getattr(old, "TYPE", None),
+                            str(getattr(old, "item", None) or "").lower())
+                           if old is not None else None)
+                new_key = (getattr(chosen_task, "TYPE", None),
+                           str(getattr(chosen_task, "item", None) or "").lower())
+                self._maybe_emit_task_switch(old_key, new_key)
                 self.bb.commitment = Commitment(chosen_task, self.tick, 0, 0, 0)
 
         # ⑫ 执行

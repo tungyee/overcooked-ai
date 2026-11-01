@@ -804,3 +804,24 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     assert a.ledger.help_request_ids()
 
 
+def test_task_switch_event_on_commitment_change(dagent, fake_worker):
+    ev = dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
+                                        ("Chop", "cucumber"), tick=100)
+    assert ev is not None and ev[0] == "task_switch"
+    assert fake_worker.events[-1] == ev
+
+
+def test_task_switch_same_item_no_event(dagent, fake_worker):
+    ev = dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
+                                        ("FetchToBoard", "cucumber"), tick=100)
+    assert ev is None
+
+
+def test_task_switch_respects_cooldown(dagent, fake_worker):
+    dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
+                                   ("Chop", "cucumber"), tick=100)
+    ev = dagent._maybe_emit_task_switch(("Chop", "cucumber"),
+                                        ("FetchToPlate", "cucumber"), tick=150)
+    assert ev is None
+
+

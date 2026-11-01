@@ -1052,6 +1052,14 @@ class DialogWorker(object):
                                 started=time.monotonic())
             self._run_llm(context, name, "", timing=timing, event_detail=detail)
             return
+        if name == "task_switch":
+            detail = "你（P2）现在去做的这一步：%s（%s）" % (
+                payload.get("task_type"), payload.get("item") or "")
+            self.last_proactive_tick = tick
+            timing = TurnTiming(source="event", event=name,
+                                started=time.monotonic())
+            self._run_llm(context, name, "", timing=timing, event_detail=detail)
+            return
         if name in ("last_seconds", "round_summary"):
             # 主循环一次性触发（各只发一次），直接说，不调工具、不再套限频闸。
             self.last_proactive_tick = tick

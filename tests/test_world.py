@@ -525,6 +525,44 @@ def test_world_plates_and_extinguishers_legacy_all_non_held():
     assert w.held_extinguishers == []
 
 
+def test_world_reads_held_plates_from_state_dump():
+    """state_dump 回放：手持盘单列在 held_plates（plates 里无 held_by），
+    World 必须把它并回 held_plates，否则 all_plates 少一块、_plate_pressure /
+    plate_by_id 在离线回放里失真（trace-20261101-223804 尾部拿放震荡复盘）。"""
+    w = W.World({
+        "plates": [
+            {"n": "-1", "name": "equipment_plate_01 (1)", "x": 1.0, "z": 2.0,
+             "count": 0},
+        ],
+        "held_plates": [
+            {"n": "-2", "name": "equipment_plate_01 (8)", "x": 3.0, "z": 4.0,
+             "count": 0, "held_by": "Player 2"},
+        ],
+    })
+    assert [p["n"] for p in w.plates] == ["-1"]
+    assert [p["n"] for p in w.held_plates] == ["-2"]
+    assert [p["n"] for p in w.all_plates] == ["-1", "-2"]
+
+
+def test_world_reads_held_items_and_extinguishers_from_state_dump():
+    """state_dump 回放：手持物/手持灭火器单列在 held_items / held_extinguishers
+    （items / extinguishers 里无 held_by），World 必须把它们并回，否则
+    held_cookware_state、灭火逻辑在离线回放里失真。"""
+    w = W.World({
+        "items": [{"n": "Cucumber", "x": 1.0, "z": 2.0}],
+        "held_items": [{"n": "utensil_pot_01", "x": 5.0, "z": 5.0,
+                        "held_by": "Player 2"}],
+        "extinguishers": [{"n": "ext_01", "x": 9.6, "z": 10.8}],
+        "held_extinguishers": [{"n": "ext_02", "x": 3.0, "z": 4.0,
+                                "held_by": "Player 1"}],
+    })
+    assert [it["n"] for it in w.items] == ["Cucumber"]
+    assert [(it["n"], it["held_by"]) for it in w.held_items] == [
+        ("utensil_pot_01", "Player 2")]
+    assert [e["n"] for e in w.extinguishers] == ["ext_01"]
+    assert [e["n"] for e in w.held_extinguishers] == ["ext_02"]
+
+
 def test_plate_by_id_sees_held_plate_via_all_plates():
     """按 id 找盘走全量视图：P2 自己端着的盘也必须能被找到。"""
     from ai.tasks.base import plate_by_id

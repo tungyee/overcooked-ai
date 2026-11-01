@@ -119,15 +119,17 @@ def test_plan_only_scores_top_layer_candidates():
 
 def _world(cookers=(), plates=(), orders=()):
     # type: (Any, Any, Any) -> Any
-    """最小 world 替身。层判定只读 cookers / plates。"""
+    """最小 world 替身。层判定只读 cookers / plates / held_plates。"""
     return type("W", (), {
         "cookers": list(cookers),
         "plates": list(plates),
+        "held_plates": [],
         "orders": list(orders),
         "stations": [],
         "items": [],
         "chefs": [],
         "level": "Sushi_1_4_2P",
+        "all_plates": property(lambda self: self.plates + self.held_plates),
     })()
 
 

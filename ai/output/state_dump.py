@@ -53,6 +53,9 @@ def snapshot(world):
         # 手持物（带 held_by）：手里那件装着什么（包肉的卷饼）只有这里看得到
         "held_items": [_copy(i) for i in (getattr(world, "held_items", None) or [])],
         "extinguishers": [_copy(e) for e in (getattr(world, "extinguishers", None) or [])],
+        # 手持灭火器单列，供离线回放重建 held_extinguishers（同 held_plates /
+        # held_items 的回放口径，见 ai/state/world.py 对应合并逻辑）。
+        "held_extinguishers": [_copy(e) for e in (getattr(world, "held_extinguishers", None) or [])],
         "stations": [_copy(s) for s in (getattr(world, "stations", None) or [])],
         "recipes": [_recipe(r) for r in (getattr(world, "recipes", None) or [])],
         "map": _map(world),

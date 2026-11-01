@@ -65,6 +65,15 @@ def test_snapshot_includes_held_items():
     assert snap["held_items"][0] is not w.held_items[0]
 
 
+def test_snapshot_includes_held_extinguishers():
+    w = _world()
+    w.held_extinguishers = [{"n": "ext_02", "held_by": "Player 1",
+                             "x": 3.0, "z": 4.0}]
+    snap = snapshot(w)
+    assert snap["held_extinguishers"] == w.held_extinguishers
+    assert snap["held_extinguishers"][0] is not w.held_extinguishers[0]
+
+
 def test_snapshot_preserves_held_plate_identity():
     w = _world()
     w.held_plates = [{"n": "bound-plate", "name": "equipment_plate_01",

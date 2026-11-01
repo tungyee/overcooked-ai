@@ -157,13 +157,19 @@ def _cooker(n="cooker1", progress=None, ctime=12.0, cooked=False,
 
 
 class _W(object):
-    """最小 world 替身：层判定只读 cookers / plates / stations。"""
+    """最小 world 替身：层判定只读 cookers / plates / held_plates / stations。"""
 
-    def __init__(self, cookers=(), plates=(), stations=()):
-        # type: (Any, Any, Any) -> None
+    def __init__(self, cookers=(), plates=(), held_plates=(), stations=()):
+        # type: (Any, Any, Any, Any) -> None
         self.cookers = list(cookers)
         self.plates = list(plates)
+        self.held_plates = list(held_plates)
         self.stations = list(stations)
+
+    @property
+    def all_plates(self):
+        # type: () -> List
+        return self.plates + self.held_plates
 
     def to_grid(self, x, z):
         # type: (float, float) -> tuple
@@ -234,6 +240,23 @@ def test_plate_pressure_three_tiers():
     assert PL.layer_of_task(t, _W(plates=[clean])) == PL.L_CLEANUP
     assert PL.layer_of_task(
         t, _W(plates=[clean, dict(clean, n="plate2")])) == PL.L_CLEANUP
+
+
+def test_plate_pressure_counts_held_plates():
+    """_plate_pressure 数全量（含手持）干净盘：P2 端着唯一一块干净盘去盛料时，
+    PlaceCleanPlate 不能因为「盘离开盘堆」被抬进 L4——否则盛料 task 被抢走、
+    盘一放下压力又归零，形成拿放死循环（trace-20261101-223804 尾部）。"""
+    held = {"n": "plate2", "contents": []}
+    t = _T("PlaceCleanPlate")
+    # 非手持 1 块 + 手持 1 块 = 2 块干净盘 → 压力 0 → PlaceCleanPlate 掉 L7
+    assert PL.layer_of_task(
+        t, _W(plates=[{"n": "plate1", "contents": []}],
+              held_plates=[held])) == PL.L_CLEANUP
+    # 非手持 0 块 + 手持 1 块 = 1 块 → 压力 1.0 → 仍升 L4（真的只剩一块可用）
+    assert PL.layer_of_task(
+        t, _W(plates=[], held_plates=[held])) == PL.L_UNBLOCK
+    # 全空 → 压力 2.0 → L4
+    assert PL.layer_of_task(t, _W(plates=[], held_plates=[])) == PL.L_UNBLOCK
 
 
 def test_missing_cooking_progress_falls_back_to_binary():

@@ -701,6 +701,13 @@ namespace Oc2AI
             }
 
             Vector2 target = PointAt(_idx);
+            // 接近门洞（下一路点就是入点）时，直接朝当前门洞入点走，不朝发令时
+            // 冻结的前一个路点走：前一个路点在移动篮子上，篮子一漂它就过期，P2
+            // 顶着过期点推、进不了 GATE_HOLD 等门范围（trace-20261101-223804
+            // t=4452 送餐在缝口 stuck 而非 gate closed）。入点坐标每帧由
+            // gate.Refresh 重算中线，跟得上篮子。
+            if (gate != null && !atExit && _idx + 1 == gate.Enter)
+                target = gate.EnterPoint;
             float dist = Vector2.Distance(pos, target);
 
             // 走点推进；门洞入/出点按跨缝坐标判（沿缝坐标一直在动，按距离可能永远差一点）

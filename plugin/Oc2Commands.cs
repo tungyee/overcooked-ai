@@ -126,6 +126,9 @@ namespace Oc2AI
         private const float REAIM_TIME = 0.6f;
         private const float TAP_HOLD = 0.1f;
         private const float VERIFY_TIME = 0.5f;
+        // 移动篮子上盛料弹回排查（trace-20261101-234046）：记录按键前后手持物
+        // 与朝向句柄（m_gridLocation）变化，定位游戏端在哪一步把料退回。排查完置 false。
+        private static readonly bool TAP_DIAG = true;
 
         private enum Phase { Reaim, Press, Verify }
         private Phase _phase = Phase.Reaim;
@@ -140,6 +143,9 @@ namespace Oc2AI
         private float _phaseStart;
         private string _heldBefore;
         private int _retries;
+        // 诊断：press 时刻的朝向句柄快照 + Verify 阶段上一次打日志的状态（变化才打）。
+        private string _lastDiagGrid;
+        private string _lastDiagHeld;
 
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
@@ -178,6 +184,9 @@ namespace Oc2AI
                         _phase = Phase.Press;
                         _phaseStart = now;
                         _heldBefore = f.HeldName;
+                        _lastDiagGrid = DiagGrid(f);
+                        _lastDiagHeld = _heldBefore;
+                        LogTapDiag("press", f);
                     }
                     else if (_hasTargetWorld)
                     {
@@ -210,10 +219,16 @@ namespace Oc2AI
                     break;
 
                 case Phase.Verify:
+                    {
+                        string g = DiagGrid(f);
+                        if (g != _lastDiagGrid) { LogTapDiag("verify grid-change " + _lastDiagGrid + " -> " + g, f); _lastDiagGrid = g; }
+                        if (f.HeldName != _lastDiagHeld) { LogTapDiag("verify held-change " + (_lastDiagHeld ?? "null") + " -> " + (f.HeldName ?? "null"), f); _lastDiagHeld = f.HeldName; }
+                    }
                     if (f.HeldName != _heldBefore) { Finish(true, null); return; }
                     if (now - _phaseStart > VERIFY_TIME)
                     {
                         if (++_retries >= 2) { Finish(false, "no effect"); return; }
+                        LogTapDiag("verify no-effect retry", f);
                         _phase = Phase.Reaim;   // 重瞄重按一次
                         _phaseStart = now;
                     }
@@ -259,6 +274,26 @@ namespace Oc2AI
             else PadEngagement.Pad.Move(f.Chef, dir.x * FLOOR_FACE_STICK, dir.y * FLOOR_FACE_STICK);
         }
 
+        private string DiagGrid(ChefFrame f)
+        {
+            return (f.GridName ?? "null") + "(" + f.GridGx + "," + f.GridGz + ")";
+        }
+
+        private void LogTapDiag(string evt, ChefFrame f)
+        {
+            if (!TAP_DIAG) return;
+            string tgt = _target != null ? (Req.Str(_target, "name") ?? "null") : "null";
+            UnityEngine.Debug.Log("[TAP] " + evt
+                + " held=" + (f.HeldName ?? "null")
+                + " grid=" + (f.GridName ?? "null") + "(" + f.GridGx + "," + f.GridGz + ")"
+                + " use=" + (f.UseName ?? "null")
+                + " pickup=" + (f.PickupName ?? "null")
+                + " place=" + (f.PlacementName ?? "null")
+                + " pos=(" + f.PosX.ToString("0.00") + "," + f.PosZ.ToString("0.00") + ")"
+                + " rel=(" + f.RelX.ToString("0.00") + "," + f.RelZ.ToString("0.00") + ")"
+                + " tgt=" + tgt);
+        }
+
         private void Finish(bool ok, string why)
         {
             PadEngagement.Pad.Stop();
@@ -266,6 +301,10 @@ namespace Oc2AI
             Done = true;
             Ok = ok;
             Why = why;
+            if (TAP_DIAG)
+                UnityEngine.Debug.Log("[TAP] done ok=" + ok + " why=" + why
+                    + " held=" + (_lastDiagHeld ?? "null")
+                    + " grid=" + (_lastDiagGrid ?? "null"));
         }
 
         private void LogHandleMismatch(ChefFrame f)

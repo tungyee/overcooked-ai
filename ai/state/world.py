@@ -173,6 +173,11 @@ class World(object):
         deduped_plates = _dicts(state.get("plates"))
         self.plates = [p for p in deduped_plates if not p.get("held_by")]
         self.held_plates = [p for p in deduped_plates if p.get("held_by")]
+        # state_dump 把手持盘单列在 held_plates（插件原始帧则混在 plates 里带
+        # held_by）。离线回放走前者，不补这行会让手持盘在重建时丢失、all_plates
+        # 少一块，按全量盘口径的判据（_plate_pressure、plate_by_id 找 P2 端着的
+        # 盘）在回放里失真。生产帧无 held_plates 键，此行是无操作。
+        self.held_plates += _dicts(state.get("held_plates"))
         self.workstations = _dicts(state.get("workstations"))
 
         # 这三类插件会报重复，构造时就去重（各自规则不同，见 occupancy）
@@ -185,11 +190,18 @@ class World(object):
         # 全部归入散落，保持原行为。
         self.items = [it for it in deduped_items if not it.get("held_by")]
         self.held_items = [it for it in deduped_items if it.get("held_by")]
+        # state_dump 把手持物单列在 held_items（插件原始帧则混在 items 里带
+        # held_by）。离线回放走前者，不补这行会让手持锅/卷饼在重建时丢失、
+        # held_cookware_state 在回放里判断不了手里锅的状态。
+        self.held_items += _dicts(state.get("held_items"))
         deduped_ext = occupancy.dedupe_extinguishers(state.get("extinguishers"))
         # 灭火器手持后也会留在 extinguishers[]（坐标跟厨师），按 held_by 拆开：
         # 灭火 task 只认非手持（挂墙/地上），手持灭火器不能当可用的取。
         self.extinguishers = [e for e in deduped_ext if not e.get("held_by")]
         self.held_extinguishers = [e for e in deduped_ext if e.get("held_by")]
+        # state_dump 把手持灭火器单列在 held_extinguishers（插件原始帧则混在
+        # extinguishers[] 里带 held_by）。离线回放走前者，补上才不丢。
+        self.held_extinguishers += _dicts(state.get("held_extinguishers"))
 
         # 注意：self.stations 现在混合了全部网格的站点（Task 7 Step 11 起
         # stations 不再按单一网格缓存）。GridMapping 的众数校准如果对全部站点

@@ -529,22 +529,45 @@ def _breaks_combo(task, world):
     队首 = _combo_head_id（id 最小）；credited = _credited_order_id（游戏把
     一盘菜记给同 dish 存活单里 remaining 最小者）。credited != 队首时 combo 断。
 
+    两个放行出口（都不拦）：
+      1. _head_credit_blocked：队首那道菜被同菜更短的别单挡着、注定记不到
+         队首——「保连击」是伪命题，继续拦只会让 P2 空转、其他单跟着过期
+         （trace-20261102-000650/002822：Balloon 队首被同菜更短单挡着，
+          10 个送餐全被 combo_break 拦死）。
+      2. _head_order_doomed：队首快过期、且场上没有它的料齐盘时放行跳单。
+         队首过期本身就会断 combo，再拦着备好的菜只会让它跟着一起过期
+         （trace-20261029-130632：MeatOnly 盘料齐后被拦 65 秒，直到队首
+         Marinara 过期才送出）。
+
     不用 solo_slack 判「队首没救」：多人协作下它是 P2 单人手口径、不准，会误放行。
-    这里只开一个保守出口（_head_order_doomed）：队首快过期、且场上没有它的
-    料齐盘时放行跳单。队首过期本身就会断 combo，再拦着备好的菜只会让它跟着
-    一起过期（trace-20261029-130632：MeatOnly 盘料齐后被拦 65 秒，直到队首
-    Marinara 过期才送出）。
     """
     if getattr(task, "TYPE", None) != "DeliverPlate":
         return False
     head = _combo_head_id(world.orders)
     if head is None:
         return False
+    if _head_credit_blocked(world):
+        return False
     dish = _dish_of_order(world.orders, getattr(task, "order_id", None))
     credited = _credited_order_id(world.orders, dish)
     if credited is None or credited == head:
         return False
     return not _head_order_doomed(world)
+
+
+def _head_credit_blocked(world):
+    # type: (World) -> bool
+    """队首单是否注定记不到：同菜里存在 remaining 比队首更小的另一单。
+
+    游戏把一盘菜记给同 dish 存活单里 remaining 最小者（_credited_order_id）。
+    若队首那道菜的最小 remaining 不是队首自己，任何该菜的送达都会记给那单
+    而非队首——combo 在队首这格本来就接不上，继续拦送餐没有意义。
+    """
+    head_id = _combo_head_id(world.orders)
+    head_dish = _dish_of_order(world.orders, head_id)
+    if head_dish is None:
+        return False
+    return _credited_order_id(world.orders, head_dish) != head_id
 
 
 # 队首剩余时间低于此值（秒）且没有料齐盘时，判定队首救不回来、允许跳单。
@@ -2259,8 +2282,15 @@ def _cooker_idle_bonus(shortfall):
 def _plate_pressure(world):
     # type: (Any) -> float
     """干净空盘稀缺度：0=充足，越大越该洗。0 块=2.0（拼装被卡死）、1 块=1.0、
-    ≥2 块=0.0（不洗）。"""
-    clean = P.clean_plate_count(world.plates)
+    ≥2 块=0.0（不洗）。
+
+    数**全量**干净空盘（含手持，走 world.all_plates）：P2 端起一块干净盘去盛料
+    是正常流程，不能因为「盘离开盘堆」就把稀缺度抬上去——否则 PlaceCleanPlate
+    升到 L4 抢走 TakeCookedToPlate、盘一放下压力又归零，形成拿放死循环
+    （trace-20261101-223804 尾部十几秒的左右震荡）。手持的装料盘 contents 非空，
+    clean_plate_count 天然不计它，不影响「干净盘」语义。
+    """
+    clean = P.clean_plate_count(world.all_plates)
     if clean <= 0:
         return 2.0
     if clean == 1:

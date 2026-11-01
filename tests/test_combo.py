@@ -97,6 +97,36 @@ def test_breaks_combo_allows_head_dish_and_non_deliver():
         T.FetchToPlate("4", ("p1",), "Seaweed"), w) is False
 
 
+def test_breaks_combo_allows_when_head_credit_blocked():
+    """队首被同菜更短的单挡着（注定记不到）→ 不拦送餐。
+
+    队首 #3 是黄瓜，但 #7 也是黄瓜且 remaining 更小；游戏把黄瓜记给 #7、
+    永远记不到 #3，combo 在队首这格本来就接不上，再拦只会让 P2 空转。
+    （trace-20261102-000650/002822 的 Balloon 死锁即此。）
+    """
+    from ai import tasks as T
+    orders = _mixed(("3", 100.0, "Sushi_Cucumber"),
+                    ("7", 40.0, "Sushi_Cucumber"),
+                    ("4", 60.0, "Sushi_Fish"))
+    w = _BreaksComboWorld(orders)
+    # 送黄瓜（游戏会记给 #7，非队首）→ 队首被挡，放行
+    assert planner._breaks_combo(T.DeliverPlate("7", ("p1",)), w) is False
+    # 送别的菜（鱼，记给 #4）→ 同样放行（combo 反正保不住）
+    assert planner._breaks_combo(T.DeliverPlate("4", ("p1",)), w) is False
+
+
+def test_head_credit_blocked_true_only_when_shorter_same_dish_exists():
+    # 同菜有更短单 → 挡
+    assert planner._head_credit_blocked(_BreaksComboWorld(
+        _mixed(("3", 100.0, "Sushi_Cucumber"), ("7", 40.0, "Sushi_Cucumber"))))
+    # 队首就是同菜最短 → 不挡
+    assert not planner._head_credit_blocked(_BreaksComboWorld(
+        _mixed(("3", 30.0, "Sushi_Cucumber"), ("7", 80.0, "Sushi_Cucumber"))))
+    # 队首那菜只有一单 → 不挡
+    assert not planner._head_credit_blocked(_BreaksComboWorld(
+        _mixed(("3", 50.0, "Sushi_Cucumber"), ("4", 60.0, "Sushi_Fish"))))
+
+
 def test_urgency_only_applies_to_head_dish():
     """urgency 只对队首（dish 会记到队首）生效，非队首备菜不给时间压力。"""
     from ai import tasks as T

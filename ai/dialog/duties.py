@@ -39,6 +39,8 @@ TICKS_PER_SECOND = 20
 # stop 是「先别」：30 秒后自动解除。prompt / schema 文案从这里格式化。
 STOP_TTL_S = 30
 STOP_TTL_TICKS = STOP_TTL_S * TICKS_PER_SECOND
+# help_request 瞬态 duty 的兜底 TTL（30 秒）；主清除路径是「该步已解决」。
+HELP_REQUEST_TTL_TICKS = 30 * TICKS_PER_SECOND
 # 约定挡住 P2 可做的活超过这么久，LLM 在回话时顺带提议调整（prompt 用）。
 BLOCKED_NUDGE_S = 10
 
@@ -408,6 +410,31 @@ class Ledger(object):
                 "%s 是救锅动作（锅刚熟或快糊时），P2 仍会去做"
                 % ("、".join(rescue),))
         return result
+
+    def add_help_request(self, task_type, item, tick,
+                         ttl_ticks=HELP_REQUEST_TTL_TICKS):
+        # type: (str, Optional[str], int, int) -> str
+        """P2 自己发起的「挪走」：给某一步加一条瞬态 claim duty。
+
+        与 `apply` 的 leave_to_p1 同款编译（负分 claim、owner P1），但 source
+        标 help_request、带 TTL。同 (task_type, item) 已有条目时返回原 id。
+        """
+        scope = frozenset({(str(task_type), str(item or "").lower())})
+        for duty in self.duties:
+            if duty.source == "help_request" and duty.scope == scope:
+                return duty.id
+        self._seq += 1
+        duty_id = "a%d" % (self._seq,)
+        self.duties.append(Duty(
+            id=duty_id, mode="leave_to_p1",
+            target="%s:%s" % (task_type, item or ""),
+            scope=scope, source="help_request",
+            created_tick=tick, expires_tick=tick + ttl_ticks))
+        return duty_id
+
+    def help_request_ids(self):
+        # type: () -> List[str]
+        return [d.id for d in self.duties if d.source == "help_request"]
 
     def prune(self, tick):
         # type: (int) -> List[Duty]

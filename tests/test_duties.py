@@ -406,3 +406,25 @@ def test_tool_schemas_use_targets_from_level(kitchen):
 def test_tool_schemas_without_duties(kitchen):
     tools = tool_schemas(kitchen.targets(), [])
     assert "enum" not in tools[0]["function"]["parameters"]["properties"]["id"]
+
+
+def test_ledger_help_request_compiles_to_claim():
+    ledger = Ledger()
+    ledger.add_help_request("Chop", "Cucumber", tick=0)
+    prefs = ledger.preferences()
+    assert any(p.kind == "claim" and p.owner == "P1" and
+               p.scope == frozenset({("Chop", "cucumber")}) for p in prefs)
+
+
+def test_ledger_help_request_expires_via_prune():
+    ledger = Ledger()
+    ledger.add_help_request("Chop", "Cucumber", tick=0, ttl_ticks=10)
+    ledger.prune(10)
+    assert ledger.help_request_ids() == []
+
+
+def test_ledger_help_request_no_duplicate():
+    ledger = Ledger()
+    a = ledger.add_help_request("Chop", "Cucumber", tick=0)
+    b = ledger.add_help_request("Chop", "Cucumber", tick=0)
+    assert a == b and len(ledger.help_request_ids()) == 1

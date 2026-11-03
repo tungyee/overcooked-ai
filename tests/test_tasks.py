@@ -372,6 +372,38 @@ def test_place_clean_plate_tree_is_two_interactions():
     assert isinstance(tree.child.children[0], PR.EnsureHandsFree)
 
 
+def test_place_clean_plate_excludes_target_counter_from_drop():
+    """清手落点排除目标拼装格：手里端着别的料时不会丢回目标台面再振荡。
+
+    实机 trace-20261103-221421 t=4287~4354：P2 捡起拼装台上的 Pasta 后，
+    PlaceCleanPlate 抢进来，树首 EnsureHandsFree 把 Pasta 就近丢回同一块
+    拼装台，台面被占 → PlaceCleanPlate 不可行 → 与 ThrowBatch 振荡。
+    """
+    t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
+    tree = t.build()
+    ensure = tree.child.children[0]
+    assert isinstance(ensure, PR.EnsureHandsFree)
+    assert ensure._exclude is not None
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES, orders=[ORDER])
+    ctx, _ = make_ctx(w)
+    assert ensure._exclude(ctx) == {(7, 0)}
+
+
+def test_ensure_hands_free_exclude_skips_target_counter():
+    """EnsureHandsFree 的 exclude 格子不作为就近落点。"""
+    sts = [
+        {"t": "counter", "n": "target", "gx": 1, "gz": 0, "x": 1.2, "z": 0.0},
+        {"t": "counter", "n": "other", "gx": 3, "gz": 0, "x": 3.6, "z": 0.0},
+    ]
+    w = FakeWorld(stations=sts, walkable=lambda gx, gz: gz == 0)
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Pasta",
+            "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    e = PR.EnsureHandsFree(exclude=lambda c: {(1, 0)})
+    e._lock_target(ctx)
+    assert e._tgt is not None and e._tgt["n"] == "other"
+
+
 def test_wash_plate_claims_sink():
     assert T.WashPlate(resources=("sink1",)).claims() == (("sink1", "wash"),)
 
@@ -1329,7 +1361,9 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     FetchToCooker 单料同构、也同样坏：必须投满 N 份才轮到 drop()，一轮
     取+投约 80 拍而整树只有 TASK_TIMEOUT_TICKS=200，第二轮没结束就被砍
     → 料全堆在地上、板上一直空着。砧板一次只放一根（feasible 要求板上
-    为空），批量投更没有意义。现在钉住它**不再有**循环与投掷。
+    为空），批量投更没有意义。现在钉住它**不再有**批量循环；单次投上板
+    走 ThrowOntoStation（crate/held 分支末尾先试投、不成就走），散落分支
+    不投。
     """
     tree = T.FetchToBoard("9", ("board_01",), "Cucumber").build()
     assert isinstance(tree, PR.Timeout)
@@ -1363,11 +1397,18 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
         "投满 N 份才上板必然超时，drop 永远执行不到"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes)
 
-    # 三个分支都必须以「往板上放」收尾
-    for branch in sel.children:
+    # 散落分支（料已在板边）直接往板上放；crate/held 两分支末尾是
+    # Selector[ThrowOntoStation, 走过去 placement]：先试投上板，不成就走。
+    last = loose.children[-1]
+    assert isinstance(last, PR.InteractWith)
+    assert last.kind == "placement"
+    for branch in (crate, held):
         last = branch.children[-1]
-        assert isinstance(last, PR.InteractWith)
-        assert last.kind == "placement"
+        assert isinstance(last, Selector)
+        assert isinstance(last.children[0], PR.ThrowOntoStation)
+        fallback = last.children[-1]
+        assert isinstance(fallback, PR.InteractWith)
+        assert fallback.kind == "placement"
 
     # 分支3 无 Condition，是「已在手/兜底」单次路径
     assert isinstance(held, Sequence)
@@ -1383,7 +1424,7 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     过，米全堆在地上、灶始终空着（trace-20261014-011202，2527 拍 0 送达）。
 
     钉住：① 没有 RepeatUntil；② 不往地上投——投掷只出现在「投进锅」
-    （ThrowIntoCooker，投完等锅收下）里；③ 每个分支都以下锅收尾：先试投进锅，
+    （ThrowOntoStation，投完等锅收下）里；③ 每个分支都以下锅收尾：先试投进锅，
     不成就走过去 placement（真的会下锅）。
     """
     tree = T.FetchToCooker(
@@ -1407,14 +1448,14 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     assert not any(isinstance(n, RepeatUntil) for n in nodes), \
         "单料下锅不该有批量循环：投满 N 份才下锅必然超时"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes), \
-        "不往地上投：投锅的 ThrowTo 在 ThrowIntoCooker 内部按需建，不在静态树里"
+        "不往地上投：投锅的 ThrowTo 在 ThrowOntoStation 内部按需建，不在静态树里"
 
     # 两个分支都必须以「下锅」收尾：先试投进锅，不成走过去放
     for branch in sel.children:
         assert isinstance(branch, Sequence)
         last = branch.children[-1]
         assert isinstance(last, Selector)
-        assert isinstance(last.children[0], PR.ThrowIntoCooker)
+        assert isinstance(last.children[0], PR.ThrowOntoStation)
         fallback = last.children[-1]
         assert isinstance(fallback, Sequence)
         place = fallback.children[-1]

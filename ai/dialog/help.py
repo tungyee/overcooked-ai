@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from ai.dialog.schema import RESCUE_TYPES
 from ai.query import predicates as P
 from ai.query import recipe_graph
+from ai.revenue import eta as ETA
 from ai.space import reachability
 
 # P1 比 P2 省多少步才值得开口求助（≈0.3 秒/步，8 步 ≈ 2.4 秒 ≈ 半张图）。
@@ -55,12 +56,18 @@ def p1_saves_enough(p1_cost, p2_cost, threshold=HELP_THRESHOLD_STEPS):
 
 @dataclass
 class FrontierStep(object):
-    """订单 DAG 前沿里、仍需做的一步及其料源/站与两侧成本。"""
+    """订单 DAG 前沿里、仍需做的一步及其料源/站与两侧成本。
+
+    `source` 为 None 表示料源暂时定位不到（料被拿在手里），此时两侧成本
+    也都是 None；该步仍算「需要做」，用于 help_request 剪枝而非排名。
+    `order_id` 是发射该步的那张订单，用于按订单紧迫度（solo_slack）排名。
+    """
     task_type: str
     item: Optional[str]
-    source: Dict
+    source: Optional[Dict]
     p1_cost: Optional[int]
     p2_cost: Optional[int]
+    order_id: Optional[str] = None
 
 
 def _source_for(world, book, task, ctx):
@@ -113,6 +120,8 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
     `field=None` 下求值——`can_interact` 对 None 场恒 True，于是
     `ingredient_available` 变成「料是否存在」而非「P2 够得着」，正好保留
     P2 够不着的料源（Rapids 土豆）。料源用 `_source_for`（同样不过滤可达性）。
+    料源定位不到（料正被拿在手里）时 `source=None`、两侧成本记 None：步骤
+    仍「需要做」，留在前沿供剪枝判定，只是不参与「谁更划算」排名。
     """
     ctx = {
         "w": world,
@@ -137,8 +146,6 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
             if not item:
                 continue
             source = _source_for(world, book, task, ctx)
-            if source is None:
-                continue
             if _rescue_for_help(task, source):
                 continue
             key = (task.TYPE, str(item).lower())
@@ -149,10 +156,28 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
                 task_type=task.TYPE,
                 item=str(item).lower(),
                 source=source,
-                p1_cost=cost_to(world, bb, P.P1_NAME, source),
-                p2_cost=cost_to(world, bb, P.P2_NAME, source),
+                p1_cost=(cost_to(world, bb, P.P1_NAME, source)
+                         if source is not None else None),
+                p2_cost=(cost_to(world, bb, P.P2_NAME, source)
+                         if source is not None else None),
+                order_id=getattr(task, "order_id", None),
             ))
     return out
+
+
+def _help_rank_key(step, slack_map=None):
+    # type: (FrontierStep, Optional[Dict[Any, float]]) -> tuple
+    """求助候选排序键：P2 够不着（blocking）最优先，其次按订单紧迫度
+    （solo_slack 小 = 更急 = 先喊），再按 P1 优势步数，最后 (task_type, item)
+    稳定兜底。slack 缺失的订单排最后（视为不紧）。"""
+    slack_map = slack_map or {}
+    blocking = 0 if step.p2_cost is None else 1
+    adv = (step.p2_cost - step.p1_cost) if (step.p1_cost is not None
+                                            and step.p2_cost is not None) else 0
+    slack = slack_map.get(step.order_id)
+    if slack is None:
+        slack = float("inf")
+    return (blocking, slack, -adv, step.task_type, step.item or "")
 
 
 def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger):
@@ -160,29 +185,34 @@ def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger)
     """P1 更划算的前沿步骤里价值最高的一个；无则 None。
 
     排除已存在 help_request duty 的 (task_type, item)；排序：P2 够不着（blocking）
-    优先、P1 优势（P2−P1）降序、再按 (task_type, item) 稳定兜底。
+    优先，其次按所属订单的 solo_slack（越紧越先），再按 P1 优势（P2−P1）降序、
+    (task_type, item) 稳定兜底。
     """
     steps = frontier_steps(world, bb, book, orders, plate_match, cooker_match)
-    p1_cheaper = {(s.task_type, s.item) for s in steps
-                  if p1_saves_enough(s.p1_cost, s.p2_cost)}
+    # 剪枝依据是「步骤仍需做」，不是「此刻 P1 更划算」：后者随厨师位置/
+    # 手持状态每拍波动，用它剪会把求助 duty 反复删掉又重发（一直喊装盘）。
+    needed = {(s.task_type, s.item) for s in steps}
     prune = getattr(ledger, "prune_help_requests", None)
     if callable(prune):
-        prune(p1_cheaper)
+        prune(needed)
     requested = set()  # type: set
     for duty in getattr(ledger, "duties", None) or ():
         if getattr(duty, "source", "") == "help_request":
             requested |= set(getattr(duty, "scope", None) or ())
+    tick = getattr(bb, "tick", 0) or 0
     candidates = [s for s in steps
-                  if p1_saves_enough(s.p1_cost, s.p2_cost)
-                  and (s.task_type, s.item) not in requested]
+                  if s.source is not None
+                  and p1_saves_enough(s.p1_cost, s.p2_cost)
+                  and (s.task_type, s.item) not in requested
+                  and not ledger.help_request_recent(s.task_type, s.item, tick)]
     if not candidates:
         return None
 
-    def key(s):
-        blocking = 0 if s.p2_cost is None else 1
-        adv = (s.p2_cost - s.p1_cost) if (s.p1_cost is not None
-                                          and s.p2_cost is not None) else 0
-        return (blocking, -adv, s.task_type, s.item or "")
-
-    candidates.sort(key=key)
+    try:
+        slack_map = ETA.solo_slack_by_order(world, book, plate_match,
+                                            cooker_match, orders=orders)
+    except Exception:                       # noqa: BLE001
+        # 紧迫度只是增强信号；算不出（空匹配/异常）时退回「都不紧」的旧行为。
+        slack_map = {}
+    candidates.sort(key=lambda s: _help_rank_key(s, slack_map))
     return candidates[0]

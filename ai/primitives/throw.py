@@ -1,4 +1,4 @@
-"""投掷原语：ThrowTo（朝目标投出）与 ThrowIntoCooker（下锅最后几步改成投进锅）。
+"""投掷原语：ThrowTo（朝目标投出）与 ThrowOntoStation（下锅/上砧板最后几步改成投上站）。
 
 投掷键 = chop，持可投掷物（食材）时按它就是投掷（spec §7.9）。锅/盘不可投掷，
 走 EnsureHandsFree 走近放下，不进这里。
@@ -122,26 +122,27 @@ POT_THROW_COOLDOWN_TICKS = 400
 POT_THROW_SAVE_CELLS = 3
 
 
-class ThrowIntoCooker(Node):
-    """下锅的最后几步改成投：手上拿着料、离锅还远时，走到 3~5m 外一个能
-    直线投进锅的格子，精准对准后投出，等锅收下。
+class ThrowOntoStation(Node):
+    """下锅/上砧板的最后几步改成投：手上拿着料、离目标站还远时，走到 3~5m
+    外一个能直线投进站的格子，精准对准后投出，等站收下。
 
-    门槛（任一不满足 → 立刻 FAILURE，调用方 Selector 退回走过去放）：
-      - 这口灶不在投锅冷却里（bb.pot_throw_cooldown）；
-      - 手上拿着要下的料、锅还没收到这份；
-      - 有出手位（space.throw.plan_pot_throw），且比走到锅旁至少省
+    锅与砧板共用这一套投掷几何与冷却（POT_* 常量是共享的投掷参数）。门槛
+    （任一不满足 → 立刻 FAILURE，调用方 Selector 退回走过去放）：
+      - 这口站不在投掷冷却里（bb.pot_throw_cooldown）；
+      - 手上拿着要下的料、站还没收到这份；
+      - 有出手位（space.throw.plan_pot_throw），且比走到站旁至少省
         POT_THROW_SAVE_CELLS 格。
 
-    投出后 POT_CATCH_WAIT_TICKS 内锅没收到（投偏落地 / 没对准没投 / 走位
+    投出后 POT_CATCH_WAIT_TICKS 内站没收到（投偏落地 / 没对准没投 / 走位
     失败）→ 写冷却、FAILURE。料若已落地，调用方下一步从地上捡回来再放。
 
-    cooker(ctx) -> 灶站点 dict；holding / placed 是调用方的手上 / 已下锅谓词；
-    cooldown_key 是写冷却用的灶资源 id。
+    station(ctx) -> 目标站站点 dict（灶/砧板）；holding / placed 是调用方的
+    手上 / 已到位谓词；cooldown_key 是写冷却用的站资源 id。
     """
 
-    def __init__(self, cooker, holding, placed, cooldown_key):
+    def __init__(self, station, holding, placed, cooldown_key):
         # type: (Callable[[Dict], Optional[Dict]], Callable[[Dict], bool], Callable[[Dict], bool], Any) -> None
-        self.cooker = cooker
+        self.station = station
         self.holding = holding
         self.placed = placed
         self.cooldown_key = cooldown_key
@@ -160,9 +161,9 @@ class ThrowIntoCooker(Node):
             others.add(w.to_grid(c["x"], c["z"]))
         return lambda cell: cell in field and cell not in others
 
-    def _pot_point(self, ctx):
+    def _target_point(self, ctx):
         # type: (Dict) -> Optional[Tuple[float, float]]
-        st = self.cooker(ctx)
+        st = self.station(ctx)
         if not st or st.get("x") is None or st.get("z") is None:
             return None
         return (float(st["x"]), float(st["z"]))
@@ -170,10 +171,10 @@ class ThrowIntoCooker(Node):
     def ok_here(self, ctx):
         # type: (Dict) -> bool
         """P2 此刻的真实位置就能投进（平台漂移、站在格边也算）。"""
-        pot, chef = self._pot_point(ctx), ctx["chef"]
-        if pot is None or chef.get("x") is None:
+        target, chef = self._target_point(ctx), ctx["chef"]
+        if target is None or chef.get("x") is None:
             return False
-        return TH.pot_throw_ok((chef["x"], chef["z"]), pot, ctx["w"].to_grid,
+        return TH.pot_throw_ok((chef["x"], chef["z"]), target, ctx["w"].to_grid,
                                self._passable_fn(ctx), TS.walls_of(ctx["w"]))
 
     def plan(self, ctx):
@@ -185,7 +186,7 @@ class ThrowIntoCooker(Node):
             return None
         if not self.holding(ctx) or self.placed(ctx):
             return None
-        pot = self._pot_point(ctx)
+        pot = self._target_point(ctx)
         field = ctx.get("field")
         if pot is None or not field:
             return None
@@ -197,7 +198,7 @@ class ThrowIntoCooker(Node):
                                  pot, self._passable_fn(ctx), TS.walls_of(w))
         if best is None:
             return None
-        st = self.cooker(ctx)
+        st = self.station(ctx)
         walk = navigation.nearest_cost(
             field, _station_interact_cells(st, w.to_grid(*pot), w, "placement"))
         if walk is not None and best["cost"] + POT_THROW_SAVE_CELLS > walk[1]:
@@ -214,7 +215,7 @@ class ThrowIntoCooker(Node):
 
         return Sequence([
             GoToCell(stance, arrived=self.ok_here, precise=True),
-            ThrowTo(self.cooker, aim_dot=POT_AIM_DOT, strict=True,
+            ThrowTo(self.station, aim_dot=POT_AIM_DOT, strict=True,
                     face_timeout_ms=POT_FACE_TIMEOUT_MS),
             WaitUntil(self.placed, POT_CATCH_WAIT_TICKS),
         ])

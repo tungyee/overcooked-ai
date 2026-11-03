@@ -19,7 +19,7 @@ from ai.primitives.move import Approach, Face, GoToCell
 from ai.primitives.tap import Tap, Confirm, Settle
 from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitNewFrame, WaitUntil
 from ai.primitives.interact import EnsureHandsFree, InteractWith
-from ai.primitives.throw import ThrowTo, ThrowIntoCooker
+from ai.primitives.throw import ThrowTo, ThrowOntoStation
 from ai.primitives.stuck import (
     MarkBlocked,
     AbandonTarget,
@@ -46,7 +46,7 @@ __all__ = [
     "EnsureHandsFree",
     "InteractWith",
     "ThrowTo",
-    "ThrowIntoCooker",
+    "ThrowOntoStation",
     "MarkBlocked",
     "AbandonTarget",
     "Timeout",

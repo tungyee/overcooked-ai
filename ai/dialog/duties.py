@@ -41,6 +41,9 @@ STOP_TTL_S = 30
 STOP_TTL_TICKS = STOP_TTL_S * TICKS_PER_SECOND
 # help_request 瞬态 duty 的兜底 TTL（30 秒）；主清除路径是「该步已解决」。
 HELP_REQUEST_TTL_TICKS = 30 * TICKS_PER_SECOND
+# 同一 (task_type, item) 的求助冷却（45 秒）：duty 被剪枝/TTL 到期后也不立即
+# 复读，避免分割图上「P1 更划算」的步骤被反复喊（trace-20261103-205951）。
+HELP_REQUEST_COOLDOWN_TICKS = 45 * TICKS_PER_SECOND
 # 约定挡住 P2 可做的活超过这么久，LLM 在回话时顺带提议调整（prompt 用）。
 BLOCKED_NUDGE_S = 10
 
@@ -349,6 +352,8 @@ class Ledger(object):
         # type: () -> None
         self.duties = []        # type: List[Duty]
         self._seq = 0
+        # (task_type, item 小写) → 最近一次求助的 tick，用于同一步冷却。
+        self._help_request_last = {}  # type: Dict[Tuple[str, str], int]
 
     def get(self, duty_id):
         # type: (Any) -> Optional[Duty]
@@ -367,6 +372,7 @@ class Ledger(object):
         """换关：清空账本，id 从 a1 重新编号。"""
         self.duties = []
         self._seq = 0
+        self._help_request_last = {}
 
     # ---- 修改
 
@@ -460,6 +466,9 @@ class Ledger(object):
         for duty in self.duties:
             if duty.source == "help_request" and duty.scope == scope:
                 return duty.id
+        # 只在真正新建一条求助（即真的会开口）时记冷却锚点；同一步已有
+        # duty 的重复调用是去重空操作，不刷新冷却。
+        self._help_request_last[(str(task_type), str(item or "").lower())] = tick
         self._seq += 1
         duty_id = "a%d" % (self._seq,)
         self.duties.append(Duty(
@@ -472,6 +481,14 @@ class Ledger(object):
     def help_request_ids(self):
         # type: () -> List[str]
         return [d.id for d in self.duties if d.source == "help_request"]
+
+    def help_request_recent(self, task_type, item, tick,
+                            cooldown=HELP_REQUEST_COOLDOWN_TICKS):
+        # type: (str, Optional[str], int, int) -> bool
+        """该 (task_type, item) 在冷却期内是否刚求助过（抑制同一步复读）。"""
+        key = (str(task_type), str(item or "").lower())
+        last = self._help_request_last.get(key)
+        return last is not None and tick - last < cooldown
 
     def prune_help_requests(self, active_scopes):
         # type: (set) -> List[Duty]

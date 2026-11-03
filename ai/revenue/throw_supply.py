@@ -34,7 +34,7 @@ THROW_MIN_DIST = 9.0
 # 曾关闭：一次只投一份（relay.MAX_BATCH_UNITS=1）时远投没有摊销，料还落在
 # 锅旁地上要再捡一次（trace-20261029-202903）。2026-10-30 重新打开试 2-2
 # （Balloon_2_3）：料箱在左/中篮、灶全在右篮，中间两道会关的门，攻略打法
-# 就是隔缝把料扔过去。近距「投进锅」仍由 FillCooker 末段 ThrowIntoCooker 负责。
+# 就是隔缝把料扔过去。近距「投进锅」仍由 FillCooker 末段 ThrowOntoStation 负责。
 ENABLE_FAR_THROW = True
 # 「在消费站附近」的半径（m，连通地图口径）：约 3 格，落地的料算已就位。
 # 2.6m 时砸在锅边弹开、落在 ~3m 处的意面不算就位，被当来源捡起来重投

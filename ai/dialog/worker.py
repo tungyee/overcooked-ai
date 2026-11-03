@@ -1045,7 +1045,7 @@ class DialogWorker(object):
                           timing=timing)
             return
         if name == "help_request":
-            detail = "要请 P1 帮忙的这一步：%s（%s）" % (
+            detail = "要请队友帮忙的这一步：%s（%s）" % (
                 payload.get("task_type"), payload.get("item") or "")
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,

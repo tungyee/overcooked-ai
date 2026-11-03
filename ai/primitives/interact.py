@@ -3,7 +3,7 @@
 EnsureHandsFree：手里有东西就放到就近的合法落点（幂等）。
 InteractWith：= Approach + (Face) + TapWhileHolding + Confirm（前置 + 后置齐备）。
 """
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from ai.query import placement
 from ai.query import predicates as P
@@ -84,12 +84,16 @@ class EnsureHandsFree(Primitive):
     见 ai/tasks/fire.py。
     """
 
-    def __init__(self, pick=None, keep=None, home_cooker=True):
-        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]], bool) -> None
+    def __init__(self, pick=None, keep=None, home_cooker=True, exclude=None):
+        # type: (Optional[Callable[[Dict], Optional[Dict]]], Optional[Callable[[Dict], bool]], bool, Optional[Callable[[Dict], Set[Tuple[int, int]]]]) -> None
         Primitive.__init__(self)
         self._pick = pick
         self._keep = keep
         self._home_cooker = home_cooker
+        # 禁区格（主网格坐标）：手里东西绝不能往这些格放。由 task 注入——
+        # 摆盘 task 用它排除自己的目标拼装格，否则清手会把端着的料丢回目标
+        # 台面、再把自己搞不可行（trace-20261103-221421 t=4287~4354）。
+        self._exclude = exclude
         self._tgt = None          # 锁定的落点：台面站点 dict 或合成的格子 dict
         self._on_station = False
         self._phase = _P_APPROACH
@@ -276,6 +280,7 @@ class EnsureHandsFree(Primitive):
         锅只能去台面/地板）。
         """
         w = ctx["w"]
+        excl = self._exclude(ctx) if self._exclude is not None else set()
         state = P.held_cookware_state(ctx["chef"], P.held_items(w), w.recipes)
         if self._home_cooker and state in (P.COOKWARE_EMPTY, P.COOKWARE_RAW):
             st = placement.find_empty_cooker(w, ctx["field"])
@@ -283,15 +288,16 @@ class EnsureHandsFree(Primitive):
                 self._tgt, self._on_station = st, True
                 return
 
-        pick = self._pick or (lambda c: placement.find_drop_station(c["w"],
-                                                                    c["field"]))
+        pick = self._pick or (lambda c: placement.find_drop_station(
+            c["w"], c["field"], excl))
         st = pick(ctx)
         if st is not None:
             self._tgt, self._on_station = st, True
             return
-        # 地板：落点 = 面朝的那格（不是脚下）。厨师此刻站的格与本次激活里
-        # 插件判过「转身后面前仍有句柄」的格不选。
+        # 地板：落点 = 面朝的那格（不是脚下）。厨师此刻站的格、本次激活里
+        # 插件判过「转身后面前仍有句柄」的格、以及 exclude 禁区格都不选。
         skip = set(self._floor_skip)
+        skip |= excl
         cur = P.chef_cell(ctx["chef"], w.to_grid)
         if cur is not None:
             skip.add(cur)

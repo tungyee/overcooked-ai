@@ -370,6 +370,11 @@ class MergePlates(Task):
         if not (book.plate_tokens(src) | book.plate_tokens(dst)) \
                 <= book.order_want_tokens(order):
             return False
+        # 并盘是把 src 的内容倒进 dst，盘里每种料只能出现一次：两盘只要有
+        # 重叠料，游戏就合不了（如两边都已有饼皮/海苔）。集合并集会把重叠
+        # 料去重，上面的并集 ⊆ 需求判断会被骗过，必须显式排除。
+        if book.plate_tokens(src) & book.plate_tokens(dst):
+            return False
         # 严格进展：并集比任一单盘都更接近该单（双方各缺对方有的料，重叠/被
         # 包含的盘对不算）。用顶层成分计数（missing/missing_union），不用
         # token 集差——token 集对熟料会重复计（rich+opaque 两个 token）。

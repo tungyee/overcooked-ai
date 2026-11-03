@@ -113,6 +113,17 @@ def test_merge_plates_feasible_false_on_overlap_no_progress():
     assert t.feasible(ctx) is False
 
 
+def test_merge_plates_feasible_false_on_shared_ingredient_even_with_progress():
+    # 两盘各有一张海苔（重叠料），并集虽补齐订单、严格进展也成立，
+    # 但盘里每种料只一份，游戏无法合并（卷饼两盘各有一张饼皮同理）。
+    src = plate("s1", ["ing:Seaweed", "ing:SushiFish"])
+    dst = plate("d1", ["ing:Seaweed",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"])
+    t = T.MergePlates("1", ("s1", "d1"))
+    ctx = make_ctx([src, dst], orders=[ORDER_FISH], chefs=[P2, P1])
+    assert t.feasible(ctx) is False
+
+
 def test_merge_plates_feasible_false_on_union_superset():
     # 并集多了黄瓜，不是该单子集
     dst = plate("d1", ["ing:SushiFish", "ing:Cucumber",
@@ -184,6 +195,16 @@ def test_gen_merge_emits_complementary_pair_more_tokens_as_dst():
 def test_gen_merge_skips_overlap_pair():
     dst = plate("d1", ["ing:Seaweed", "ing:SushiFish"])
     w = _merge_world([SEAWEED, dst], [ORDER_FISH], [P2W, P1W])
+    assert _merge_tasks(planner._gen_merge(w, Blackboard(), book())) == []
+
+
+def test_gen_merge_skips_shared_ingredient_even_with_progress():
+    # 两盘各有一张海苔（重叠料），并集补齐订单且严格进展成立，但游戏无法
+    # 合并，_gen_merge 不得产出候选。
+    src = plate("s1", ["ing:Seaweed", "ing:SushiFish"])
+    dst = plate("d1", ["ing:Seaweed",
+                       "CookedCompositeAssembledNode(Pot){ ing:SushiRice }"])
+    w = _merge_world([src, dst], [ORDER_FISH], [P2W, P1W])
     assert _merge_tasks(planner._gen_merge(w, Blackboard(), book())) == []
 
 

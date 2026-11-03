@@ -252,6 +252,10 @@ def _gen_merge(world, bb, book):
             pa, ta = eligible[i]
             pb, tb = eligible[j]
             union = ta | tb
+            if ta & tb:
+                # 两盘有重叠料（如都已有饼皮/海苔），游戏无法并盘。集合并集会
+                # 把重叠料去重，单靠 union ⊆ want + 严格进展会被骗过。
+                continue
             best_oid, best_key = None, None
             for o in orders:
                 oid = o.get("id")

@@ -11,8 +11,9 @@ import pytest
 from ai import tasks as T
 from ai.agent import _TASK_META
 from ai.core import planner
-from ai.dialog.duties import (STOP_TTL_S, STOP_TTL_TICKS, WEIGHT_NOW, Kitchen,
-                              Ledger, render_ledger, tool_schemas)
+from ai.dialog.duties import (HELP_REQUEST_COOLDOWN_TICKS, STOP_TTL_S,
+                              STOP_TTL_TICKS, WEIGHT_NOW, Kitchen, Ledger,
+                              render_ledger, tool_schemas)
 from ai.dialog.schema import preference_matches_task
 from ai.query.recipe_graph import _compile_node
 from ai.query.recipes import RecipeBook
@@ -432,6 +433,27 @@ def test_ledger_help_request_no_duplicate():
     a = ledger.add_help_request("Chop", "Cucumber", tick=0)
     b = ledger.add_help_request("Chop", "Cucumber", tick=0)
     assert a == b and len(ledger.help_request_ids()) == 1
+
+
+def test_ledger_help_request_cooldown_suppresses_repeat():
+    ledger = Ledger()
+    ledger.add_help_request("Chop", "Cucumber", tick=0)
+    # 冷却期内：同一步视为「刚求助过」，不同 task / 不同物料不受影响。
+    assert ledger.help_request_recent("Chop", "Cucumber", tick=10) is True
+    assert ledger.help_request_recent("FetchToPlate", "Cucumber", tick=10) is False
+    assert ledger.help_request_recent("Chop", "SushiFish", tick=10) is False
+    # 冷却窗口边界：恰好到 cooldown 时解禁。
+    assert ledger.help_request_recent(
+        "Chop", "Cucumber", tick=HELP_REQUEST_COOLDOWN_TICKS) is False
+
+
+def test_ledger_help_request_dedup_does_not_refresh_cooldown():
+    ledger = Ledger()
+    ledger.add_help_request("Chop", "Cucumber", tick=0)
+    # 同一步的重复 add 是去重空操作：不刷新冷却锚点，tick 仍锚在 0。
+    ledger.add_help_request("Chop", "Cucumber", tick=50)
+    assert ledger.help_request_recent(
+        "Chop", "Cucumber", tick=HELP_REQUEST_COOLDOWN_TICKS) is False
 
 
 def test_step_target_expand(kitchen):

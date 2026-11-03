@@ -94,7 +94,7 @@
 ## 单份投掷 / 精准投进锅（2026-10-29，插件 0.23.2 / 协议 7）
 
 - **ThrowBatch 一次只投一份**（`relay.MAX_BATCH_UNITS = 1`）：缺口封顶到 1，树去掉 `RepeatUntil`、投完一份就交还 Planner，`batch_bonus` 随之为 0。分割地图（Rapids_2_1）照常投给对面；**连通地图远投关闭**（`throw_supply.ENABLE_FAR_THROW = False`）：单份没有摊销，料还落在锅旁地上要再捡。批量（锅位封顶、打分）以后再议。
-- **FillCooker / FetchToCooker 末段精准投锅**（`primitives.ThrowIntoCooker`）：反编译确认锅接料靠触发器（`ServerAttachmentCatchingProxy` → `ServerIngredientCatcher.CanHandleCatch`：锅挂在灶上、能收这种料就收），飞行中穿过锅即可，不必落进锅；台面（`ServerAttachStation`）只接**非飞行**物，不会半路截走，但别的灶/锅会。命中关键是朝向：唯一成功样本 `trace-20261029-213506` t=558 出手距 4.7m、朝向偏 4°，此前落空的远投偏 ~13°（插件门槛 0.97≈14°）。现在出手距 3~5m、路径只过可走地板且无别的厨师、`aim_dot=0.996`（≈5°，5m 横偏 0.44m）、`strict`（超时没对准就不投）。投偏/没对准写 20s 冷却，期间这口灶走过去放；投偏的料先从地上捡回再放。
+- **FillCooker / FetchToCooker 末段精准投锅**（`primitives.ThrowOntoStation`）：反编译确认锅接料靠触发器（`ServerAttachmentCatchingProxy` → `ServerIngredientCatcher.CanHandleCatch`：锅挂在灶上、能收这种料就收），飞行中穿过锅即可，不必落进锅；台面（`ServerAttachStation`）只接**非飞行**物，不会半路截走，但别的灶/锅会。命中关键是朝向：唯一成功样本 `trace-20261029-213506` t=558 出手距 4.7m、朝向偏 4°，此前落空的远投偏 ~13°（插件门槛 0.97≈14°）。现在出手距 3~5m、路径只过可走地板且无别的厨师、`aim_dot=0.996`（≈5°，5m 横偏 0.44m）、`strict`（超时没对准就不投）。投偏/没对准写 20s 冷却，期间这口灶走过去放；投偏的料先从地上捡回再放。
 - 插件 `ThrowCommand` 新增可选字段 `aim_dot` / `strict` / `face_timeout_ms`，对准要连续 2 帧满足；缺省行为不变（旧 Python 不受影响）。
 - **待实机标定**：出手距离带 3~5m（近距离料可能还在上升段越过锅）、0.996 门槛下小推杆转身能否稳定对准（`aim timeout` 多就放宽到 0.993）、冷却时长。
 

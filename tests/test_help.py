@@ -4,9 +4,9 @@ import json
 import os
 
 from ai.dialog.duties import Ledger
-from ai.dialog.help import (HELP_THRESHOLD_STEPS, FrontierStep, _rescue_for_help,
-                            cost_to, frontier_steps, p1_saves_enough,
-                            top_help_request)
+from ai.dialog.help import (HELP_THRESHOLD_STEPS, FrontierStep, _help_rank_key,
+                            _rescue_for_help, cost_to, frontier_steps,
+                            p1_saves_enough, top_help_request)
 from ai.query import predicates as P
 from ai.query.recipes import RecipeBook
 from ai.state import blackboard as BB
@@ -74,6 +74,20 @@ def test_frontier_only_upstream_ready():
     assert not any(s.task_type == "Chop" and s.item == "potato" for s in steps)
 
 
+def test_frontier_keeps_step_when_source_held(monkeypatch):
+    # 料被拿在手里（source 定位不到）时，步骤仍是「需要做」，留在前沿、
+    # 成本记 None；这样 help_request duty 不会因「被拿着」而误剪。
+    import ai.dialog.help as help_mod
+    w, book, bb, _ = _rapids_world_book_ledger()
+    monkeypatch.setattr(help_mod, "_source_for", lambda *a, **k: None)
+    steps = frontier_steps(w, bb, book, w.orders, {}, {})
+    by = {(s.task_type, s.item): s for s in steps}
+    assert ("FetchToBoard", "potato") in by
+    assert by[("FetchToBoard", "potato")].source is None
+    assert by[("FetchToBoard", "potato")].p1_cost is None
+    assert by[("FetchToBoard", "potato")].p2_cost is None
+
+
 def test_rescue_for_help_skips_rescue_types():
     class _T(object):
         TYPE = "RescueCooked"
@@ -105,6 +119,17 @@ def test_top_help_request_skips_already_requested():
     assert got is None or (got.task_type, got.item) != ("FetchToBoard", "potato")
 
 
+def test_top_help_request_cooldown_suppresses_repeat_after_prune():
+    # duty 被剪枝（该步已解决）后，同一步在冷却期内不应立刻复读。
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    first = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert first is not None
+    ledger.add_help_request(first.task_type, first.item, tick=0)
+    ledger.prune_help_requests(set())          # 清掉 help_request duty
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is None or (got.task_type, got.item) != (first.task_type, first.item)
+
+
 def test_source_for_take_cooked_uses_cooker():
     from ai.dialog.help import _source_for
     class _T(object):
@@ -134,6 +159,22 @@ def test_top_help_request_prunes_resolved_duty():
     assert ledger.help_request_ids() == []
 
 
+def test_top_help_request_keeps_duty_when_step_needed_but_not_cheaper():
+    # mine24 出生帧：前沿步骤 P1 只近 3~5 步（<8），不构成「更划算」，
+    # 但步骤仍需做；已有求助 duty 不应因此被剪掉（否则会反复喊）。
+    fp = os.path.join(os.path.dirname(__file__), "fixtures", "mine",
+                      "mine24-20261031-230344-burrito.ndjson.gz")
+    with gzip.open(fp, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    w = W.World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    ledger = Ledger()
+    ledger.add_help_request("FetchToCooker", "boiledrice", tick=0)
+    assert ledger.help_request_ids()
+    top_help_request(w, BB.Blackboard(), book, w.orders, {}, {}, ledger)
+    assert ledger.help_request_ids() != []
+
+
 def test_top_help_request_silent_in_mine24_spawn():
     # Mine_2_4 出生帧：肉/饭 P1 只近 3~5 步（<8），连通图不喊
     fp = os.path.join(os.path.dirname(__file__), "fixtures", "mine",
@@ -144,3 +185,27 @@ def test_top_help_request_silent_in_mine24_spawn():
     book = RecipeBook(w.recipes, w.stations)
     assert top_help_request(w, BB.Blackboard(), book, w.orders, {}, {},
                             Ledger()) is None
+
+
+def test_frontier_step_carries_order_id():
+    w, book, bb, _ = _rapids_world_book_ledger()
+    steps = frontier_steps(w, bb, book, w.orders, {}, {})
+    assert steps
+    order_ids = {str(o.get("id")) for o in w.orders}
+    for s in steps:
+        assert s.order_id is not None
+        assert str(s.order_id) in order_ids
+
+
+def test_help_rank_key_orders_by_slack():
+    urgent = FrontierStep("FetchToCooker", "rice", None, 2, 10, order_id="1")
+    calm = FrontierStep("FetchToBoard", "prawn", None, 2, 10, order_id="2")
+    slack_map = {"1": 10.0, "2": 100.0}
+    assert _help_rank_key(urgent, slack_map) < _help_rank_key(calm, slack_map)
+
+
+def test_help_rank_key_blocking_first():
+    blocking = FrontierStep("FetchToBoard", "potato", None, 3, None, order_id="1")
+    urgent = FrontierStep("FetchToCooker", "rice", None, 2, 10, order_id="1")
+    slack_map = {"1": 10.0}
+    assert _help_rank_key(blocking, slack_map) < _help_rank_key(urgent, slack_map)

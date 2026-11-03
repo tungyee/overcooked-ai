@@ -803,11 +803,11 @@ def test_precise_goto_no_nudge_near_center_or_when_throwable(frame_offcenter):
 
 
 def test_throw_trees_use_precise_goto():
-    from ai.primitives.throw import ThrowIntoCooker
+    from ai.primitives.throw import ThrowOntoStation
     seq = _throw_shroom().build().child
     goto = next(ch for ch in seq.children if isinstance(ch, PR.GoToCell))
     assert goto.precise is True
-    pot = ThrowIntoCooker(lambda c: None, lambda c: True, lambda c: False, "k")._build_child()
+    pot = ThrowOntoStation(lambda c: None, lambda c: True, lambda c: False, "k")._build_child()
     assert next(ch for ch in pot.children if isinstance(ch, PR.GoToCell)).precise is True
 
 

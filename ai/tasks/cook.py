@@ -271,12 +271,12 @@ class FetchToCooker(Task):
                     wait_pred=arrived, wait_timeout=CONVEYOR_WAIT_TICKS)
 
             def drop():
-                # 最后几步：离锅还远、能直线投进时精准投进锅（ThrowIntoCooker），
+                # 最后几步：离锅还远、能直线投进时精准投进锅（ThrowOntoStation），
                 # 否则 / 投偏后走过去放。投偏料落在锅附近地上，先捡回来再放
                 # （ingredient_source 散落优先于料箱），不回料箱重取。
                 station = lambda x: cooker_station(x, cooker_id)  # noqa: E731
                 return Selector([
-                    PR.ThrowIntoCooker(station, holding, placed, cooker_id),
+                    PR.ThrowOntoStation(station, holding, placed, cooker_id),
                     Sequence([
                         Selector([Condition(holding), pickup()]),
                         PR.InteractWith(station, "placement", placed),

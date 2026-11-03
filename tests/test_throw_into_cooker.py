@@ -1,4 +1,4 @@
-"""下锅最后几步改成投进锅（ThrowIntoCooker）：几何、门槛、真实帧行为、命令字段。
+"""下锅最后几步改成投进锅（ThrowOntoStation）：几何、门槛、真实帧行为、命令字段。
 
 真实帧：tests/fixtures/balloon/balloon23-20261029-213506.ndjson.gz（Balloon_2_3）
   [0] t=105 P2 拿着意面在 (17.4,-13.2)，离 2 号锅 7.8m —— 该先走到 3~5m 出手位
@@ -70,7 +70,7 @@ def _node():
         cc = cooker_state(c, POT2)
         return "pasta" in str((cc or {}).get("pot_contents")).lower()
 
-    return PR.ThrowIntoCooker(lambda c: cooker_station(c, POT2), holding, placed, POT2)
+    return PR.ThrowOntoStation(lambda c: cooker_station(c, POT2), holding, placed, POT2)
 
 
 # ---------------------------------------------------------------- 几何

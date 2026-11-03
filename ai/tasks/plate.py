@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
-from ai.query.placement import counter_occupied
+from ai.query.placement import counter_cell_now, counter_occupied
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
                            plate_cell, plate_on_counter, station_at_cell)
@@ -179,10 +179,18 @@ class PlaceCleanPlate(Task):
             # -34858 去摆 -34158）。
             return P.holds_plate(c["chef"], plate_by_id(c, plate_id))
 
+        def excluded(c):
+            # 清手落点排除本 task 的目标拼装格：手里端着别的料（如 Pasta）时，
+            # EnsureHandsFree 就近落点正好是这块台面，把料丢回去 → 台面被占 →
+            # 本 task 不可行 → 与 ThrowBatch 振荡（trace-20261103-221421
+            # t=4287~4354）。移动台面每帧按站点重投影，取本帧格。
+            cur = counter_cell_now(c["w"], cell)
+            return {tuple(cur)} if cur is not None else set()
+
         return PR.Timeout(Sequence([
             # 树首清手：被抢占时手里可能端着上一 task 的东西（spec §7.4）；
-            # keep：手里已经是这块盘就别放下再捡
-            PR.EnsureHandsFree(keep=holding_bound),
+            # keep：手里已经是这块盘就别放下再捡；exclude：别丢回目标拼装格。
+            PR.EnsureHandsFree(keep=holding_bound, exclude=excluded),
             PR.InteractWith(
                 lambda c: plate_by_id(c, plate_id), "pickup", holding_bound),
             PR.InteractWith(

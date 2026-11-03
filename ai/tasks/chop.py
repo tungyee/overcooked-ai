@@ -176,6 +176,15 @@ class FetchToBoard(Task):
         def drop():
             return PR.InteractWith(board, "placement", placed)
 
+        def place_or_throw():
+            # 手里有料、离砧板还远时先试投上板（ThrowOntoStation），门槛不过
+            # （冷却中 / 省不了几步 / 没出手位）或投偏 → 退回走过去放。与下锅
+            # 的 ThrowOntoStation 同构：投偏退行走，不额外跑去捡散料。
+            return Selector([
+                PR.ThrowOntoStation(board, holding, placed, board_id),
+                drop(),
+            ])
+
         def board_empty(c):
             return not P.board_item(c["w"].workstations, str(board_id))
 
@@ -214,13 +223,13 @@ class FetchToBoard(Task):
                 Condition(source_is_crate),
                 PR.EnsureHandsFree(keep=holding),
                 PR.InteractWith(crate, "pickup", holding),
-                drop(),
+                place_or_throw(),
             ]),
             # 分支3：生料已在手上（pickup 靠 expect 短路）→ 直接放上砧板
             Sequence([
                 PR.EnsureHandsFree(keep=holding),
                 pickup(),
-                drop(),
+                place_or_throw(),
             ]),
         ])]), TASK_TIMEOUT_TICKS)
 

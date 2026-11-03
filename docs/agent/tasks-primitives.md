@@ -35,7 +35,7 @@
 
 `FetchToBoard` 腾板（`chop.py`）：砧板上是**产物**（`book.needs_chopping` 为假：切好的料、切出来的饼……不按物料特判）、没人在切、P2 够得着、不是分割地图的共享砧板（`T.board_clearable`）时，树首先空手拿起板上的东西放到就近空台面，再取料上板。候选生成（`recipe_graph._inst_fetch_board`）只在 P2 够得着的空板一块都没有时才给可腾的板发候选。还没切的生料不腾（那是 `Chop` 的输入）。
 
-连通地图的「投进锅」不走 ThrowBatch：`FetchToCooker` / `FillCooker` 单料路径的下锅一步是 `Selector[ThrowIntoCooker, 走过去 placement]`，见下表 `ThrowIntoCooker`。
+连通地图的「投进锅」不走 ThrowBatch：`FetchToCooker` / `FillCooker` 单料路径的下锅一步是 `Selector[ThrowOntoStation, 走过去 placement]`，见下表 `ThrowOntoStation`。
 
 另有第 18 号 `FillCooker`（`cook.py`，继承 `FetchToCooker`）：**订单无关**的填灶，
 `order_id` 恒为 None，谓词是纯世界谓词（空灶 + 熟料缺口 > 0）。它存在的理由是
@@ -59,11 +59,11 @@
 | `WaitUntil` | **不发任何命令**等到 `pred` 成立（端盘在锅前等饭熟）。（`timeout` 必须显式传） |
 | `HoldUntil` | 发 `hold` 命令直到 `pred` 成立（切菜/喷灭火器/洗盘）。语义早停：`pred` 成立即 SUCCESS（插件只负责按住 + 位置重验 + timeout） |
 | `TapWhileHolding` | 单击的同时把反向顶带键并入 `tap` 命令的 `hold_dir`（传送带顶位专用，防被推走） |
-| `EnsureHandsFree` | 手里有东西就放到就近合法落点，**幂等**。落点物料感知：空锅回灶、熟锅/糊锅不上灶；`home_cooker=False` 关掉归位（灭火端下来的锅只去台面/地上，否则会被当空灶放回去继续烧） |
+| `EnsureHandsFree` | 手里有东西就放到就近合法落点，**幂等**。落点物料感知：空锅回灶、熟锅/糊锅不上灶；`home_cooker=False` 关掉归位（灭火端下来的锅只去台面/地上，否则会被当空灶放回去继续烧）；`exclude(ctx)->Set[(gx,gz)]` 追加禁区格（摆盘 task 用它排除自己的目标拼装格，避免把端着的料丢回目标台面再振荡） |
 | `InteractWith` | 复合 = Approach + (Face) + Tap + Confirm。（`expect` 必传，漏给即 TypeError） |
 | `GoToCell` | 走到指定格（投掷出手位），首拍定格、move 回 ok 即成功。（不是「目标旁交互位」，与 `Approach` 区分；站在漂流平台上不追每拍新格） |
 | `ThrowTo` | `throw` 命令投掷手持可投掷物，只校验离手。插件 0.21 起朝向闭环（`dot>0.97` 才按、0.6s 内确认手空）。射程固定 ≈7.5m，落点由出手站位决定（`ai/space/throw.py`），不由原语控制。可选 `aim_dot` / `strict` / `face_timeout_ms`（插件 0.23.2+）：更严的朝向门槛、没对准就失败不投、转向时限 |
-| `ThrowIntoCooker` | 下锅最后几步改成投：拿着料、离锅远时走到 3~5m（`space.throw.POT_THROW_MIN/MAX`）外一个直线无遮挡（只过可走地板、无别的厨师）的格，`ThrowTo(aim_dot=0.996≈5°, strict)` 投出，`WaitUntil` 锅收下。锅接料靠触发器（飞行中穿过、能收这种料就收），不必落进锅。门槛：不在冷却、手上有料且锅还没收、比走到锅旁至少省 `POT_THROW_SAVE_CELLS` 格。投偏/没对准 → 写 `bb.pot_throw_cooldown[灶]`（20s）并 FAILURE，调用方先捡回地上那份再走过去放 |
+| `ThrowOntoStation` | 下锅/上砧板最后几步改成投：拿着料、离目标站（灶/砧板）远时走到 3~5m（`space.throw.POT_THROW_MIN/MAX`）外一个直线无遮挡（只过可走地板、无别的厨师）的格，`ThrowTo(aim_dot=0.996≈5°, strict)` 投出，`WaitUntil` 站收下。锅接料靠触发器（飞行中穿过、能收这种料就收），不必落进锅；砧板同理。门槛：不在冷却、手上有料且站还没收、比走到站旁至少省 `POT_THROW_SAVE_CELLS` 格。投偏/没对准 → 写 `bb.pot_throw_cooldown[站]`（20s）并 FAILURE，调用方先捡回地上那份再走过去放 |
 | `Timeout` | task 级超时装饰，超时 halt 子树转 FAILURE 交还 Planner |
 | `MarkBlocked` / `AbandonTarget` | 三级脱困的 L1/L3，**这两个节点本身仍预留未接线**（但 L1 的拉黑机制已有消费方：`AlignToCell` 写 `scratch.bad_pairs`、`Approach` 读它，是第一条真正接线的脱困路径）。实际脱困靠两处：`HoldUntil` 的位置自愈，以及 Agent 的连续失败计数（同一 task 连败 `ABANDON_FAIL_STREAK=3` → 写 `scratch.abandoned`，`filter_feasible` 跳过该候选，TTL 200 拍）。**灭火是例外**：`Extinguish` 声明 `NO_ABANDON`、`plan_firefighting` 传 `ignore_abandon=True`——拉黑按资源 id 记，别的 task 在同一口灶上反复失败会把着火的那口灶也写进去 |
 

@@ -895,6 +895,7 @@ class Agent:
             "p2_options": options,
             "duties": self._duty_rows(world, kitchen, tick),
             "dag": kitchen.render(),
+            "division": _open_division_payload(world, self.bb),
             "dish_dags": {dish: kitchen.render([dish], shared=False)
                           for dish in kitchen.dags},
             "tools": tools,

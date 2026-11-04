@@ -305,3 +305,17 @@ def test_assistant_and_tool_messages_round_trip():
     tool = tool_message("c1", {"ok": True, "id": "a1"})
     assert tool["role"] == "tool" and tool["tool_call_id"] == "c1"
     assert json.loads(tool["content"]) == {"ok": True, "id": "a1"}
+
+
+def test_render_state_includes_reachable_division():
+    """世界状态里要有「你能做的动作 / P1 能做的动作」，防止 LLM 抢够不着的活。"""
+    text = render_state({
+        "division": {"p2_actions": ["切"], "p1_actions": ["下锅", "装盘", "送餐"]},
+    })
+    assert "你能做的动作（够得着的）：切" in text
+    assert "P1 能做的动作：下锅、装盘、送餐" in text
+
+
+def test_render_state_omits_division_when_none():
+    text = render_state({})
+    assert "你能做的动作" not in text

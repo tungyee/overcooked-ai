@@ -606,7 +606,7 @@ def tool_schemas(targets=None, duty_ids=None):
     """
     props = {
         "op": {"type": "string", "enum": list(OPS),
-               "description": "add 新增（同一 action 已有约定时就是改写它）；cancel 撤销（按 mode+action+item 定位）"},
+               "description": "add 新增（同一 action 已有约定时就是改写它）；cancel 撤销这个 action 的约定"},
         "mode": {"type": "string", "enum": list(MODES),
                  "description": "now=马上去（一次性）；assign=分工（持续，带 direction）；stop=先别做（30 秒自动解除）"},
         "action": {"type": "string", "enum": list(ACTION_TASK_TYPES),

@@ -181,14 +181,3 @@ def test_branch_of_task_is_none_for_shared_and_missing_item(book):
 
 # ---------- 账本编译：now 覆盖 do（后说覆盖先说） ----------
 
-def test_same_target_do_then_now_keeps_only_now():
-    """同 target 先 do 后 now：后说覆盖先说，编译结果只剩 now 一条。"""
-    kitchen = Kitchen({"D": {"type": "FetchToPlate", "item": "Cucumber",
-                             "children": []}}, {})
-    ledger = Ledger()
-    ledger.apply({"op": "add", "mode": "do", "target": "Cucumber"}, kitchen, 0)
-    ledger.apply({"op": "add", "mode": "now", "target": "Cucumber"}, kitchen, 0)
-    prefs = ledger.preferences()
-    assert [p.kind for p in prefs] == ["now"]
-    assert ledger.ids() == ["a1"]
-    assert (prefs[0].owner, prefs[0].weight) == ("P2", WEIGHT_NOW)

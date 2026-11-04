@@ -583,6 +583,15 @@ class Agent:
                 results.append({"ok": False, "reason": "参数不是合法 JSON"})
                 continue
             if name == "update_duties":
+                if isinstance(args, dict):
+                    action = args.get("action")
+                    direction = args.get("direction") or "P2"
+                    if action is not None:
+                        ok, reason = _validate_action(kitchen, action,
+                                                      direction, world, self.bb)
+                        if not ok:
+                            results.append({"ok": False, "reason": reason})
+                            continue
                 result = self.ledger.apply(args, kitchen, tick,
                                            source=getattr(batch, "source", ""))
             else:

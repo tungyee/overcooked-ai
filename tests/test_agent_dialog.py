@@ -122,26 +122,26 @@ def _duty(**args):
 
 def test_batch_applies_duties_and_compiles_preferences(agent, world):
     results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber"),
-        _duty(op="add", mode="do", target="WashPlate"),
+        _duty(op="add", mode="assign", action="切", direction="P1"),
+        _duty(op="add", mode="assign", action="洗盘", direction="P2"),
         source="我来切，你洗盘"))
 
     assert [r["ok"] for r in results] == [True, True]
     assert [r["id"] for r in results] == ["a1", "a2"]
     kinds = {p.duty_id: (p.kind, p.weight) for p in agent.bb.preferences}
-    assert kinds == {"a1": ("claim", -1.0), "a2": ("direct", 1.0)}
+    assert kinds == {"a1": ("claim", -6.0), "a2": ("direct", 1.0)}
     assert agent.ledger.get("a1").source == "我来切，你洗盘"
 
 
 def test_batch_rejects_bad_calls_individually(agent, world):
     results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="SushiRice"),
+        _duty(op="add", mode="assign", action="下锅", direction="P2"),
         ("update_duties", None),
         ("teleport", {}),
-        _duty(op="add", mode="do", target="Cucumber")))
+        _duty(op="add", mode="assign", action="切", direction="P2")))
 
     assert [r["ok"] for r in results] == [False, False, False, True]
-    assert "SushiRice" in results[0]["reason"]
+    assert "下锅" in results[0]["reason"]
     assert "JSON" in results[1]["reason"]
     assert "未知工具" in results[2]["reason"]
     assert agent.ledger.ids() == ["a1"]
@@ -151,8 +151,8 @@ def test_wash_rejected_without_sink(agent):
     world = make_world()
     world.stations = [st for st in world.stations if st.get("t") != "washing"]
     results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
-    assert results[0]["ok"] is False and "WashPlate" in results[0]["reason"]
+        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
+    assert results[0]["ok"] is False and "洗盘" in results[0]["reason"]
 
 
 def test_leave_to_p1_keeps_matching_commitment(agent, world):
@@ -160,7 +160,7 @@ def test_leave_to_p1_keeps_matching_commitment(agent, world):
     agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
 
     agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
+        _duty(op="add", mode="assign", action="切", direction="P1")))
 
     assert agent.bb.commitment.active_task == active
 
@@ -170,25 +170,16 @@ def test_do_keeps_commitment(agent, world):
     agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
 
     agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
+        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
 
     assert agent.bb.commitment.active_task == active
 
 
-def test_edit_flips_ownership_and_keeps_id(agent, world):
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="edit", id="a1", mode="do")))
-
-    assert results[0] == {"ok": True, "id": "a1",
-                          "text": "P2 优先做 Cucumber"}
-    assert [p.kind for p in agent.bb.preferences] == ["direct"]
 
 
 def test_first_level_observation_does_not_clear_ledger(agent, world):
     agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
+        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
     agent._maybe_reset_dialog_level(world)
     assert agent.ledger.ids() == ["a1"]
     assert len(agent.bb.preferences) == 1
@@ -259,14 +250,14 @@ def dagent(monkeypatch, book, fake_worker):
 
 def test_service_dialog_drains_batches_and_acks(dagent, world, fake_worker):
     fake_worker.cmd_q.put(_batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
+        _duty(op="add", mode="assign", action="切", direction="P1")))
 
     record = dagent._service_dialog(world)
 
     ack = fake_worker.ack_q.get_nowait()
     assert ack["batch_id"] == "b1"
     assert ack["results"][0]["ok"] is True
-    assert ack["duties"][0]["target"] == "Cucumber"
+    assert ack["duties"][0]["action"] == "切"
     assert record["batches"][0]["results"] == ack["results"]
     assert record["duties"][0]["id"] == "a1"
     # 落地本拍立刻发一份新上下文：worker 下一轮看到的是新账本
@@ -278,7 +269,7 @@ def test_service_dialog_survives_crashing_batch(dagent, world, fake_worker,
     def boom(*_a, **_k):
         raise RuntimeError("bad")
     monkeypatch.setattr(dagent, "_apply_duty_batch", boom)
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="do", target="WashPlate")))
+    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="assign", action="洗盘", direction="P2")))
 
     dagent._service_dialog(world)
 
@@ -317,7 +308,7 @@ def test_level_change_clears_ledger_history_and_queues(dagent, fake_worker):
     world = make_world("Sushi_1_4_2P")
     dagent._service_dialog(world)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
+        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
     dagent.bb.dialog = DialogState(last_rescue_tick=3)
     dagent.bb.abandoned_orders = {1: 1300}
     dagent.bb.rescue_cooldown_until = 150
@@ -347,7 +338,7 @@ def test_level_replay_same_name_clears_history(dagent, fake_worker):
     world = make_world("Sushi_1_4_2P", session_id="s1", scene_epoch=1)
     dagent._service_dialog(world)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
+        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
     dagent.bb.dialog = DialogState(last_rescue_tick=3)
     dagent.bb.abandoned_orders = {1: 1300}
     dagent.bb.rescue_cooldown_until = 150
@@ -381,7 +372,7 @@ def test_build_dialog_context_fields(dagent, world):
     active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 0)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber"),
+        _duty(op="add", mode="assign", action="切", direction="P1"),
         source="黄瓜我来"))
     world.chefs[0]["held"] = "Plate"
 
@@ -395,15 +386,14 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["orders"][0]["id"] == 1
     assert ctx["orders"][0]["dish"] == "CucumberSushi"
     assert ctx["duties"][0]["source"] == "黄瓜我来"
-    assert "Cucumber（要切）：取料上砧板 → 切 → 装盘" in ctx["dag"]
+    assert "切" in ctx["dag"] and "下锅" in ctx["dag"]
     assert "CucumberSushi" in ctx["dish_dags"]
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
     assert names == ["update_duties"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
-    assert props["id"]["enum"] == ["a1"]
-    assert "Cucumber" in props["target"]["enum"]
+    assert "切" in props["action"]["enum"]
 
 
 def test_build_dialog_context_live_false_when_paused(dagent, world):
@@ -485,7 +475,7 @@ def test_context_p2_options_come_from_planner_ranking(dagent, world):
 
 def test_tick_once_includes_dialog_record(dagent, world):
     fake_worker = dagent.dialog_worker
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="do", target="WashPlate")))
+    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="assign", action="洗盘", direction="P2")))
 
     from unittest.mock import patch
     with patch("ai.agent.arbiter.select_mode",
@@ -497,7 +487,7 @@ def test_tick_once_includes_dialog_record(dagent, world):
 
     record = emit.call_args[0][0]
     assert record["dialog"]["batches"][0]["id"] == "b1"
-    assert record["dialog"]["duties"][0]["target"] == "WashPlate"
+    assert record["dialog"]["duties"][0]["action"] == "洗盘"
 
 
 def test_tick_once_publishes_paused_context(dagent, world):

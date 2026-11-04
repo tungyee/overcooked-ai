@@ -133,3 +133,30 @@ def _row(record, task):
 
 # --------------------------------------------------------- 场景 1：送餐
 
+
+
+# ------------------------------------------------- 动作级端到端（重构后）
+
+def test_action_division_reaches_planner(monkeypatch):
+    """动作级分工走完整链：判 + apply + 编译偏好 + planner 在同一黑板重选。"""
+    path = _fixture_path()
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        frame = json.loads(f.readlines()[-1])
+    world = World(frame)
+    agent = _make_agent(monkeypatch, world)
+
+    # P2 负责切、P1 负责下锅
+    assert _apply(agent, world, op="add", mode="assign", action="切",
+                  direction="P2")["ok"] is True
+    assert _apply(agent, world, op="add", mode="assign", action="下锅",
+                  direction="P1")["ok"] is True
+
+    # 偏好编译：切=direct(+1)、下锅=claim(-6)
+    kinds = {p.kind: p.weight for p in agent.bb.preferences}
+    assert kinds.get("direct") == 1.0
+    assert kinds.get("claim") == -6.0
+
+    # planner 在同一黑板上重新选，能出结果（偏好已就位、链路不崩）
+    chosen, record = planner.plan(world, agent.bb, None, agent.book)
+    assert chosen is not None

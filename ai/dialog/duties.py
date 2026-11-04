@@ -1,31 +1,24 @@
-"""分工账本：本关物料目录、作用域、账本条目与 op 应用。
+"""分工账本：动作级作用域、账本条目与 op 应用。
 
-LLM 只通过 `update_duties` 工具改账本：`add` / `edit` / `remove` 三种 op，
-每条只描述 **P2 自己**的行为（mode）：
+LLM 只通过 `update_duties` 工具改账本：`add` / `cancel` 两种 op，每条描述
+「做什么**动作**」和「什么**性质**」（mode）：
 
-- `do`          —— P2 优先做（「你负责 X」「X 归你」），有空就做；
-- `now`         —— P2 马上去（「去 X」「马上 X」「先 X」「现在 X」「帮我 X」）；
-- `leave_to_p1` —— P1 优先做，P2 尽量避开，但订单收尾需要时可以补位；
-- `stop`        —— P2 先别做（「先别 X」「别做 X」），30 秒后自动解除。
+- `now`    —— P2 马上去（一次性，做完即失效）；
+- `assign` —— 分工（带 direction）：`P2`=你负责做，`P1`=交给 P1（P2 避开、
+             订单收尾时系统可补位）；
+- `stop`   —— P2 先别做，30 秒后自动解除。
 
-「做什么」= `target`，只有两类：
+「做什么」= `action`，6 个动作之一（切/下锅/拌/装盘/送餐/洗盘，对应砧板/
+灶/搅拌站/盘/出餐口/洗碗池），定义见 `ai/dialog/actions.py`。**不按物料认领**
+（物料链横跨多个动作、归多人）。取料/投掷/救援不开放认领：由 planner 按
+可达性/物理证据决定。
 
-- **物料**：本关各道菜配方 DAG 根下的直接成分（`Cucumber`、`BoiledSushiRice`
-  …），代表这种料的**整条加工链**：取料、切、下锅、盛盘、装盘，以及同 item
-  的预取 / 填灶。作用域是这棵子树里出现的 item 名集合（含中间产物，如意面链
-  里的 Tomato），按 `task.item` 匹配候选；
-- **共享动作**：task 类声明 `SHARED` 的类型（洗盘 / 摆盘 / 送餐），不分菜，
-  按 task 类型匹配；`STATION` 声明的站点本关没有时不进目录。
+同一 `(mode, action)` 再次 add 就是改写它；`cancel` 撤销这个动作的约定。
+重叠时新条目优先（旧条目 `Preference.exclude` 掉新条目的作用域）。
 
-灭火等救援动作不开放认领：由 arbiter / planner 按物理证据决定。
-
-同一 target 只有一条约定：再次 add 就是改写它。不同物料的 item 集合重叠时
-（两道菜共用中间产物），**新条目优先**：编译偏好时旧条目扣掉被新条目覆盖的
-item（`Preference.exclude`）。
-
-本模块只依赖标准库与 `ai.dialog.schema`；RecipeBook 按鸭子类型读，DAG 编译
-函数与 task 元数据由调用方注入（避免 `ai.dialog` 反向导入 `ai.query` /
-`ai.tasks`）。
+本模块只依赖标准库、`ai.dialog.schema` 与 `ai.dialog.actions`；RecipeBook
+按鸭子类型读，DAG 编译函数与 task 元数据由调用方注入（避免反向导入
+`ai.query` / `ai.tasks`）。
 """
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple

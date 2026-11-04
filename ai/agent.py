@@ -512,7 +512,6 @@ class Agent:
 
         self._dialog_scene_key = None  # 上次观察到的场景身份 (session_id, scene_epoch, level)；换关清账本
         self._seen_orders = {}         # 本关见过的菜 → 首张订单（新菜只说一次）
-        self._seen_materials = set()   # 本关已分配过的物料（新单无新物料则不播）
         self._last_seconds_fired = False   # 最后 10 秒提醒只发一次
         self._round_summary_fired = False  # 结束总结只发一次
         self._round_started = False        # 计时器是否跑过（区分未开局/已结束）
@@ -654,19 +653,6 @@ class Agent:
         self._last_help_request_tick = tick
         return {"task_type": step.task_type, "item": step.item}
 
-    def _maybe_emit_task_switch(self, old_key, new_key, tick=None):
-        # type: (Optional[tuple], tuple, Optional[int]) -> Optional[tuple]
-        """承诺换到显著不同的事（跨 task 类型/物料）→ 发 task_switch 事件。"""
-        if old_key is None or old_key == new_key:
-            return None
-        tick = tick if tick is not None else (self.bb.tick or 0)
-        if tick - getattr(self, "_last_task_switch_tick", 0) < 80:
-            return None
-        self._last_task_switch_tick = tick
-        event = ("task_switch", {"task_type": new_key[0], "item": new_key[1]})
-        self._put_event(event)
-        return event
-
     def _maybe_reset_dialog_level(self, world):
         # type: (World) -> None
         """换关卡时清空账本与对话历史（spec §4.7 / §6.3）。
@@ -696,7 +682,6 @@ class Agent:
         self.bb.abandoned_orders = {}
         self.bb.rescue_cooldown_until = 0
         self._seen_orders = {}
-        self._seen_materials = set()
         self._last_seconds_fired = False
         self._round_summary_fired = False
         self._round_started = False
@@ -1132,9 +1117,9 @@ class Agent:
         if status == "success":
             success_task = chosen_task  # 保存成功的 task（trace 记录用）
             self._note_success(chosen_task)
-            # 「马上去」落实**成功**才降级成 do：失败不降，now 的紧迫性保留到
-            # 下次重试。执行期间由 planner 层去抖兜住（当前承诺命中 now 时
-            # 闸不再抢选），这里只做终态消费。
+            # 「做」（now）落实成功才消费：失败不删，now 的紧迫性保留到下次重试。
+            # 执行期间由 planner 层去抖兜住（当前承诺命中 now 时闸不再抢选），
+            # 这里只做终态消费（一次性删除，不持久）。
             if chosen_task and self.ledger.consume_now(chosen_task):
                 self.bb.preferences[:] = self.ledger.preferences()
             if chosen_task and hasattr(chosen_task, "claims"):

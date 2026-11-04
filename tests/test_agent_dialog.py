@@ -832,8 +832,8 @@ def test_open_division_payload_proximity_split(monkeypatch):
     payload = A._open_division_payload(w, None)
 
     assert payload is not None
-    assert set(payload["p1_actions"]) == {"切", "洗盘"}
-    assert set(payload["p2_actions"]) == {"下锅", "装盘", "送餐"}
+    assert set(payload["p1_actions"]) == {"切"}
+    assert set(payload["p2_actions"]) == {"下锅", "装盘"}
 
 
 def test_open_division_payload_falls_back_when_equidistant(monkeypatch):
@@ -849,8 +849,31 @@ def test_open_division_payload_falls_back_when_equidistant(monkeypatch):
     payload = A._open_division_payload(w, None)
 
     assert payload is not None
-    assert set(payload["p1_actions"]) == {"切", "洗盘"}
-    assert set(payload["p2_actions"]) == {"下锅", "装盘", "送餐"}
+    assert set(payload["p1_actions"]) == {"切"}
+    assert set(payload["p2_actions"]) == {"下锅", "装盘"}
+
+
+def test_open_division_skips_deliver_and_wash(monkeypatch):
+    """洗碗、送餐不进开局分工：不 assign 给 P1，避免 P2 因此避开。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+        {"t": "mixing", "n": "mixer_s1", "gx": 3, "gz": 3},
+    )
+    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 5)  # 全部等距
+
+    payload = A._open_division_payload(w, None)
+
+    assert payload is not None
+    all_actions = set(payload["p1_actions"]) | set(payload["p2_actions"])
+    assert "送餐" not in all_actions
+    assert "洗盘" not in all_actions
+    # 其余动作仍参与分工
+    assert "切" in all_actions
+    assert "下锅" in all_actions
+    assert "装盘" in all_actions
 
 
 def test_open_division_payload_keeps_unreachable_split(monkeypatch):

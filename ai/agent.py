@@ -347,8 +347,12 @@ def _validate_action(kitchen, action, direction, world, bb):
     return True, ""
 
 
-# 就近不明确时的兜底分工：P2 守灶/盘/出餐口（煮+装+送），P1 守砧板/搅拌/洗碗（备+洗）。
-_P2_DEFAULT_ACTIONS = ("下锅", "装盘", "送餐")
+# 就近不明确时的兜底分工：P2 守灶/盘（煮+装），P1 守砧板/搅拌（备）。
+_P2_DEFAULT_ACTIONS = ("下锅", "装盘")
+
+# 洗碗、送餐不进开局分工：它们被 assign 给 P1 会落 claim(-6)，P2 就避开了；
+# 保持「谁近谁做」，交给 planner 自由选。
+_OPEN_DIVISION_SKIP_ACTIONS = ("送餐", "洗盘")
 
 # 动作站点离一边近多少步才算「明显归这边」；否则走兜底默认分工。
 OPEN_DIVISION_PROXIMITY_STEPS = 6
@@ -367,11 +371,13 @@ def _open_division_payload(world, bb):
     """本关「动作→边」切分；只有不到两个可分工动作时才返回 None。
 
     就近聚类为主：一边够不着归另一边（硬分裂）；两边都够得着时，明显近的一边
-    认领；就近不明确的动作用兜底默认分工（P2 煮装送、P1 切拌洗），保证连通图
-    也总能开一次分工。
+    认领；就近不明确的动作用兜底默认分工（P2 煮装、P1 切拌），保证连通图
+    也总能开一次分工。洗碗、送餐不参与分工（谁近谁做）。
     """
     p1_actions, p2_actions = [], []
     for action, station_type in ACTION_STATION_TYPES.items():
+        if action in _OPEN_DIVISION_SKIP_ACTIONS:
+            continue
         stations = [st for st in world.stations if st.get("t") == station_type]
         if not stations:
             continue

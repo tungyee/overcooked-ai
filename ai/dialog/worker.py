@@ -324,6 +324,20 @@ class DialogClients(object):
     ptt: Any = None
 
 
+def _event_detail(name, payload):
+    # type: (str, Any) -> str
+    """把一个主动事件转成给 LLM 的具体说明（batch 合成用）。"""
+    payload = payload or {}
+    if name == "open_division":
+        return "开局分工建议：P2 负责 %s；P1 负责 %s" % (
+            "、".join(payload.get("p2_actions") or []),
+            "、".join(payload.get("p1_actions") or []))
+    if name == "help_request":
+        return "要请队友帮忙的这一步：%s（%s）" % (
+            payload.get("task_type"), payload.get("item") or "")
+    return ""
+
+
 class DialogWorker(object):
     """语音对话后台 worker（spec §6.2）。"""
 
@@ -1008,10 +1022,7 @@ class DialogWorker(object):
 
     def _handle_event(self, event, context):
         # type: (Any, dict) -> None
-        """主循环投递的主动事件。
-
-        当前只有 `("new_order", ids)`：新菜出现时由 LLM 定新物料分工。
-        """
+        """主循环投递的主动事件。"""
         if not isinstance(event, (tuple, list)):
             log.debug("忽略未知事件: %r", event)
             return
@@ -1022,18 +1033,16 @@ class DialogWorker(object):
         context = context or {}
         tick = int(context.get("tick", 0) or 0)
 
-        if name == "open_division":
-            detail = "开局分工建议：P2 负责 %s；P1 负责 %s" % (
-                "、".join(payload.get("p2_actions") or []),
-                "、".join(payload.get("p1_actions") or []))
+        if name == "batch":
+            # 同一拍多个事件合成一段：把每个子事件的说明拼起来，一次说完。
+            detail = "\n".join(_event_detail(n, p) for n, p in (payload or []))
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
             self._run_llm(context, name, "", timing=timing, event_detail=detail)
             return
-        if name == "help_request":
-            detail = "要请队友帮忙的这一步：%s（%s）" % (
-                payload.get("task_type"), payload.get("item") or "")
+        if name in ("open_division", "help_request"):
+            detail = _event_detail(name, payload)
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())

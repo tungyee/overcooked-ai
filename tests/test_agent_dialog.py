@@ -717,8 +717,34 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     a.bb.tick = 100
     a.book = book
     a._service_dialog(w)
-    assert any(e[0] == "help_request" for e in fake_worker.events)
+    # 事件现在合成 batch：help_request 可能在 batch 里，也可能单独发。
+    assert any(
+        e[0] == "help_request"
+        or (e[0] == "batch" and any(sub[0] == "help_request" for sub in e[1]))
+        for e in fake_worker.events)
     assert a.ledger.help_request_ids()
     assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
 
 
+
+
+def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
+    """同一拍多个主动事件 → 合成一个 batch，而不是各自发（避免队列挤掉）。"""
+    import gzip
+    import json
+    import os
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                           "rapids21-20261028.ndjson.gz")
+    with gzip.open(fixture, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    w = World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    a = Agent(dialog_worker=fake_worker)
+    a.bb.tick = 100
+    a.book = book
+    a._service_dialog(w)
+    assert len(fake_worker.events) == 1
+    assert fake_worker.events[0][0] == "batch"
+    assert {e[0] for e in fake_worker.events[0][1]} == \
+        {"open_division", "help_request"}

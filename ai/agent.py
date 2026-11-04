@@ -736,7 +736,6 @@ class Agent:
             self._open_division_fired = True
             event = _maybe_open_division(world, self.bb)
             if event is not None:
-                self._put_event(event)
                 events.append(event)
 
         # ② drain 工具批次 → 账本落地 → 逐条结果回 worker
@@ -778,16 +777,19 @@ class Agent:
         if (not self._last_seconds_fired and time_left is not None
                 and time_left <= LAST_SECONDS_WARN_S * 20):
             self._last_seconds_fired = True
-            event = ("last_seconds", None)
-            self._put_event(event)
-            events.append(event)
+            events.append(("last_seconds", None))
 
         # ④.6 求助：P1 做某步明显更划算 → 开口 + 挪走（spec §5.2）。
         help_payload = self._maybe_request_help(world, book)
         if help_payload is not None:
-            event = ("help_request", help_payload)
-            self._put_event(event)
-            events.append(event)
+            events.append(("help_request", help_payload))
+
+        # 同一拍的事件合成一段对话：单个直接发，多个合并成 batch，worker 一次说完。
+        if events:
+            if len(events) == 1:
+                self._put_event(events[0])
+            else:
+                self._put_event(("batch", events))
 
         # ⑥ 2 Hz 上下文（20 Hz 主循环 / 10 拍）；有事件时立刻发一份，
         # 让 worker 处理事件时看到的是本拍状态。

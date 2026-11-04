@@ -244,9 +244,11 @@ def test_system_message_carries_rules_and_dag():
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
-    # 口头答应不算数：P1 说「你去X」必须落 now 工具调用
+    # 口头答应不算数：P1 说「你去X」「你负责X」必须落 now，不要 assign
     assert "口头答应不算数" in text
     assert "assign_action(mode=now)" in text
+    assert "不要用 assign" in text
+    assert "你负责X" in text
     # 步骤语义来自目录渲染（task 的 DESC），prompt 里不手写类型清单、不写关卡物料
     assert "DAG 节点类型" not in text
     assert "BoiledSushiRice" not in text.split("本关目录")[0]

@@ -119,8 +119,8 @@ class _RecordingWorker(object):
 
 
 def _apply(agent, world, **args):
-    """落一条 update_duties；返回该条结果 dict。"""
-    batch = DutyBatch(batch_id="t", calls=[("update_duties", args)])
+    """落一条 assign_action；返回该条结果 dict。"""
+    batch = DutyBatch(batch_id="t", calls=[("assign_action", args)])
     return agent._apply_duty_batch(world, batch)[0]
 
 

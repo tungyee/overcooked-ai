@@ -15,7 +15,7 @@ from ai.core import arbiter, executor, planner
 from ai.dialog.actions import ACTION_STATION_TYPES
 from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
-from ai.dialog.help import top_help_request
+from ai.dialog.help import cost_to, top_help_request
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
 from ai.space import (navigation, portals, reachability, regions, seam_clock,
@@ -347,28 +347,57 @@ def _validate_action(kitchen, action, direction, world, bb):
     return True, ""
 
 
+# 就近不明确时的兜底分工：P2 守灶/盘/出餐口（煮+装+送），P1 守砧板/搅拌/洗碗（备+洗）。
+_P2_DEFAULT_ACTIONS = ("下锅", "装盘", "送餐")
+
+# 动作站点离一边近多少步才算「明显归这边」；否则走兜底默认分工。
+OPEN_DIVISION_PROXIMITY_STEPS = 6
+
+
+def _min_interact_cost(world, bb, name, stations):
+    # type: (World, Blackboard, str, list) -> Optional[int]
+    """厨师到一类站点的最短交互步数；全够不着返回 None。"""
+    costs = [cost_to(world, bb, name, st) for st in stations]
+    costs = [c for c in costs if c is not None]
+    return min(costs) if costs else None
+
+
 def _open_division_payload(world, bb):
     # type: (World, Blackboard) -> Optional[Dict[str, List[str]]]
-    """本关「动作→边」切分；无干净切分返回 None。
+    """本关「动作→边」切分；只有不到两个可分工动作时才返回 None。
 
-    对每个动作，判其站点整类归谁（可达性口径）：只有 P2 够得着 → P2；只有
-    P1 够得着 → P1；两边都够得着或分散 → 共享。存在「归 P1」与「归 P2」的
-    动作才返回切分。连通图的就近切分（出生侧聚类）是后续优化，此处先按
-    可达性硬分裂。
+    就近聚类为主：一边够不着归另一边（硬分裂）；两边都够得着时，明显近的一边
+    认领；就近不明确的动作用兜底默认分工（P2 煮装送、P1 切拌洗），保证连通图
+    也总能开一次分工。
     """
     p1_actions, p2_actions = [], []
     for action, station_type in ACTION_STATION_TYPES.items():
         stations = [st for st in world.stations if st.get("t") == station_type]
         if not stations:
             continue
-        p2_ok = all(regions.reachable_by(world, st, bb=bb) for st in stations)
-        p1_ok = all(regions.reachable_by(world, st, P.P1_NAME, bb=bb)
-                    for st in stations)
-        if p2_ok and not p1_ok:
+        p1 = _min_interact_cost(world, bb, P.P1_NAME, stations)
+        p2 = _min_interact_cost(world, bb, P.P2_NAME, stations)
+        if p1 is None and p2 is None:
+            continue
+        if p1 is None:
             p2_actions.append(action)
-        elif p1_ok and not p2_ok:
+        elif p2 is None:
             p1_actions.append(action)
+        elif p1 + OPEN_DIVISION_PROXIMITY_STEPS <= p2:
+            p1_actions.append(action)
+        elif p2 + OPEN_DIVISION_PROXIMITY_STEPS <= p1:
+            p2_actions.append(action)
+        else:
+            target = p2_actions if action in _P2_DEFAULT_ACTIONS else p1_actions
+            target.append(action)
     if p1_actions and p2_actions:
+        return {"p1_actions": p1_actions, "p2_actions": p2_actions}
+    # 只有一边有活：至少两个动作时硬挪一个过去，保证两边都有分工。
+    if len(p1_actions) + len(p2_actions) >= 2:
+        if not p1_actions:
+            p1_actions.append(p2_actions.pop())
+        else:
+            p2_actions.append(p1_actions.pop())
         return {"p1_actions": p1_actions, "p2_actions": p2_actions}
     return None
 
@@ -410,6 +439,16 @@ def _ranked_tasks(plan_record):
         seen.add(text)
         out.append(task)
     return out
+
+
+def _step_is_top(step, ranked):
+    # type: (Any, List) -> bool
+    """求助步骤是否 == planner 打分第一名（按 (TYPE, item) 匹配，忽略 order/站）。"""
+    top = ranked[0] if ranked else None
+    if top is None:
+        return False
+    return (getattr(top, "TYPE", None) == step.task_type
+            and str(getattr(top, "item", None) or "").lower() == step.item)
 
 
 def _stuck_info(bb, world, motion=None):
@@ -581,7 +620,7 @@ class Agent:
             if args is None:
                 results.append({"ok": False, "reason": "参数不是合法 JSON"})
                 continue
-            if name == "update_duties":
+            if name == "assign_action":
                 if isinstance(args, dict) and args.get("op") != "cancel":
                     action = args.get("action")
                     direction = args.get("direction") or "P2"
@@ -623,6 +662,24 @@ class Agent:
                 commitment.infeasible_streak = 0
                 return
 
+    def _land_open_division(self, payload, tick):
+        # type: (Dict, int) -> None
+        """把开局分工直接写进账本：P2 动作 assign(P2)、P1 动作 assign(P1)。
+
+        open_division 之前只是「口头建议」，等 P1 确认才落地；现在一开口就
+        落成软偏好（P2 direct、P1 claim），planner 本拍立刻跟着分工走。
+        """
+        for action in (payload.get("p2_actions") or []):
+            self.ledger.apply(
+                {"op": "add", "mode": "assign", "action": action,
+                 "direction": "P2"},
+                None, tick, source="open_division")
+        for action in (payload.get("p1_actions") or []):
+            self.ledger.apply(
+                {"op": "add", "mode": "assign", "action": action,
+                 "direction": "P1"},
+                None, tick, source="open_division")
+
     def _dialog_matches(self, world, book):
         # type: (World, RecipeBook) -> Tuple[list, Dict, Dict]
         """与 planner.plan 同口径的盘/灶 1:1 匹配（spec §6.4）。"""
@@ -647,6 +704,10 @@ class Agent:
         step = top_help_request(world, self.bb, book, live_orders,
                                 plate_match, cooker_match, self.ledger)
         if step is None:
+            return None
+        # 结构性（P2 够不着）必喊；经济性（P2 够得着）只有它是 P2 当前 #1 才喊，
+        # 否则这一步现在不急、就算 P1 更省力也不打断 P1。
+        if step.p2_cost is not None and not _step_is_top(step, self._last_ranked):
             return None
         self.ledger.add_help_request(step.task_type, step.item, tick)
         self._sync_duty_preferences()      # 挪走立刻落成 claim 偏好，本拍规划可见
@@ -731,11 +792,13 @@ class Agent:
         events = []  # type: list
         tick = self.bb.tick or 0
 
-        # 开局分工：本关第一次算一次「动作→边」切分，有干净切分才开口。
+        # 开局分工：本关第一次算一次「动作→边」切分，一开口就落地。
         if not getattr(self, "_open_division_fired", False):
             self._open_division_fired = True
             event = _maybe_open_division(world, self.bb)
             if event is not None:
+                self._land_open_division(event[1], tick)
+                self._sync_duty_preferences()
                 events.append(event)
 
         # ② drain 工具批次 → 账本落地 → 逐条结果回 worker

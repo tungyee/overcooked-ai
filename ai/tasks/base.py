@@ -97,7 +97,7 @@ class Task(object):
     # - STATION：本关要有这类站点（frame stations[].t）才进目录；
     SHARED = False
     STATION = None      # type: Optional[str]
-    # 共享动作允许的分工档位（update_duties 的 mode）。None = 四档都接受；
+    # 共享动作允许的分工档位（assign_action 的 mode）。None = 四档都接受；
     # 例如送餐设 ("now", "do")：不能「交给 P1」也不能「先别做」——谁在旁边谁送。
     DUTY_MODES = None   # type: Optional[tuple]
     # 手部前置（spec §6.1(b)）：需要什么样的手才能做。"any" / "empty"。

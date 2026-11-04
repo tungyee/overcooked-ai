@@ -16,8 +16,8 @@ from ai.query import recipe_graph
 from ai.revenue import eta as ETA
 from ai.space import reachability
 
-# P1 比 P2 省多少步才值得开口求助（≈0.3 秒/步，8 步 ≈ 2.4 秒 ≈ 半张图）。
-HELP_THRESHOLD_STEPS = 8
+# P1 比 P2 省多少步才值得开口求助（≈0.3 秒/步，12 步 ≈ 3.6 秒 ≈ 大半张图）。
+HELP_THRESHOLD_STEPS = 12
 
 # 料源定位时故意不过滤 P2 可达性：p1/p2 谁更划算由 cost_to 另行比较。
 _SOURCE_ANY = lambda st: True  # noqa: E731

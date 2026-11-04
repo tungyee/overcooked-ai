@@ -114,7 +114,7 @@ def _batch(*calls, source=""):
 
 
 def _duty(**args):
-    return ("update_duties", args)
+    return ("assign_action", args)
 
 
 # ---------------------------------------------------------- 账本落地
@@ -136,7 +136,7 @@ def test_batch_applies_duties_and_compiles_preferences(agent, world):
 def test_batch_rejects_bad_calls_individually(agent, world):
     results = agent._apply_duty_batch(world, _batch(
         _duty(op="add", mode="assign", action="下锅", direction="P2"),
-        ("update_duties", None),
+        ("assign_action", None),
         ("teleport", {}),
         _duty(op="add", mode="assign", action="切", direction="P2")))
 
@@ -391,7 +391,7 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["update_duties"]
+    assert names == ["assign_action"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
     assert "切" in props["action"]["enum"]
 
@@ -726,6 +726,59 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
 
 
+# ------------------------------------------------------- help_request 触发门槛
+
+def _fake_help_step(**kw):
+    from ai.dialog.help import FrontierStep
+    defaults = dict(task_type="FetchToBoard", item="cucumber",
+                    source={"t": "crate"}, p1_cost=5, p2_cost=20,
+                    order_id="1")
+    defaults.update(kw)
+    return FrontierStep(**defaults)
+
+
+def _patch_help_trigger(monkeypatch, dagent, step):
+    monkeypatch.setattr("ai.agent.top_help_request", lambda *a, **k: step)
+    monkeypatch.setattr(dagent, "_dialog_matches", lambda *a, **k: ([], {}, {}))
+    dagent._last_help_request_tick = 0
+
+
+def test_maybe_request_help_requires_p2_top_for_economic(dagent, world, book,
+                                                         monkeypatch):
+    """经济性求助（P2 够得着、P1 省 ≥12 步）只有该步是 P2 #1 才喊。"""
+    step = _fake_help_step()
+    _patch_help_trigger(monkeypatch, dagent, step)
+    dagent._last_ranked = [T.Chop(1, ("board_01",), "Cucumber")]  # #1 是切菜，不是取料
+
+    assert dagent._maybe_request_help(world, book) is None
+    assert dagent.ledger.help_request_ids() == []
+
+
+def test_maybe_request_help_fires_when_economic_step_is_p2_top(dagent, world,
+                                                               book, monkeypatch):
+    step = _fake_help_step()
+    _patch_help_trigger(monkeypatch, dagent, step)
+    dagent._last_ranked = [T.FetchToBoard(1, ("board_01",), "Cucumber")]  # #1 正是取黄瓜
+
+    payload = dagent._maybe_request_help(world, book)
+
+    assert payload == {"task_type": "FetchToBoard", "item": "cucumber"}
+    assert dagent.ledger.help_request_ids()
+
+
+def test_maybe_request_help_fires_structural_without_p2_top(dagent, world,
+                                                            book, monkeypatch):
+    """结构性（P2 够不着）取料仍必喊，不看 P2 是否 #1。"""
+    step = _fake_help_step(item="potato", p2_cost=None)
+    _patch_help_trigger(monkeypatch, dagent, step)
+    dagent._last_ranked = []  # 没有 #1 也喊
+
+    payload = dagent._maybe_request_help(world, book)
+
+    assert payload == {"task_type": "FetchToBoard", "item": "potato"}
+    assert dagent.ledger.help_request_ids()
+
+
 
 
 def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
@@ -748,3 +801,123 @@ def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
     assert fake_worker.events[0][0] == "batch"
     assert {e[0] for e in fake_worker.events[0][1]} == \
         {"open_division", "help_request"}
+
+
+# ------------------------------------------------------- open_division 就近聚类
+
+def _with_stations(w, *stations):
+    w.stations = list(w.stations) + list(stations)
+    return w
+
+
+def test_open_division_payload_proximity_split(monkeypatch):
+    """连通图（两边都够得着）也按就近产出分工。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 12, "gz": 0},
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 12},
+    )
+
+    def fake_cost(world, bb, name, source):
+        t = source.get("t")
+        p1 = name == "Player 1"
+        if t in ("chopping", "washing"):
+            return 1 if p1 else 12
+        if t in ("cooking", "plate_station"):
+            return 12 if p1 else 1
+        return None
+
+    monkeypatch.setattr(A, "cost_to", fake_cost)
+    payload = A._open_division_payload(w, None)
+
+    assert payload is not None
+    assert set(payload["p1_actions"]) == {"切", "洗盘"}
+    assert set(payload["p2_actions"]) == {"下锅", "装盘", "送餐"}
+
+
+def test_open_division_payload_falls_back_when_equidistant(monkeypatch):
+    """就近不明确（等距）也兜底分工：P2 煮装送、P1 切洗。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+    )
+    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 5)  # 全部等距
+
+    payload = A._open_division_payload(w, None)
+
+    assert payload is not None
+    assert set(payload["p1_actions"]) == {"切", "洗盘"}
+    assert set(payload["p2_actions"]) == {"下锅", "装盘", "送餐"}
+
+
+def test_open_division_payload_keeps_unreachable_split(monkeypatch):
+    """一边够不着仍是硬分裂（保留旧行为）。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 12, "gz": 0},
+    )
+
+    def fake_cost(world, bb, name, source):
+        t = source.get("t")
+        p1 = name == "Player 1"
+        if t == "chopping":
+            return 3 if p1 else None      # P2 够不着切板
+        if t == "cooking":
+            return None if p1 else 3      # P1 够不着灶
+        return 5                          # 其余共享
+
+    monkeypatch.setattr(A, "cost_to", fake_cost)
+    payload = A._open_division_payload(w, None)
+
+    assert payload is not None
+    assert "切" in payload["p1_actions"]
+    assert "下锅" in payload["p2_actions"]
+
+
+def test_land_open_division_adds_assign_duties(dagent):
+    dagent._land_open_division(
+        {"p1_actions": ["切", "下锅"], "p2_actions": ["装盘", "送餐"]}, 100)
+    dagent._sync_duty_preferences()
+
+    duties = dagent.ledger.snapshot(100)
+    by_action = {d["action"]: d for d in duties}
+    assert by_action["切"]["direction"] == "P1"
+    assert by_action["下锅"]["direction"] == "P1"
+    assert by_action["装盘"]["direction"] == "P2"
+    assert by_action["送餐"]["direction"] == "P2"
+    assert all(d["source"] == "open_division" for d in duties)
+
+    kinds = {(p.owner, p.kind) for p in dagent.bb.preferences}
+    assert ("P1", "claim") in kinds
+    assert ("P2", "direct") in kinds
+
+
+def test_service_dialog_lands_open_division_duties(monkeypatch, fake_worker):
+    """open_division 一开口就把分工落进账本，而不是只说话。"""
+    import gzip
+    import json
+    import os
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                           "rapids21-20261028.ndjson.gz")
+    with gzip.open(fixture, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    w = World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    a = Agent(dialog_worker=fake_worker)
+    a.bb.tick = 100
+    a.book = book
+
+    a._service_dialog(w)
+
+    assign = [d for d in a.ledger.snapshot(100)
+              if d["mode"] == "assign" and d["source"] == "open_division"]
+    assert assign
+    assert any(d.get("direction") == "P1" for d in assign)
+    assert any(d.get("direction") == "P2" for d in assign)
+    assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
+    assert any(p.kind == "direct" and p.owner == "P2" for p in a.bb.preferences)

@@ -69,7 +69,7 @@ def test_llm_chat_returns_content_and_sends_tools(monkeypatch):
     monkeypatch.setattr(llm.requests, "post", fake_post)
     client = LLMClient("key", "https://ark.cn-beijing.volces.com/api/v3",
                        "doubao-seed-2-1-pro-260915")
-    tools = [{"type": "function", "function": {"name": "update_duties"}}]
+    tools = [{"type": "function", "function": {"name": "assign_action"}}]
     messages = [{"role": "user", "content": "我来切"}]
     reply = client.chat(messages, tools)
 
@@ -133,10 +133,10 @@ def test_llm_chat_without_tools_omits_tool_fields(monkeypatch):
 def test_llm_chat_accumulates_streamed_tool_calls(monkeypatch):
     resp = FakeSSE([
         _chunk("好"),
-        _tool_chunk(0, name="update_duties", arguments='{"op": "add", ',
+        _tool_chunk(0, name="assign_action", arguments='{"op": "add", ',
                     call_id="call_a"),
         _tool_chunk(0, arguments='"mode": "do", "target": "WashPlate"}'),
-        _tool_chunk(1, name="update_duties",
+        _tool_chunk(1, name="assign_action",
                     arguments='{"op": "remove", "id": "a1"}', call_id="call_b"),
         "data: [DONE]\n\n",
     ])
@@ -151,7 +151,7 @@ def test_llm_chat_accumulates_streamed_tool_calls(monkeypatch):
 
 
 def test_tool_call_bad_json_args_is_none(monkeypatch):
-    resp = FakeSSE([_tool_chunk(0, name="update_duties", arguments="{oops"),
+    resp = FakeSSE([_tool_chunk(0, name="assign_action", arguments="{oops"),
                     "data: [DONE]\n\n"])
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: resp)
     reply = LLMClient("key", "https://x.example/v3", "m").chat([], [{}])
@@ -244,6 +244,9 @@ def test_system_message_carries_rules_and_dag():
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
+    # 口头答应不算数：P1 说「你去X」必须落 now 工具调用
+    assert "口头答应不算数" in text
+    assert "assign_action(mode=now)" in text
     # 步骤语义来自目录渲染（task 的 DESC），prompt 里不手写类型清单、不写关卡物料
     assert "DAG 节点类型" not in text
     assert "BoiledSushiRice" not in text.split("本关目录")[0]
@@ -297,11 +300,11 @@ def test_chat_passes_tool_choice_none(monkeypatch):
 
 
 def test_assistant_and_tool_messages_round_trip():
-    reply = llm.LLMReply("好", [llm.ToolCall("c1", "update_duties", '{"op":"add"}')])
+    reply = llm.LLMReply("好", [llm.ToolCall("c1", "assign_action", '{"op":"add"}')])
     msg = assistant_message(reply)
     assert msg["tool_calls"][0] == {
         "id": "c1", "type": "function",
-        "function": {"name": "update_duties", "arguments": '{"op":"add"}'}}
+        "function": {"name": "assign_action", "arguments": '{"op":"add"}'}}
     tool = tool_message("c1", {"ok": True, "id": "a1"})
     assert tool["role"] == "tool" and tool["tool_call_id"] == "c1"
     assert json.loads(tool["content"]) == {"ok": True, "id": "a1"}

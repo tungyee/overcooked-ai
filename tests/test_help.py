@@ -41,9 +41,9 @@ def test_p1_saves_enough_p2_unreachable():
 
 
 def test_p1_saves_enough_at_threshold():
-    assert HELP_THRESHOLD_STEPS == 8
-    assert p1_saves_enough(2, 10) is True      # 10 - 2 == 8
-    assert p1_saves_enough(2, 9) is False      # 7 < 8
+    assert HELP_THRESHOLD_STEPS == 12
+    assert p1_saves_enough(2, 14) is True      # 14 - 2 == 12
+    assert p1_saves_enough(2, 13) is False     # 11 < 12
 
 
 def test_cost_to_rapids_p2_cannot_reach_potato():

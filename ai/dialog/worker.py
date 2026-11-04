@@ -84,6 +84,7 @@ class TurnTiming(object):
     event: str
     started: float
     audio_ms: float = 0.0
+    peak_db: float = None
     asr_started: float = None
     asr_done: float = None
     first_token_at: float = None
@@ -414,10 +415,14 @@ class DialogWorker(object):
     def _latency_fields(self, timing, outcome=None):
         # type: (TurnTiming, Any) -> dict
         """把 TurnTiming 压成一行可读的毫秒字段。"""
+        floor = getattr(self.clients.vad, "floor_db", None)
         fields = {
             "event": timing.event,
             "source": timing.source,
             "audio_ms": int(round(timing.audio_ms or 0)),
+            "peak_db": (round(timing.peak_db, 1)
+                        if timing.peak_db is not None else None),
+            "floor_db": (round(floor, 1) if floor is not None else None),
             "asr_ms": self._ms_since(timing.asr_started, timing.asr_done),
             "end_to_asr_ms": self._ms_since(timing.started, timing.asr_done),
             "llm_first_token_ms": self._ms_since(timing.started,
@@ -627,6 +632,13 @@ class DialogWorker(object):
         pcm = _pcm16([frame])
         utterance.session.feed(pcm)
         utterance.timing.audio_ms += getattr(self.clients.vad, "frame_ms", 50)
+        # 诊断：跟踪这段录音的最大 RMS 电平，区分「静音」和「有声音但太短」。
+        samples = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if samples.size:
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+            level = float(20.0 * np.log10(max(rms, 1e-10)))
+            if utterance.timing.peak_db is None or level > utterance.timing.peak_db:
+                utterance.timing.peak_db = level
 
     def _poll_utterance(self, utterance):
         # type: (_Utterance) -> bool
@@ -709,13 +721,27 @@ class DialogWorker(object):
             except Exception as exc:            # noqa: BLE001
                 log.exception("PTT 启动失败，退回 VAD")
                 self._log_event("worker_error", where="ptt", error=str(exc))
+        last_loop_at = time.monotonic()
         try:
             while not self._stop.is_set():
+                loop_start = time.monotonic()
+                iter_dt = loop_start - last_loop_at
+                last_loop_at = loop_start
                 # 事件优先于音频：主动开口不能被采集阻塞。
                 self._drain_events()
                 # 单张新单只会投一次 `("new_order", [id])`，必须由 worker
                 # 周期性用空 id 再调一次，1 秒合并窗口才会关窗触发。
                 self._flush_pending_orders()
+                drain_dt = time.monotonic() - loop_start
+                if iter_dt > 0.15:
+                    # 诊断：worker 主循环被拖慢时记录整轮耗时与 drain 占比，
+                    # 区分「事件/LLM/TTS 阻塞」与「采集帧变慢」。
+                    self._log_event(
+                        "loop_slow", iter_ms=int(round(iter_dt * 1000.0)),
+                        drain_ms=int(round(drain_dt * 1000.0)),
+                        ptt_recording=ptt_recording,
+                        vad_paused=self.clients.vad.paused,
+                        frame_count=frame_count)
                 if utterance is not None and self._poll_utterance(utterance):
                     utterance = None
                 if self.clients.vad.paused:
@@ -1009,6 +1035,11 @@ class DialogWorker(object):
         self._log_event(
             "asr", text=text, tick=tick, source=timing.source,
             audio_ms=int(round(timing.audio_ms or 0)),
+            peak_db=(round(timing.peak_db, 1)
+                     if timing.peak_db is not None else None),
+            floor_db=(round(getattr(self.clients.vad, "floor_db", None), 1)
+                      if getattr(self.clients.vad, "floor_db", None) is not None
+                      else None),
             asr_ms=self._ms_since(timing.asr_started, timing.asr_done),
             end_to_asr_ms=self._ms_since(timing.started, timing.asr_done))
         log.debug("ASR 文本: %r（tick=%s）", text, tick)
@@ -1096,11 +1127,12 @@ class DialogWorker(object):
         tools = context.get("tools") or None
         choice = "auto" if event in ("speech", "new_order") else "none"
 
-        # 一整轮的流式 TTS：第一段 / 第二段的 text 都按句喂进去，按序播放。
+        # 一整轮的流式 TTS。第一段先不喂：有工具调用时第一段可能"先答应"，
+        # 等工具结果回来第二段再一次性说清；无工具调用时下面再补喂第一段。
         stream = StreamingTTS(self, timing)
         first = self._chat(head + history + [world] + turn,
                            tools, event, "first", tool_choice=choice,
-                           timing=timing, on_text=stream.feed)
+                           timing=timing)
         if first is None or self.state is not state_obj:
             stream.cancel()
             if first is None:
@@ -1141,6 +1173,9 @@ class DialogWorker(object):
                 return
             content = second.content
             final = dataclasses.replace(first, content=content, tool_calls=[])
+        else:
+            # 无工具调用：第一段就是最终答案，现在才流式播它。
+            stream.feed(first.content)
         turn.append(assistant_message(final))
         self._remember(state_obj, turn)
         timing.llm_done_at = time.monotonic()

@@ -1,6 +1,6 @@
 """分工账本：动作级作用域、账本条目与 op 应用。
 
-LLM 只通过 `update_duties` 工具改账本：`add` / `cancel` 两种 op，每条描述
+LLM 只通过 `assign_action` 工具改账本：`add` / `cancel` 两种 op，每条描述
 「做什么**动作**」和「什么**性质**」（mode）：
 
 - `now`    —— P2 马上去（一次性，做完即失效）；
@@ -382,7 +382,7 @@ class Ledger(object):
 
     def apply(self, args, kitchen, tick, source=""):
         # type: (Any, Kitchen, int, str) -> Dict[str, Any]
-        """应用一条动作级 `update_duties` 调用，返回给 LLM 的结果 dict。
+        """应用一条动作级 `assign_action` 调用，返回给 LLM 的结果 dict。
 
         args = {op: add/cancel, mode: now/assign/stop, action: 动作,
                 direction?: P2/P1（assign 用）, item?: 可选（now/stop 用）}。
@@ -617,7 +617,7 @@ def tool_schemas(targets=None, duty_ids=None):
     return [{
         "type": "function",
         "function": {
-            "name": "update_duties",
+            "name": "assign_action",
             "description": "修改你（P2）的分工约定。玩家一句话里涉及几个动作就调用几次；闲聊、提问不要调用。",
             "parameters": {"type": "object", "properties": props,
                            "required": ["op", "mode", "action"]},

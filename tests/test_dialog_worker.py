@@ -44,7 +44,7 @@ def reply(content="", *calls):
 
 
 def duty(**args):
-    return ("update_duties", args)
+    return ("assign_action", args)
 
 
 class FakeLLM(object):
@@ -275,7 +275,7 @@ def wait_until(predicate, timeout=2.0):
 
 # ------------------------------------------------------- speech pipeline
 
-TOOLS = [{"type": "function", "function": {"name": "update_duties"}}]
+TOOLS = [{"type": "function", "function": {"name": "assign_action"}}]
 
 
 def ack_for(bundle, results):
@@ -296,7 +296,7 @@ def test_speech_two_pass_speaks_final_reply_after_tool_results():
     batch = bundle.cmd_q.get(timeout=2)
 
     assert isinstance(batch, DutyBatch)
-    assert batch.calls == [("update_duties", {
+    assert batch.calls == [("assign_action", {
         "op": "add", "mode": "leave_to_p1", "target": "Cucumber"})]
     assert batch.source == "我来切"
 
@@ -305,8 +305,8 @@ def test_speech_two_pass_speaks_final_reply_after_tool_results():
     thread.join(2)
 
     assert not thread.is_alive()
-    # 第一段 text 现在也流式播，第二段紧随其后
-    assert bundle.tts.spoken == ["我先答应一下。", "行，切菜你来。"]
+    # 有工具调用时只播最终那句，第一段"先答应"不播（避免先出口后改口）
+    assert bundle.tts.spoken == ["行，切菜你来。"]
     assert llm.choices == ["auto", "none"]
     assert llm.calls[0][1] == TOOLS and llm.calls[1][1] == TOOLS
     # 第二段看得到工具结果
@@ -906,7 +906,7 @@ def test_debug_logging_emits_pipeline_content(caplog):
 
     text = caplog.text
     assert "ASR" in text and "我来切" in text
-    assert "LLM 回复" in text and "update_duties" in text
+    assert "LLM 回复" in text and "assign_action" in text
     assert "播报" in text and "行，你切。" in text
 
 

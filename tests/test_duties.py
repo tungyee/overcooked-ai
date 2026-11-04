@@ -359,3 +359,35 @@ def test_step_target_expand(kitchen):
 def test_step_target_rejects_unknown_task(kitchen):
     _, err = kitchen.expand("NotATask:Cucumber")
     assert err != ""
+
+
+# ------------------------------------------------------------ planner 硬/软分离（动作级 scope）
+
+from ai.dialog.schema import Preference
+
+
+def test_stop_never_vetoes_rescue():
+    bb = Blackboard()
+    bb.preferences = [Preference(kind="stop", owner="P2", weight=0.0,
+                                 scope=action_scope("装盘"))]
+    rescue = T.TakeCookedToPlate("9", (), "FriedChips")
+    assert planner._is_stopped(rescue, bb) is False
+    fetch_plate = T.FetchToPlate("9", (), "FriedChips")
+    assert planner._is_stopped(fetch_plate, bb) is True
+
+
+def test_item_level_now_scope_matches_only_that_item():
+    pref = Preference(kind="now", owner="P2", weight=20.0,
+                      scope=action_scope("切", "Chicken"))
+    assert preference_matches_task(pref, _task("Chop", "Chicken")) is True
+    assert preference_matches_task(pref, _task("Chop", "Potato")) is False
+
+
+def test_claim_negative_weight_enters_scoring():
+    bb = Blackboard()
+    pref = Preference(kind="claim", owner="P1", weight=-6.0,
+                      scope=action_scope("切"))
+    bb.preferences = [pref]
+    cand = planner.Candidate(_task("Chop", "Cucumber"), [], 1)
+    matched = planner._matching_preferences(cand, bb, layer=6)
+    assert any(w == -6.0 and p.kind == "claim" for p, w in matched)

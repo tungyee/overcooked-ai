@@ -209,3 +209,15 @@ def test_help_rank_key_blocking_first():
     urgent = FrontierStep("FetchToCooker", "rice", None, 2, 10, order_id="1")
     slack_map = {"1": 10.0}
     assert _help_rank_key(blocking, slack_map) < _help_rank_key(urgent, slack_map)
+
+
+def test_top_help_request_skips_non_fetch_on_split(monkeypatch):
+    """分割图（P2 够不着）只喊取料，不喊下锅/装盘这类 P1 的活。"""
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    from ai.dialog import help as H
+    fake = H.FrontierStep(task_type="FetchToCooker", item="FriedChips",
+                          source={"t": "cooking"}, p1_cost=3, p2_cost=None,
+                          order_id="1")
+    monkeypatch.setattr(H, "frontier_steps", lambda *a, **k: [fake])
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is None

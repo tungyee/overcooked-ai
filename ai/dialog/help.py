@@ -9,6 +9,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from ai.dialog.actions import FETCH_TASK_TYPES
 from ai.dialog.schema import RESCUE_TYPES, scope_matches
 from ai.query import predicates as P
 from ai.query import recipe_graph
@@ -209,6 +210,9 @@ def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger)
     candidates = [s for s in steps
                   if s.source is not None
                   and p1_saves_enough(s.p1_cost, s.p2_cost)
+                  # 分割图（P2 够不着）只对「取料」这类交接必喊；下锅/装盘/送餐
+                  # 是 P1 的活、开局分工已说清，不反复提醒（否则聒噪）。
+                  and (s.p2_cost is not None or s.task_type in FETCH_TASK_TYPES)
                   and not _already_requested(s)
                   and not ledger.help_request_recent(s.task_type, s.item, tick)]
     if not candidates:

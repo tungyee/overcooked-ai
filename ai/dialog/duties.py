@@ -602,26 +602,31 @@ def render_ledger(rows):
     return "\n".join(lines) if lines else "（空）"
 
 
-def tool_schemas(targets, duty_ids):
-    # type: (List[str], List[str]) -> List[dict]
-    """按本关数据生成 OpenAI tools；enum 让模型只能选真实存在的值。"""
+def tool_schemas(targets=None, duty_ids=None):
+    # type: (Any, Any) -> List[dict]
+    """动作级 OpenAI tool schema（替换旧物料/步骤/共享 target 枚举）。
+
+    `targets`/`duty_ids` 参数保留签名兼容、不再使用：动作枚举是静态的 6 个
+    动作，不随关卡/账本变化。
+    """
     props = {
         "op": {"type": "string", "enum": list(OPS),
-               "description": "add 新增（同一 target 已有约定时就是改写它）；edit 改已有条目（必须带 id，只写要改的字段）；remove 删除（必须带 id）"},
-        "id": {"type": "string", "description": "约定条目 id，edit/remove 必填"},
+               "description": "add 新增（同一 action 已有约定时就是改写它）；cancel 撤销（按 mode+action+item 定位）"},
         "mode": {"type": "string", "enum": list(MODES),
-                 "description": "do=有空优先做；now=马上去；leave_to_p1=P1优先，P2可为收尾补位；stop=先别做"},
-        "target": {"type": "string", "enum": list(targets),
-                   "description": "物料名（代表这种料的整条加工链）或共享动作"},
+                 "description": "now=马上去（一次性）；assign=分工（持续，带 direction）；stop=先别做（30 秒自动解除）"},
+        "action": {"type": "string", "enum": list(ACTION_TASK_TYPES),
+                   "description": "动作（绑定站点）：切/下锅/拌/装盘/送餐/洗盘"},
+        "direction": {"type": "string", "enum": ["P2", "P1"],
+                      "description": "assign 用：P2=你负责做，P1=交给 P1（你避开、收尾可补位）"},
+        "item": {"type": "string",
+                 "description": "可选，now/stop 用：具体哪一种料（如「鸡块」），用于选对 task"},
     }
-    if duty_ids:
-        props["id"]["enum"] = list(duty_ids)
     return [{
         "type": "function",
         "function": {
             "name": "update_duties",
-            "description": "修改你（P2）的分工约定。玩家一句话里涉及几种物料/动作就调用几次；闲聊、提问不要调用。",
+            "description": "修改你（P2）的分工约定。玩家一句话里涉及几个动作就调用几次；闲聊、提问不要调用。",
             "parameters": {"type": "object", "properties": props,
-                           "required": ["op"]},
+                           "required": ["op", "mode", "action"]},
         },
     }]

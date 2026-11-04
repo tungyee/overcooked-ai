@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from ai.dialog.actions import (ACTION_STATION_TYPES, ACTION_TASK_TYPES,
-                               action_scope)
+                               action_scope, task_action)
 from ai.dialog.schema import Preference, scope_matches
 
 MODES = ("now", "assign", "stop")
@@ -449,10 +449,19 @@ class Ledger(object):
         # type: (str, Optional[str], int, int) -> str
         """P2 自己发起的「挪走」：给某一步加一条瞬态 claim duty。
 
-        与 `apply` 的 leave_to_p1 同款编译（负分 claim、owner P1），但 source
-        标 help_request、带 TTL。同 (task_type, item) 已有条目时返回原 id。
+        可分工动作（task_type 在 ACTION_TASK_TYPES）→ `assign(P1, 动作)`
+        动作级 scope；取料/交接/救援 → 保持节点级 `{(task_type, item)}`。
+        同 scope 已有条目时返回原 id。
         """
-        scope = frozenset({(str(task_type), str(item or "").lower())})
+        action = task_action(str(task_type))
+        if action is not None:
+            scope = action_scope(action)
+            duty_action = action
+            duty_item = None
+        else:
+            scope = frozenset({(str(task_type), str(item or "").lower())})
+            duty_action = ""
+            duty_item = str(item or "").lower()
         for duty in self.duties:
             if duty.source == "help_request" and duty.scope == scope:
                 return duty.id
@@ -462,7 +471,7 @@ class Ledger(object):
         self._seq += 1
         duty_id = "a%d" % (self._seq,)
         self.duties.append(Duty(
-            id=duty_id, mode="assign", action="", item=str(item or "").lower(),
+            id=duty_id, mode="assign", action=duty_action, item=duty_item,
             direction="P1", scope=scope, source="help_request",
             created_tick=tick, expires_tick=tick + ttl_ticks))
         return duty_id
@@ -481,16 +490,24 @@ class Ledger(object):
 
     def prune_help_requests(self, active_scopes):
         # type: (set) -> List[Duty]
-        """删掉 scope 已不在 active_scopes 里的 help_request duty（该步已解决/
-        不再 P1 更划算）；返回被删的。TTL 只是兜底，主清除路径走这里。"""
+        """删掉已不在 active_scopes 里的 help_request duty；返回被删的。
+
+        - 动作级 duty（`action != ""`）：只要该动作还有任一 task_type 在前沿
+          （active_scopes 里）就保留；
+        - 节点级 duty（取料类，`action == ""`）：精确匹配 (task_type, item)。
+        TTL 只是兜底，主清除路径走这里。
+        """
+        active_types = {t for t, _item in active_scopes}
         removed = []
         kept = []
         for d in self.duties:
             if d.source == "help_request":
-                if d.scope and d.scope <= active_scopes:
-                    kept.append(d)
+                if d.action:
+                    types = {t for t, _i in d.scope}
+                    keep = bool(types & active_types)
                 else:
-                    removed.append(d)
+                    keep = bool(d.scope and d.scope <= active_scopes)
+                (kept if keep else removed).append(d)
             else:
                 kept.append(d)
         self.duties = kept

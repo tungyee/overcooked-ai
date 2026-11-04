@@ -294,12 +294,20 @@ def test_tool_schemas_drops_target_and_id():
     assert set(fn["parameters"]["required"]) == {"op", "mode", "action"}
 
 
-def test_ledger_help_request_compiles_to_claim():
+def test_ledger_help_request_compiles_to_action_claim():
     ledger = Ledger()
     ledger.add_help_request("Chop", "Cucumber", tick=0)
-    prefs = ledger.preferences()
-    assert any(p.kind == "claim" and p.owner == "P1" and
-               p.scope == frozenset({("Chop", "cucumber")}) for p in prefs)
+    claim = [p for p in ledger.preferences() if p.kind == "claim"]
+    assert claim and claim[0].owner == "P1" and claim[0].weight == -6.0
+    assert claim[0].scope == action_scope("切")  # 动作级，不是节点级
+
+
+def test_ledger_help_request_fetch_keeps_node_scope():
+    # 取料（FetchToBoard）无动作归属，保持节点级 claim
+    ledger = Ledger()
+    ledger.add_help_request("FetchToBoard", "Potato", tick=0)
+    claim = [p for p in ledger.preferences() if p.kind == "claim"]
+    assert claim and claim[0].scope == frozenset({("FetchToBoard", "potato")})
 
 
 def test_ledger_help_request_expires_via_prune():

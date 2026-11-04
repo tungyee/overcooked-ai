@@ -51,6 +51,17 @@ ACTION_STATION_TYPES = {
     "洗盘": "washing",
 }  # type: Dict[str, str]
 
+_TASK_TO_ACTION = {}  # type: Dict[str, str]
+for _action, _types in ACTION_TASK_TYPES.items():
+    for _t in _types:
+        _TASK_TO_ACTION[_t] = _action
+
+
+def task_action(task_type):
+    # type: (str) -> Optional[str]
+    """task TYPE → 所属动作；取料/交接/救援（不在 ACTION_TASK_TYPES）返回 None。"""
+    return _TASK_TO_ACTION.get(str(task_type))
+
 
 def action_scope(action, item=None):
     # type: (str, Optional[str]) -> FrozenSet[Tuple[Optional[str], Optional[str]]]

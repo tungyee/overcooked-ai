@@ -96,25 +96,17 @@ def test_targets_are_materials_then_steps_then_shared_actions(kitchen):
     assert "FetchToCooker:BoiledSushiRice" in steps
 
 
-def test_render_lists_dishes_materials_steps_and_legend(kitchen):
+def test_kitchen_render_is_action_oriented(kitchen):
     text = kitchen.render()
     assert "Sushi_Cucumber = Seaweed + BoiledSushiRice + Cucumber" in text
-    assert "Seaweed（直接装盘）：%s" % (T.FetchToPlate.LABEL,) in text
-    assert "BoiledSushiRice（要煮）：%s → %s" % (
-        T.FetchToCooker.LABEL, T.TakeCookedToPlate.LABEL) in text
-    assert "Cucumber（要切）：%s → %s → %s" % (
-        T.FetchToBoard.LABEL, T.Chop.LABEL, T.FetchToPlate.LABEL) in text
-    assert "WashPlate（%s）" % (T.WashPlate.LABEL,) in text
-    auto = [l for l in text.splitlines() if l.startswith("不开放认领")][0]
-    assert T.Extinguish.LABEL in auto
-    assert T.TakeCookedToPlate.LABEL not in auto
+    assert "切" in text and "下锅" in text and "装盘" in text
+    assert "物料（target" not in text
 
 
-def test_render_single_dish_without_shared(kitchen):
+def test_kitchen_render_single_dish(kitchen):
     text = kitchen.render(["Sushi_Fish"], shared=False)
     assert "Sushi_Fish" in text and "Sushi_Cucumber" not in text
-    assert "SushiFish（要切）" in text and "Cucumber（" not in text
-    assert "共享动作" not in text
+    assert "切" in text and "下锅" in text
 
 
 def test_every_registered_task_has_a_description():
@@ -147,10 +139,7 @@ def test_intermediate_items_join_the_material_scope():
     kitchen = Kitchen({"Pasta": dag}, _TASK_META)
     scope, _ = kitchen.expand("Pasta_TomatoOnly")
     assert scope == frozenset({(None, "pasta_tomatoonly"), (None, "tomato")})
-    text = kitchen.render()
-    assert "Pasta_TomatoOnly（要切、煮）：取料上砧板 Tomato → 切 Tomato → 下锅 → 盛盘" in text
     assert kitchen.processes("Pasta_TomatoOnly") == ["切", "煮"]
-    assert "本关没有对应站点、做不了：洗盘（WashPlate）" in text
 
 
 def test_every_material_is_hit_by_level_candidates(world, book):
@@ -158,11 +147,6 @@ def test_every_material_is_hit_by_level_candidates(world, book):
                  if c.task.item}
     for name in ("Seaweed", "Cucumber", "SushiFish"):
         assert name.lower() in hit_items
-
-
-def test_render_marks_deliver_mode_restriction(kitchen):
-    text = kitchen.render()
-    assert "DeliverPlate（送餐）（只接受：P2 马上去、P2 优先做）" in text
 
 
 # ------------------------------------------------------------ 动作级账本 op

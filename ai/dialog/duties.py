@@ -30,7 +30,8 @@ item（`Preference.exclude`）。
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from ai.dialog.actions import ACTION_TASK_TYPES, action_scope
+from ai.dialog.actions import (ACTION_STATION_TYPES, ACTION_TASK_TYPES,
+                               action_scope)
 from ai.dialog.schema import Preference, scope_matches
 
 MODES = ("now", "assign", "stop")
@@ -282,45 +283,24 @@ class Kitchen(object):
 
     def render(self, dishes=None, shared=True):
         # type: (Optional[Iterable[str]], bool) -> str
-        """给 LLM 看的本关目录：菜 = 物料组合；每种物料带加工方式和步骤。
+        """给 LLM 看的本关目录：菜 = 物料组合；本关有哪些动作（及缺哪些）。
 
-        加工方式（要切 / 要煮 / 要拌 / 直接装盘）与步骤短名都来自 task 类的
-        `PROCESS` / `LABEL`，不写死类型名。`dishes` 只渲染这些菜（new_order
-        用），`shared` 控制是否带共享动作。
+        `shared` 参数保留签名兼容、不再使用：共享动作（洗盘/送餐/装盘）已
+        并入动作枚举。
         """
         wanted = None if dishes is None else set(dishes)
         lines = ["本关菜："]
-        names = []  # type: List[str]
         for dish, mats in self.dish_materials.items():
             if wanted is not None and dish not in wanted:
                 continue
             lines.append("  %s = %s" % (dish, " + ".join(mats)))
-            names.extend(m for m in mats if m not in names)
-        lines.append("物料（target 用这些名字，代表这种料的整条加工链）：")
-        for name in names:
-            procs = self.processes(name)
-            tag = "要" + "、".join(procs) if procs else "直接装盘"
-            chain = " → ".join(self._step_text(name, t, i)
-                               for t, i in self.materials[name].steps)
-            lines.append("  %s（%s）：%s" % (name, tag, chain))
-        if shared:
-            lines.append("共享动作（不分菜）：")
-            for key in self.shared_keys():
-                m = self._meta(key)
-                line = "  %s（%s）" % (key, m.label or m.desc)
-                if m.allowed_modes:
-                    line += "（只接受：%s）" % "、".join(
-                        _MODE_TEXT[md] for md in m.allowed_modes)
-                lines.append(line)
-            missing = ["%s（%s）" % (self._meta(k).label or k, k)
-                       for k in self.unavailable()]
-            if missing:
-                lines.append("本关没有对应站点、做不了：" + "、".join(missing))
-            auto = sorted({self._meta(k).label for k in self.auto_only()
-                           if self._meta(k).label})
-            if auto:
-                lines.append("不开放认领（谁在旁边谁处理，你会自动去做）："
-                             + "、".join(auto))
+        lines.append("本关动作（分工用这些名字，对应一类站点）：")
+        for action in ACTION_TASK_TYPES:
+            st = ACTION_STATION_TYPES[action]
+            if st in self.stations:
+                lines.append("  %s（%s）" % (action, _ACTION_TEXT[action]))
+            else:
+                lines.append("  本关没有：%s" % (action,))
         return "\n".join(lines)
 
 
@@ -342,9 +322,14 @@ class Duty(object):
 
 
 _DIRECTION_TEXT = {"P2": "P2 负责", "P1": "P1 负责"}
-# 旧共享动作档位文案：Task 6 重写 Kitchen.render 前仍需（allowed_modes 显示）。
-_MODE_TEXT = {"do": "P2 优先做", "now": "P2 马上去",
-              "leave_to_p1": "交给 P1", "stop": "P2 先别做"}
+_ACTION_TEXT = {
+    "切": "砧板切",
+    "下锅": "灶/炸锅/烤箱（炸煮烤）",
+    "拌": "搅拌站拌",
+    "装盘": "盘/出餐台装盘盛盘",
+    "送餐": "出餐口送餐",
+    "洗盘": "洗碗池洗盘",
+}
 
 
 def _duty_text(mode, action, direction=""):

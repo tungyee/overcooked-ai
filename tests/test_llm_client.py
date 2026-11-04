@@ -239,8 +239,8 @@ def test_system_message_carries_rules_and_dag():
     assert msg["role"] == "system"
     text = msg["content"]
     assert "你是 Overcooked 2 里的 P2" in text
-    assert "leave_to_p1" in text and "do" in text
-    assert "target" in text and "整条" in text
+    assert "now" in text and "assign" in text and "stop" in text
+    assert "action" in text and "动作" in text
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
@@ -259,16 +259,16 @@ def test_render_state_is_readable_and_in_seconds():
         "p1": {"holding": "cucumber"},
         "p2": {"doing": "Chop:SushiFish（订单 #1）", "held": None},
         "p2_options": ["FetchToBoard:SushiFish（订单 #1）"],
-        "duties": [{"id": "a1", "mode": "leave_to_p1", "target": "Cucumber",
-                    "source": "我来切黄瓜",
-                    "impact": "挡住了你 2 个可做的活（Chop:Cucumber），已 12.0 秒；P1 手上：空手"}],
+        "duties": [{"id": "a1", "mode": "assign", "action": "下锅",
+                    "direction": "P1", "source": "下锅我来",
+                    "impact": "挡住了你 2 个可做的活，已 12.0 秒；P1 手上：空手"}],
     })
     assert "剩余 99.0 秒" in text
     assert "#1 Sushi_Fish 剩 18.1 秒" in text
     assert "在煮，40%" in text
     assert "P1：手持 cucumber" in text
     assert "Chop:SushiFish" in text
-    assert "[a1] 交给 P1 Cucumber  来源「我来切黄瓜」" in text
+    assert "[a1] P1 负责 下锅  来源「下锅我来」" in text
     assert "此刻：挡住了你 2 个可做的活" in text
 
 

@@ -30,10 +30,11 @@ item（`Preference.exclude`）。
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
+from ai.dialog.actions import ACTION_TASK_TYPES, action_scope
 from ai.dialog.schema import Preference, scope_matches
 
-MODES = ("do", "leave_to_p1", "now", "stop")
-OPS = ("add", "edit", "remove")
+MODES = ("now", "assign", "stop")
+OPS = ("add", "cancel")
 
 TICKS_PER_SECOND = 20
 # stop 是「先别」：30 秒后自动解除。prompt / schema 文案从这里格式化。
@@ -51,7 +52,7 @@ BLOCKED_NUDGE_S = 10
 # 与熟料压力。旧值 direct +4 / claim -8 会把 P2 锁死在自己的一种物料上，
 # 即使另一张盘只差最后一味也继续填灶（trace-20261022-142224）。
 WEIGHT_DO = 1.0
-WEIGHT_CLAIM = -1.0
+WEIGHT_CLAIM = -6.0
 # now 权重仅 trace 展示；实际「马上去」的选中由 planner 闸消费（Task 2）。
 WEIGHT_NOW = 20.0
 
@@ -330,16 +331,41 @@ class Kitchen(object):
 class Duty(object):
     """账本里的一条约定（不可变；改动时整条替换）。"""
     id: str
-    mode: str
-    target: str
+    mode: str            # "now" | "assign" | "stop"
+    action: str          # 动作名（assign/now/stop）；help_request 为 ""
+    item: Optional[str]  # now/stop 的可选 item；其余为 None
+    direction: str       # "P2" | "P1"（assign）；其余为 ""
     scope: Scope
     source: str = ""
     created_tick: int = 0
     expires_tick: int = 0       # 0 = 长期；只有 stop 有到期
 
 
+_DIRECTION_TEXT = {"P2": "P2 负责", "P1": "P1 负责"}
+# 旧共享动作档位文案：Task 6 重写 Kitchen.render 前仍需（allowed_modes 显示）。
 _MODE_TEXT = {"do": "P2 优先做", "now": "P2 马上去",
               "leave_to_p1": "交给 P1", "stop": "P2 先别做"}
+
+
+def _duty_text(mode, action, direction=""):
+    # type: (str, str, str) -> str
+    if mode == "assign":
+        return "%s%s" % (_DIRECTION_TEXT.get(direction, ""), action)
+    if mode == "now":
+        return "P2 马上去%s" % (action,)
+    return "P2 先别做%s" % (action,)
+
+
+def _mode_label(row):
+    # type: (Dict[str, Any]) -> str
+    mode = row.get("mode")
+    if mode == "assign":
+        return _DIRECTION_TEXT.get(row.get("direction"), "分工")
+    if mode == "now":
+        return "P2 马上去"
+    if mode == "stop":
+        return "P2 先别做"
+    return str(mode)
 
 
 class Ledger(object):
@@ -378,81 +404,60 @@ class Ledger(object):
 
     def apply(self, args, kitchen, tick, source=""):
         # type: (Any, Kitchen, int, str) -> Dict[str, Any]
-        """应用一条 `update_duties` 调用，返回给 LLM 的结果 dict。
+        """应用一条动作级 `update_duties` 调用，返回给 LLM 的结果 dict。
 
-        结果形如 `{"ok": bool, "id"?, "text"?, "reason"?, "warning"?}`；
-        失败时账本不变。
+        args = {op: add/cancel, mode: now/assign/stop, action: 动作,
+                direction?: P2/P1（assign 用）, item?: 可选（now/stop 用）}。
+        失败时账本不变。`kitchen` 参数保留签名兼容，本方法不再使用。
         """
         if not isinstance(args, dict):
             return {"ok": False, "reason": "参数必须是对象"}
         op = args.get("op")
         if op not in OPS:
             return {"ok": False, "reason": "未知 op：%s" % (op,)}
-        if op == "remove":
-            duty = self.get(args.get("id"))
-            if duty is None:
-                return {"ok": False, "reason": "没有 %s 这条约定" % (args.get("id"),)}
-            self.duties = [d for d in self.duties if d.id != duty.id]
-            return {"ok": True, "id": duty.id, "removed": True}
-
-        old = None
-        if op == "edit":
-            old = self.get(args.get("id"))
-            if old is None:
-                return {"ok": False, "reason": "没有 %s 这条约定" % (args.get("id"),)}
-            mode = args.get("mode") or old.mode
-            target = args.get("target") or old.target
-        else:
-            mode = args.get("mode")
-            target = args.get("target")
+        mode = args.get("mode")
         if mode not in MODES:
             return {"ok": False, "reason": "未知 mode：%s" % (mode,)}
-        if not target:
-            return {"ok": False, "reason": "缺少 target"}
-        target = str(target)
-        scope, reason = kitchen.expand(target)
-        if scope is None:
-            return {"ok": False, "reason": reason}
-        allowed = kitchen.allowed_modes(target)
-        if allowed is not None and mode not in allowed:
-            return {"ok": False,
-                    "reason": "%s 只接受 %s（不能 %s）" % (
-                        target,
-                        "、".join(_MODE_TEXT[m] for m in allowed),
-                        _MODE_TEXT[mode])}
-
-        # 同一 target 只有一条约定：add 到已有 target 上等于改写它
-        same = next((d for d in self.duties if d.target == target), None)
-        if old is None and same is not None:
-            if same.mode == mode:
-                return {"ok": True, "id": same.id, "unchanged": True,
-                        "text": "%s %s" % (_MODE_TEXT[mode], target)}
-            old = same
-        if old is not None and old.target != target:
-            # edit 换了 target：新 target 上原有的约定被它取代
-            self.duties = [d for d in self.duties
-                           if d.target != target or d.id == old.id]
-
-        if old is None:
+        action = args.get("action")
+        if action not in ACTION_TASK_TYPES:
+            return {"ok": False, "reason": "未知 action：%s" % (action,)}
+        action = str(action)
+        item = args.get("item")
+        item_key = str(item or "").lower()
+        if op == "cancel":
+            for duty in self.duties:
+                if duty.mode == mode and duty.action == action \
+                        and (duty.item or "") == item_key:
+                    self.duties = [d for d in self.duties if d.id != duty.id]
+                    return {"ok": True, "id": duty.id, "removed": True}
+            return {"ok": False, "reason": "没有这条约定"}
+        # op == "add"
+        direction = "P2"
+        if mode == "assign":
+            direction = args.get("direction")
+            if direction not in ("P2", "P1"):
+                return {"ok": False, "reason": "assign 需要 direction：P2 或 P1"}
+        # 同 (mode, action, item) 再次 add = 覆盖（改方向/内容）
+        same = next((d for d in self.duties
+                     if d.mode == mode and d.action == action
+                     and (d.item or "") == item_key), None)
+        if same is not None and same.direction == direction:
+            return {"ok": True, "id": same.id, "unchanged": True,
+                    "text": _duty_text(mode, action, direction)}
+        duty_id = same.id if same is not None else None
+        if duty_id is None:
             self._seq += 1
             duty_id = "a%d" % (self._seq,)
-        else:
-            duty_id = old.id
+        scope = action_scope(action, item if mode in ("now", "stop") else None)
         expires = tick + STOP_TTL_TICKS if mode == "stop" else 0
-        duty = Duty(id=duty_id, mode=mode, target=target, scope=scope,
-                    source=source or (old.source if old else ""),
+        duty = Duty(id=duty_id, mode=mode, action=action, item=item,
+                    direction=direction, scope=scope,
+                    source=source or (same.source if same else ""),
                     created_tick=tick, expires_tick=expires)
         # 重新声明的条目挪到末尾：它是最新的说法，重叠时优先
         self.duties = [d for d in self.duties if d.id != duty_id] + [duty]
-
-        result = {"ok": True, "id": duty_id,
-                  "text": "%s %s" % (_MODE_TEXT[mode], target)}
-        rescue = kitchen.rescue_types(target)
-        if mode in ("leave_to_p1", "stop") and rescue:
-            result["warning"] = (
-                "%s 是救锅动作（锅刚熟或快糊时），P2 仍会去做"
-                % ("、".join(rescue),))
-        return result
+        return {"ok": True, "id": duty_id,
+                "text": _duty_text(mode, action, direction)}
 
     def add_help_request(self, task_type, item, tick,
                          ttl_ticks=HELP_REQUEST_TTL_TICKS):
@@ -472,9 +477,8 @@ class Ledger(object):
         self._seq += 1
         duty_id = "a%d" % (self._seq,)
         self.duties.append(Duty(
-            id=duty_id, mode="leave_to_p1",
-            target="%s:%s" % (task_type, item or ""),
-            scope=scope, source="help_request",
+            id=duty_id, mode="assign", action="", item=str(item or "").lower(),
+            direction="P1", scope=scope, source="help_request",
             created_tick=tick, expires_tick=tick + ttl_ticks))
         return duty_id
 
@@ -519,23 +523,20 @@ class Ledger(object):
 
     def consume_now(self, task):
         # type: (Any) -> bool
-        """「马上去」是一次性的：P2 已认下这个活（task 命中 now 作用域），
-        就把命中的 now 降级成 do——马上去的「这就去」落实一次，剩下的交给
-        do 的持续优先级，不再每拍触发 planner 硬指令闸（否则同一作用域里
-        FetchToCooker↔FillCooker 逐拍换选、执行树逐拍重建，取料永远做不完）。
+        """「做」（now）是一次性的：task 命中 now 作用域就删掉该 now（不持久）。
 
+        与旧的「now→do 降级」不同：spec §5.2 说「执行完即失效，不持久」。
         返回是否有改动（True = 调用方需重新编译偏好）。
         """
         if task is None:
             return False
-        changed = False
-        for i, duty in enumerate(self.duties):
-            if duty.mode != "now":
-                continue
-            if scope_matches(duty.scope, task):
-                self.duties[i] = replace(duty, mode="do")
-                changed = True
-        return changed
+        matched = [d for d in self.duties
+                   if d.mode == "now" and scope_matches(d.scope, task)]
+        if not matched:
+            return False
+        ids = {d.id for d in matched}
+        self.duties = [d for d in self.duties if d.id not in ids]
+        return True
 
     # ---- 编译 / 渲染
 
@@ -547,16 +548,17 @@ class Ledger(object):
         for duty in reversed(self.duties):
             common = dict(scope=duty.scope, exclude=frozenset(newer),
                           duty_id=duty.id, expires_tick=duty.expires_tick)
-            if duty.mode == "do":
-                out.append(Preference(kind="direct", owner="P2",
-                                      weight=WEIGHT_DO, **common))
-            elif duty.mode == "now":
+            if duty.mode == "now":
                 out.append(Preference(kind="now", owner="P2",
                                       weight=WEIGHT_NOW, **common))
-            elif duty.mode == "leave_to_p1":
-                out.append(Preference(kind="claim", owner="P1",
-                                      weight=WEIGHT_CLAIM, **common))
-            else:
+            elif duty.mode == "assign":
+                if duty.direction == "P2":
+                    out.append(Preference(kind="direct", owner="P2",
+                                          weight=WEIGHT_DO, **common))
+                else:
+                    out.append(Preference(kind="claim", owner="P1",
+                                          weight=WEIGHT_CLAIM, **common))
+            else:  # stop
                 out.append(Preference(kind="stop", owner="P2", weight=0.0,
                                       **common))
             newer |= duty.scope
@@ -568,8 +570,12 @@ class Ledger(object):
         """给上下文 / trace 的账本快照（秒为单位）。"""
         out = []
         for duty in self.duties:
-            row = {"id": duty.id, "mode": duty.mode, "target": duty.target,
+            row = {"id": duty.id, "mode": duty.mode, "action": duty.action,
                    "source": duty.source}
+            if duty.item:
+                row["item"] = duty.item
+            if duty.direction:
+                row["direction"] = duty.direction
             if duty.expires_tick:
                 row["remaining_s"] = round(
                     max(0, duty.expires_tick - tick) / float(TICKS_PER_SECOND), 1)
@@ -582,8 +588,10 @@ def render_ledger(rows):
     """账本快照 → 文本；每条带上主循环算好的「此刻影响」（有的话）。"""
     lines = []
     for row in rows or ():
-        line = "[%s] %s %s" % (row.get("id"), _MODE_TEXT.get(row.get("mode"), row.get("mode")),
-                               row.get("target"))
+        action = row.get("action") or ""
+        if row.get("item"):
+            action += ":%s" % row["item"]
+        line = "[%s] %s %s" % (row.get("id"), _mode_label(row), action)
         if row.get("remaining_s") is not None:
             line += "（还剩 %s 秒）" % (row["remaining_s"],)
         if row.get("source"):

@@ -1022,38 +1022,17 @@ class DialogWorker(object):
         context = context or {}
         tick = int(context.get("tick", 0) or 0)
 
-        if name == "new_order":
-            ids = payload or []
-            if ids and self._pending_order_at is None:
-                # 从第一张新单到达开始算，包含 1 秒合并窗口。
-                self._pending_order_at = time.monotonic()
-            trigger, batch = merge_new_orders(ids, self.state, tick)
-            if not trigger:
-                return
-            # 首次 new_order 记下时间点，供首次 check-in 避让。
-            if self._first_new_order_at is None:
-                self._first_new_order_at = time.monotonic()
-            # 1 秒合并窗口就是 new_order 的限频，不再套全局 4 秒闸。
-            self.last_proactive_tick = tick
-            timing = TurnTiming(
-                source="event", event=name,
-                started=(self._pending_order_at
-                         if self._pending_order_at is not None
-                         else time.monotonic()))
-            self._pending_order_at = None
-            self._run_llm(context, name, "", new_orders=batch,
-                          timing=timing)
-            return
-        if name == "help_request":
-            detail = "要请队友帮忙的这一步：%s（%s）" % (
-                payload.get("task_type"), payload.get("item") or "")
+        if name == "open_division":
+            detail = "开局分工建议：P2 负责 %s；P1 负责 %s" % (
+                "、".join(payload.get("p2_actions") or []),
+                "、".join(payload.get("p1_actions") or []))
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
             self._run_llm(context, name, "", timing=timing, event_detail=detail)
             return
-        if name == "task_switch":
-            detail = "你（P2）现在去做的这一步：%s（%s）" % (
+        if name == "help_request":
+            detail = "要请队友帮忙的这一步：%s（%s）" % (
                 payload.get("task_type"), payload.get("item") or "")
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,

@@ -283,13 +283,6 @@ def test_state_message_is_system_with_world_state():
     assert "事件" not in msg["content"]
 
 
-def test_state_message_new_order_includes_new_dish_dag():
-    msg = state_message("new_order", {}, "Pasta\n  └ Chop:Tomato")
-    assert "【新菜】" in msg["content"]
-    assert "Chop:Tomato" in msg["content"]
-    assert "系统：" not in msg["content"]
-
-
 def test_event_note_is_system():
     assert event_note("new_order")["role"] == "system"
 

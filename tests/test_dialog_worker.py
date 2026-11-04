@@ -533,60 +533,6 @@ def test_speak_is_noop_after_stop():
 
 # --------------------------------------------------------------- events
 
-def test_new_order_event_waits_for_batch_window():
-    llm = FakeLLM(reply("新菜黄瓜寿司，我煮饭你切黄瓜？"))
-    worker, bundle = make_worker(llm=llm)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Cucumber"}],
-               "dish_dags": {"Sushi_Cucumber": "Sushi_Cucumber\n  └ Chop:Cucumber"},
-               "tools": TOOLS}
-
-    worker._handle_event(("new_order", [1]), context)
-    assert llm.calls == []
-
-    worker._handle_event(("new_order", []), dict(context, tick=1020))
-    assert len(llm.calls) == 1
-    messages, tools = llm.calls[0]
-    # 新菜的 DAG 进本轮 system 消息；new_order 可直接调 update_duties
-    state = messages[-2]
-    assert state["role"] == "system"
-    assert "Chop:Cucumber" in state["content"] and "新菜" in state["content"]
-    # 事件回合没有 user 消息，只有一条事件占位
-    assert messages[-1]["role"] == "system" and "new_order" in messages[-1]["content"]
-    assert all(m["role"] != "user" for m in messages)
-    # new_order 与 speech 一样 tool_choice=auto：可以直接落账本
-    assert tools == TOOLS and llm.choices == ["auto"]
-    assert bundle.tts.spoken == ["新菜黄瓜寿司，我煮饭你切黄瓜？"]
-
-
-def test_new_order_can_write_duties_directly():
-    llm = FakeLLM(
-        reply("", duty(op="add", mode="do", target="BoiledSushiRice")),
-        reply("新菜鱼寿司，米饭我煮，海苔和鱼你来切。"))
-    worker, bundle = make_worker(llm=llm)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Fish"}],
-               "dish_dags": {"Sushi_Fish": "Sushi_Fish\n  └ Chop:SushiFish"},
-               "tools": TOOLS}
-
-    worker._handle_event(("new_order", [1]), context)
-    thread = run_async(worker._handle_event, ("new_order", []),
-                       dict(context, tick=1020))
-
-    batch = bundle.cmd_q.get(timeout=2)
-    assert isinstance(batch, DutyBatch)
-    assert batch.calls == [("update_duties", {
-        "op": "add", "mode": "do", "target": "BoiledSushiRice"})]
-    assert batch.origin == "new_order"
-    assert bundle.tts.spoken == []
-
-    bundle.ack_q.put({"batch_id": batch.batch_id,
-                      "results": [{"ok": True, "id": "a1"}]})
-    thread.join(2)
-
-    assert not thread.is_alive()
-    assert llm.choices == ["auto", "none"]
-    assert bundle.tts.spoken == ["新菜鱼寿司，米饭我煮，海苔和鱼你来切。"]
-
-
 def test_help_event_is_gone():
     worker, _ = make_worker(llm=FakeLLM(reply("好。")))
 
@@ -726,45 +672,6 @@ def test_put_event_drops_oldest_when_full():
 
     assert bundle.event_q.get_nowait() == ("rescue", 3)
     assert bundle.event_q.empty()
-
-
-def test_thread_drains_event_queue():
-    worker, bundle = make_worker(llm=FakeLLM(reply("我来帮你。")))
-    worker.publish_context({"tick": 1000})
-    worker.start()
-
-    worker.put_event(("new_order", [1]))
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-    assert wait_until(lambda: worker.state.pending_orders == [1])
-
-    worker.publish_context({"tick": 1021})
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-
-    assert wait_until(lambda: bundle.tts.spoken == ["我来帮你。"])
-    worker.stop()
-
-
-def test_run_flushes_single_new_order_batch_after_window():
-    llm = FakeLLM(reply("新单来了。"))
-    worker, bundle = make_worker(llm=llm)
-    worker.publish_context({"tick": 100})
-    worker.start()
-
-    # 单张新单只投一次 [id]：批窗内不触发
-    worker.put_event(("new_order", [1]))
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-    assert wait_until(lambda: worker.state.pending_orders == [1])
-    assert llm.prompts == []
-
-    # 窗口过后由 worker 的周期 flush 以空 id 推进；批次 [1] 触发一次
-    worker.publish_context({"tick": 121})
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-
-    assert wait_until(lambda: len(llm.prompts) == 1)
-    assert worker.state.pending_orders == []
-    assert "新菜" in llm.prompts[0]
-    assert bundle.tts.spoken == ["新单来了。"]
-    worker.stop()
 
 
 def test_thread_transcribes_utterance_as_int16_pcm():
@@ -1055,36 +962,6 @@ def test_turn_latency_logs_asr_llm_tts_and_audio(tmp_path):
     assert latency["outcome"] == "ok"
 
 
-def test_new_order_latency_includes_level_and_merge_window(tmp_path):
-    log_path = tmp_path / "voice-new-order.jsonl"
-    config = make_config()
-    config.log_path = str(log_path)
-    worker, _bundle = make_worker(
-        llm=TimedLLM(reply("新单来了，我煮饭。")), config=config)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Cucumber"}],
-               "tools": TOOLS}
-
-    worker.start()
-    try:
-        worker.log_event("level_start", level="Sushi_1_4_2P")
-        time.sleep(0.01)
-        worker._handle_event(("new_order", [1]), context)
-        worker._handle_event(("new_order", []), dict(context, tick=1020))
-    finally:
-        worker.stop()
-
-    latency = next(r for r in _log_records(log_path)
-                   if r["kind"] == "turn_latency")
-    assert latency["event"] == "new_order"
-    assert latency["source"] == "event"
-    assert latency["since_level_ms"] >= 10
-    # 事件回合没有 ASR/音频时长，但 LLM/TTS/出声都要有。
-    assert latency["asr_ms"] is None
-    assert latency["llm_first_token_ms"] is not None
-    assert latency["tts_first_chunk_ms"] is not None
-    assert latency["first_audio_ms"] is not None
-
-
 def test_tool_ack_duration_is_logged(tmp_path):
     log_path = tmp_path / "voice-tools.jsonl"
     config = make_config()
@@ -1137,40 +1014,6 @@ def test_speak_flushes_only_the_playback_window():
     assert capture.marks == [7]
     assert capture.flushed_since == [7]
     assert capture.flushed == 0
-
-
-def test_first_checkin_defers_until_after_first_new_order():
-    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
-    worker.publish_context({"level": "Sushi_1_4_2P",
-                            "orders": [{"id": 1, "dish": "X"}],
-                            "tick": 100,
-                            "live": True})
-    worker._first_new_order_at = time.monotonic()
-    worker._next_checkin_at = time.monotonic() - 1.0
-    worker._checkins_fired = 0
-
-    worker._maybe_checkin(None, False, False)
-
-    assert worker._checkins_fired == 0
-    assert worker._next_checkin_at >= (
-        worker._first_new_order_at + worker_mod.CHECKIN_MIN_S - 0.01)
-    assert bundle.tts.spoken == []
-
-
-def test_second_checkin_is_not_deferred_by_first_new_order():
-    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
-    worker.publish_context({"level": "Sushi_1_4_2P",
-                            "orders": [{"id": 1, "dish": "X"}],
-                            "tick": 100,
-                            "live": True})
-    worker._first_new_order_at = time.monotonic() - 100.0
-    worker._next_checkin_at = time.monotonic() - 1.0
-    worker._checkins_fired = 1
-
-    worker._maybe_checkin(None, False, False)
-
-    assert worker._checkins_fired == 2
-    assert bundle.tts.spoken == ["局面不错。"]
 
 
 def test_checkin_clears_schedule_when_round_finished():

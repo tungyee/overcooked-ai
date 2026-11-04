@@ -347,6 +347,41 @@ def _validate_action(kitchen, action, direction, world, bb):
     return True, ""
 
 
+def _open_division_payload(world, bb):
+    # type: (World, Blackboard) -> Optional[Dict[str, List[str]]]
+    """本关「动作→边」切分；无干净切分返回 None。
+
+    对每个动作，判其站点整类归谁（可达性口径）：只有 P2 够得着 → P2；只有
+    P1 够得着 → P1；两边都够得着或分散 → 共享。存在「归 P1」与「归 P2」的
+    动作才返回切分。连通图的就近切分（出生侧聚类）是后续优化，此处先按
+    可达性硬分裂。
+    """
+    p1_actions, p2_actions = [], []
+    for action, station_type in ACTION_STATION_TYPES.items():
+        stations = [st for st in world.stations if st.get("t") == station_type]
+        if not stations:
+            continue
+        p2_ok = all(regions.reachable_by(world, st, bb=bb) for st in stations)
+        p1_ok = all(regions.reachable_by(world, st, P.P1_NAME, bb=bb)
+                    for st in stations)
+        if p2_ok and not p1_ok:
+            p2_actions.append(action)
+        elif p1_ok and not p2_ok:
+            p1_actions.append(action)
+    if p1_actions and p2_actions:
+        return {"p1_actions": p1_actions, "p2_actions": p2_actions}
+    return None
+
+
+def _maybe_open_division(world, bb):
+    # type: (World, Blackboard) -> Optional[Tuple[str, Dict]]
+    """开局分工事件：有切分返回 ("open_division", payload)，否则 None。"""
+    payload = _open_division_payload(world, bb)
+    if payload is None:
+        return None
+    return ("open_division", payload)
+
+
 def _option_text(task):
     # type: (Any) -> str
     """「接下来可做的」一项：节点 + 一句话说明。"""
@@ -656,6 +691,7 @@ class Agent:
         self._last_seconds_fired = False
         self._round_summary_fired = False
         self._round_started = False
+        self._open_division_fired = False
         # 上一关遗留的批次和 ack 必须丢掉：它们代表旧 World 上的决定。
         self._drain_dialog_queues()
         reset = getattr(self.dialog_worker, "reset_state", None)
@@ -701,6 +737,14 @@ class Agent:
         events = []  # type: list
         tick = self.bb.tick or 0
 
+        # 开局分工：本关第一次算一次「动作→边」切分，有干净切分才开口。
+        if not getattr(self, "_open_division_fired", False):
+            self._open_division_fired = True
+            event = _maybe_open_division(world, self.bb)
+            if event is not None:
+                self._put_event(event)
+                events.append(event)
+
         # ② drain 工具批次 → 账本落地 → 逐条结果回 worker
         while True:
             try:
@@ -731,28 +775,8 @@ class Agent:
             if expiry > tick
         }
 
-        # ④ 新菜谱事件：每种菜一局只说一次（开局第一批也算，spec §5.1）。
-        new_ids = []
+        # ④ 新菜谱事件已移除（open_division 取代它：分工由开局切分 + 求助覆盖）。
         book = self.book or RecipeBook(world.recipes, world.stations)
-        for order in world.orders:
-            order_id, dish = order.get("id"), order.get("dish")
-            if order_id is None or not dish:
-                continue
-            if dish not in self._seen_orders:
-                self._seen_orders[dish] = dict(order)
-                # 只有带来「新物料」的菜才播：新单的物料若全被之前的单覆盖，
-                # 分工没变，不再打扰（spec §5.1 的收窄）。
-                ingredients = [str(i).lower()
-                               for i in book.requirements(order)]
-                new_mats = [i for i in ingredients
-                            if i not in self._seen_materials]
-                if new_mats:
-                    self._seen_materials.update(new_mats)
-                    new_ids.append(order_id)
-        if new_ids:
-            event = ("new_order", new_ids)
-            self._put_event(event)
-            events.append(event)
 
         # ④.5 临结束提醒：最后 10 秒发一次（结束总结在 _tick_once 的等待分支里，
         # 因为 round_finished 时本函数已不会被执行）。
@@ -1072,13 +1096,6 @@ class Agent:
         # ⑪ 登记 commitment（存 Task 对象本身：承诺惯性按四元身份比较）
         if chosen_task:
             if not self.bb.commitment or self.bb.commitment.active_task != chosen_task:
-                old = self.bb.commitment.active_task if self.bb.commitment else None
-                old_key = ((getattr(old, "TYPE", None),
-                            str(getattr(old, "item", None) or "").lower())
-                           if old is not None else None)
-                new_key = (getattr(chosen_task, "TYPE", None),
-                           str(getattr(chosen_task, "item", None) or "").lower())
-                self._maybe_emit_task_switch(old_key, new_key)
                 self.bb.commitment = Commitment(chosen_task, self.tick, 0, 0, 0)
 
         # ⑫ 执行

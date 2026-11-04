@@ -512,42 +512,6 @@ def test_tick_once_publishes_paused_context(dagent, world):
     assert fake_worker.contexts[-1]["live"] is False
 
 
-def test_service_dialog_emits_new_order_only_once(dagent, world,
-                                                  fake_worker):
-    dagent._service_dialog(world)
-    dagent._service_dialog(world)
-
-    new_orders = [e for e in fake_worker.events if e[0] == "new_order"]
-    assert new_orders == [("new_order", [1])]
-
-
-def test_service_dialog_new_order_skips_covered_materials(dagent, world,
-                                                          fake_worker):
-    world.orders = [
-        {"id": 1, "dish": "Salad", "composition": ["Cucumber", "Tomato"],
-         "remaining": 60, "lifetime": 130},
-    ]
-    dagent._service_dialog(world)
-    fake_worker.events.clear()
-
-    # 新单「生菜」：物料全被之前的单覆盖，不播 new_order。
-    world.orders.append({
-        "id": 2, "dish": "CucumberSalad", "composition": ["Cucumber"],
-        "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events if e[0] == "new_order"] == []
-
-    # 新单「鱼」：有新物料，播一次。
-    world.orders.append({
-        "id": 3, "dish": "FishSalad", "composition": ["SushiFish"],
-        "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == [("new_order", [3])]
-
-
 def test_service_dialog_emits_last_seconds_once(dagent, world, fake_worker):
     # 最后 10 秒内：last_seconds 只发一次。
     world.raw["timer"] = {"server": {"left": 5, "limit": 130}}
@@ -574,43 +538,6 @@ def test_tick_once_emits_round_summary_once(dagent, world, fake_worker):
 
     assert [e for e in fake_worker.events
             if e[0] == "round_summary"] == [("round_summary", None)]
-
-
-def test_service_dialog_new_order_dedupes_by_dish(dagent, world,
-                                                  fake_worker):
-    dagent._service_dialog(world)
-    fake_worker.events.clear()
-
-    # 同一道菜已经有单，再来一张重复单：不触发新菜谱事件。
-    world.orders.append({
-        "id": 2, "dish": "CucumberSushi",
-        "composition": ["Cucumber"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == []
-
-    # 新菜谱出现：触发一次，只带新单 id。
-    world.orders.append({
-        "id": 3, "dish": "FishSushi",
-        "composition": ["SushiFish"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == [("new_order", [3])]
-
-    # 这道菜全部消失后再出现：本局已经播过，不再触发。
-    world.orders = [order for order in world.orders
-                    if order.get("dish") != "FishSushi"]
-    dagent._service_dialog(world)
-    fake_worker.events.clear()
-    world.orders.append({
-        "id": 4, "dish": "FishSushi",
-        "composition": ["SushiFish"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == []
 
 
 def test_service_dialog_publishes_context_every_10_ticks(dagent, world,
@@ -803,26 +730,5 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     assert any(e[0] == "help_request" for e in fake_worker.events)
     assert a.ledger.help_request_ids()
     assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
-
-
-def test_task_switch_event_on_commitment_change(dagent, fake_worker):
-    ev = dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
-                                        ("Chop", "cucumber"), tick=100)
-    assert ev is not None and ev[0] == "task_switch"
-    assert fake_worker.events[-1] == ev
-
-
-def test_task_switch_same_item_no_event(dagent, fake_worker):
-    ev = dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
-                                        ("FetchToBoard", "cucumber"), tick=100)
-    assert ev is None
-
-
-def test_task_switch_respects_cooldown(dagent, fake_worker):
-    dagent._maybe_emit_task_switch(("FetchToBoard", "cucumber"),
-                                   ("Chop", "cucumber"), tick=100)
-    ev = dagent._maybe_emit_task_switch(("Chop", "cucumber"),
-                                        ("FetchToPlate", "cucumber"), tick=150)
-    assert ev is None
 
 

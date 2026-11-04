@@ -483,3 +483,31 @@ def test_validate_rejects_missing_action_station(rapids_world, rapids_kitchen):
     bb = Blackboard()
     ok, reason = _validate_action(rapids_kitchen, "洗盘", "P2", rapids_world, bb)
     assert ok is False and "没有" in reason
+
+
+# ---- Task 8: 开局分工事件 ----
+
+DIALOG_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
+                              "dialog_scenarios.ndjson.gz")
+
+
+@pytest.fixture
+def sushi_world():
+    with gzip.open(DIALOG_FIXTURE, "rt") as fh:
+        frame = [json.loads(line) for line in fh][-1]
+    return World(frame)
+
+
+def test_open_division_on_split_map(rapids_world):
+    from ai.agent import _maybe_open_division
+    event = _maybe_open_division(rapids_world, Blackboard())
+    assert event is not None
+    assert event[0] == "open_division"
+    assert "切" in event[1]["p2_actions"]
+    assert "下锅" in event[1]["p1_actions"]
+
+
+def test_no_open_division_on_connected_map(sushi_world):
+    from ai.agent import _maybe_open_division
+    event = _maybe_open_division(sushi_world, Blackboard())
+    assert event is None

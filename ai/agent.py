@@ -583,7 +583,7 @@ class Agent:
                 results.append({"ok": False, "reason": "参数不是合法 JSON"})
                 continue
             if name == "update_duties":
-                if isinstance(args, dict):
+                if isinstance(args, dict) and args.get("op") != "cancel":
                     action = args.get("action")
                     direction = args.get("direction") or "P2"
                     if action is not None:

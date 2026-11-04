@@ -9,7 +9,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from ai.dialog.schema import RESCUE_TYPES
+from ai.dialog.schema import RESCUE_TYPES, scope_matches
 from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.revenue import eta as ETA
@@ -195,15 +195,21 @@ def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger)
     prune = getattr(ledger, "prune_help_requests", None)
     if callable(prune):
         prune(needed)
-    requested = set()  # type: set
-    for duty in getattr(ledger, "duties", None) or ():
-        if getattr(duty, "source", "") == "help_request":
-            requested |= set(getattr(duty, "scope", None) or ())
+    requested_scopes = [getattr(d, "scope", None) for d in
+                        (getattr(ledger, "duties", None) or ())
+                        if getattr(d, "source", "") == "help_request"]
     tick = getattr(bb, "tick", 0) or 0
+
+    def _already_requested(step):
+        # 动作级 help duty 的 scope 是 {(type, None)}，节点级是 {(type, item)}；
+        # 统一用 scope_matches 判覆盖，避免动作级 scope 被节点级精确匹配漏掉。
+        task = type("T", (), {"TYPE": step.task_type, "item": step.item})()
+        return any(scope_matches(scope, task) for scope in requested_scopes)
+
     candidates = [s for s in steps
                   if s.source is not None
                   and p1_saves_enough(s.p1_cost, s.p2_cost)
-                  and (s.task_type, s.item) not in requested
+                  and not _already_requested(s)
                   and not ledger.help_request_recent(s.task_type, s.item, tick)]
     if not candidates:
         return None

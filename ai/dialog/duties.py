@@ -410,9 +410,9 @@ class Ledger(object):
         item = args.get("item")
         item_key = str(item or "").lower()
         if op == "cancel":
+            # 撤销这个动作的约定（不区分 mode/item：「算了别切了」）。
             for duty in self.duties:
-                if duty.mode == mode and duty.action == action \
-                        and (duty.item or "") == item_key:
+                if duty.action == action:
                     self.duties = [d for d in self.duties if d.id != duty.id]
                     return {"ok": True, "id": duty.id, "removed": True}
             return {"ok": False, "reason": "没有这条约定"}
@@ -620,8 +620,6 @@ def tool_schemas(targets=None, duty_ids=None):
                    "description": "动作（绑定站点）：切/下锅/拌/装盘/送餐/洗盘"},
         "direction": {"type": "string", "enum": ["P2", "P1"],
                       "description": "assign 用：P2=你负责做，P1=交给 P1（你避开、收尾可补位）"},
-        "item": {"type": "string",
-                 "description": "可选，now/stop 用：具体哪一种料（如「鸡块」），用于选对 task"},
     }
     return [{
         "type": "function",

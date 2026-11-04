@@ -383,3 +383,15 @@ def test_claim_negative_weight_enters_scoring():
     cand = planner.Candidate(_task("Chop", "Cucumber"), [], 1)
     matched = planner._matching_preferences(cand, bb, layer=6)
     assert any(w == -6.0 and p.kind == "claim" for p, w in matched)
+
+
+def test_apply_cancel_by_action_ignores_mode_and_item(kitchen):
+    led = Ledger()
+    _add(led, kitchen, "assign", "切", direction="P2")
+    r = led.apply({"op": "cancel", "mode": "now", "action": "切"}, kitchen, 0)
+    assert r["ok"] is True and led.preferences() == []
+
+
+def test_tool_schemas_has_no_item_field():
+    props = tool_schemas()[0]["function"]["parameters"]["properties"]
+    assert "item" not in props

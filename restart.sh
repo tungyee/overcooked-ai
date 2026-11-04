@@ -7,7 +7,9 @@
 #   ./restart.sh --voice      # 显式开语音（缺 key 直接报错退出）
 #   ./restart.sh --no-voice   # 强制关语音
 #   ./restart.sh --skip-build # 跳过编译（仅重启；只改了 Python 侧时用）
-# 各 flag 可组合，如 ./restart.sh --skip-build --voice
+#   ./restart.sh --voice-debug            # 语音调试日志开到 DEBUG
+#   ./restart.sh --voice-log voice.jsonl  # 对话日志落盘（配合 --voice-debug 排查用）
+# 各 flag 可组合，如 ./restart.sh --skip-build --voice --voice-debug --voice-log voice.jsonl
 # 游戏目录默认用 Steam 默认安装路径，可用 GAME_DIR 环境变量覆盖（非默认 Steam 库时用）。
 set -u
 
@@ -22,13 +24,25 @@ PORT=27411
 EXEC_PORT=27412
 SKIP_BUILD=0
 VOICE_FLAG=""          # 空=自动（有 key 就开）；--voice 显式开；--no-voice 显式关
-for arg in "$@"; do
-    case "$arg" in
+VOICE_DEBUG_FLAG=""
+VOICE_LOG_PATH=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --skip-build) SKIP_BUILD=1 ;;
         --voice)      VOICE_FLAG="--voice" ;;
         --no-voice)   VOICE_FLAG="--no-voice" ;;
-        *) echo "[restart] 未知参数: $arg" >&2; exit 2 ;;
+        --voice-debug) VOICE_DEBUG_FLAG="--voice-debug" ;;
+        --voice-log)
+            if [ $# -lt 2 ]; then
+                echo "[restart] --voice-log 需要一个路径参数" >&2
+                exit 2
+            fi
+            VOICE_LOG_PATH="$2"
+            shift
+            ;;
+        *) echo "[restart] 未知参数: $1" >&2; exit 2 ;;
     esac
+    shift
 done
 
 # 用进程命令行精确匹配，避免误杀 Steam/脚本自身。
@@ -93,4 +107,5 @@ fi
 # 6. 前台起 Agent，Ctrl+C 可停；不再把 Agent 留在隐藏的后台。
 echo "[restart] 启动 Agent ..."
 echo "[restart] 提示：虚拟手柄只在主菜单能 engage 成 P2——标题画面按 A/空格进 P1、到主菜单后会自动接入。"
-exec "$PYTHON" run_agent.py $VOICE_FLAG
+exec "$PYTHON" run_agent.py $VOICE_FLAG $VOICE_DEBUG_FLAG \
+    ${VOICE_LOG_PATH:+--voice-log "$VOICE_LOG_PATH"}

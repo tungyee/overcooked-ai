@@ -39,6 +39,18 @@ OTHER_TASK_TYPES = (
     "Discard", "RecoverLoosePot", "StashHeld", "ResetPlate", "Extinguish",
 )  # type: Tuple[str, ...]
 
+# 每个可分工动作绑定的站点类型（frame stations[].t），供「判」做粗粒度校验
+# （站点在本关存在、P2 是否够得着）。装盘/送餐都归到 plate_station（盘/出餐
+# 口一侧），精确站点由 planner 每拍选。
+ACTION_STATION_TYPES = {
+    "切": "chopping",
+    "下锅": "cooking",
+    "拌": "mixing",
+    "装盘": "plate_station",
+    "送餐": "plate_station",
+    "洗盘": "washing",
+}  # type: Dict[str, str]
+
 
 def action_scope(action, item=None):
     # type: (str, Optional[str]) -> FrozenSet[Tuple[Optional[str], Optional[str]]]

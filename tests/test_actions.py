@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """动作级作用域映射：ai/dialog/actions.py 的单元测试。"""
 from ai import tasks as T
-from ai.dialog.actions import (ACTION_TASK_TYPES, FETCH_TASK_TYPES,
-                               OTHER_TASK_TYPES, action_scope)
+from ai.dialog.actions import (ACTION_STATION_TYPES, ACTION_TASK_TYPES,
+                               FETCH_TASK_TYPES, OTHER_TASK_TYPES, action_scope)
+
+
+def test_action_station_types_cover_all_actions():
+    assert set(ACTION_STATION_TYPES) == set(ACTION_TASK_TYPES)
+    assert ACTION_STATION_TYPES["切"] == "chopping"
+    assert ACTION_STATION_TYPES["下锅"] == "cooking"
+    assert ACTION_STATION_TYPES["洗盘"] == "washing"
 
 
 def test_action_partition_covers_all_task_types():

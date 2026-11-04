@@ -432,3 +432,54 @@ def test_task_own_failure_still_abandons(agent):
     for _ in range(A.ABANDON_FAIL_STREAK):
         agent._note_failure(task, ctx)
     assert agent.bb.scratch.abandoned_actions[task.claims()[0]] == agent.tick + A.ABANDON_TTL_TICKS
+
+
+# ---- Task 4: _validate_action（用 2-1 真实帧） ----
+
+import gzip
+import json
+import os
+
+from ai.dialog.duties import Kitchen
+from ai.query.recipe_graph import _compile_node
+from ai.query.recipes import RecipeBook
+
+RAPIDS21 = os.path.join(os.path.dirname(__file__), "fixtures",
+                        "rapids", "rapids21-20261028.ndjson.gz")
+
+
+@pytest.fixture
+def rapids_world():
+    with gzip.open(RAPIDS21, "rt") as fh:
+        frame = [json.loads(line) for line in fh][-1]
+    return World(frame)
+
+
+@pytest.fixture
+def rapids_kitchen(rapids_world):
+    from ai.agent import _TASK_META
+    book = RecipeBook(rapids_world.recipes, rapids_world.stations)
+    stations = {st.get("t") for st in rapids_world.stations if st.get("t")}
+    return Kitchen.from_orders(book, rapids_world.orders, _compile_node,
+                               _TASK_META, stations)
+
+
+def test_validate_rejects_cross_side_assign(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, reason = _validate_action(rapids_kitchen, "下锅", "P2", rapids_world, bb)
+    assert ok is False and "够不着" in reason
+
+
+def test_validate_accepts_p2_reachable_action(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, _ = _validate_action(rapids_kitchen, "切", "P2", rapids_world, bb)
+    assert ok is True
+
+
+def test_validate_rejects_missing_action_station(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, reason = _validate_action(rapids_kitchen, "洗盘", "P2", rapids_world, bb)
+    assert ok is False and "没有" in reason

@@ -12,12 +12,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ai import tasks as T
 from ai.core import arbiter, executor, planner
+from ai.dialog.actions import ACTION_STATION_TYPES
 from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
                               node_key, tool_schemas)
 from ai.dialog.help import top_help_request
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
-from ai.space import navigation, portals, reachability, seam_clock, seams, shuttle
+from ai.space import (navigation, portals, reachability, regions, seam_clock,
+                      seams, shuttle)
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
@@ -325,6 +327,24 @@ def _plates_text(world, book):
 def _duty_tools(kitchen, ledger):
     # type: (Kitchen, Ledger) -> List[dict]
     return tool_schemas(kitchen.targets(), ledger.ids())
+
+
+def _validate_action(kitchen, action, direction, world, bb):
+    # type: (Kitchen, str, str, World, Blackboard) -> Tuple[bool, str]
+    """校验一个动作意图是否可行（判）。返回 (ok, reason)。
+
+    - action 的站点类型本关不存在 → (False, "本关没有这个动作")。
+    - direction=="P2" 且 P2 够不着该动作站点 → (False, "够不着...")。
+    - direction=="P1"（让给 P1）不校验 P2 可达性，只校验动作存在。
+    """
+    station_type = ACTION_STATION_TYPES[action]
+    stations = [st for st in world.stations if st.get("t") == station_type]
+    if not stations:
+        return False, "本关没有%s这个动作" % (action,)
+    if direction == "P2":
+        if not any(regions.reachable_by(world, st, bb=bb) for st in stations):
+            return False, "够不着%s（它的站点在 P1 那边）" % (action,)
+    return True, ""
 
 
 def _option_text(task):

@@ -447,16 +447,6 @@ def _ranked_tasks(plan_record):
     return out
 
 
-def _step_is_top(step, ranked):
-    # type: (Any, List) -> bool
-    """求助步骤是否 == planner 打分第一名（按 (TYPE, item) 匹配，忽略 order/站）。"""
-    top = ranked[0] if ranked else None
-    if top is None:
-        return False
-    return (getattr(top, "TYPE", None) == step.task_type
-            and str(getattr(top, "item", None) or "").lower() == step.item)
-
-
 def _stuck_info(bb, world, motion=None):
     # type: (Any, World, Optional[Dict]) -> Optional[Dict]
     """卡住事实（纯读）：arbiter 同格卡住优先，回退 motion 空转（spec §G.1）。
@@ -698,10 +688,11 @@ class Agent:
 
     def _maybe_request_help(self, world, book):
         # type: (World, RecipeBook) -> Optional[Dict]
-        """P1 做某步明显更划算 → 落挪走 duty，返回 help_request 事件 payload。
+        """P2 做不了/赶不及的步骤 → 落挪走 duty，返回 help_request 事件 payload。
 
         4 秒冷却（每次最多一条）；top_help_request 已按账本里 help_request
-        duty 去重，所以同 (料/站) 不重复喊。
+        duty 去重，所以同 (料/站) 不重复喊。触发只两类：结构性（P2 够不着）
+        与赶不及救锅，见 `ai/dialog/help.py`。
         """
         tick = self.bb.tick or 0
         if tick - getattr(self, "_last_help_request_tick", 0) < 80:
@@ -710,10 +701,6 @@ class Agent:
         step = top_help_request(world, self.bb, book, live_orders,
                                 plate_match, cooker_match, self.ledger)
         if step is None:
-            return None
-        # 结构性（P2 够不着）必喊；经济性（P2 够得着）只有它是 P2 当前 #1 才喊，
-        # 否则这一步现在不急、就算 P1 更省力也不打断 P1。
-        if step.p2_cost is not None and not _step_is_top(step, self._last_ranked):
             return None
         self.ledger.add_help_request(step.task_type, step.item, tick)
         self._sync_duty_preferences()      # 挪走立刻落成 claim 偏好，本拍规划可见

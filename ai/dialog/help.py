@@ -2,9 +2,10 @@
 """P1 求助触发：P1/P2 成本比较、订单 DAG 前沿扫描与候选排名（spec §5.1–§5.2）。
 
 本模块由主循环（`agent._service_dialog`）调用，只读 `World` / `Blackboard`，
-不写；产出的是「P1 做哪一步明显更划算」的判定，最终经 `help_request` 事件
-交给对话 worker 措辞。与投掷机制的区别：这里只算「谁去更划算」，真正发令
-（扔/取/切/煮/盛/装）仍是 P1（人类）或 P2 自己的规划，不由本模块控制。
+不写；产出的是「P2 做不了（够不着料源）或赶不及（锅要糊）→ 需 P1 搭手」的
+判定，最终经 `help_request` 事件交给对话 worker 措辞。与投掷机制的区别：这里
+只算「该不该请 P1」，真正发令（扔/取/切/煮/盛/装）仍是 P1（人类）或 P2 自己
+的规划，不由本模块控制。
 """
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -14,12 +15,9 @@ from ai.dialog.schema import RESCUE_TYPES, scope_matches
 from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.revenue import eta as ETA
-from ai.space import reachability
+from ai.space import reachability, seams
 
-# P1 比 P2 省多少步才值得开口求助（≈0.3 秒/步，12 步 ≈ 3.6 秒 ≈ 大半张图）。
-HELP_THRESHOLD_STEPS = 12
-
-# 料源定位时故意不过滤 P2 可达性：p1/p2 谁更划算由 cost_to 另行比较。
+# 料源定位时故意不过滤 P2 可达性：p1/p2 谁够得着由 cost_to 另行比较。
 _SOURCE_ANY = lambda st: True  # noqa: E731
 
 
@@ -41,18 +39,14 @@ def cost_to(world, bb, name, source):
     return min(vals) if vals else None
 
 
-def p1_saves_enough(p1_cost, p2_cost, threshold=HELP_THRESHOLD_STEPS):
-    # type: (Optional[int], Optional[int], int) -> bool
-    """P1 是否明显更划算（spec §5.1 统一阈值）。
+def p1_saves_enough(p1_cost, p2_cost):
+    # type: (Optional[int], Optional[int]) -> bool
+    """P2 够不着、P1 够得着才求助（结构性，分割图）。
 
-    P2 够不着（None）→ 必喊（结构性，分割图）；P1 够不着（None）→ 不喊；
-    否则 P2 步数 − P1 步数 ≥ threshold 才喊。
+    经济性（P2 够得着但 P1 更省步数）不再作为求助触发条件：那类「你更划算」
+    不是紧急事件，还容易对 P1 反复喊（trace-20261103-205951）。
     """
-    if p1_cost is None:
-        return False
-    if p2_cost is None:
-        return True
-    return p2_cost - p1_cost >= threshold
+    return p1_cost is not None and p2_cost is None
 
 
 @dataclass
@@ -104,13 +98,60 @@ def _source_for(world, book, task, ctx):
 
 def _rescue_for_help(task, source):
     # type: (Any, Dict) -> bool
-    """该步是否永不求助：救援类恒跳过；盛盘在锅快糊/起火时跳过。"""
+    """该步是否永不求助：救援类/灭火恒跳过；盛盘只在锅已着火时跳过。
+
+    「快糊/已糊（burning）」的盛盘放行进候选——它正是「锅熟了但赶不及去救」
+    的求助场景。真着火（onFire）归 P2 自己灭火/救锅，不麻烦 P1。
+    """
     t = getattr(task, "TYPE", None)
     if t in RESCUE_TYPES or t == "Extinguish":
         return True
     if t == "TakeCookedToPlate":
-        return bool((source or {}).get("burning") or (source or {}).get("onFire"))
+        return bool((source or {}).get("onFire"))
     return False
+
+
+def _burn_remaining_ticks(cooker):
+    # type: (Optional[Dict]) -> Optional[float]
+    """这口灶还有多少拍烧糊；没在煮（空灶/刚点火）或字段缺失返回 None。
+
+    口径与 `ai/core/planner.py::_burn_eta_ticks` 一致：`cooking_progress` 单位≈秒，
+    糊点 = 2 × `cooking_time`；`burning`/`onFire` 视为 0 拍。
+    """
+    if not cooker:
+        return None
+    if cooker.get("burning") or cooker.get("onFire"):
+        return 0.0
+    prog = cooker.get("cooking_progress")
+    ctime = cooker.get("cooking_time")
+    if prog is None or ctime is None:
+        return None
+    try:
+        burn_at = 2.0 * float(ctime)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (burn_at - float(prog)) * ETA.TICKS_PER_SECOND)
+
+
+def _burn_rescue_needed(step):
+    # type: (FrontierStep) -> bool
+    """盛盘（TakeCookedToPlate）的「赶不及救锅」：锅要糊、P2 救不了、P1 够得着。
+
+    P2 够不着（p2_cost=None，分割图或动态图被切断）也算「赶不及」，只要 P1
+    够得着就喊；P2 够得着但走过去的耗时超过剩余烧糊时间也算。P1 也够不着
+    则求了没用，不喊。
+    """
+    if step.task_type != "TakeCookedToPlate" or step.source is None:
+        return False
+    if step.p1_cost is None:
+        return False
+    remaining = _burn_remaining_ticks(step.source)
+    if remaining is None:
+        return False
+    if step.p2_cost is None:
+        return True
+    p2_ticks = step.p2_cost * seams.SEC_PER_STEP * ETA.TICKS_PER_SECOND
+    return p2_ticks > remaining
 
 
 def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
@@ -168,26 +209,30 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
 
 def _help_rank_key(step, slack_map=None):
     # type: (FrontierStep, Optional[Dict[Any, float]]) -> tuple
-    """求助候选排序键：P2 够不着（blocking）最优先，其次按订单紧迫度
-    （solo_slack 小 = 更急 = 先喊），再按 P1 优势步数，最后 (task_type, item)
+    """求助候选排序键：赶不及救锅最优先，其次 P2 够不着（blocking），再按
+    订单紧迫度（solo_slack 小 = 更急 = 先喊）、P1 优势步数，最后 (task_type, item)
     稳定兜底。slack 缺失的订单排最后（视为不紧）。"""
     slack_map = slack_map or {}
-    blocking = 0 if step.p2_cost is None else 1
+    if _burn_rescue_needed(step):
+        urgency = 0                      # 锅要糊了，最急
+    elif step.p2_cost is None:
+        urgency = 1                      # P2 够不着（结构性）
+    else:
+        urgency = 2
     adv = (step.p2_cost - step.p1_cost) if (step.p1_cost is not None
                                             and step.p2_cost is not None) else 0
     slack = slack_map.get(step.order_id)
     if slack is None:
         slack = float("inf")
-    return (blocking, slack, -adv, step.task_type, step.item or "")
+    return (urgency, slack, -adv, step.task_type, step.item or "")
 
 
 def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger):
     # type: (Any, Any, Any, List[Dict], Dict, Dict, Any) -> Optional[FrontierStep]
-    """P1 更划算的前沿步骤里价值最高的一个；无则 None。
+    """P2 做不了/赶不及、需 P1 搭手的前沿步骤里最紧急的一个；无则 None。
 
-    排除已存在 help_request duty 的 (task_type, item)；排序：P2 够不着（blocking）
-    优先，其次按所属订单的 solo_slack（越紧越先），再按 P1 优势（P2−P1）降序、
-    (task_type, item) 稳定兜底。
+    排除已存在 help_request duty 的 (task_type, item)；排序：赶不及救锅最优先，
+    其次 P2 够不着（blocking），再按 solo_slack、P1 优势、(task_type, item)。
     """
     steps = frontier_steps(world, bb, book, orders, plate_match, cooker_match)
     # 剪枝依据是「步骤仍需做」，不是「此刻 P1 更划算」：后者随厨师位置/
@@ -207,12 +252,18 @@ def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger)
         task = type("T", (), {"TYPE": step.task_type, "item": step.item})()
         return any(scope_matches(scope, task) for scope in requested_scopes)
 
+    def _needs_help(step):
+        # 两类触发：
+        # 1) 结构性：P2 够不着料源（分割图），且是取料类交接 → 必喊；
+        # 2) 赶不及救锅：盛盘的锅快糊/已糊，P2 走过去的耗时超过剩余烧糊时间。
+        if step.source is None:
+            return False
+        structural = (step.task_type in FETCH_TASK_TYPES
+                      and p1_saves_enough(step.p1_cost, step.p2_cost))
+        return structural or _burn_rescue_needed(step)
+
     candidates = [s for s in steps
-                  if s.source is not None
-                  and p1_saves_enough(s.p1_cost, s.p2_cost)
-                  # 分割图（P2 够不着）只对「取料」这类交接必喊；下锅/装盘/送餐
-                  # 是 P1 的活、开局分工已说清，不反复提醒（否则聒噪）。
-                  and (s.p2_cost is not None or s.task_type in FETCH_TASK_TYPES)
+                  if _needs_help(s)
                   and not _already_requested(s)
                   and not ledger.help_request_recent(s.task_type, s.item, tick)]
     if not candidates:

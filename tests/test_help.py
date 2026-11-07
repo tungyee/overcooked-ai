@@ -4,9 +4,9 @@ import json
 import os
 
 from ai.dialog.duties import Ledger
-from ai.dialog.help import (HELP_THRESHOLD_STEPS, FrontierStep, _help_rank_key,
-                            _rescue_for_help, cost_to, frontier_steps,
-                            p1_saves_enough, top_help_request)
+from ai.dialog.help import (FrontierStep, _help_rank_key, _rescue_for_help,
+                            cost_to, frontier_steps, p1_saves_enough,
+                            top_help_request)
 from ai.query import predicates as P
 from ai.query.recipes import RecipeBook
 from ai.state import blackboard as BB
@@ -40,10 +40,10 @@ def test_p1_saves_enough_p2_unreachable():
     assert p1_saves_enough(3, None) is True
 
 
-def test_p1_saves_enough_at_threshold():
-    assert HELP_THRESHOLD_STEPS == 12
-    assert p1_saves_enough(2, 14) is True      # 14 - 2 == 12
-    assert p1_saves_enough(2, 13) is False     # 11 < 12
+def test_p1_saves_enough_economic_no_longer_fires():
+    # 经济性（P2 够得着、P1 更省）不再触发：只有结构性（P2 够不着）才 True。
+    assert p1_saves_enough(2, 14) is False
+    assert p1_saves_enough(2, 13) is False
 
 
 def test_cost_to_rapids_p2_cannot_reach_potato():
@@ -97,11 +97,13 @@ def test_rescue_for_help_skips_rescue_types():
     assert _rescue_for_help(_E(), {}) is True
 
 
-def test_rescue_for_help_take_cooked_only_when_burning():
+def test_rescue_for_help_take_cooked_skips_only_on_fire():
     class _T(object):
         TYPE = "TakeCookedToPlate"
-    assert _rescue_for_help(_T(), {"burning": True}) is True
+    # 快糊（burning）放行进候选（= 赶不及救锅场景）；真着火（onFire）跳过。
+    assert _rescue_for_help(_T(), {"burning": True}) is False
     assert _rescue_for_help(_T(), {"burning": False, "onFire": False}) is False
+    assert _rescue_for_help(_T(), {"burning": True, "onFire": True}) is True
 
 
 # ---------- Task 4 ----------
@@ -159,9 +161,9 @@ def test_top_help_request_prunes_resolved_duty():
     assert ledger.help_request_ids() == []
 
 
-def test_top_help_request_keeps_duty_when_step_needed_but_not_cheaper():
-    # mine24 出生帧：前沿步骤 P1 只近 3~5 步（<8），不构成「更划算」，
-    # 但步骤仍需做；已有求助 duty 不应因此被剪掉（否则会反复喊）。
+def test_top_help_request_keeps_duty_when_step_needed():
+    # mine24 出生帧：前沿步骤仍需做（即使此刻不触发求助）；已有求助 duty
+    # 不应因此被剪掉（否则会反复喊）。
     fp = os.path.join(os.path.dirname(__file__), "fixtures", "mine",
                       "mine24-20261031-230344-burrito.ndjson.gz")
     with gzip.open(fp, "rt", encoding="utf8") as fh:
@@ -218,6 +220,76 @@ def test_top_help_request_skips_non_fetch_on_split(monkeypatch):
     fake = H.FrontierStep(task_type="FetchToCooker", item="FriedChips",
                           source={"t": "cooking"}, p1_cost=3, p2_cost=None,
                           order_id="1")
+    monkeypatch.setattr(H, "frontier_steps", lambda *a, **k: [fake])
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is None
+
+
+# ---------- 赶不及救锅 ----------
+
+def test_burn_rescue_needed_when_p2_too_far():
+    # 锅熟、还剩 60 拍（3 秒）糊；P2 要 15 步（=75 拍）→ 赶不及。
+    from ai.dialog.help import _burn_rescue_needed
+    step = FrontierStep("TakeCookedToPlate", "friedmushrooms",
+                        {"cooking_progress": 21.0, "cooking_time": 12.0,
+                         "cooked": True, "burning": False, "onFire": False},
+                        p1_cost=2, p2_cost=15, order_id="1")
+    assert _burn_rescue_needed(step) is True
+
+
+def test_burn_rescue_not_needed_when_p2_close():
+    from ai.dialog.help import _burn_rescue_needed
+    step = FrontierStep("TakeCookedToPlate", "friedmushrooms",
+                        {"cooking_progress": 21.0, "cooking_time": 12.0,
+                         "cooked": True, "burning": False, "onFire": False},
+                        p1_cost=2, p2_cost=5, order_id="1")  # 5 步=25 拍 < 60 拍
+    assert _burn_rescue_needed(step) is False
+
+
+def test_burn_rescue_needed_when_already_burning():
+    from ai.dialog.help import _burn_rescue_needed
+    step = FrontierStep("TakeCookedToPlate", "friedmushrooms",
+                        {"burning": True, "onFire": False},
+                        p1_cost=2, p2_cost=3, order_id="1")  # burning → 0 拍剩余
+    assert _burn_rescue_needed(step) is True
+
+
+def test_burn_rescue_needed_when_p2_unreachable():
+    # 分割图/动态图被切断：P2 够不着、P1 够得着、锅要糊 → 必喊。
+    from ai.dialog.help import _burn_rescue_needed
+    step = FrontierStep("TakeCookedToPlate", "friedmushrooms",
+                        {"burning": True, "onFire": False},
+                        p1_cost=2, p2_cost=None, order_id="1")
+    assert _burn_rescue_needed(step) is True
+
+
+def test_burn_rescue_not_needed_when_p1_unreachable():
+    # 锅在 P2 自己这边、P1 够不着 → 求了没用，不喊。
+    from ai.dialog.help import _burn_rescue_needed
+    step = FrontierStep("TakeCookedToPlate", "friedmushrooms",
+                        {"burning": True, "onFire": False},
+                        p1_cost=None, p2_cost=3, order_id="1")
+    assert _burn_rescue_needed(step) is False
+
+
+def test_top_help_request_returns_burn_rescue(monkeypatch):
+    from ai.dialog import help as H
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    fake = H.FrontierStep(task_type="TakeCookedToPlate", item="friedmushrooms",
+                          source={"burning": True, "onFire": False},
+                          p1_cost=2, p2_cost=3, order_id="1")
+    monkeypatch.setattr(H, "frontier_steps", lambda *a, **k: [fake])
+    got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
+    assert got is not None and got.task_type == "TakeCookedToPlate"
+
+
+def test_top_help_request_skips_burn_rescue_when_p2_close(monkeypatch):
+    from ai.dialog import help as H
+    w, book, bb, ledger = _rapids_world_book_ledger()
+    fake = H.FrontierStep(task_type="TakeCookedToPlate", item="friedmushrooms",
+                          source={"cooking_progress": 21.0, "cooking_time": 12.0,
+                                  "cooked": True, "burning": False, "onFire": False},
+                          p1_cost=2, p2_cost=5, order_id="1")
     monkeypatch.setattr(H, "frontier_steps", lambda *a, **k: [fake])
     got = top_help_request(w, bb, book, w.orders, {}, {}, ledger)
     assert got is None

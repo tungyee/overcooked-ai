@@ -743,29 +743,6 @@ def _patch_help_trigger(monkeypatch, dagent, step):
     dagent._last_help_request_tick = 0
 
 
-def test_maybe_request_help_requires_p2_top_for_economic(dagent, world, book,
-                                                         monkeypatch):
-    """经济性求助（P2 够得着、P1 省 ≥12 步）只有该步是 P2 #1 才喊。"""
-    step = _fake_help_step()
-    _patch_help_trigger(monkeypatch, dagent, step)
-    dagent._last_ranked = [T.Chop(1, ("board_01",), "Cucumber")]  # #1 是切菜，不是取料
-
-    assert dagent._maybe_request_help(world, book) is None
-    assert dagent.ledger.help_request_ids() == []
-
-
-def test_maybe_request_help_fires_when_economic_step_is_p2_top(dagent, world,
-                                                               book, monkeypatch):
-    step = _fake_help_step()
-    _patch_help_trigger(monkeypatch, dagent, step)
-    dagent._last_ranked = [T.FetchToBoard(1, ("board_01",), "Cucumber")]  # #1 正是取黄瓜
-
-    payload = dagent._maybe_request_help(world, book)
-
-    assert payload == {"task_type": "FetchToBoard", "item": "cucumber"}
-    assert dagent.ledger.help_request_ids()
-
-
 def test_maybe_request_help_fires_structural_without_p2_top(dagent, world,
                                                             book, monkeypatch):
     """结构性（P2 够不着）取料仍必喊，不看 P2 是否 #1。"""

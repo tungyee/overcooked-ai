@@ -26,7 +26,12 @@ def default_path(root=None, now=None):
     # type: (Optional[str], Optional[time.struct_time]) -> str
     """默认落盘路径：<root>/trace-<YYYYmmdd-HHMMSS>.jsonl。"""
     root = root or REPO_ROOT
-    stamp = time.strftime("%Y%m%d-%H%M%S", now or time.localtime())
+    if now is not None:
+        stamp = time.strftime("%Y%m%d-%H%M%S", now)
+    else:
+        # 同一次启动的 trace / voice 日志共用一个 stamp（restart.sh 导出）。
+        stamp = os.environ.get("OC2_RUN_STAMP") or time.strftime(
+            "%Y%m%d-%H%M%S", time.localtime())
     return os.path.join(root, "trace-%s.jsonl" % stamp)
 
 

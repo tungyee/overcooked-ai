@@ -49,7 +49,7 @@ ACK_TIMEOUT_S = 2.0
 MAX_AGENT_TURNS = 4
 # 轮询播放状态的间隔与最长等待（兜底防止设备卡死拖住 worker 线程）。
 SPEAK_POLL_S = 0.02
-SPEAK_TIMEOUT_S = 30.0
+SPEAK_TIMEOUT_S = 10.0
 # 超时后给 producer 线程的收尾时间：不能跟着卡住的网络流一起等。
 TTS_JOIN_S = 0.1
 # 本关对话历史上限（消息条数，含 tool 结果）。
@@ -233,26 +233,48 @@ class StreamingTTS(object):
 
     def wait(self, timeout=SPEAK_TIMEOUT_S):
         # type: (float) -> None
-        self._producer_done.wait(timeout)
-        if self.error is not None:
-            self.worker._log_event("worker_error", where="tts",
-                                   error=str(self.error))
-        self._play_thread.join(timeout)
+        """等本轮播完；总时长硬上限 timeout，绝不无限拖住 worker。
+
+        以前三段各自 wait(timeout)，最坏会卡 3×timeout；而且中途异常会跳过
+        `_resume_capture`，把 VAD 永久留在 paused，后续语音全部收不到。
+        """
         deadline = time.monotonic() + timeout
-        while (self.worker.clients.player.is_playing
-               and not self.worker._stop.is_set()):
-            self.worker._poll_first_audio(self.timing, self._snippet())
-            if not self.worker._context_live():
-                # 游戏暂停/退出时立刻停播，别把过期的播报念完。
+        try:
+            self._producer_done.wait(
+                max(0.0, deadline - time.monotonic()))
+            if self.error is not None:
+                self.worker._log_event("worker_error", where="tts",
+                                       error=str(self.error))
+            if not self._producer_done.is_set():
+                # TTS 网络/生成卡住：主动取消，别让播放线程继续等。
+                self._cancelled = True
+                self.sentences.put(None)
+                self.pcm.put(None)
                 self.worker._shutdown(self.worker.clients.player, ("stop",))
-                break
-            if time.monotonic() >= deadline:
+                self.worker._log_event("worker_error", where="tts",
+                                       error="TTS 超时（未在 %.1fs 内结束）"
+                                             % timeout)
+            self._play_thread.join(
+                max(0.0, deadline - time.monotonic()))
+            while (self.worker.clients.player.is_playing
+                   and not self.worker._stop.is_set()
+                   and time.monotonic() < deadline):
+                self.worker._poll_first_audio(self.timing, self._snippet())
+                if not self.worker._context_live():
+                    # 游戏暂停/退出时立刻停播，别把过期的播报念完。
+                    self.worker._shutdown(self.worker.clients.player, ("stop",))
+                    break
+                time.sleep(SPEAK_POLL_S)
+            if (self.worker.clients.player.is_playing
+                    and time.monotonic() >= deadline):
                 self.worker._shutdown(self.worker.clients.player, ("stop",))
-                break
-            time.sleep(SPEAK_POLL_S)
-        self.worker._poll_first_audio(self.timing, self._snippet())
-        self._resume_capture()
-        self.timing.playback_done = time.monotonic()
+        finally:
+            try:
+                self.worker._poll_first_audio(self.timing, self._snippet())
+            except Exception:                   # noqa: BLE001
+                log.debug("poll_first_audio 失败", exc_info=True)
+            self._resume_capture()
+            self.timing.playback_done = time.monotonic()
 
     def _snippet(self):
         # type: () -> str
@@ -409,6 +431,12 @@ class DialogWorker(object):
         self._stop = threading.Event()
         # 当前正在播放的流式 TTS；PTT 按下时用它做最小 barge-in。
         self._active_stream = None
+        # 当前回合的看门狗状态：卡住时定期写 turn_stall，定位卡在 ASR/LLM/TTS。
+        self._turn_started_at = None
+        self._turn_stage = "idle"
+        self._turn_event = ""
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = None
         self._thread = None  # type: Any
         self._closed = False
         self._context = {}  # type: dict
@@ -557,6 +585,11 @@ class DialogWorker(object):
             except Exception:               # noqa: BLE001
                 log.debug("TTS 预连失败（不影响后续逐句建连）", exc_info=True)
         self._stop.clear()
+        self._watchdog_stop.clear()
+        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name="dialog-watchdog", daemon=True)
+            self._watchdog_thread.start()
         self._thread = threading.Thread(
             target=self._run, name="dialog-worker", daemon=True
         )
@@ -571,6 +604,7 @@ class DialogWorker(object):
         开头检查 stop。
         """
         self._stop.set()
+        self._watchdog_stop.set()
         self._closed = True
         self._log_event("stop")
         # 先停客户端再 join：AudioCapture.frames() 阻塞在队列上，close()
@@ -579,6 +613,9 @@ class DialogWorker(object):
         self._shutdown(self.clients.ptt, ("stop",))
         self._shutdown(self.clients.capture, ("stop", "close"))
         self._shutdown(self.clients.tts, ("close",))
+        watchdog = self._watchdog_thread
+        if watchdog is not None:
+            watchdog.join(timeout=1.0)
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
@@ -863,6 +900,11 @@ class DialogWorker(object):
                 if ptt_ok:
                     for event in ptt.poll():
                         log.debug("PTT 事件: %s（帧 #%d）", event, frame_count)
+                        self._log_event(
+                            "ptt", event=event, vad_paused=bool(
+                                getattr(self.clients.vad, "paused", False)),
+                            recording=ptt_recording,
+                            utterance=utterance is not None)
                         if event == "down":
                             if not ptt_recording and utterance is None:
                                 ptt_recording = True
@@ -1043,6 +1085,9 @@ class DialogWorker(object):
             started=speech_end if speech_end is not None else time.monotonic(),
             audio_ms=audio_ms or 0.0,
         )
+        self._turn_started_at = time.monotonic()
+        self._turn_stage = "asr"
+        self._turn_event = "speech"
         try:
             pcm = _pcm16(frames)
             if not pcm:
@@ -1072,6 +1117,10 @@ class DialogWorker(object):
         except Exception as exc:
             log.exception("ASR / 对话回合失败")
             self._log_event("worker_error", where="asr", error=str(exc))
+        finally:
+            self._turn_started_at = None
+            self._turn_stage = "idle"
+            self._turn_event = ""
 
     # ------------------------------------------------------------ commands
 
@@ -1160,13 +1209,54 @@ class DialogWorker(object):
             return
         log.debug("忽略未知事件: %r", name)
 
+    def _watchdog_loop(self):
+        # type: () -> None
+        """回合卡住时每 2 秒写一条 turn_stall，定位卡在 ASR/LLM/TTS。"""
+        last_log = 0.0
+        while not self._watchdog_stop.wait(2.0):
+            started = self._turn_started_at
+            if started is None:
+                continue
+            elapsed = time.monotonic() - started
+            if elapsed < 5.0:
+                continue
+            now = time.monotonic()
+            if now - last_log < 2.0:
+                continue
+            last_log = now
+            stream = self._active_stream
+            try:
+                playing = bool(self.clients.player.is_playing)
+            except Exception:                   # noqa: BLE001
+                playing = None
+            producer_done = None
+            if stream is not None:
+                try:
+                    producer_done = bool(stream._producer_done.is_set())
+                except Exception:               # noqa: BLE001
+                    producer_done = None
+            try:
+                vad_paused = bool(self.clients.vad.paused)
+            except Exception:                   # noqa: BLE001
+                vad_paused = None
+            self._log_event(
+                "turn_stall", stage=self._turn_stage,
+                event=self._turn_event, elapsed_ms=int(elapsed * 1000),
+                vad_paused=vad_paused, player_playing=playing,
+                producer_done=producer_done,
+                stream_cancelled=(bool(getattr(stream, "_cancelled", False))
+                                  if stream is not None else None))
+
     def _on_ptt_event(self, event):
         # type: (str) -> None
         """PTT 按下：立刻停掉正在播的 TTS（最小 barge-in）。"""
+        self._log_event("ptt_cb", event=event, stage=self._turn_stage,
+                        active_stream=self._active_stream is not None)
         if event != "down":
             return
         stream = self._active_stream
         if stream is not None:
+            self._log_event("barge_in", ptt=event, stage=self._turn_stage)
             try:
                 stream.stop()
             except Exception:                   # noqa: BLE001
@@ -1301,6 +1391,12 @@ class DialogWorker(object):
             return self._run_llm_legacy(
                 context, event, transcript, new_orders=new_orders,
                 timing=timing, event_detail=event_detail, failed=failed)
+        self._turn_started_at = time.monotonic()
+        self._turn_stage = "llm"
+        self._turn_event = event
+        self._log_event("turn_start", event=event, stage="llm",
+                        source=(timing.source if timing is not None else "?"),
+                        text=(str(transcript or "")[:120]))
         state_obj = self.state
         context = context or {}
         if timing is None:
@@ -1335,6 +1431,8 @@ class DialogWorker(object):
             if reply is None or self.state is not state_obj:
                 stream.cancel()
                 self._active_stream = None
+                self._turn_started_at = None
+                self._turn_stage = "idle"
                 if reply is None:
                     self._log_event(
                         "turn_latency",
@@ -1351,8 +1449,10 @@ class DialogWorker(object):
             turn_messages.append(assistant_msg)
             action_results = []  # type: list
             if action_calls:
+                self._turn_stage = "tools"
                 action_results, _commands = self._submit_tools(
                     action_calls, event, transcript, timing=timing)
+                self._turn_stage = "llm"
                 for call, result in zip(action_calls, action_results):
                     tool_msg = tool_message(call.id, result)
                     messages.append(tool_msg)
@@ -1391,8 +1491,12 @@ class DialogWorker(object):
         turn = turn_messages
         self._remember(state_obj, turn)
         timing.llm_done_at = time.monotonic()
+        self._turn_stage = "tts"
         stream.finish()
         stream.wait()
+        self._turn_started_at = None
+        self._turn_stage = "idle"
+        self._turn_event = ""
         if event != "round_summary":
             self._next_checkin_at = (time.monotonic()
                                      + random.uniform(CHECKIN_MIN_S, CHECKIN_MAX_S))

@@ -7,8 +7,8 @@
 #   ./restart.sh --voice      # 显式开语音（缺 key 直接报错退出）
 #   ./restart.sh --no-voice   # 强制关语音
 #   ./restart.sh --skip-build # 跳过编译（仅重启；只改了 Python 侧时用）
-#   ./restart.sh --voice-debug            # 语音调试日志开到 DEBUG
-#   ./restart.sh --voice-log voice.jsonl  # 对话日志落盘（配合 --voice-debug 排查用）
+#   ./restart.sh --voice-debug            # 语音调试日志开到 DEBUG（有语音时默认开）
+#   ./restart.sh --voice-log PATH         # 指定对话日志；默认 voice-<trace 时间戳>.jsonl
 # 各 flag 可组合，如 ./restart.sh --skip-build --voice --voice-debug --voice-log voice.jsonl
 # 游戏目录默认用 Steam 默认安装路径，可用 GAME_DIR 环境变量覆盖（非默认 Steam 库时用）。
 set -u
@@ -105,7 +105,21 @@ if [ "$READY" -ne 1 ]; then
 fi
 
 # 6. 前台起 Agent，Ctrl+C 可停；不再把 Agent 留在隐藏的后台。
+# trace 与 voice 日志共用同一个时间戳，方便一一对应。
+STAMP="$(date +%Y%m%d-%H%M%S)"
+export OC2_RUN_STAMP="$STAMP"
+if [ "$VOICE_FLAG" != "--no-voice" ]; then
+    [ -z "$VOICE_DEBUG_FLAG" ] && VOICE_DEBUG_FLAG="--voice-debug"
+    [ -z "$VOICE_LOG_PATH" ] && VOICE_LOG_PATH="voice-$STAMP.jsonl"
+fi
 echo "[restart] 启动 Agent ..."
+echo "[restart] trace: trace-$STAMP.jsonl"
+if [ -n "$VOICE_LOG_PATH" ]; then
+    echo "[restart] voice: $VOICE_LOG_PATH"
+fi
 echo "[restart] 提示：虚拟手柄只在主菜单能 engage 成 P2——标题画面按 A/空格进 P1、到主菜单后会自动接入。"
-exec "$PYTHON" run_agent.py $VOICE_FLAG $VOICE_DEBUG_FLAG \
-    ${VOICE_LOG_PATH:+--voice-log "$VOICE_LOG_PATH"}
+AGENT_ARGS=("$PYTHON" run_agent.py)
+[ -n "$VOICE_FLAG" ] && AGENT_ARGS+=("$VOICE_FLAG")
+[ -n "$VOICE_DEBUG_FLAG" ] && AGENT_ARGS+=("$VOICE_DEBUG_FLAG")
+[ -n "$VOICE_LOG_PATH" ] && AGENT_ARGS+=("--voice-log" "$VOICE_LOG_PATH")
+exec "${AGENT_ARGS[@]}"

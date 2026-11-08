@@ -1101,3 +1101,71 @@ def test_ptt_down_stops_active_tts():
     assert stream.stopped is True
     worker._on_ptt_event("up")
     assert stream.stopped is True
+
+
+def test_watchdog_logs_turn_stall(tmp_path):
+    log_path = tmp_path / "voice-stall.jsonl"
+    config = make_config()
+    config.log_path = str(log_path)
+    worker, _bundle = make_worker(config=config)
+    worker.start()
+    try:
+        worker._turn_started_at = time.monotonic() - 10
+        worker._turn_stage = "tts"
+        worker._turn_event = "speech"
+        assert wait_until(
+            lambda: any(r["kind"] == "turn_stall"
+                        for r in _log_records(log_path)),
+            timeout=4.0)
+    finally:
+        worker.stop()
+    rec = next(r for r in _log_records(log_path)
+               if r["kind"] == "turn_stall")
+    assert rec["stage"] == "tts"
+    assert rec["elapsed_ms"] >= 5000
+
+
+def test_barge_in_is_logged(tmp_path):
+    log_path = tmp_path / "voice-barge.jsonl"
+    config = make_config()
+    config.log_path = str(log_path)
+    worker, _bundle = make_worker(config=config)
+    worker._open_log()
+
+    class FakeStream(object):
+        def stop(self):
+            pass
+
+    worker._active_stream = FakeStream()
+    worker._turn_stage = "tts"
+    worker._on_ptt_event("down")
+    rec = next(r for r in _log_records(log_path)
+               if r["kind"] == "barge_in")
+    assert rec["ptt"] == "down" and rec["stage"] == "tts"
+
+
+def test_tts_wait_total_timeout_resumes_vad():
+    """TTS 生成卡住时 wait 不能拖 3×timeout，且必须恢复 VAD。"""
+    worker, bundle = make_worker()
+
+    class BlockingTTS(object):
+        def synthesize(self, text):
+            def gen():
+                yield b"\x00\x00"
+                time.sleep(5.0)          # 模拟卡住的网络流
+            return gen()
+
+    bundle.tts = BlockingTTS()
+    bundle.player.hold()
+    timing = worker_mod.TurnTiming(source="direct", event="speech",
+                                   started=time.monotonic())
+    stream = worker_mod.StreamingTTS(worker, timing)
+    stream.feed("测试")
+    stream.finish()
+
+    started = time.monotonic()
+    stream.wait(timeout=0.2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert bundle.vad.paused is False

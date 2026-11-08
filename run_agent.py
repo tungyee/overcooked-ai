@@ -106,6 +106,21 @@ def _env_text(env, key, default=""):
     return raw or default
 
 
+def _default_voice_log():
+    # type: () -> str
+    """默认 voice 日志：与本次 trace 同时间戳，方便一一对应。"""
+    try:
+        from ai.output import trace as trace_mod
+        path = trace_mod.TRACE_PATH
+        name = os.path.basename(path)
+        if name.startswith("trace-") and name.endswith(".jsonl"):
+            stamp = name[len("trace-"):-len(".jsonl")]
+            return os.path.join(os.path.dirname(path), "voice-%s.jsonl" % stamp)
+    except Exception:                       # noqa: BLE001
+        pass
+    return ""
+
+
 def _use_mimo(env):
     # type: (dict) -> bool
     """LLM provider 选择：显式 LLM_PROVIDER 优先，否则有 MIMO key 就用 MIMO。"""
@@ -234,6 +249,7 @@ def _build_voice_config(args, env):
             VOICE_DEFAULTS["OC2_VOICE_PTT_KEY"]) or None),
         log_path=(args.voice_log
                   or _env_text(env, "OC2_VOICE_LOG", "")
+                  or _default_voice_log()
                   or None),
         debug=bool(args.voice_debug),
     )

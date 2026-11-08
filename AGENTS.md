@@ -59,7 +59,7 @@ python3 tools/replay_dialog_llm.py --trace trace-<时间戳>.jsonl  # 历史 tra
 # PTT：.env 设 OC2_VOICE_PTT_KEY=f8；笔记本按 Fn+F8，按住说话、松开发送
 ```
 
-- 语音 CLI：`--voice` 显式启用（缺必需 key 时报错退出 2；优先于 `OC2_VOICE=0`）；`--no-voice` 恒关闭；无 flag 时有 key 才启用、缺 key 告警后退回无语音。`--voice-debug` 把 `ai.dialog` 日志开到 DEBUG（ASR 文本、LLM 原文/回合、命令/ack、播报、错误；不含分段计时），`--voice-log PATH` 写逐行 JSON 对话日志（`ts`/`kind` + 事件字段；每轮 `turn_latency` 含 ASR/LLM 首 token/TTS 首包/首帧出声/`since_level_ms` 分段耗时）；`--env-file PATH` / `--no-env-file` 控制启动时 `.env` 的自动加载（默认仓库根 `.env`）。
+- 语音 CLI：`--voice` 显式启用（缺必需 key 时报错退出 2；优先于 `OC2_VOICE=0`）；`--no-voice` 恒关闭；无 flag 时有 key 才启用、缺 key 告警后退回无语音。`--voice-debug` 把 `ai.dialog` 日志开到 DEBUG（ASR 文本、LLM 原文/回合、命令/ack、播报、错误；不含分段计时），`--voice-log PATH` 写逐行 JSON 对话日志（`ts`/`kind` + 事件字段；每轮 `turn_latency` 含 ASR/LLM 首 token/TTS 首包/首帧出声/`since_level_ms` 分段耗时；另有 `turn_start`/`turn_stall`/`ptt_cb`/`barge_in` 诊断事件；不传路径时默认 `voice-<trace 时间戳>.jsonl`，与 trace 一一对应；`restart.sh` 有语音时默认开 `--voice-debug` 并写该日志）；`--env-file PATH` / `--no-env-file` 控制启动时 `.env` 的自动加载（默认仓库根 `.env`）。
 - 语音环境变量：`VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID`、`VOLC_TTS_API_KEY`、`VOLC_TTS_VOICE`、`VOLC_TTS_RESOURCE_ID`、`ARK_API_KEY`、`ARK_MODEL`、`ARK_BASE_URL`、`OC2_VOICE`、`OC2_VOICE_RATE`（0.5–2.0，当前仅保留、未接到 TTS 参数）、`OC2_VOICE_VOLUME`（0.3–1.2）、`OC2_VOICE_VAD_DB`（2–20，底噪之上的 dB，越小越敏感）、`OC2_VOICE_PTT_KEY`（如 `f8`；设置后按住录音、松开发送，手柄可用 Steam Input 映射）、`OC2_LLM_TIMEOUT`（1–60 秒，默认 10）、`OC2_VOICE_LOG`（示例见 `.env.example`，说明见 `docs/dialog_system.md`）。非有限值回退默认，超范围收敛到边界。
 - Agent 连不上 27411 直接退出（退出码 1）；收到 `level` 帧才真正决策。
 - **执行后端**：唯一执行后端是插件逐帧闭环 + InControl 虚拟手柄（走 27412 exec 通道，**无需辅助功能**）。要求 agent 启动时游戏在主菜单（虚拟手柄只在主菜单能 engage 成 P2），已进关卡则报 not engaged、AI 空转。

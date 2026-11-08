@@ -1618,6 +1618,9 @@ class DialogWorker(object):
                             if timing is not None else None))
         log.debug("LLM 回复（event=%s stage=%s）: %r tools=%s",
                   event, stage, reply.content, reply.tool_calls)
+        if reply.tool_calls:
+            log.debug("LLM 工具调用: %s",
+                      [(c.name, c.args()) for c in reply.tool_calls])
         return reply
 
     def _remember(self, state_obj, turn, compact=True):
@@ -1652,6 +1655,8 @@ class DialogWorker(object):
         )
         self.cmd_q.put(batch)
         tool_started = time.monotonic()
+        log.debug("工具批次: %s",
+                  [(name, args) for name, args in batch.calls])
         self._log_event("duty_batch", event=event, batch_id=batch.batch_id,
                         calls=batch.calls)
         deadline = tool_started + ACK_TIMEOUT_S
@@ -1675,10 +1680,14 @@ class DialogWorker(object):
             if len(results) < len(calls):
                 results += [{"ok": False, "reason": "主循环未处理"}] * (
                     len(calls) - len(results))
+            log.debug("工具结果: %s commands=%s",
+                      results, ack.get("commands"))
             return results[:len(calls)], ack.get("commands")
         ack_ms = self._ms_since(tool_started, time.monotonic())
         if timing is not None:
             timing.tool_ack_ms = ack_ms
+        log.debug("工具结果超时（%.0fms）: %s", ack_ms,
+                  [(name, args) for name, args in batch.calls])
         self._log_event("duty_ack", batch_id=batch.batch_id, results=None,
                         ack_ms=ack_ms)
         return [{"ok": False, "reason": "主循环超时未确认"}] * len(calls), None

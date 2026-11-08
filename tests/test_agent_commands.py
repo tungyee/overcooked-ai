@@ -75,6 +75,26 @@ def test_execute_action_creates_persistent_command(agent, world):
     assert agent.bb.command_scope == cmd.scope
 
 
+def test_execute_actions_queues_in_order(agent, world):
+    """execute_actions 按数组顺序逐条校验/入队，返回逐条结果。"""
+    out = agent._execute_actions(world, {"actions": [
+        {"action": "chop", "target": "Cucumber"},
+        {"action": "chop", "target": "Cucumber"},
+    ]})
+    assert out["ok"] is True
+    assert len(out["results"]) == 2
+    assert all(r.get("ok") for r in out["results"])
+    assert out["results"][0]["action"] == "chop"
+    assert out["results"][1]["action"] == "chop"
+    assert len(agent.commands.commands) == 1   # 第二条 dedupe 到同一条命令
+
+
+def test_execute_actions_rejects_empty_array(agent, world):
+    out = agent._execute_actions(world, {"actions": []})
+    assert out["ok"] is False
+    assert "非空数组" in out["reason"]
+
+
 def test_execute_action_dedupes_same_command(agent, world):
     first = agent._execute_action(world, {"action": "chop", "target": "Cucumber"})
     second = agent._execute_action(world, {"action": "chop", "target": "Cucumber"})

@@ -618,16 +618,17 @@ ACCEPT_LEGACY_TOOL_CALLS = True
 
 # 新工具的动作枚举（英文标识，内部翻译成中文 key）。
 TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch"]
-# check_action 暂时不暴露给模型：execute_action 内部已经原子校验。
+# check_action 暂时不暴露给模型：execute_actions 内部已经原子校验。
 ENABLE_CHECK_ACTION = False
+# execute_action 已合并进 execute_actions；旧 handler 保留兼容旧 trace/回放。
 
 
 def tool_schemas(targets=None, duty_ids=None):
     # type: (Any, Any) -> List[dict]
-    """新工具协议：check_action / execute_action / cancel_action / speak。
+    """新工具协议：execute_actions / cancel_action / speak / get_world_state。
 
     `targets`/`duty_ids` 保留签名兼容、不再使用；target 由本关 DAG 的英文名
-    自由填写，check 失败时返回 valid_targets 让模型改口。
+    自由填写，失败时返回 valid_targets 让模型改口。
     """
     action_prop = {
         "type": "string",
@@ -654,12 +655,26 @@ def tool_schemas(targets=None, duty_ids=None):
         {
             "type": "function",
             "function": {
-                "name": "execute_action",
-                "description": "把动作排成持久命令并执行。没有命令在跑时立即开始；已有命令时按顺序排队（最多 3 条待执行）。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
+                "name": "execute_actions",
+                "description": "把动作数组按顺序排成持久命令并执行。单动作也传长度为 1 的数组。没有命令在跑时第一条立即开始；已有命令时按顺序排队（最多 3 条待执行）。每条返回 ok/status/reason；不可行的那条不影响后面的条目。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
                 "parameters": {
                     "type": "object",
-                    "properties": {"action": action_prop, "target": target_prop},
-                    "required": ["action"],
+                    "properties": {
+                        "actions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action": action_prop,
+                                    "target": target_prop,
+                                },
+                                "required": ["action"],
+                            },
+                            "description": "按执行顺序排列的动作；一句话有多个动作时全部放进来。",
+                        }
+                    },
+                    "required": ["actions"],
                 },
             },
         },

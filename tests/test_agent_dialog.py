@@ -391,10 +391,10 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["execute_action", "cancel_action", "speak",
+    assert names == ["execute_actions", "cancel_action", "speak",
                      "get_world_state"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
-    assert "chop" in props["action"]["enum"]
+    assert "chop" in props["actions"]["items"]["properties"]["action"]["enum"]
 
 
 def test_build_dialog_context_live_false_when_paused(dagent, world):

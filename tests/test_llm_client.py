@@ -239,7 +239,8 @@ def test_system_message_carries_rules_and_dag():
     assert msg["role"] == "system"
     text = msg["content"]
     assert "AI 队友" in text
-    assert "execute_action" in text
+    assert "execute_actions" in text
+    assert "execute_action(" not in text
     assert "cancel_action" in text and "speak" in text
     assert "get_world_state" in text
     assert "check_action" not in text
@@ -255,11 +256,11 @@ def test_system_prompt_allows_retry_after_state_change():
     """ok=false 后世界状态变了（例如现在有脏盘）要允许重试同一个动作。
 
     旧规则“不要重复同一个 target”会让模型在 wash 刚失败两次后，即使
-    玩家说“切完洗碗”、场上已经有脏盘，也不敢再调 execute_action(wash)。
+    玩家说“切完洗碗”、场上已经有脏盘，也不敢再调 execute_actions。
     """
     text = system_message("本关菜：\n  Sushi_Cucumber = Cucumber")["content"]
     assert "不要重复同一个 target" not in text
-    assert "可以重新 execute_action" in text
+    assert "可以重新放进 execute_actions" in text
 
 
 def test_render_state_is_readable_and_in_seconds():

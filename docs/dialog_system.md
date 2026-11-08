@@ -27,10 +27,12 @@
 模型只看到 4 个工具：
 
 ```text
-check_action(action, target=None)   只读检查；ok/reason/already_done
-execute_action(action, target=None) 排成持久命令并执行；返回 running/queued
+execute_actions(actions=[{action, target?}, ...])
+                                    一次提交一个或多个动作，按数组顺序排队；
+                                    逐条返回 ok/status/reason
 cancel_action(action=None)          撤销当前命令和队列，停手约 5 秒
 speak(text)                         唯一发言通道；不调用就不出声
+get_world_state()                   按需读取最新世界状态
 ```
 
 - `action` 用英文标识：`chop / cook / mix / plate / deliver / wash / fetch`（`prepare` 为后续目标级动作）。

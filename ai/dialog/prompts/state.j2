@@ -1,4 +1,4 @@
-【世界状态】（最近快照，可能滞后；订单/灶/盘里有什么等明细用 get_world_state 查询，动作是否可行以 execute_action 返回为准）{{ '\n' }}
+【世界状态】（最近快照，可能滞后；订单/灶/盘里有什么等明细用 get_world_state 查询，动作是否可行以 execute_actions 返回为准）{{ '\n' }}
 {% if live is sameas false %}注意：游戏当前已暂停或不在关卡，你不能行动；只回话，不要调用动作工具。{{ '\n' }}{% endif %}
 {% if round_finished %}注意：本关已经结束。{{ '\n' }}{% endif %}
 {% if time_left is not none %}本关剩余 {{ time_left }} 秒。{{ '\n' }}{% endif %}

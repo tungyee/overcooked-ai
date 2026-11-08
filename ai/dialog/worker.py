@@ -364,11 +364,18 @@ class DialogClients(object):
 
 def _tool_nudge(results):
     # type: (Any) -> str
-    """工具结果后的硬提醒：模型必须用 speak 说话、按 check 结果行动。"""
-    notes = []
+    """工具结果后的硬提醒：模型必须用 speak 说话、按结果行动。"""
+    flat = []  # type: list
     for result in results or ():
         if not isinstance(result, dict):
             continue
+        nested = result.get("results")
+        if isinstance(nested, list):
+            flat.extend(item for item in nested if isinstance(item, dict))
+        else:
+            flat.append(result)
+    notes = []
+    for result in flat:
         if result.get("observation"):
             # get_world_state 的观察结果：只提供信息，不催 execute/speak。
             continue
@@ -384,7 +391,7 @@ def _tool_nudge(results):
         elif result.get("status") in ("running", "queued") or result.get("dispatched"):
             notes.append("动作已派发；如果要说话必须调用 speak，content 不会播出去。")
         elif result.get("ok") is True:
-            notes.append("check 通过：下一轮调用 execute_action；说话用 speak。")
+            notes.append("check 通过：下一轮调用 execute_actions；说话用 speak。")
     return " ".join(dict.fromkeys(notes))
 
 
@@ -1414,9 +1421,9 @@ class DialogWorker(object):
         """一轮对话：多轮工具调用，直到模型不再需要动作或给出 speak。
 
         新协议：
-        - check_action / execute_action / cancel_action 交主循环落地；
+        - execute_actions / cancel_action 交主循环落地；
         - speak 在 worker 本地播放，是唯一出声通道；
-        - execute_action 与 speak 同轮时，先落地动作：成功才播 speak，
+        - execute_actions 与 speak 同轮时，先落地动作：成功才播 speak，
           失败则不播乐观台词，继续一轮让模型用真实原因说话；
         - 成功动作没有 speak 就安静结束（不做固定兜底）；
         - 命令结果事件会作为新的 event 再进来，由模型决定是否汇报。
@@ -1539,7 +1546,8 @@ class DialogWorker(object):
                 break
             if not action_calls:
                 break
-            if any(c.name in ("execute_action", "cancel_action")
+            if any(c.name in ("execute_actions", "execute_action",
+                              "cancel_action")
                    for c in action_calls):
                 if not speak_calls:
                     # 动作已派发但模型没确认；强制补一句短确认。
@@ -1915,8 +1923,14 @@ def _compact_turn(turn):
                     text = args.get("text")
                     if text:
                         spoken.append(str(text))
-                elif name in ("check_action", "execute_action", "cancel_action"):
-                    actions.append((name, args if isinstance(args, dict) else {}))
+                elif name in ("check_action", "execute_action",
+                              "execute_actions", "cancel_action"):
+                    if name == "execute_actions" and isinstance(args, dict):
+                        for item in args.get("actions") or ():
+                            if isinstance(item, dict):
+                                actions.append(("execute_actions", item))
+                    else:
+                        actions.append((name, args if isinstance(args, dict) else {}))
     for text in spoken:
         out.append({"role": "assistant", "content": text})
     if actions:

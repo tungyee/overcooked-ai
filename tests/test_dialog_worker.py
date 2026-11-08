@@ -1224,9 +1224,48 @@ def test_execute_without_speak_forces_ack():
                               "function": {"name": "speak"}}
 
 
+def test_tool_nudge_flattens_execute_actions_results():
+    """execute_actions 的逐条结果也要参与 nudge。"""
+    ok = [{"ok": True, "results": [
+        {"ok": True, "status": "running"},
+        {"ok": True, "status": "queued"},
+    ]}]
+    assert "动作已派发" in worker_mod._tool_nudge(ok)
+    bad = [{"ok": False, "results": [
+        {"ok": False, "reason": "现在没有脏盘"},
+    ]}]
+    assert "工具返回失败" in worker_mod._tool_nudge(bad)
+
+
 def test_tool_nudge_ignores_world_state_observation():
     """get_world_state 只提供信息：不能被当成 check 通过去催 execute。"""
     assert worker_mod._tool_nudge(
         [{"ok": True, "observation": True, "state": {}}]) == ""
-    # 普通 ok:true 仍按旧协议催 execute（check_action 启用时）。
-    assert "execute_action" in worker_mod._tool_nudge([{"ok": True}])
+    # 普通 ok:true 仍按旧协议催 execute_actions（check_action 启用时）。
+    assert "execute_actions" in worker_mod._tool_nudge([{"ok": True}])
+
+
+def test_execute_actions_batch_sent_to_main_loop():
+    """execute_actions 的 actions 数组原样交给主循环，逐条结果回填。"""
+    calls = {"actions": [
+        {"action": "chop", "target": "Cucumber"},
+        {"action": "wash"},
+    ]}
+    llm = FakeLLM(
+        reply("", ("execute_actions", calls), ("speak", {"text": "好，先切再洗"})),
+    )
+    worker, bundle = make_worker(llm=llm)
+    thread = run_async(worker._handle_transcript, "切黄瓜，然后洗碗",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    assert batch.calls == [("execute_actions", calls)]
+    bundle.ack_q.put({
+        "batch_id": batch.batch_id,
+        "results": [{"ok": True, "results": [
+            {"ok": True, "status": "running", "action": "chop"},
+            {"ok": True, "status": "queued", "action": "wash"},
+        ]}],
+    })
+    thread.join(2)
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，先切再洗"]

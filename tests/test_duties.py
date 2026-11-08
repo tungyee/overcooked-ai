@@ -295,13 +295,16 @@ def test_render_ledger_text_with_action():
 def test_tool_schemas_new_protocol():
     tools = tool_schemas()
     names = [t["function"]["name"] for t in tools]
-    assert names == ["execute_action", "cancel_action", "speak",
+    assert names == ["execute_actions", "cancel_action", "speak",
                      "get_world_state"]
-    props = tools[0]["function"]["parameters"]["properties"]
-    assert set(props["action"]["enum"]) == {
+    params = tools[0]["function"]["parameters"]
+    props = params["properties"]
+    assert set(params["required"]) == {"actions"}
+    item = props["actions"]["items"]
+    assert set(item["properties"]["action"]["enum"]) == {
         "chop", "cook", "mix", "plate", "deliver", "wash", "fetch"}
-    assert "target" in props
-    assert set(tools[0]["function"]["parameters"]["required"]) == {"action"}
+    assert "target" in item["properties"]
+    assert set(item["required"]) == {"action"}
 
 
 def test_ledger_help_request_compiles_to_action_claim():

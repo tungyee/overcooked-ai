@@ -315,7 +315,7 @@ def _plates_text(world, book):
     """盘子概况：只给数量，不给内容。
 
     盘子内容变化快，2 Hz 快照容易滞后；具体能不能送、缺什么，以
-    `execute_action` 的返回为准，避免模型拿旧内容自己推断。
+    `execute_actions` 的返回为准，避免模型拿旧内容自己推断。
     """
     empty, filled = 0, 0
     for plate in getattr(world, "plates", None) or ():
@@ -651,7 +651,8 @@ class Agent:
         # type: (World, Any) -> List[Dict]
         """一轮 LLM 工具调用 → 逐条落地，返回给 LLM 的结果。
 
-        新协议：check_action / execute_action / cancel_action / speak。
+        新协议：execute_actions / cancel_action / speak / get_world_state。
+        旧 execute_action 保留 handler 兼容旧 trace/回放，不再暴露给模型。
         旧的 assign_action 保留代码，只在 ENABLE_LEGACY_TOOLS 时可用。
         """
         results = []  # type: List[Dict]
@@ -661,7 +662,10 @@ class Agent:
                 continue
             if name == "check_action":
                 results.append(self._check_action(world, args))
+            elif name == "execute_actions":
+                results.append(self._execute_actions(world, args))
             elif name == "execute_action":
+                # 旧工具名：handler 保留，兼容旧 trace/回放；新 prompt 不再暴露。
                 results.append(self._execute_action(world, args))
             elif name == "cancel_action":
                 results.append(self._cancel_action(world, args))
@@ -875,6 +879,29 @@ class Agent:
             if dest:
                 out["destination"] = dest
         return out
+
+    def _execute_actions(self, world, args):
+        # type: (World, Any) -> Dict
+        """批量执行：按数组顺序逐条校验/入队，返回逐条结果。
+
+        单动作也走这里（长度为 1 的数组）。某条不可行只影响它自己，后面的
+        动作仍按顺序处理——比如 chop 失败不妨碍用户接着要的 wash 入队。
+        """
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "参数必须是对象"}
+        actions = args.get("actions")
+        if not isinstance(actions, list) or not actions:
+            return {"ok": False, "reason": "actions 必须是非空数组"}
+        results = []  # type: List[Dict]
+        for item in actions:
+            if not isinstance(item, dict):
+                results.append({"ok": False, "reason": "每条动作必须是对象"})
+                continue
+            results.append(self._execute_action(world, item))
+        return {
+            "ok": all(bool(result.get("ok")) for result in results),
+            "results": results,
+        }
 
     def _execute_action(self, world, args):
         # type: (World, Any) -> Dict

@@ -259,22 +259,51 @@ class RecipeBook(object):
             return None
         return self._cookable.get(str(form).lower())
 
+    def carrier(self, dish):
+        # type: (Optional[str]) -> Optional[Tuple[str, str, str, Optional[str]]]
+        """统一的「载体菜」概念：底料本身能装别的料。
+
+        返回 (kind, base, form, station)：
+          - ("cook", base, form, station)  披萨：底料是可烹饪载体（cookable.prep），
+            配料放上底料后整份进炉，熟了端盘取；
+          - ("wrap", base, form, None)     卷饼/汉堡：底料是 Composite* 叶子，
+            熟料直接装进底料、不进炉，装齐后放进盘送餐。
+        不是载体菜返回 None。base = 底料的订单成分名；form = 底料的取料形态
+        （披萨是切好的饼、卷饼是卷饼皮本身）；station = 进炉类要求的灶型，
+        wrap 类恒为 None。
+        """
+        if self.node_kind(dish) == "cook":
+            # 披萨：底料切成可烹饪载体（cookable.prep），整份进炉。
+            for comp in self.components(dish):
+                form = self.cook_input_form(comp)
+                cap = self.cookable_of(form)
+                if cap and cap.get("prep") and cap.get("station"):
+                    return ("cook", comp, str(form), str(cap["station"]))
+            return None
+        if self.node_kind(dish) == "assemble":
+            # 卷饼/汉堡：唯一 Composite* 叶子是包裹底料，其余熟料装进去。
+            leaves = [c for c in self.components(dish) if self._composite_leaf(c)]
+            if len(leaves) != 1:
+                return None
+            base = leaves[0]
+            fillings = tuple(c for c in self.components(dish)
+                             if c != base and self.needs_cooking(c))
+            if not fillings:
+                return None          # 没有熟料要装：不是包裹底料
+            return ("wrap", base, base, None)
+        return None
+
     def carrier_base(self, dish):
         # type: (Optional[str]) -> Optional[Tuple[str, str, str]]
         """整份进炉的熟料：(底料成分, 载体形态, 要求站型)；不是这种菜返回 None。
 
         反编译：CookablePreparationContainer = 可放料的载体 + CookingHandler。
         披萨的面团切成 Pizza_Base_Raw（prep=True, station=Oven），番茄/芝士
-        放在饼上、整份进烤箱。判据只读插件上报的能力，不按菜名。
+        放在饼上、整份进烤箱。判据只读插件上报的能力，不按菜名。wrap 类
+        （卷饼）不进炉，不在此列——见 wrap_base。
         """
-        if self.node_kind(dish) != "cook":
-            return None
-        for comp in self.components(dish):
-            form = self.cook_input_form(comp)
-            cap = self.cookable_of(form)
-            if cap and cap.get("prep") and cap.get("station"):
-                return (comp, str(form), str(cap["station"]))
-        return None
+        c = self.carrier(dish)
+        return c[1:] if c is not None and c[0] == "cook" else None
 
     def carrier_toppings(self, dish):
         # type: (Optional[str]) -> Tuple[str, ...]
@@ -283,6 +312,34 @@ class RecipeBook(object):
         if base is None:
             return ()
         return tuple(c for c in self.components(dish) if c != base[0])
+
+    def wrap_base(self, dish):
+        # type: (Optional[str]) -> Optional[str]
+        """wrap 类载体菜（卷饼/汉堡）的唯一包裹底料名；不是返回 None。"""
+        c = self.carrier(dish)
+        return c[1] if c is not None and c[0] == "wrap" else None
+
+    def wrap_fillings(self, dish):
+        # type: (Optional[str]) -> Tuple[str, ...]
+        """wrap 类载体要装进去的熟料成分（保序，不含底料本身）。"""
+        c = self.carrier(dish)
+        if c is None or c[0] != "wrap":
+            return ()
+        base = c[1]
+        return tuple(x for x in self.components(dish)
+                     if x != base and self.needs_cooking(x))
+
+    def _composite_leaf(self, ing):
+        # type: (Optional[str]) -> bool
+        """叶子成分是否「Composite* 底料」：plate 字段是 Composite 预置件名。
+
+        普通叶子（米/蘑菇）plate 是 null 或食材名（ingredients_rice_boiled_01）；
+        卷饼皮/海苔/汉堡胚这类能叠料的底料 plate 是 Composite*。
+        """
+        if self.node_kind(ing) != "leaf":
+            return False
+        plate = str((self.recipe(ing) or {}).get("plate") or "")
+        return plate.startswith("Composite")
 
     def cooked_of_raw(self, raw):
         # type: (Optional[str]) -> List[str]

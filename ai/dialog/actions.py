@@ -31,7 +31,8 @@ ACTION_TASK_TYPES = {
 }  # type: Dict[str, Tuple[str, ...]]
 
 # 取料/搬运：planner 按料源可达性自动归位，不进 LLM 枚举。
-FETCH_TASK_TYPES = ("FetchToBoard", "FetchToCarrier", "Prefetch")  # type: Tuple[str, ...]
+FETCH_TASK_TYPES = ("FetchToBoard", "FetchToCarrier", "FillCarrier",
+                    "Prefetch")  # type: Tuple[str, ...]
 
 # auto_only / 跨边交接 / 救援：不开放认领。
 OTHER_TASK_TYPES = (

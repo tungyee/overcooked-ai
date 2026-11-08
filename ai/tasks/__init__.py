@@ -1,10 +1,10 @@
-"""16 个 task 的身份、可行性、完成判定与树构建（spec §6.1 / §7.3）。
+"""24 个 task 的身份、可行性、完成判定与树构建（spec §6.1 / §7.3）。
 
 本包是 tasks 的唯一对外入口。调用方一律：
 
     from ai import tasks as T
     T.Chop("9", ("board_01",), "Cucumber")
-    T.TASK_TYPES          # 全部 22 个 task 类型
+    T.TASK_TYPES          # 全部 24 个 task 类型
 
 **不要直接 import 子模块**——plate / cook / fire / chop / assembly /
 cleanup / relay / carrier 的分组边界是实现细节（为满足 spec §11.5 的 400 行上限而拆），不是 API。

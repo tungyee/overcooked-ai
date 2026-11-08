@@ -55,7 +55,7 @@ PRESSURE_RESCUE = 1.0
 # **不是** planner._COMBO_PREP_TYPES——后者还含 PlaceCleanPlate（分层后在 L4）。
 LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                     "FetchToCooker", "FillCooker", "Mix",
-                    "FetchToCarrier", "PlaceCarrierInCooker",
+                    "FetchToCarrier", "FillCarrier", "PlaceCarrierInCooker",
                     "TakeCookedToPlate", "ThrowBatch", "MergePlates")
 
 

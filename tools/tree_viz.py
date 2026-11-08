@@ -152,6 +152,7 @@ def placeholder_task(cls):
         "DeliverPlate": ("p0",),
         "StashHeld": (),
         "Prefetch": (),
+        "FillCarrier": ("cooker0", "Tortilla", ()),
     }
     return cls(order_id="0", resources=needs.get(cls.TYPE, ()),
                item="Cucumber")

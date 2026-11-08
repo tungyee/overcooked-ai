@@ -93,6 +93,23 @@ def carriers(world, include_held=True):
     return out
 
 
+def wrap_carrier_exists(world, base_form, contents):
+    # type: (Any, str, Any) -> bool
+    """场上是否存在「底料 = base_form、内容 = contents」的已装料载体（含手持）。
+
+    与 carriers() 同一口径：载体 = 不在飞、非锅非盘、detail 解析出 token 的
+    物品；底料按名字小写比、内容按签名（排序元组）比。给 FillCarrier 判
+    「盛完这份料后卷饼已成型」用——盛料一进底料，载体就从「空卷饼」（不是
+    载体）变成「装了料的卷饼」（载体），所以只在非空 contents 时才有意义。
+    """
+    want_base = str(base_form or "").strip().lower()
+    sig = signature(contents)
+    for c in carriers(world):
+        if c["base"] == want_base and c["sig"] == sig:
+            return True
+    return False
+
+
 def carrier_fits(book, carrier, order, plate=None):
     # type: (Any, Dict, Dict, Optional[Dict]) -> bool
     """载体能否放进这一单（的这只盘）：底料 + 内容 ⊆ 订单需求，且与盘已有的

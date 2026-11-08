@@ -142,6 +142,7 @@ _CAND_META = {
     "Mix": (["hands_empty"], EST_COOK_OPS),
     "SendAcross": (["hands_empty"], EST_FETCH),
     "FetchToCarrier": (["hands_empty"], EST_FETCH),
+    "FillCarrier": (["hands_empty"], EST_COOK_OPS),
     "PlaceCarrierInCooker": (["hands_empty"], EST_COOK_OPS),
     "MergePlates": (["hands_empty"], EST_FETCH),
 }
@@ -775,7 +776,8 @@ COMBO_PREP_DISCOUNT = 0.25
 # 不含 FillCooker（订单无关）与清理类。
 _COMBO_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                      "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate",
-                     "FetchToCarrier", "PlaceCarrierInCooker", "MergePlates")
+                     "FetchToCarrier", "FillCarrier", "PlaceCarrierInCooker",
+                     "MergePlates")
 W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩罚）
 
 # 填灶权重（第 1 组 1.4）：灶空转的机会成本是 12 秒不可压缩的时钟，补不回来。

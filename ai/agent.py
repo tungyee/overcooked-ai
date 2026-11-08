@@ -804,7 +804,7 @@ class Agent:
         mapping = {
             "FetchToBoard": "board", "FetchToCooker": "cooker",
             "FetchToPlate": "plate", "FetchToCarrier": "carrier",
-            "Prefetch": "counter",
+            "FillCarrier": "carrier", "Prefetch": "counter",
         }
         for cand in feasible or ():
             dest = mapping.get(getattr(cand.task, "TYPE", ""))

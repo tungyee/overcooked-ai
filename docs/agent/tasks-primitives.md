@@ -11,7 +11,7 @@
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier）。`T.TASK_TYPES` 登记全部 22 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier）。`T.TASK_TYPES` 登记全部 24 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
 主线 20 个 task 类型（另两个 `ThrowBatch` / `FillCooker` 见表后）：
 

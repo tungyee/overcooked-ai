@@ -227,11 +227,68 @@ def _compile_node(book, name):
             "children": children,
         }
     if kind == "assemble":
-        return {
-            "type": "DeliverPlate", "item": name,
-            "children": [_compile_node(book, c) for c in book.components(name)],
-        }
+        children = [_compile_node(book, c) for c in book.components(name)]
+        # wrap 类（卷饼）：在盘装路径之外，额外给一条「卷饼直接装熟料」的路径
+        # （FillCarrier 链 → 装好料的卷饼端进盘）。盘装仍是 fallback，谁可行/
+        # 谁分高由 planner 选。
+        wrap = _wrap_node(book, name)
+        if wrap is not None:
+            children.append(wrap)
+        return {"type": "DeliverPlate", "item": name, "children": children}
     return None
+
+
+def _cook_node(book, name):
+    # type: (RecipeBook, str) -> Optional[Dict]
+    """熟料 name 的「下锅」节点（只到灶上煮，不含端盘盛熟）。
+
+    wrap 装馅（FillCarrier）的依赖是「这份馅已经在锅里煮」，不是「盛到盘上」
+    ——盛熟是 FillCarrier 自己（端卷饼去锅边盛）。所以这里只取 FetchToCooker
+    这一层，与 _compile_node 的 cook 分支（TakeCookedToPlate←FetchToCooker）
+    区分开。
+    """
+    if book.node_kind(name) != "cook":
+        return None
+    children = [n for n in
+                (_raw_production(book, r) for r in book.raws_of(name)) if n]
+    return {"type": "FetchToCooker", "item": name, "children": children}
+
+
+def _wrap_node(book, name):
+    # type: (RecipeBook, str) -> Optional[Dict]
+    """wrap 类载体菜（卷饼/汉堡）：卷饼直接装熟料、不进炉，装齐后端进盘。
+
+        DeliverPlate
+          └─ FetchToPlate(底料, contents=全部熟料 token)
+               └─ FillCarrier(最后一样馅) ← [煮料链] + FillCarrier(前一样馅)
+                    └─ ... 逐样往回，第一样馅只有煮料链
+    盘装路径由 _compile_node 的 assemble 分支并行给出，作为 fallback。
+    """
+    base = book.wrap_base(name)
+    if base is None:
+        return None
+    fillings = book.wrap_fillings(name)
+    tokens = []  # type: List[str]
+    for f in fillings:
+        t = book.rich_token(f)
+        if t:
+            tokens.append(t)
+    contents = CR.signature(tokens)   # 装完的卷饼内容签名（排序元组）
+
+    fill_node = None  # type: Optional[Dict]
+    # 从第一样馅往最后一样搭：FillCarrier(f) 依赖 f 的煮料链 + 前一样馅的
+    # FillCarrier，所以最后一样馅是链顶（FetchToPlate 的子节点）。
+    for i in range(len(fillings)):
+        f = fillings[i]
+        pre_sig = CR.signature(tokens[:i])   # 排在这份馅之前的馅的 token 签名
+        cook_chain = _cook_node(book, f)
+        children = [cook_chain] if cook_chain is not None else []
+        if fill_node is not None:
+            children.append(fill_node)
+        fill_node = {"type": "FillCarrier", "item": f, "base_form": base,
+                     "pre_contents": pre_sig, "children": children}
+    return {"type": "FetchToPlate", "item": base, "contents": contents,
+            "children": [fill_node]}
 
 
 def _carrier_node(book, name):
@@ -383,14 +440,29 @@ def _node_done(node, ctx):
         if node.get("carrier_base"):
             return True                       # 这一单已有饼
         return bool(book.want_tokens(item) & set(car["contents"]))
+    if t == "FillCarrier":
+        # 这份馅已被该单配到的载体盖住 → 装馅视为已完成（由「载体端盘」路径
+        # 处理），不再从零切/煮一份（trace-20261031-233010：肉已在卷饼里，
+        # 旧行为仍去切肉）。否则判「底料已装好前置 + 这份熟料」。
+        if CR.carrier_covers(book, ctx.get("carrier"), item):
+            return True
+        token = book.rich_token(item)
+        toks = set(node.get("pre_contents") or ())
+        if token:
+            toks.add(token)
+        return CR.wrap_carrier_exists(world, node.get("base_form"),
+                                      CR.signature(toks))
     if t == "FetchToBoard":
         return _raw_on_board(world, item)
     if t == "Chop":
         return _chopped_available(world, book, item)
     if t in ("FetchToPlate", "TakeCookedToPlate"):
         p = _plate_by_n(world, plate_id) if plate_id is not None else None
+        contents = node.get("contents")
         if p is not None and book.plate_has(p, item):
-            return True
+            # wrap 的 FetchToPlate 节点带 contents：盘里还得有装进去的料才算齐
+            if contents is None or set(contents) <= book.plate_tokens(p):
+                return True
         # 该单配到的已装料载体里已有这份料（包了熟肉的卷饼）：不再备料/端锅，
         # 由「把载体放进盘」那一步（底料的 FetchToPlate）一起带进去。
         return CR.carrier_covers(book, ctx.get("carrier"), item)
@@ -534,6 +606,11 @@ def _inst_fetch_to_plate(node, ctx):
     if plate_id is None:
         return []
     item = node["item"]
+    contents = node.get("contents")
+    if contents is not None:
+        # wrap 节点：只发「装好料的底料端进盘」（带内容签名）；盘装 fallback 由
+        # 并行的普通 FetchToPlate 路径发，不在这里重复。
+        return [T.FetchToPlate(ctx["order_id"], (plate_id, tuple(contents)), item)]
     out = [T.FetchToPlate(ctx["order_id"], (plate_id,), item)]
     carrier = ctx.get("carrier")
     book = ctx["book"]
@@ -607,6 +684,30 @@ def _inst_take_cooked(node, ctx):
         if _claimed(cid, "take_cooked", ctx["bb"]):
             continue
         tasks.append(T.TakeCookedToPlate(ctx["order_id"], (cid, plate_id), item))
+    return tasks
+
+
+def _inst_fill_carrier(node, ctx):
+    # type: (Dict, Dict) -> List[Any]
+    """wrap 类：这份熟料还没装进卷饼、且卷饼（前置内容）可取/在手上 → 发候选。
+
+    与 _inst_take_cooked 同源：遍历配到这一单的熟料源（灶上锅/散熟锅），
+    只对装着这份熟料的那口发 FillCarrier；目标（卷饼）每拍现配，不认领。
+    """
+    item = node["item"]
+    pre = tuple(node.get("pre_contents") or ())
+    tasks = []  # type: List[Any]
+    for cid, oid in ctx["cooker_match"].items():
+        if oid != ctx["order_id"]:
+            continue
+        if not _takeable_cooked_source(ctx["world"], ctx["book"], cid):
+            continue
+        if not _source_has(ctx["world"], ctx["book"], cid, item):
+            continue
+        if _claimed(cid, "take_cooked", ctx["bb"]):
+            continue
+        tasks.append(T.FillCarrier(ctx["order_id"],
+                                   (cid, node["base_form"], pre), item))
     return tasks
 
 
@@ -692,6 +793,8 @@ def _instantiate(node, ctx):
         return _inst_fetch_to_carrier(node, ctx)
     if t == "PlaceCarrierInCooker":
         return _inst_place_carrier(node, ctx)
+    if t == "FillCarrier":
+        return _inst_fill_carrier(node, ctx)
     return []
 
 

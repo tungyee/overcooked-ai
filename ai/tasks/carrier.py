@@ -11,7 +11,7 @@ station_type），不按菜名特判。
 
 外部不直接 import 本模块，一律 `from ai import tasks as T`。
 """
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ai.query import carriers as CR
 from ai.query import predicates as P
@@ -19,7 +19,10 @@ from ai import primitives as PR
 from ai.exec.bt import Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            _station_for_item, cooker_state, cooker_station,
+                           cooked_sources, held_matches_contents,
                            ingredient_available, ingredient_source)
+from ai.tasks.cook import (_cooker_ready_to_take, TAKE_COOKED_TIMEOUT_TICKS,
+                           WAIT_COOKED_TIMEOUT_TICKS)
 
 
 def _order(ctx, order_id):
@@ -215,6 +218,146 @@ class PlaceCarrierInCooker(Task):
             PR.InteractWith(lambda c: cooker_station(c, task.cooker_id),
                             "placement", placed),
         ]), TASK_TIMEOUT_TICKS)
+
+
+@_register
+class FillCarrier(Task):
+    """端着包裹底料（卷饼皮）去熟料源，把熟料直接装进底料（wrap 类载体菜）。
+
+    wrap 类载体菜（卷饼/汉堡）的「装馅」：与 TakeCookedToPlate 同一套
+    「端容器 → 走到锅前等熟 → 盛进去」机制，只是手里的容器从盘换成底料
+    （PreparationContainer，非盘非锅、能直接装熟料）。装完的底料是「已装料
+    载体」，由 FetchToPlate 带内容签名端进盘、送餐。
+
+    item = 要盛的熟料名（BoiledRice / FriedMushrooms）；
+    resources = (source_id, base_form, pre_contents)：
+      source_id  熟料源（灶实例名 / 散锅 item 名，与 TakeCookedToPlate 同口径）；
+      base_form  底料的取料形态名（Tortilla）；
+      pre_contents 盛这份料之前底料里已有的内容签名（第一份为空元组）。
+    不认领底料：底料实例每拍现找（空卷饼在箱子里无限供应、装了一半的是
+    载体按内容签名匹配），与 FetchToCarrier 同一理由。
+    """
+
+    TYPE = "FillCarrier"
+    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    DESC = "端着卷饼把煮好的料装进去"
+    LABEL = "装馅"
+    HANDS = "empty"       # 要空手去端卷饼；手不空时打分加腾手代价（spec §6.1(b)）
+    NO_ABANDON = True     # 盛料是停烧糊的必经之路（与 TakeCookedToPlate 同源）
+
+    @property
+    def source_id(self):
+        return self._resources[0]
+
+    @property
+    def base_form(self):
+        return self._resources[1]
+
+    @property
+    def pre_contents(self):
+        # type: () -> Tuple[str, ...]
+        return tuple(self._resources[2]) if len(self._resources) > 2 else ()
+
+    def claims(self):
+        return ((self.source_id, "take_cooked"),)
+
+    def _after(self, ctx):
+        # type: (Dict) -> Tuple[str, ...]
+        """盛完这份料后底料应有的内容签名（前置内容 + 这份熟料的 token）。"""
+        token = ctx["book"].rich_token(self.item)
+        toks = set(self.pre_contents)
+        if token:
+            toks.add(token)
+        return CR.signature(toks)
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        """盛料一进底料，底料就从「空卷饼」（不是载体）变成「装了料的载体」。"""
+        return CR.wrap_carrier_exists(ctx["w"], self.base_form, self._after(ctx))
+
+    def _source(self, ctx):
+        # type: (Dict) -> Optional[Dict]
+        """熟料源（灶上煮中/熟锅 / 台面散熟锅），与 TakeCookedToPlate._source 同源。"""
+        sid = self.source_id
+        c = cooker_state(ctx, sid)
+        if c is not None:
+            if P.cooker_started(c) and not P.cooker_burning(c):
+                return {"kind": "cooker", "target": cooker_station(ctx, sid)}
+            return None
+        token = ctx["book"].rich_token(self.item)
+        for src in cooked_sources(ctx["w"], ctx["book"]):
+            if src["kind"] != "loose" or str(src["id"]) != str(sid):
+                continue
+            if token and token not in src["tokens"]:
+                continue
+            return {"kind": "loose", "target": src["item"]}
+        return None
+
+    def _holding_wrapper(self, ctx):
+        # type: (Dict) -> bool
+        """手里正是「底料 + 前置内容」的那件（空卷饼 / 装了部分料的卷饼）。"""
+        return held_matches_contents(ctx, self.base_form, self.pre_contents)
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        """分两段（与 TakeCookedToPlate 同理由）：
+
+          - 启动看源 + 时机：灶上熟料 / 散熟锅才值得去盛；煮中只等到离熟
+            TAKE_COOKED_LEAD_S 秒以内才放行，别端卷饼去锅边干等；
+          - 执行中看手：手里已经是「前置内容对得上」的卷饼也算可行，别因
+            卷饼离开原位而把自己判成不可行。
+        """
+        if self.done(ctx):
+            return False
+        if self._holding_wrapper(ctx):
+            return True
+        if not ingredient_available(ctx, self.base_form, self.pre_contents):
+            return False
+        s = self._source(ctx)
+        if s is None:
+            return False
+        if s["kind"] == "cooker":
+            if not _cooker_ready_to_take(cooker_state(ctx, self.source_id)):
+                return False
+        return True
+
+    def build(self):
+        # type: () -> Node
+        base_form, pre = self.base_form, self.pre_contents
+
+        def holding(c):
+            return held_matches_contents(c, base_form, pre)
+
+        def wrapper_source(c):
+            return ingredient_source(c, base_form, pre)
+
+        def source_target(c):
+            s = self._source(c)
+            return s["target"] if s else None
+
+        def source_ready(c):
+            s = self._source(c)
+            if s is None:
+                return False
+            if s["kind"] == "loose":
+                return True
+            cc = cooker_state(c, self.source_id)
+            return P.cooker_cooked(cc) and not P.cooker_burning(cc)
+
+        def filled(c):
+            return held_matches_contents(c, base_form, self._after(c))
+
+        # 端卷饼盛料：端卷饼 → 提前站到锅前等熟 → 熟了盛进卷饼。交互句柄用
+        # kind=None（通用朝向句柄），与 TakeCookedToPlate 同理由（端容器面对锅
+        # 时 placement 句柄为 null、pickup 会被脚边散料抢走）。
+        return PR.Timeout(Sequence([
+            PR.EnsureHandsFree(keep=holding),
+            PR.InteractWith(wrapper_source, "pickup", holding),
+            PR.Approach(source_target, None),
+            PR.Face(source_target),
+            PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),
+            PR.InteractWith(source_target, None, filled),
+        ]), TAKE_COOKED_TIMEOUT_TICKS)
 
 
 # ---------------------------------------------------------------- 送载体过去

@@ -49,7 +49,7 @@ ACTION_TASK_TYPES = {
     "deliver": ("DeliverPlate",),
     "wash": ("WashPlate",),
     "fetch": ("FetchToBoard", "FetchToCooker", "FetchToPlate",
-              "FetchToCarrier", "Prefetch"),
+              "FetchToCarrier", "FillCarrier", "Prefetch"),
     "prepare": None,       # 整道菜：取该菜全部 task
 }  # type: Dict[str, Optional[Tuple[str, ...]]]
 

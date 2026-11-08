@@ -83,6 +83,7 @@ TASK_COST = {
     "Discard": COST_TAKE_COOKED,
     "Mix": COST_CHOP,
     "FetchToCarrier": COST_FETCH_TO_PLATE,
+    "FillCarrier": COST_TAKE_COOKED,
     "PlaceCarrierInCooker": COST_FETCH_TO_COOKER,
 }
 

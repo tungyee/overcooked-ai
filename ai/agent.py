@@ -714,7 +714,10 @@ class Agent:
         self._sync_division_preferences()
         out = {
             "tool": "set_division",
-            "ok": bool(applied) or not rejected,
+            # 有任何一条被拒就按失败处理：worker 不会播乐观台词，会强制
+            # 模型先说明原因/重试，避免「切肉煎肉」这类错话先出口。
+            "ok": not rejected,
+            "partial": bool(applied) and bool(rejected),
             "division": self.bb.division.snapshot(),
             "changed": changed,
             "division_changed": bool(changed),

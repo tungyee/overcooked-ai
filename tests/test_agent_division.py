@@ -184,6 +184,22 @@ def test_set_division_rejects_deliver_and_unknown_item(agent):
     assert len(result["rejected"]) == 2
 
 
+def test_set_division_partial_reject_is_failure(agent):
+    """部分条目被拒也要按失败返回，worker 才不会先播乐观台词。"""
+    world = make_world()
+    agent.book = RecipeBook(world.recipes, world.stations)
+    result = agent._apply_duty_batch(world, _batch(
+        ("set_division", {"assignments": [
+            {"action": "cook", "owner": "you"},
+            {"action": "chop", "owner": "you", "item": "Bun"},
+        ]})
+    ))[0]
+    assert result["ok"] is False
+    assert result["partial"] is True
+    assert result["division_changed"] is True
+    assert result["rejected"]
+
+
 def test_read_cookbook(agent):
     world = make_world()
     agent._maybe_reset_dialog_level(world)

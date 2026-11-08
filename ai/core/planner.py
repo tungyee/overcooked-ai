@@ -799,6 +799,10 @@ W_COOKER_IDLE = 5.6
 # 缺口饱和点：缺 3 份以上就算"满额紧急"，再多不额外加分——否则开局 5 单
 # 全要米时填灶会盖过送餐和灭火。
 COOKER_SHORTFALL_SATURATION = 3
+# 盘量折扣下限：需要该熟料的订单一张盘都没有时，填灶只保留 25% 优先级。
+# 不能直接归零——否则「没盘 → 不煮 → 单过期」的死锁会回来（见
+# tests/test_fill_cooker_priority.py::test_fill_is_not_gated_on_having_a_plate）。
+FILL_PLATE_DISCOUNT_FLOOR = 0.25
 
 # 摆盘压力权重：一块盘都没就位时 = 拼装链没有落点，和「0 干净盘」等价
 # 地卡死整条装配。
@@ -2046,7 +2050,8 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     if task.TYPE == "FillCooker":
         shortfall = CS.cooked_shortfall(world, book, task.item) \
             if book is not None else 0
-        terms["cooker_idle"] = _cooker_idle_bonus(shortfall)
+        terms["cooker_idle"] = _cooker_idle_bonus(shortfall) * _fill_plate_factor(
+            shortfall, world, book, plate_match, task.item)
     else:
         terms["cooker_idle"] = 0.0
 
@@ -2248,6 +2253,44 @@ def _cooker_idle_bonus(shortfall):
         return 0.0
     ratio = min(1.0, float(shortfall) / COOKER_SHORTFALL_SATURATION)
     return W_COOKER_IDLE * ratio
+
+
+def _fill_plate_factor(shortfall, world, book, plate_match, item):
+    # type: (int, World, Any, Optional[Dict[Any, Any]], Any) -> float
+    """按「有多少订单真的能上盘」给填灶打折。
+
+    `cooked_demand` 数所有活单；没有匹配到盘的订单即使煮了也上不了桌，
+    盘瓶颈时会把灶全部占满、挡住鱼/菜等备菜。这里把缺口按**有盘订单数**
+    封顶：
+
+      3 单都要米、都有盘 → 1.0
+      3 单都要米、只有 1 单有盘 → 只按缺 1 份计
+      一张盘都没有 → FILL_PLATE_DISCOUNT_FLOOR（不是 0，避免死锁）
+
+    `plate_match is None` 表示没有匹配信息，不惩罚（旧调用点/单测）。
+    """
+    if book is None or plate_match is None:
+        return 1.0
+    want = str(item).lower()
+    matched = {str(v) for v in plate_match.values()}
+    demand = 0
+    platable = 0
+    for order in getattr(world, "orders", None) or ():
+        if not any(str(r).lower() == want
+                   for r in book.requirements(order)):
+            continue
+        demand += 1
+        if str(order.get("id")) in matched:
+            platable += 1
+    if demand <= 0:
+        return 1.0
+    if platable <= 0:
+        return FILL_PLATE_DISCOUNT_FLOOR
+    if shortfall <= platable:
+        return 1.0
+    base = _cooker_idle_bonus(shortfall)
+    target = _cooker_idle_bonus(platable)
+    return target / base if base > 0 else 1.0
 
 
 def _plate_pressure(world):

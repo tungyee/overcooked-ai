@@ -51,7 +51,8 @@ def _world_hot_pot(progress=23.0):
 
 
 _PLATE_EMPTY = {"n": "p1", "name": "plate", "x": 3.0, "z": 3.0,
-                "contents": [], "detail": []}
+                "contents": [], "detail": [],
+                "stack_top": True, "stack_clean": True}
 
 
 def test_hot_pot_outranks_prep():
@@ -75,7 +76,9 @@ def test_fill_cooker_outranks_prep():
     trace-20261014-120406 的 1700~3270 窗口三口灶 59% 空转，而同期 planner
     一直在摆海苔、切鱼，order#3/4/5 三单全在这窗口过期。
     """
-    w = _world([_cooker("c1"), _cooker("c2")], plates=[_PLATE_EMPTY])
+    # 三单都要米：每单一张盘，否则盘量折扣会按可上盘订单数封顶。
+    plates = [dict(_PLATE_EMPTY, n="p%d" % i) for i in (1, 2, 3)]
+    w = _world([_cooker("c1"), _cooker("c2")], plates=plates)
     by = _score(w, [
         T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice"),
         T.FetchToPlate("1", ("p1", (3, 3)), "Seaweed"),

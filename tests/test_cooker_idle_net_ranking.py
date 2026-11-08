@@ -13,7 +13,7 @@ from ai.core import planner
 from ai import tasks as T
 from ai.state.blackboard import Blackboard
 from ai.query.recipes import RecipeBook
-from tests.test_fill_cooker_priority import _cooker, _world
+from tests.test_fill_cooker_priority import _cooker, _plate, _world
 
 
 def _score(w, tasks):
@@ -47,7 +47,9 @@ def test_hot_pot_still_beats_fill_on_net_score():
 
 def test_fill_beats_prep_with_margin():
     """填灶 > 备菜，且余量要够——0.17 分的胜负是噪声级，不算钉住。"""
-    w = _world([_cooker("c1"), _cooker("c2")])
+    # 三单都要米：给每单一张盘，否则盘量折扣会按「能上盘的订单」封顶。
+    plates = [_plate("p1"), _plate("p2"), _plate("p3")]
+    w = _world([_cooker("c1"), _cooker("c2")], plates=plates)
     by = _score(w, [
         T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice"),
         T.FetchToPlate("1", ("p1",), "Seaweed"),

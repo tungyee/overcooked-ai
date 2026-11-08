@@ -56,12 +56,20 @@ def _cooker(n):
             "burning": False, "onFire": False, "pot_contents": []}
 
 
+def _plate(n):
+    return {"n": n, "x": 1.0, "z": 1.0, "contents": [], "detail": [],
+            "stack_top": True, "stack_clean": True}
+
+
 def _world(n_orders):
     return World({
         "orders": [_order(str(i + 1), 60 + 20 * i) for i in range(n_orders)],
         "stations": STATIONS, "recipes": RECIPES,
         "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
-        "plates": [], "workstations": [],
+        # 每单一张盘：这些用例测的是「订单能上盘时」的填灶量级；
+        # 无盘时的折扣由 test_fill_cooker_priority 的盘量折扣用例单独钉住。
+        "plates": [_plate("p%d" % (i + 1)) for i in range(n_orders)],
+        "workstations": [],
         "cookers": [_cooker("c1"), _cooker("c2")],
         "items": [], "extinguishers": [], "grid": {"nodeMap": None},
     })
@@ -79,9 +87,10 @@ def _net(w, task):
     """层内净分（走 L6 白名单裁剪，与生产路径一致）。"""
     bb = Blackboard()
     book = RecipeBook(w.recipes, w.stations)
+    plate_match = planner._match_plates_to_orders(w, bb, book)
     cand = planner.Candidate(task, [], 15)
     _score, terms = planner._score_candidate(
-        w, bb, cand, book, plate_match={}, layer=L_PREP)
+        w, bb, cand, book, plate_match=plate_match, layer=L_PREP)
     from ai.core.planner_layers import filter_terms
     return filter_terms(terms, L_PREP)[0]
 

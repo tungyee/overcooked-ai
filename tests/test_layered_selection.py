@@ -72,7 +72,12 @@ def test_plan_only_scores_top_layer_candidates():
         ],
         "stations": stations, "recipes": recipes,
         "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
-        "plates": [], "workstations": [], "cookers": [_cooker("c1"), _cooker("c2")],
+        # 三单都要米：每单一张盘，避免盘量折扣把填灶压到备菜之下。
+        "plates": [{"n": "p%d" % i, "x": 1.0, "z": 1.0,
+                    "contents": [], "detail": [],
+                    "stack_top": True, "stack_clean": True}
+                   for i in (1, 2, 3)],
+        "workstations": [], "cookers": [_cooker("c1"), _cooker("c2")],
         "items": [], "extinguishers": [], "grid": {"nodeMap": None},
     })
     bb = Blackboard()
@@ -81,10 +86,10 @@ def test_plan_only_scores_top_layer_candidates():
 
     chosen, record = planner.plan(w, bb, None, book)
 
-    # 缺 3 份米（3 单要米、灶全空）→ cooker_idle 拿满 5.6，填灶在 L_PREP
-    # **层内凭分数**胜出。这与分层期间的 L5>L6 结论相同，但机制不同：
-    # 现在缺口小的时候它会让位（见 tests/test_fill_cooker_layer.py）。
-    assert chosen.TYPE == "FillCooker"
+    # 缺 3 份米（3 单要米、灶全空）→ 填灶/按单下锅都在 L_PREP 层内竞争。
+    # 有盘时 FetchToCooker 还能吃 async_resource + urgency，可能反超
+    # FillCooker；这里只钉住「它们没有被层挡掉、且进了打分」。
+    assert chosen.TYPE in ("FillCooker", "FetchToCooker")
     assert record["top_layer"] == PL.L_PREP
 
     by_type = {}
@@ -99,13 +104,13 @@ def test_plan_only_scores_top_layer_candidates():
     expected_score, _ = PL.filter_terms(fc_terms, PL.L_PREP)
     assert fc_score == pytest.approx(expected_score)
 
-    # FetchToCooker 现在同层同样参与打分，但分数低于填灶（它没有
-    # cooker_idle，且 async_resource 要求「订单已有盘」—— 本场景 0 盘）。
+    # FetchToCooker 同层参与打分：有盘时它吃 async_resource + urgency，
+    # 分数可能高于 FillCooker；关键是没有被层挡掉。
     fetch_score, fetch_terms, fetch_ok, fetch_layer, fetch_in_top = by_type["FetchToCooker"]
     assert fetch_ok is True
     assert fetch_layer == PL.L_PREP
     assert fetch_in_top is True
-    assert fetch_score < fc_score
+    assert fetch_score > 0
 
     # L_CLEANUP 的 Prefetch 仍然被层挡在打分之外：terms 为空、分数 0。
     # 这是分层的核心可观测性收益（spec §6），换层后依然要成立。

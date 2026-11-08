@@ -174,10 +174,6 @@ def test_carrier_task_done_needs_contents_in_plate(frames):
 
 # ---------- 端到端：规划选中 ----------
 
-@pytest.mark.xfail(
-    reason="删除 eta / ingredient_reuse 后的已知回归：带料载体 FetchToPlate "
-           "失去成本与复用信用，输给 FillCooker。待实机验证后重新标定。",
-    strict=False)
 @pytest.mark.parametrize("idx", [0, 1])
 def test_planner_picks_carrier_to_plate(frames, idx):
     w, book = _wb(frames[idx])
@@ -240,10 +236,6 @@ def _plan_with(frame, tortilla_detail, plate_detail):
     return str(task), [str(c[0]) for c in rec["candidates"]]
 
 
-@pytest.mark.xfail(
-    reason="删除 eta / ingredient_reuse 后的已知回归：带料载体 FetchToPlate "
-           "失去成本与复用信用，输给 FillCooker。待实机验证后重新标定。",
-    strict=False)
 @pytest.mark.parametrize("idx", [0, 1])
 @pytest.mark.parametrize("tortilla,plate,sig", [
     ([RICE_D, MEAT_D], [], (MEAT_T, RICE_T)),      # 包齐的卷 + 空盘
@@ -251,6 +243,10 @@ def _plan_with(frame, tortilla_detail, plate_detail):
     ([RICE_D], [], (RICE_T,)),                      # 包饭的卷 + 空盘（只凑到 2/3）
 ])
 def test_planner_picks_carrier_variants(frames, idx, tortilla, plate, sig):
+    if idx == 0 and sig == (RICE_T,):
+        pytest.xfail(
+            "删除 eta / ingredient_reuse 后的已知回归：只凑到 2/3 的带料载体 "
+            "在 idx0 仍输给 FillCooker。待实机验证后重新标定。")
     chosen, _ = _plan_with(frames[idx], tortilla, plate)
     assert chosen == "FetchToPlate(Tortilla, %s, %s, order#4)" % (PLATE, sig)
 

@@ -2,8 +2,7 @@
 """FillCooker（订单无关的填灶 task）回归（第 1 组 1.1）。
 
 为什么要一个新 task 而不是调权重：`FetchToCooker` 绑订单，只能由
-recipe_graph 按单发射，`_in_flight_cook_claim` 压掉同单第二个下锅候选，
-`_match_cookers_to_orders` 又是严格 1:1。结构上「5 单要米」就不可能变成
+recipe_graph 按单发射，`_match_cookers_to_orders` 又是严格 1:1。结构上「5 单要米」就不可能变成
 「3 口灶在烧」——实测 trace-20261014-120406 的 1700~3270 窗口 59% 的拍里
 三口灶一个都没在煮，order#3/4/5 三单全在这窗口过期。
 

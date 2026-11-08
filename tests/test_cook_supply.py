@@ -2,7 +2,7 @@
 """熟料供需计数回归（第 1 组 1.2）。
 
 根因不是权重而是结构：`FetchToCooker` 只能由 recipe_graph 按单发射，
-`_in_flight_cook_claim` 压掉同单第二个下锅候选，`_match_cookers_to_orders`
+`FetchToCooker` 按单发射，`_match_cookers_to_orders`
 又是严格 1:1 —— 于是「5 单要米」永远不等于「3 口灶在烧」。实测
 trace-20261014-120406 的 1700~3270 窗口（正是 order#3/4/5 三单过期的窗口）
 **59% 的拍里三口灶一个都没在煮**，峰值也只有 2 口。

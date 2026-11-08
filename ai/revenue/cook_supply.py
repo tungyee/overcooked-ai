@@ -2,8 +2,8 @@
 """熟料供需计数（第 1 组 1.2）。
 
 **为什么需要这一层**：本局 3 个 miss 的根因不是权重而是结构。
-`FetchToCooker` 只能由 `recipe_graph.emit` 按单发射，`_in_flight_cook_claim`
-压掉同一单的第二个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 ——
+`FetchToCooker` 只能由 `recipe_graph.emit` 按单发射，一份熟料在一单里只发
+一个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 ——
 于是「5 单要米」永远不等于「3 口灶在烧」。实测 trace-20261014-120406 的
 1700~3270 窗口（正是 order#3/4/5 三单过期的窗口）**59% 的拍里三口灶一个都
 没在煮**，峰值也只有 2 口。灶空转的机会成本是 12 秒不可压缩的时钟。

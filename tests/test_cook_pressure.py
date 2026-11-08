@@ -179,15 +179,6 @@ def test_gen_cook_suppressed_when_order_already_producing():
     assert "FetchToCooker" not in types
 
 
-def test_gen_cook_suppressed_when_in_flight_claim():
-    """队友已有在途认领（fetch_to）→ 不再重复生成。"""
-    w = _rice_world()
-    book = RecipeBook(w.recipes, w.stations)
-    bb = Blackboard()
-    bb.claim("cooker_09", "fetch_to", "P1", "order1", 0)
-    assert "FetchToCooker" not in _emit_types(w, bb, book, w.orders[0])
-
-
 # ---------- 取熟料侧也要吃"该单需熟料" ----------
 
 def _take_world(plate_contents):

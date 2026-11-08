@@ -366,8 +366,8 @@ class FillCooker(FetchToCooker):
     """填灶：订单无关地把生料下进空锅，让灶常驻满载。
 
     **为什么不能靠调权重解决**（第 1 组 1.1）：`FetchToCooker` 绑订单，
-    只能由 `recipe_graph.emit` 按单发射，`_in_flight_cook_claim` 压掉同一单
-    的第二个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 —— 结构上
+    只能由 `recipe_graph.emit` 按单发射，一份熟料在一单里只发一个下锅候选，
+    `_match_cookers_to_orders` 又是严格 1:1 —— 结构上
     「5 单要米」就不可能变成「3 口灶在烧」。实测 trace-20261014-120406 的
     1700~3270 窗口 **59% 的拍里三口灶一个都没在煮**（峰值也只有 2 口），而
     order#3/4/5 三单全在这个窗口过期。灶空转的机会成本是 12 秒不可压缩的

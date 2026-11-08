@@ -423,43 +423,7 @@ def _mix_done(world, book, node):
     return False
 
 
-# ---------- 发射（实例化：绑资源 + 认领） ----------
-
-def _in_flight_cook_claim(ctx, item=None):
-    # type: (Dict, Any) -> bool
-    """该单是否已有在途的 下锅/取熟/救熟 认领（等价 _order_needs_cooked 第 2 源）。
-
-    作用域按**熟料**而非整单（第 1 组 1.3）：原先只问「这单有没有任意烹饪
-    类认领」，于是一单要两份熟料（或多料菜）时，第一份一下锅就把第二份的
-    候选全压掉——AI 站着等、灶空着。认领的本意是「同一份熟料别重复下锅」。
-
-    认领没记 item（老认领 / 非烹饪路径）时退化回整单作用域：宁可少发一个
-    候选，也不要重复下锅。
-
-    **只看别人的认领**：P2 自己上一拍写的认领不能压掉这一拍的候选，否则
-    同一个 task 会隔拍消失/出现，Executor 的树每拍重建（实机 t=1480~1559
-    同一口灶的 order#3/#6 候选互换）。同一 agent 的重复下锅本来由
-    `used_cookers` 与 cooker 状态兜住。
-    """
-    want = str(item).lower() if item is not None else None
-    for (_res, action), claim in ctx["bb"].claims.items():
-        if getattr(claim, "owner", None) == T.OWNER:
-            # P2 自己的在途认领不压候选：下一拍规划还要继续生成同一个
-            # task，好让 Executor 复用同一棵树。压掉会让候选在「有认领 /
-            # 没认领」之间每拍翻转（trace-20261108-161828 t=1480~1559：
-            # 同一口灶的 order#3 / order#6 候选隔拍互换，task key 变、
-            # 树每拍重建，P2 在原地冻住）。
-            continue
-        if getattr(claim, "order_id", None) != ctx["order_id"]:
-            continue
-        if action not in ("fetch_to", "take_cooked", "rescue"):
-            continue
-        claimed = getattr(claim, "item", None)
-        if want is None or claimed is None:
-            return True
-        if str(claimed).lower() == want:
-            return True
-    return False
+# ---------- 发射（实例化：绑资源） ----------
 
 
 def _takeable_cooked_source(world, book, cid):
@@ -582,19 +546,16 @@ def _inst_fetch_to_plate(node, ctx):
 def _inst_fetch_to_cooker(node, ctx):
     # type: (Dict, Dict) -> List[Any]
     item = node["item"]
-    if _in_flight_cook_claim(ctx, item):
-        return []
     tasks = []  # type: List[Any]
     # 去重按**熟料**分桶：`used_cookers` 原先是整单共享的一个 set，而本函数
     # 会遍历所有空灶各发一个候选——于是第一样熟料就把所有空灶"用掉"，第二样
-    # 一个候选都发不出来（第 1 组 1.3 的第二层结构限制，由
-    # tests/test_cook_claim_scope.py 暴露）。候选只是选项，真正的互斥由
-    # claims 负责，所以同一口灶出现在不同熟料的候选里没有问题。
+    # 一个候选都发不出来（第 1 组 1.3 的第二层结构限制）。候选只是选项，
+    # 同一口灶出现在不同熟料的候选里没有问题。
     used = ctx["used_cookers"].setdefault(str(item).lower(), set())
     want_cookware = (ctx["book"].cookware_of(item) or "").lower()
     for c in _cookers(ctx["world"]):
         cid = P.resource_id(c)
-        if not cid[1] or _claimed(cid, "fetch_to", ctx["bb"]):
+        if not cid[1]:
             continue
         if not P.cooker_has_pot(c):
             continue
@@ -619,8 +580,6 @@ def _inst_fetch_to_cooker(node, ctx):
         if _it != item:
             continue
         cid = P.resource_id(c)
-        if _claimed(cid, "fetch_to", ctx["bb"]):
-            continue
         if _claimed(pot_name, "recover", ctx["bb"]):
             continue
         tasks.append(T.FetchToCooker(ctx["order_id"],
@@ -699,13 +658,11 @@ def _inst_place_carrier(node, ctx):
     book = ctx["book"]
     if car is None or CR.prep_missing(book, car, node["item"]):
         return []
-    if _in_flight_cook_claim(ctx, node["item"]):
-        return []
     station = book.carrier_base(node["item"])[2]
     tasks = []  # type: List[Any]
     for c in _cookers(ctx["world"]):
         cid = P.resource_id(c)
-        if not cid[1] or _claimed(cid, "fetch_to", ctx["bb"]):
+        if not cid[1]:
             continue
         if not cooker_accepts(c, station) or not cooker_free(c):
             continue

@@ -1227,10 +1227,10 @@ class Agent:
         """命令 scope 这一拍没有可行候选时的兜底。
 
         正在跑的树如果仍在命令 scope 内，就保持它，不要切去干别的：候选为空
-        往往只是**这棵自己的**在途认领（`_in_flight_cook_claim`）把同一份熟料
-        的下锅候选压掉了，不是它真的做不了。此时若标记 waiting 并改选 scope
-        外的任务，下一拍认领释放、候选又出现，就会每拍重建树、P2 原地抖动
-        （trace-20261108-161828 t=1438~1559：chosen 每拍在 FetchToCooker 和
+        往往只是这一拍 scope 内的任务暂时不可行（资源状态刚好变化 / 候选被
+        过滤），不是命令本身做不了。此时若标记 waiting 并改选 scope 外的
+        任务，下一拍候选又出现、又切回来，就会每拍重建树、P2 原地抖动
+        （trace-20261108-161828 t=1438~1479：chosen 每拍在 FetchToCooker 和
         TakeCookedToPlate 之间跳，位置几乎不动）。
 
         没有在跑的 scope 内任务时才让位：命令标 waiting，清 scope，按无 scope

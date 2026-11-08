@@ -607,17 +607,17 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     # type: (Candidate, Dict, Blackboard, bool, Optional[float]) -> Tuple[bool, str]
     """判断单个候选是否可行，返回 (ok, 否决原因)。
 
-    否决原因供 trace 排查：claimed（资源被他人认领）/ abandoned（L3 拉黑）
-    / p2_suppressed（账本 stop：玩家让先别做）/ infeasible（task.feasible()
-    为假）。ok=True 时原因为空串。
+    否决原因供 trace 排查：abandoned（L3 拉黑）/ p2_suppressed（账本 stop：
+    玩家让先别做）/ infeasible（task.feasible() 为假）。ok=True 时原因为空串。
+
+    单 agent（只有 P2 写认领）下不再检查 `claims_available`：所有认领都是
+    P2 自己的，`is_claimed_by_other` 恒假，只会让同一 task 隔拍被压掉。
 
     ignore_abandon=True 给火情用：拉黑是按资源 id 记的，别的 task 在同一
     口灶上反复失败也会把着火的那口灶写进 scratch.abandoned（比如 Normal
     模式里 ReturnPot 卡在灶边），但火不能不管。
     """
     task = cand.task
-    if not T.claims_available(task, ctx):
-        return False, "claimed"
     # 方案 B（篮子移动时否决目标在篮子上的候选 task）已禁用。
     # if _targets_moving_platform(task, ctx):
     #     return False, "platform_moving"

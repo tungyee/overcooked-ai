@@ -285,7 +285,8 @@ def test_wash_plate_tree_faces_the_sink_stack():
     assert isinstance(seq, Sequence)
     sel = seq.children[0]
     assert isinstance(sel, Selector)
-    pickup = sel.children[0].children[0]
+    # 第 0 支是「手里已有脏盘 → 直接放池子」；取脏盘的是第 1 支
+    pickup = sel.children[1].children[0]
     assert isinstance(pickup, PR.InteractWith)
     assert pickup._face is not None, \
         "脏盘摞是固定站点，不转身则 pickup 句柄永远为 null"
@@ -311,7 +312,7 @@ def test_wash_plate_dirty_target_prefers_station_with_grid():
     world.items = [{"n": "DirtyPlateStack", "x": 13.2, "z": -12.0}]
 
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].children[0].children[0].target
+    dirty = tree.child.children[0].children[1].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     got = dirty(ctx)
     assert got is not None
@@ -328,7 +329,7 @@ def test_wash_plate_dirty_target_none_when_no_dirty_stack():
                    "gx": -1, "gz": -5, "x": 13.2, "z": -12.0}])
     world.items = []
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].children[0].children[0].target
+    dirty = tree.child.children[0].children[1].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     assert dirty(ctx) is None
 

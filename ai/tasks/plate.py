@@ -104,13 +104,12 @@ def clean_plate_at_source(ctx):
 
 def dirty_plate_exists(ctx, sink_id=None):
     # type: (Dict, Any) -> bool
-    """有要洗的盘：场上的 DirtyPlateStack，或洗碗池里待洗的盘（plate_count>0）。
+    """有要洗的盘：场上的 DirtyPlateStack、手里的脏盘、或洗碗池里待洗的盘。
 
-    后者是「盘已放进池子、正在洗」的进行态：盘一入池就离开 items[]，
-    若只认 items[]，feasible 会在入池那一拍翻脸，承诺惯性 3 拍后把正在
-    洗的树抢走（实机 trace-20261017-182700 t=1678~1680）。
+    手持的也要算：P2 捡起脏盘摞后它离开 items[]，只认 items[] 会让
+    feasible 在捡起那一拍翻脸，树被抢走后 wash 命令挂在那里没人接。
     """
-    for it in ctx["w"].items:
+    for it in (list(ctx["w"].items) + list(getattr(ctx["w"], "held_items", ()))):
         if "dirtyplate" in str(it.get("n") or "").lower():
             return True
     return sink_plate_count(ctx, sink_id) > 0
@@ -236,6 +235,14 @@ class WashPlate(Task):
         # 叠加「已经洗出干净盘在取盘位」。
         if sink_plate_count(ctx, self.sink_id) > 0:
             return False
+        # 手里还端着脏盘也不算完：只看池子+干净盘会在「刚捡起脏盘、还没
+        # 放进池子」时误判完成（trace-20261108-164955 t=1932：wash 命令在
+        # 捡起 DirtyPlateStack 的那一拍被标 succeeded）。场上别的脏盘摞不算
+        # ——那由 L4 层决定要不要洗，不能让它把 done 永久压成 False
+        # （test_wash_plate_infeasible_when_already_done）。
+        for it in getattr(ctx["w"], "held_items", ()) or ():
+            if "dirtyplate" in str(it.get("n") or "").lower():
+                return False
         return clean_plate_at_source(ctx)
 
     def feasible(self, ctx):
@@ -305,8 +312,19 @@ class WashPlate(Task):
                     return st
             return stack
 
+        def holding_dirty(c):
+            """手里已经端着脏盘（捡起后、还没放进池子）。"""
+            return "dirtyplate" in P.held_name(c.get("chef"))
+
         return PR.Timeout(Sequence([
             Selector([
+                # 起点 C：手里已经端着脏盘（上一步刚捡起 / 被救锅打断后重建树）
+                # → 直接去池子放下，不再找脏盘摞。
+                Sequence([
+                    Condition(holding_dirty),
+                    PR.InteractWith(sink, "placement",
+                                    lambda c: P.hands_free(c["chef"])),
+                ]),
                 Sequence([
                     # face=True：脏盘摞是**固定站点**，站对位置但朝向不对时
                     # `interactions.pickup` 为 null，不转身就永远按不到（实机

@@ -111,6 +111,25 @@ def test_wash_done_only_after_dirty_count_drops(agent, world):
     assert command_done(world, agent.book, cmd) is True
 
 
+def test_wash_not_done_while_holding_dirty_plate(agent, world):
+    """捡起脏盘摞不等于洗完：dirty_count / command_done 要算手持物。
+
+    trace-20261108-164955 t=1932：P2 刚 pick 起 DirtyPlateStack，items[]
+    里的脏盘消失、脏盘计数 1→0，wash 命令被误标 succeeded 并移出队列。
+    """
+    world.items = [{"n": "DirtyPlateStack", "x": 0.0, "z": 0.0}]
+    agent._execute_action(world, {"action": "wash"})
+    cmd = agent.commands.active()
+    assert cmd.start_dirty == 1
+    world.items = []
+    world.held_items = [{"n": "DirtyPlateStack", "held_by": "Player 2"}]
+    assert dirty_count(world) == 1
+    assert command_done(world, agent.book, cmd) is False
+    # 洗完：手里没了、池子也空
+    world.held_items = []
+    assert command_done(world, agent.book, cmd) is True
+
+
 def test_prompt_has_no_internal_codes(world):
     text = llm.system_message("Sushi_Cucumber = Seaweed + Cucumber")["content"]
     assert "P1" not in text and "P2" not in text

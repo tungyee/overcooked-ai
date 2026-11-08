@@ -571,6 +571,13 @@ def on_plate(world, form):
 
 def dirty_count(world):
     # type: (Any) -> int
+    """待洗脏盘数：池子里的 + 场上/手里的脏盘摞。
+
+    手持的也要算：P2 捡起脏盘摞的那一刻它从 items[] 移到 held_items[]，
+    只数 items[] 会让 wash 命令在“刚拿起来、还没洗”时就判完成
+    （trace-20261108-164955 t=1932：dirty_count 1→0，cmd2 wash 被标
+    succeeded 并移出队列，紧接着救锅，再也没回去洗）。
+    """
     count = 0
     for station in _world_list(world, "stations"):
         if isinstance(station, dict) and station.get("t") == "washing":
@@ -578,7 +585,8 @@ def dirty_count(world):
                 count += int(station.get("plate_count") or 0)
             except (TypeError, ValueError):
                 pass
-    for item in _world_list(world, "items"):
+    for item in (_world_list(world, "items")
+                 + _world_list(world, "held_items")):
         if isinstance(item, dict) and "dirtyplate" in _norm(item.get("n")):
             count += 1
     return count

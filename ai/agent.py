@@ -214,7 +214,8 @@ def _dirty_plate_count(world):
                 count += int(st.get("plate_count") or 0)
             except (TypeError, ValueError):
                 pass
-    for it in getattr(world, "items", None) or ():
+    for it in (list(getattr(world, "items", None) or ())
+               + list(getattr(world, "held_items", None) or ())):
         if isinstance(it, dict) and \
                 "dirtyplate" in str(it.get("n") or "").lower():
             count += 1

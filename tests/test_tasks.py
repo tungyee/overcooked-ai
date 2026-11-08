@@ -478,6 +478,17 @@ def test_wash_plate_done_requires_clean_plate_at_drying_or_stack():
     assert T.WashPlate(resources=("sink1",)).done(ctx2) is False
 
 
+def test_wash_plate_done_false_while_holding_dirty_plate():
+    """手里端着脏盘时不能判洗完：先放池子，再等池子清空。"""
+    w = FakeWorld(stations=[SINK, DRYING], recipes=RECIPES, orders=[ORDER],
+                  plates=[plate("p1", -3, 0)])       # 晾干架上的干净盘
+    w.held_items = [{"n": "DirtyPlateStack", "held_by": "Player 2"}]
+    ctx, _ = make_ctx(w)
+    assert T.WashPlate(resources=("sink1",)).done(ctx) is False
+    w.held_items = []
+    assert T.WashPlate(resources=("sink1",)).done(ctx) is True
+
+
 def test_wash_plate_infeasible_when_already_done():
     """`done` 已成立就不该再可行（下游 PlaceCleanPlate 的 feasible 咬合）。
 
@@ -562,22 +573,26 @@ def test_wash_plate_feasible_when_p1_plates_in_sink_and_clean_exists():
 
 
 def test_wash_plate_tree_supports_plates_already_in_sink():
-    """build 支持「盘已在池子里」的起点：Selector 第一分支捡+放、第二分支直接去池子。"""
+    """build 支持三种起点：手里已有脏盘 / 去捡脏盘 / 盘已在池子里。"""
     t = T.WashPlate(resources=("sink1",))
     tree = t.build()
     seq = tree.child
     assert isinstance(seq, Sequence)
     sel = seq.children[0]
     assert isinstance(sel, Selector)
-    assert len(sel.children) == 2
-    # 第一分支：捡脏盘 + 放进池子
+    assert len(sel.children) == 3
+    # 第一分支：手里已端着脏盘 → 直接放池子
     assert isinstance(sel.children[0], Sequence)
-    assert isinstance(sel.children[0].children[0], PR.InteractWith)
-    # 第二分支：直接走到池子洗（Condition + Approach + Face）
+    assert isinstance(sel.children[0].children[0], Condition)
+    assert isinstance(sel.children[0].children[1], PR.InteractWith)
+    # 第二分支：捡脏盘 + 放进池子
     assert isinstance(sel.children[1], Sequence)
-    assert isinstance(sel.children[1].children[0], Condition)
-    assert isinstance(sel.children[1].children[1], PR.Approach)
-    assert isinstance(sel.children[1].children[2], PR.Face)
+    assert isinstance(sel.children[1].children[0], PR.InteractWith)
+    # 第三分支：直接走到池子洗（Condition + Approach + Face）
+    assert isinstance(sel.children[2], Sequence)
+    assert isinstance(sel.children[2].children[0], Condition)
+    assert isinstance(sel.children[2].children[1], PR.Approach)
+    assert isinstance(sel.children[2].children[2], PR.Face)
 
 
 def test_reset_plate_feasible_when_contents_match_no_order():

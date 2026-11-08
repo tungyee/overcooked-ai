@@ -1222,6 +1222,31 @@ class Agent:
         self.bb.command_scope = None
         self.bb.command_id = None
 
+    def _scope_empty_fallback(self, world, plan_record):
+        # type: (World, Dict) -> Tuple[Optional[Any], Dict]
+        """命令 scope 这一拍没有可行候选时的兜底。
+
+        正在跑的树如果仍在命令 scope 内，就保持它，不要切去干别的：候选为空
+        往往只是**这棵自己的**在途认领（`_in_flight_cook_claim`）把同一份熟料
+        的下锅候选压掉了，不是它真的做不了。此时若标记 waiting 并改选 scope
+        外的任务，下一拍认领释放、候选又出现，就会每拍重建树、P2 原地抖动
+        （trace-20261108-161828 t=1438~1559：chosen 每拍在 FetchToCooker 和
+        TakeCookedToPlate 之间跳，位置几乎不动）。
+
+        没有在跑的 scope 内任务时才让位：命令标 waiting，清 scope，按无 scope
+        重规划，让 P2 先干别的。
+        """
+        active = self.executor_inst.active_task
+        cmd = self.commands.get(self.bb.command_id)
+        if cmd is not None and active is not None \
+                and scope_matches_task(cmd.scope, active):
+            return active, plan_record
+        if cmd is not None:
+            self.commands.mark_waiting(cmd, "暂时没有可做的任务", self.bb.tick)
+        self.bb.command_scope = None
+        self.bb.command_id = None
+        return planner.plan(world, self.bb, None, self.book)
+
     def _service_dialog(self, world):
         # type: (World) -> Dict
         """每拍对话服务：工具批次落地、到期、事件、上下文（spec §6.3）。
@@ -1526,15 +1551,8 @@ class Agent:
         if new_mode == "Normal":
             chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
             if plan_record.get("command_scope_empty"):
-                # 兜底：_service_commands 已经筛过；世界在这一拍变化时再让位。
-                cmd = self.commands.get(self.bb.command_id)
-                if cmd is not None:
-                    self.commands.mark_waiting(cmd, "暂时没有可做的任务",
-                                               self.bb.tick)
-                self.bb.command_scope = None
-                self.bb.command_id = None
-                chosen_task, plan_record = planner.plan(
-                    world, self.bb, None, self.book)
+                chosen_task, plan_record = self._scope_empty_fallback(
+                    world, plan_record)
             # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
             # 两者永远相等，那条可观测性就是假的。
             planner_choice = chosen_task

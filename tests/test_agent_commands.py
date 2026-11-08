@@ -179,3 +179,58 @@ def test_raw_item_resolves_to_material_for_balloon_level():
     # 模型偶尔输出复数 Prawns；单数兜底到同一 material。
     mode, resolved, _d, _r, _v = resolve_target(kitchen, "chop", "Prawns")
     assert (mode, resolved) == ("material", "PanFriedPrawns")
+
+
+def test_scope_empty_keeps_active_task_in_command_scope(agent, world):
+    """命令 scope 暂时没候选时，正在跑的同 scope 树不能切走。
+
+    否则候选被自己的在途认领压掉 → 标 waiting → 改选 scope 外 → 下一拍
+    认领释放候选又回来，每拍重建树，P2 原地抖动（trace-20261108-161828）。
+    """
+    scope = frozenset({("FetchToCooker", "friedmushrooms")})
+    result = agent.commands.add("cook", "FriedMushrooms", scope, 100,
+                                display_target="FriedMushrooms")
+    cmd_id = result["command_id"]
+    agent.bb.command_scope = scope
+    agent.bb.command_id = cmd_id
+
+    class _Active(object):
+        TYPE = "FetchToCooker"
+        item = "FriedMushrooms"
+
+    active = _Active()
+    agent.executor_inst.active_task = active
+
+    chosen, record = agent._scope_empty_fallback(
+        world, {"candidates": [], "command_scope_empty": True})
+
+    assert chosen is active
+    assert agent.bb.command_scope == scope
+    assert agent.bb.command_id == cmd_id
+    assert agent.commands.get(cmd_id).status != "waiting"
+
+
+def test_scope_empty_yields_when_active_task_out_of_scope(agent, world):
+    """在跑的树不在命令 scope 内：让位、标 waiting，按无 scope 重规划。"""
+    scope = frozenset({("FetchToCooker", "friedmushrooms")})
+    result = agent.commands.add("cook", "FriedMushrooms", scope, 100,
+                                display_target="FriedMushrooms")
+    cmd_id = result["command_id"]
+    agent.bb.command_scope = scope
+    agent.bb.command_id = cmd_id
+
+    class _Active(object):
+        TYPE = "DeliverPlate"
+        item = "FriedMushrooms"
+
+    agent.executor_inst.active_task = _Active()
+    sentinel = object()
+    with patch("ai.agent.planner.plan",
+               return_value=(sentinel, {"candidates": []})):
+        chosen, _record = agent._scope_empty_fallback(
+            world, {"candidates": [], "command_scope_empty": True})
+
+    assert chosen is sentinel
+    assert agent.bb.command_scope is None
+    assert agent.bb.command_id is None
+    assert agent.commands.get(cmd_id).status == "waiting"

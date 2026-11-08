@@ -316,6 +316,30 @@ def test_cooked_pizza_in_hand_is_not_put_back_in_oven(frames):
     assert XS.stuck_carriers(w, book, bb=None) == []
 
 
+def test_cooked_pizza_in_hand_yields_to_raw_carrier_on_counter(frames):
+    """手里是熟饼、台面上还有一张同单的生饼时，不能把熟饼当成进炉载体。
+
+    trace-20261109-011315 t=3156~3307：RescueCooked 把熟饼端到手里后，
+    `_holding` 只比形态名仍返回真；行为树 keep 住熟饼、拿生饼那步短路，
+    最后又把熟饼塞回烤箱 → 与 RescueCooked 来回 12 次。
+    """
+    from ai.query import carriers as CR
+    from tests.test_exec_primitives import FakeExec
+    f = _holding_cooked_pizza(frames[3])
+    f = _base_on(f, COUNTER, ["ing:Tomato", "ing:Cheese"])
+    w, book, bb, ctx = _ctx(f)
+    # 台面上那张生饼才是这一单的载体
+    assert "1" in CR.match_prep_carriers(w, book)
+    task = T.PlaceCarrierInCooker("1", (("GridManager", "Oven"), BASE),
+                                  "MargheritaPizza")
+    assert task.feasible(ctx)          # 空灶 + 有生饼：任务仍该去做
+    assert not task._holding(ctx)      # 但手里那张熟饼不算「载体已在手」
+    # 树首先去放熟饼，而不是直接往烤箱里放
+    ctx = dict(ctx, exec=FakeExec(), tick=0)
+    assert task.build().tick(ctx) == Status.RUNNING
+    assert ctx["interaction"]["target"] != ("GridManager", "Oven")
+
+
 def _pizza_on(frame, station, cooked):
     """台面上一张烤过的饼（出炉后 RescueCooked 放下的形态，node=底料节点）。"""
     f = json.loads(json.dumps(frame))

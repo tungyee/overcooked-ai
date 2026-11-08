@@ -195,7 +195,25 @@ class PlaceCarrierInCooker(Task):
 
     def _holding(self, ctx):
         # type: (Dict) -> bool
-        return P.held_matches(ctx["chef"], self.base_form)
+        """手里这份就是这一单要进炉的载体：形态名对、**还是生的**、料齐。
+
+        只比名字会把 RescueCooked 刚端出炉的熟披萨当成待进炉载体：熟饼名字
+        仍是 Pizza_Base_Raw、cookable.prep 仍为真。于是树首 keep 住它、拿生饼
+        那步 expect 短路，最后整份塞回烤箱；RescueCooked 再端出来——无限拿进
+        拿出（trace-20261109-011315 t=3156~3307、trace-20261109-010647
+        t=3928~4440，最后烧着）。料也要对：别把另一道菜的饼塞进这单的炉子。
+        """
+        if not P.held_matches(ctx["chef"], self.base_form):
+            return False
+        held = CR.held_item(ctx["w"], P.P2_NAME)
+        if held is None:
+            return True       # 旧帧没有 held_items：保持只看名字的旧行为
+        if not CR.is_raw_carrier({"item": held}):
+            return False
+        car = {"name": str(held.get("n") or ""),
+               "contents": CR.item_contents(held)}
+        return CR.prep_fits(ctx["book"], car, self.item) \
+            and not CR.prep_missing(ctx["book"], car, self.item)
 
     def build(self):
         # type: () -> Node

@@ -20,6 +20,28 @@
 - 主循环仍是 **20 Hz** 的唯一决策者；`DialogWorker` 是独立 daemon 线程，只通过上下文快照（2 Hz）、事件、工具批次、ack 四个队列与主循环通信，**不读 World、不写 Blackboard**。
 - 语音是可选能力：没装依赖或没配 key 时，加上 `--no-voice`（或什么都不加）就退回纯行为树模式，仍由插件虚拟手柄执行，决策行为不变。
 
+## 1.1 新工具协议（2026-11）
+
+对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型（代码保留，`ai/dialog/duties.py` 的 `ENABLE_LEGACY_TOOLS=False`，handler 仍可接收旧调用供回放/测试）。
+
+模型只看到 4 个工具：
+
+```text
+check_action(action, target=None)   只读检查；ok/reason/already_done
+execute_action(action, target=None) 排成持久命令并执行；返回 running/queued
+cancel_action(action=None)          撤销当前命令和队列，停手约 5 秒
+speak(text)                         唯一发言通道；不调用就不出声
+```
+
+- `action` 用英文标识：`chop / cook / mix / plate / deliver / wash / fetch`（`prepare` 为后续目标级动作）。
+- `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/commands.py` 里做一次归一化。
+- 动作是**目标状态**：`cook(Tomato)` 会自动补取料、切；`plate(dish)` 会自动补上游。命令带 `scope` 和 `done`，不会因为第一个子任务成功就被消费。
+- 命令队列最多 3 条待执行；满了丢最后一条待执行项，新指令照收。当前命令 waiting（煎/煮/资源被占）时，下一条有可行任务的命令可以跑；依赖由 scope 可行性天然表达。
+- 永久不可行（订单过期/目标不再需要）、连续任务失败、waiting 超时 → 命令 failed，队列暂停；失败事件让模型解释/重试/跳过。成功默认不打扰，失败必须说。
+- 模型可见文本（system prompt、工具 description、状态/事件模板、工具结果 reason）统一用「你 / 队友 / 玩家」，不出现 P1/P2，避免被念出来。
+- prompt 用 Jinja2 模板管理：`ai/dialog/prompts/system.j2`、`state.j2`、`event.j2`，渲染入口 `ai/dialog/prompts.py`。`requirements-voice.txt` 已加 `jinja2>=3.1,<4`。
+- LLM provider：`run_agent.py` 优先读 `LLM_PROVIDER`，未设置时有 `MIMO_API_KEY` 就用 MIMO，否则用 ARK。MIMO 相关变量见 `.env.example`；`thinking.type=disabled` 对两家都发送。
+
 ## 2. 先决条件
 
 - **Windows 或 macOS + 麦克风 + 扬声器/耳机**，使用系统默认输入/输出设备。
@@ -77,8 +99,12 @@ python3 run_agent.py --voice --voice-debug
 | `VOLC_TTS_API_KEY` | 是 | — |
 | `VOLC_TTS_VOICE` | 否 | `zh_female_vv_uranus_bigtts`（Vivi，2.0 音色；1.0 音色与 `seed-tts-2.0` 不匹配） |
 | `VOLC_TTS_RESOURCE_ID` | 否 | `seed-tts-2.0` |
-| `ARK_API_KEY` | 是 | — |
-| `ARK_MODEL` | 是 | —（方舟推理接入点 ID 或模型名；推荐 `doubao-seed-2-1-pro-260915`（lite 理解分工指令不稳；plan 端点上 pro 整轮 1.5–5 s，turbo `doubao-seed-2-1-turbo-260628` 介于两者之间）。客户端固定传 `thinking.type=disabled`，带「深度思考」标签的模型也不会思考） |
+| `LLM_PROVIDER` | 否 | 不填时有 `MIMO_API_KEY` 用 `mimo`，否则用 `ark` |
+| `MIMO_API_KEY` | 二选一 | — |
+| `MIMO_MODEL` | 二选一 | —（如 `mimo-v2.6-pro-ultraspeed`） |
+| `MIMO_BASE_URL` | 否 | `https://api.xiaomimimo.com/v1` |
+| `ARK_API_KEY` | 二选一 | — |
+| `ARK_MODEL` | 二选一 | —（方舟推理接入点 ID 或模型名；推荐 `doubao-seed-2-1-pro-260915`（lite 理解分工指令不稳；plan 端点上 pro 整轮 1.5–5 s，turbo `doubao-seed-2-1-turbo-260628` 介于两者之间）。客户端固定传 `thinking.type=disabled`，带「深度思考」标签的模型也不会思考） |
 | `ARK_BASE_URL` | 否 | `https://ark.cn-beijing.volces.com/api/v3`；方舟「兼容 OpenAI 接口协议工具」/ plan 套餐 key 用 `https://ark.cn-beijing.volces.com/api/plan/v3` |
 | `OC2_VOICE` | 否 | 不设；`0` 强制关，其他值表示希望开（缺 key 时仍告警退回） |
 | `OC2_VOICE_RATE` | 否 | `1.05`（允许 0.5–2.0，超出收敛；**当前仅保留、未接到 TTS 参数**） |
@@ -92,7 +118,9 @@ python3 run_agent.py --voice --voice-debug
 
 `OC2_VOICE_RATE` / `OC2_VOICE_VOLUME` 的非法或非有限值（`nan`/`inf`）会告警并回退默认值；有限但超范围的值会收敛到边界。
 
-## 4. 对话与分工账本
+## 4. 对话与分工账本（legacy）
+
+> 本节描述旧的 `assign_action` / 物料级分工；2026-11 起已停用，新协议见 §1.1。以下内容仅用于回放旧 trace 或回滚参考。
 
 - **一轮对话**：P1 的话作为 user 消息；世界状态（订单、灶、盘、P1/P2 在做什么、规划器接下来可做的、账本）作为本轮的 system 消息，不进历史。有工具调用时走两段式：第一段调用工具 → 主循环落地 → 第二段按真实结果说话（被拒的会如实说明）；闲聊/提问只请求一次。
 - **历史**：本关完整对话（user / assistant / tool 结果）留在 `DialogState.history`，最多 60 条；换关卡清空，暂停不清。

@@ -13,9 +13,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai import tasks as T
 from ai.core import arbiter, executor, planner
 from ai.dialog.actions import ACTION_STATION_TYPES
-from ai.dialog.duties import (Kitchen, Ledger, TaskMeta,
+from ai.dialog.commands import (Command, CommandQueue, build_scope,
+                                command_done, command_failed, deliveries,
+                                dirty_count, resolve_target, scope_matches_task)
+from ai.dialog.duties import (ACCEPT_LEGACY_TOOL_CALLS, ENABLE_LEGACY_TOOLS,
+                              Kitchen, Ledger, TaskMeta, TOOL_ACTIONS,
                               node_key, tool_schemas)
 from ai.dialog.help import cost_to, top_help_request
+from ai.dialog.policy import EventQueue
 from ai.dialog.schema import DialogState, preference_matches_task
 from ai.revenue import eta as ETA
 from ai.space import (navigation, portals, reachability, regions, seam_clock,
@@ -329,6 +334,15 @@ def _duty_tools(kitchen, ledger):
     return tool_schemas(kitchen.targets(), ledger.ids())
 
 
+def _probe_command(action, resolved, display, scope, world, mode="material"):
+    # type: (str, Optional[str], Optional[str], Any, World, str) -> Command
+    """只用于 check_action 的 done 探测，不进队列。"""
+    return Command(
+        id="probe", action=action, target=resolved, resolved_target=resolved,
+        display_target=display or resolved, scope=scope, mode=mode,
+        start_deliveries=deliveries(world), start_dirty=dirty_count(world))
+
+
 def _validate_action(kitchen, action, direction, world, bb):
     # type: (Kitchen, str, str, World, Blackboard) -> Tuple[bool, str]
     """校验一个动作意图是否可行（判）。返回 (ok, reason)。
@@ -533,7 +547,7 @@ class Agent:
             self.cmd_q = queue.Queue()
             self.ack_q = queue.Queue()
             self.ctx_q = queue.Queue(maxsize=1)
-            self.event_q = queue.Queue(maxsize=1)
+            self.event_q = EventQueue(maxsize=3)
             # 延迟导入：离线运行不加载音频/网络客户端。
             from ai.dialog.worker import DialogWorker
             self.dialog_worker = DialogWorker(
@@ -543,7 +557,7 @@ class Agent:
             self.cmd_q = self.cmd_q or queue.Queue()
             self.ack_q = self.ack_q or queue.Queue()
             self.ctx_q = self.ctx_q or queue.Queue(maxsize=1)
-            self.event_q = self.event_q or queue.Queue(maxsize=1)
+            self.event_q = self.event_q or EventQueue(maxsize=3)
 
         self._dialog_scene_key = None  # 上次观察到的场景身份 (session_id, scene_epoch, level)；换关清账本
         self._seen_orders = {}         # 本关见过的菜 → 首张订单（新菜只说一次）
@@ -551,8 +565,11 @@ class Agent:
         self._round_summary_fired = False  # 结束总结只发一次
         self._round_started = False        # 计时器是否跑过（区分未开局/已结束）
         self._last_ranked = []         # 上一拍 planner 打分前几名（给 LLM 看）
-        # 分工账本：`bb.preferences` 只由它编译（ai/dialog/duties.py）。
+        # 分工账本：旧持久分工保留代码；新工具不再暴露 assign_action。
         self.ledger = Ledger()
+        # 临时命令队列（新工具协议）：planner 只跑当前命令的 scope。
+        self.commands = CommandQueue()
+        self._last_command_result = None
 
     def run(self, max_seconds=None, stop_requested=None):
         """主循环入口（20 Hz）。插件 5 Hz 推帧，中间 4 拍复用最新帧重 tick。"""
@@ -608,31 +625,230 @@ class Agent:
 
     def _apply_duty_batch(self, world, batch):
         # type: (World, Any) -> List[Dict]
-        """一轮 LLM 工具调用 → 逐条落账本，返回给 LLM 的结果。"""
-        kitchen = self._kitchen(world)
-        tick = self.bb.tick or 0
+        """一轮 LLM 工具调用 → 逐条落地，返回给 LLM 的结果。
+
+        新协议：check_action / execute_action / cancel_action / speak。
+        旧的 assign_action 保留代码，只在 ENABLE_LEGACY_TOOLS 时可用。
+        """
         results = []  # type: List[Dict]
         for name, args in getattr(batch, "calls", None) or ():
             if args is None:
                 results.append({"ok": False, "reason": "参数不是合法 JSON"})
                 continue
-            if name == "assign_action":
-                if isinstance(args, dict) and args.get("op") != "cancel":
-                    action = args.get("action")
-                    direction = args.get("direction") or "P2"
-                    if action is not None:
-                        ok, reason = _validate_action(kitchen, action,
-                                                      direction, world, self.bb)
-                        if not ok:
-                            results.append({"ok": False, "reason": reason})
-                            continue
-                result = self.ledger.apply(args, kitchen, tick,
-                                           source=getattr(batch, "source", ""))
+            if name == "check_action":
+                results.append(self._check_action(world, args))
+            elif name == "execute_action":
+                results.append(self._execute_action(world, args))
+            elif name == "cancel_action":
+                results.append(self._cancel_action(world, args))
+            elif name == "speak":
+                # 发言由 worker 播放；主循环只确认收到。
+                results.append({"ok": True})
+            elif name == "assign_action" and ACCEPT_LEGACY_TOOL_CALLS:
+                results.append(self._legacy_apply_action(world, args, batch))
             else:
-                result = {"ok": False, "reason": "未知工具：%s" % (name,)}
-            results.append(result)
+                results.append({"ok": False, "reason": "未知工具：%s" % (name,)})
         self._sync_duty_preferences()
         return results
+
+    def _legacy_apply_action(self, world, args, batch):
+        # type: (World, Any, Any) -> Dict
+        """旧 assign_action 的落地逻辑，保留给回滚/回放。"""
+        kitchen = self._kitchen(world)
+        tick = self.bb.tick or 0
+        if isinstance(args, dict) and args.get("op") != "cancel":
+            action = args.get("action")
+            direction = args.get("direction") or "P2"
+            if action is not None:
+                ok, reason = _validate_action(kitchen, action, direction,
+                                              world, self.bb)
+                if not ok:
+                    return {"ok": False, "reason": reason}
+        return self.ledger.apply(args, None, tick,
+                                 source=getattr(batch, "source", ""))
+
+    # ------------------------------------------------------------ 新工具
+
+    def _command_kitchen(self, world):
+        # type: (World) -> Kitchen
+        return self._kitchen(world)
+
+    def _command_order_id(self, world, action, resolved_target):
+        # type: (World, str, Optional[str]) -> Any
+        """deliver/plate 绑定到最紧急的一张匹配订单。"""
+        orders = planner._dialog_live_orders(world, self.bb)
+        if action == "deliver":
+            if resolved_target:
+                for order in orders:
+                    if str(order.get("dish")) == str(resolved_target):
+                        return order.get("id")
+                return None
+            return orders[0].get("id") if orders else None
+        if action == "plate" and resolved_target:
+            for order in orders:
+                if str(order.get("dish")) == str(resolved_target):
+                    return order.get("id")
+        return None
+
+    @staticmethod
+    def _fetch_destination(feasible):
+        # type: (List[Any]) -> str
+        mapping = {
+            "FetchToBoard": "board", "FetchToCooker": "cooker",
+            "FetchToPlate": "plate", "FetchToCarrier": "carrier",
+            "Prefetch": "counter",
+        }
+        for cand in feasible or ():
+            dest = mapping.get(getattr(cand.task, "TYPE", ""))
+            if dest:
+                return dest
+        return ""
+
+    def _check_action(self, world, args):
+        # type: (World, Any) -> Dict
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "参数必须是对象"}
+        kitchen = self._command_kitchen(world)
+        action = str(args.get("action") or "")
+        if action not in TOOL_ACTIONS:
+            return {"ok": False, "reason": "未知动作：%s" % (action,)}
+        target_raw = args.get("target")
+        mode, resolved, display, reason, valid = resolve_target(
+            kitchen, action, target_raw)
+        if reason and not resolved:
+            return {"ok": False, "action": action, "target": target_raw,
+                    "reason": reason, "valid_targets": valid}
+        scope, scope_reason = build_scope(kitchen, action, resolved, mode)
+        if scope is None:
+            return {"ok": False, "action": action,
+                    "target": display or resolved or target_raw,
+                    "reason": scope_reason, "valid_targets": valid}
+        if action == "wash" and dirty_count(world) == 0:
+            return {"ok": False, "action": action, "reason": "现在没有脏盘"}
+        probe = _probe_command(action, resolved, display, scope, world, mode)
+        if command_done(world, self.book, probe):
+            out = {"ok": True, "action": action,
+                   "target": display or resolved or target_raw,
+                   "resolved_target": resolved, "already_done": True}
+            return out
+        feasible, _cands, _ctx, _pm, _cm = planner.feasible_candidates(
+            world, self.bb, self.book, command_scope=scope)
+        if not feasible:
+            if action == "deliver":
+                reason = ("还没有装好的盘可送"
+                          if planner._dialog_live_orders(world, self.bb)
+                          else "现在没有可送的订单")
+            else:
+                labels = {
+                    "wash": "现在没有脏盘",
+                    "fetch": "现在没有可取的料",
+                }
+                reason = labels.get(action, "现在没有可做的这一步")
+            return {"ok": False, "action": action,
+                    "target": display or resolved or target_raw,
+                    "reason": reason, "valid_targets": valid}
+        if resolved:
+            out = {"ok": True, "action": action,
+                   "target": display or resolved,
+                   "resolved_target": resolved}
+        else:
+            targets = []
+            seen = set()
+            for cand in feasible:
+                item = getattr(cand.task, "item", None)
+                if not item:
+                    continue
+                key = str(item).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append(str(item))
+            out = {"ok": True, "action": action, "targets": targets[:6]}
+        if action == "fetch":
+            dest = self._fetch_destination(feasible)
+            if dest:
+                out["destination"] = dest
+        return out
+
+    def _execute_action(self, world, args):
+        # type: (World, Any) -> Dict
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "参数必须是对象"}
+        kitchen = self._command_kitchen(world)
+        action = str(args.get("action") or "")
+        if action not in TOOL_ACTIONS:
+            return {"ok": False, "reason": "未知动作：%s" % (action,)}
+        target_raw = args.get("target")
+        mode, resolved, display, reason, valid = resolve_target(
+            kitchen, action, target_raw)
+        if reason and not resolved:
+            return {"ok": False, "action": action, "target": target_raw,
+                    "reason": reason, "valid_targets": valid}
+        scope, scope_reason = build_scope(kitchen, action, resolved, mode)
+        if scope is None:
+            return {"ok": False, "action": action,
+                    "target": display or resolved or target_raw,
+                    "reason": scope_reason, "valid_targets": valid}
+        if not resolved:
+            feasible, _cands, _ctx, _pm, _cm = planner.feasible_candidates(
+                world, self.bb, self.book, command_scope=scope)
+            if not feasible:
+                if action == "deliver":
+                    reason = ("还没有装好的盘可送"
+                              if planner._dialog_live_orders(world, self.bb)
+                              else "现在没有可送的订单")
+                else:
+                    labels = {"wash": "现在没有脏盘",
+                              "fetch": "现在没有可取的料"}
+                    reason = labels.get(action, "现在没有可做的这一步")
+                return {"ok": False, "action": action, "reason": reason}
+            resolved = str(getattr(feasible[0].task, "item", "") or "") or None
+            display = display or resolved
+            if resolved:
+                mode2, resolved2, display2, _r2, _v2 = resolve_target(
+                    kitchen, action, resolved)
+                scope2, _sr2 = build_scope(kitchen, action, resolved2, mode2)
+                if scope2:
+                    scope, resolved, display = scope2, resolved2, display2 or resolved
+        if action == "wash" and dirty_count(world) == 0:
+            return {"ok": False, "action": action, "reason": "现在没有脏盘"}
+        order_id = self._command_order_id(world, action, resolved)
+        if action == "deliver" and order_id is None:
+            return {"ok": False, "action": action,
+                    "target": display or resolved,
+                    "reason": "现在没有可送的订单"}
+        tick = self.bb.tick or 0
+        result = self.commands.add(
+            action, resolved, scope, tick, order_id=order_id,
+            display_target=display or resolved,
+            start_deliveries=deliveries(world),
+            start_dirty=dirty_count(world), mode=mode or "material")
+        if result.get("status") == "running":
+            self.bb.commitment = Commitment()
+            self.bb.hold_until = 0
+            self.bb.command_scope = scope
+            self.bb.command_id = result.get("command_id")
+        result["action"] = action
+        result["target"] = display or resolved
+        return result
+
+    def _cancel_action(self, world, args):
+        # type: (World, Any) -> Dict
+        args = args if isinstance(args, dict) else {}
+        action = str(args.get("action") or "")
+        target_raw = args.get("target")
+        target = target_raw
+        if target_raw:
+            _mode, resolved, _display, _reason, _valid = resolve_target(
+                self._command_kitchen(world), action, target_raw)
+            target = resolved or target_raw
+        result = self.commands.cancel(action or None, target)
+        if result.get("ok"):
+            self.bb.command_scope = None
+            self.bb.command_id = None
+            self.bb.commitment = Commitment()
+            self.bb.hold_until = (self.bb.tick or 0) + 5 * 20
+        return result
 
     def _sync_duty_preferences(self):
         # type: () -> None
@@ -731,6 +947,11 @@ class Agent:
         self._dialog_scene_key = key
         self._log_dialog_level_start(level)
         self.ledger.clear()
+        self.commands.clear()
+        self._last_command_result = None
+        self.bb.command_scope = None
+        self.bb.command_id = None
+        self.bb.hold_until = 0
         self.bb.preferences[:] = []
         self.bb.dialog = DialogState()
         self.bb.abandoned_orders = {}
@@ -770,6 +991,124 @@ class Agent:
                 except queue.Empty:
                     break
 
+    def _service_commands(self, world):
+        # type: (World) -> None
+        """命令生命周期：done / waiting / timeout / 选当前 scope。
+
+        只做一次全量 feasible 计算，再按队列顺序找第一条有可行任务的命令；
+        依赖关系由 scope 可行性天然表达（前面的命令 waiting 时后面的可以跑）。
+        """
+        tick = self.bb.tick or 0
+        if tick < getattr(self.bb, "hold_until", 0):
+            self.bb.command_scope = None
+            self.bb.command_id = None
+            return
+        if self.commands.paused:
+            self.bb.command_scope = None
+            self.bb.command_id = None
+            return
+
+        # 1) 永久不可行 → 失败并暂停队列
+        for command in list(self.commands.commands):
+            if command.terminal():
+                continue
+            reason = command_failed(world, self.book, command)
+            if reason:
+                was_queued = command.status == "queued"
+                self.commands.mark_failed(command, reason)
+                self._last_command_result = {
+                    "label": command.label, "target": command.display_target,
+                    "status": "failed", "reason": reason,
+                }
+                self._put_event(("command_result", {
+                    "command_id": command.id, "action": command.action,
+                    "label": command.label,
+                    "target": command.display_target, "status": "failed",
+                    "reason": reason,
+                }))
+                if was_queued:
+                    # 还没开始就不可行：丢掉这一条，不拖累正在跑的。
+                    self.commands.paused = False
+                    self.commands.commands = [
+                        c for c in self.commands.commands
+                        if c.id != command.id]
+                    continue
+                self.bb.command_scope = None
+                self.bb.command_id = None
+                return
+
+        # 2) 已经满足目标（包括队友替我们做完）
+        for command in list(self.commands.commands):
+            if command.terminal():
+                continue
+            if command_done(world, self.book, command):
+                self.commands.mark_succeeded(command)
+                self._last_command_result = {
+                    "label": command.label, "target": command.display_target,
+                    "status": "succeeded",
+                }
+                self._put_event(("command_result", {
+                    "command_id": command.id, "action": command.action,
+                    "label": command.label,
+                    "target": command.display_target, "status": "succeeded",
+                }))
+
+        # 3) waiting 超时
+        for command in self.commands.expire(tick):
+            self._last_command_result = {
+                "label": command.label, "target": command.display_target,
+                "status": "failed", "reason": command.reason,
+            }
+            self._put_event(("command_result", {
+                "command_id": command.id, "action": command.action,
+                "label": command.label,
+                "target": command.display_target, "status": "failed",
+                "reason": command.reason,
+            }))
+
+        if self.commands.paused:
+            self.bb.command_scope = None
+            self.bb.command_id = None
+            return
+        self.commands.commands = [c for c in self.commands.commands
+                                  if not c.terminal()]
+        if not self.commands.commands:
+            self.bb.command_scope = None
+            self.bb.command_id = None
+            return
+
+        # 常见情况只有一条命令：直接钉住 scope，让 planner 自己判断有没有活，
+        # 避免每拍多做一次全量 feasible。
+        if len(self.commands.commands) == 1:
+            command = self.commands.commands[0]
+            self.commands.mark_running(command, tick)
+            self.bb.commitment = Commitment()
+            self.bb.command_scope = command.scope
+            self.bb.command_id = command.id
+            return
+
+        # 多条命令：一次全量 feasible；按队列顺序找第一条有可行任务的命令
+        try:
+            all_feasible = planner.feasible_candidates(
+                world, self.bb, self.book)[0]
+        except Exception:                       # noqa: BLE001
+            log.exception("命令调度：可行性计算失败")
+            all_feasible = []
+        for command in self.commands.commands:
+            if command.terminal():
+                continue
+            has_work = any(scope_matches_task(command.scope, cand.task)
+                           for cand in all_feasible)
+            if has_work:
+                self.commands.mark_running(command, tick)
+                self.bb.commitment = Commitment()
+                self.bb.command_scope = command.scope
+                self.bb.command_id = command.id
+                return
+            self.commands.mark_waiting(command, "等待资源或烹饪", tick)
+        self.bb.command_scope = None
+        self.bb.command_id = None
+
     def _service_dialog(self, world):
         # type: (World) -> Dict
         """每拍对话服务：工具批次落地、到期、事件、上下文（spec §6.3）。
@@ -777,7 +1116,7 @@ class Agent:
         必须在 `self.book` 重建、`bb.tick` 推进之后、arbiter/planner 之前
         调用：账本先编成偏好，本拍规划才能看见。返回本拍的 trace 摘要。
         """
-        record = {"batches": [], "event": None, "duties": []}
+        record = {"batches": [], "event": None, "commands": []}
         if self.dialog_worker is None:
             return record
 
@@ -785,8 +1124,8 @@ class Agent:
         events = []  # type: list
         tick = self.bb.tick or 0
 
-        # 开局分工：本关第一次算一次「动作→边」切分，一开口就落地。
-        if not getattr(self, "_open_division_fired", False):
+        # 开局分工：旧的持久分工入口，暂不暴露给模型。
+        if ENABLE_LEGACY_TOOLS and not getattr(self, "_open_division_fired", False):
             self._open_division_fired = True
             event = _maybe_open_division(world, self.bb)
             if event is not None:
@@ -813,7 +1152,8 @@ class Agent:
             self._put_ack({
                 "batch_id": getattr(batch, "batch_id", None),
                 "results": results,
-                "duties": self._duty_rows(world, None, tick),
+                "commands": self.commands.snapshot(),
+                "duties": self.ledger.snapshot(tick),
             })
 
         # ③ 到期：stop 30 秒解除；放弃订单 60 秒恢复。
@@ -835,10 +1175,11 @@ class Agent:
             self._last_seconds_fired = True
             events.append(("last_seconds", None))
 
-        # ④.6 求助：P1 做某步明显更划算 → 开口 + 挪走（spec §5.2）。
-        help_payload = self._maybe_request_help(world, book)
-        if help_payload is not None:
-            events.append(("help_request", help_payload))
+        # ④.6 求助：旧的持久分工入口，暂不暴露给模型。
+        if ENABLE_LEGACY_TOOLS:
+            help_payload = self._maybe_request_help(world, book)
+            if help_payload is not None:
+                events.append(("help_request", help_payload))
 
         # 同一拍的事件合成一段对话：单个直接发，多个合并成 batch，worker 一次说完。
         if events:
@@ -860,6 +1201,7 @@ class Agent:
 
         if events:
             record["event"] = events[-1] if len(events) == 1 else events
+        record["commands"] = self.commands.snapshot()
         record["duties"] = self.ledger.snapshot(tick)
         return record
 
@@ -919,9 +1261,15 @@ class Agent:
             "eta": _seconds(getattr(rows.get(order.get("id")), "eta", None)),
         } for order in live_orders]
         # P2 接下来可做的：planner 最近一拍的打分前几名（节点 + 说明）。
-        options = [_option_text(task) for task in self._last_ranked[:6]]
+        # 有当前命令时只显示 scope 内的步骤，避免模型看到无关选项。
+        current_command = self.commands.active()
+        ranked = self._last_ranked
+        if current_command is not None:
+            ranked = [task for task in ranked
+                      if scope_matches_task(current_command.scope, task)]
+        options = [_option_text(task) for task in ranked[:6]]
 
-        tools = _duty_tools(kitchen, self.ledger)
+        tools = tool_schemas()
         return {
             "level": getattr(world, "level", None),
             "live": bool(getattr(world, "phase", None) == "level"
@@ -949,7 +1297,11 @@ class Agent:
                 "stuck": _stuck_text(_stuck_info(self.bb, world)),
             },
             "p2_options": options,
-            "duties": self._duty_rows(world, kitchen, tick),
+            "current_command": current_command,
+            "queue": self.commands.pending(),
+            "last_result": self._last_command_result,
+            "commands": self.commands.snapshot(),
+            "duties": self.ledger.snapshot(tick),
             "dag": kitchen.render(),
             "division": _open_division_payload(world, self.bb),
             "dish_dags": {dish: kitchen.render([dish], shared=False)
@@ -1029,6 +1381,8 @@ class Agent:
 
         # 对话服务：命令先落偏好/硬否决，本拍规划立刻可见（spec §6.3）。
         dialog_record = self._service_dialog(world)
+        # 命令生命周期：done / waiting / 选当前 scope，必须在 planner 之前。
+        self._service_commands(world)
 
         # ② skip_ticks 跳过
         if self.bb.scratch and getattr(self.bb.scratch, "skip_ticks", 0) > 0:
@@ -1058,6 +1412,16 @@ class Agent:
         settle_active = False  # ⑨.5 接回的旧 task 后置条件已成立：⑫ 直接收尾
         if new_mode == "Normal":
             chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
+            if plan_record.get("command_scope_empty"):
+                # 兜底：_service_commands 已经筛过；世界在这一拍变化时再让位。
+                cmd = self.commands.get(self.bb.command_id)
+                if cmd is not None:
+                    self.commands.mark_waiting(cmd, "暂时没有可做的任务",
+                                               self.bb.tick)
+                self.bb.command_scope = None
+                self.bb.command_id = None
+                chosen_task, plan_record = planner.plan(
+                    world, self.bb, None, self.book)
             # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
             # 两者永远相等，那条可观测性就是假的。
             planner_choice = chosen_task
@@ -1191,6 +1555,22 @@ class Agent:
                     self.bb.claims.pop((resource, action), None)
                 self._note_motion_failure(chosen_task, ctx)
                 self._note_failure(chosen_task, ctx)
+                failed = self.commands.note_task_failure(
+                    chosen_task, "任务执行失败")
+                if failed is not None:
+                    self._last_command_result = {
+                        "label": failed.label,
+                        "target": failed.display_target,
+                        "status": "failed", "reason": failed.reason,
+                    }
+                    self._put_event(("command_result", {
+                        "command_id": failed.id, "action": failed.action,
+                        "label": failed.label,
+                        "target": failed.display_target,
+                        "status": "failed", "reason": failed.reason,
+                    }))
+                    self.bb.command_scope = None
+                    self.bb.command_id = None
             if self.bb.commitment:
                 self.bb.commitment.interrupt_failure_count += 1
             self.bb.commitment = None
@@ -1265,6 +1645,8 @@ class Agent:
             # 黑板整体换新：账本是 bb.preferences 的唯一来源，必须一起清，
             # 否则下一次同步会把上一局的约定编回新黑板。
             self.ledger.clear()
+            self.commands.clear()
+            self._last_command_result = None
             self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)
             self.book = None
             self._prev_balloon_box = None

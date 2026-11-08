@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai.dialog.schema import (NO_BRANCH_TYPES, RESCUE_TYPES,
-                              preference_matches_task)
+                              preference_matches_task, scope_matches)
 from ai.revenue import cook_supply as CS
 from ai.revenue import economy as ECON
 from ai.revenue import eta as ETA
@@ -1247,6 +1247,38 @@ def select_task(world, bb, order, book):
     return plan(world, bb, order, book)[0]
 
 
+def feasible_candidates(world, bb, book, command_scope=None):
+    # type: (World, Blackboard, RecipeBook, Any) -> Tuple[List[Any], List[Any], Dict, Dict, Dict]
+    """只读地算出当前可行候选；供对话层的 check_action / 命令调度用。
+
+    与 `plan` 的候选生成、可行性过滤同口径，但不选任务、不写黑板、不触发
+    截止闸/承诺惯性。`command_scope` 非空时只保留命中 scope 的候选。
+    """
+    live_orders = _dialog_live_orders(world, bb)
+    plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
+    carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                orders=live_orders)
+    cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
+                                            orders=live_orders,
+                                            carrier_match=carrier_match)
+    slack_map = ETA.solo_slack_by_order(world, book, plate_match,
+                                        cooker_match, orders=live_orders)
+    candidates = generate_candidates(world, bb, None, book,
+                                     plate_match, cooker_match, carrier_match)
+    ctx = _make_context(world, bb, book)
+    ctx["plate_match"], ctx["cooker_match"] = plate_match, cooker_match
+    time_left = _time_left_ticks(world)
+    feasible = []
+    for cand in candidates:
+        ok, _veto = _feasibility_of(cand, ctx, bb, time_left=time_left)
+        if not ok:
+            continue
+        if command_scope and not scope_matches(command_scope, cand.task):
+            continue
+        feasible.append(cand)
+    return feasible, candidates, ctx, plate_match, cooker_match
+
+
 def plan(world, bb, order, book):
     # type: (World, Blackboard, Optional[Any], RecipeBook) -> Tuple[Optional[Any], Dict]
     """select_task 的完整版：额外返回候选/打分明细（供 trace 记录）。
@@ -1265,6 +1297,17 @@ def plan(world, bb, order, book):
     candidates 含**全部**生成候选：被可行性过滤掉的（ok=False）也保留，
     并用 veto 标注被否决原因，方便复盘「为什么没选拿熟饭」。
     """
+    # 临时停手（cancel_action 之后）：planner 不选任何任务。
+    hold_until = getattr(bb, "hold_until", 0) or 0
+    if hold_until and getattr(bb, "tick", 0) < hold_until:
+        record = _record([], {}, {})
+        record["hold"] = True
+        return None, record
+
+    # 对话层临时命令：只在命令 scope 内选任务；scope 没可行任务时由
+    # Agent 标 waiting 并尝试下一条命令。
+    command_scope = getattr(bb, "command_scope", None)
+
     # ⓪ 同步硬停止/放弃整单；柔性分工认领不打断当前承诺。
     _clear_claimed_commitment(bb)
     # ⓪.1 抢回保护期只保护「还在执行的那个 task」：承诺已清（做完/失败/
@@ -1310,9 +1353,26 @@ def plan(world, bb, order, book):
         if ok:
             feasible.append(cand)
 
+    # ③.4 对话层临时命令：只在 scope 内选任务。没有可行任务时返回空记录，
+    # 由 Agent 把命令标 waiting、尝试下一条命令。
+    if command_scope:
+        feasible = [c for c in feasible
+                    if scope_matches(command_scope, c.task)]
+        if not feasible:
+            record_cands = []
+            for cand in candidates:
+                ok, veto = ok_map[cand.task.key]
+                record_cands.append((cand.task, 0.0, {}, ok, veto, False))
+            record = _record(record_cands, plate_match, cooker_match)
+            record["command_scope_empty"] = True
+            record["branches"] = {str(c.task.key): c.branch
+                                  for c in candidates}
+            return None, record
+
     # ③.5「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中，跳过
     # 层选择 / 打分 / 承诺惯性。L0-L2 救援在闸内让位，这里只在无火情时抢选。
-    imperative = _select_imperative(feasible, world, bb)
+    # 命令模式下命令 scope 本身就是硬指令，不再走旧 now 闸。
+    imperative = None if command_scope else _select_imperative(feasible, world, bb)
     if imperative is not None:
         chosen_task = imperative.task
         # 仍用 layer_filter 算 layer_map 供 trace（闸跳过了层选择，但层号是

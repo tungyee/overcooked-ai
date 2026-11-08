@@ -52,6 +52,7 @@ DEFAULTS = {
     "VOLC_TTS_VOICE": "zh_female_vv_uranus_bigtts",
     "VOLC_TTS_RESOURCE_ID": "seed-tts-2.0",
     "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MIMO_BASE_URL": "https://api.xiaomimimo.com/v1",
     "OC2_VOICE_VAD_DB": 9.0,
 }
 REQUIRED = {
@@ -135,8 +136,30 @@ def _env_float(name, default, low, high):
     return min(high, max(low, value))
 
 
+def _use_mimo():
+    # type: () -> bool
+    provider = _env_text("LLM_PROVIDER", "").strip().lower()
+    if provider == "mimo":
+        return True
+    if provider == "ark":
+        return False
+    return bool(_env_text("MIMO_API_KEY"))
+
+
+def _llm_env():
+    # type: () -> tuple
+    if _use_mimo():
+        return (_env_text("MIMO_API_KEY"),
+                _env_text("MIMO_BASE_URL", DEFAULTS["MIMO_BASE_URL"]),
+                _env_text("MIMO_MODEL"))
+    return (_env_text("ARK_API_KEY"),
+            _env_text("ARK_BASE_URL", DEFAULTS["ARK_BASE_URL"]),
+            _env_text("ARK_MODEL"))
+
+
 def _settings():
     # type: () -> Settings
+    llm_key, llm_base, llm_model = _llm_env()
     return Settings(
         asr_key=_env_text("VOLC_ASR_API_KEY"),
         asr_resource_id=_env_text(
@@ -145,9 +168,9 @@ def _settings():
         tts_voice=_env_text("VOLC_TTS_VOICE", DEFAULTS["VOLC_TTS_VOICE"]),
         tts_resource_id=_env_text(
             "VOLC_TTS_RESOURCE_ID", DEFAULTS["VOLC_TTS_RESOURCE_ID"]),
-        ark_key=_env_text("ARK_API_KEY"),
-        ark_base_url=_env_text("ARK_BASE_URL", DEFAULTS["ARK_BASE_URL"]),
-        ark_model=_env_text("ARK_MODEL"),
+        ark_key=llm_key,
+        ark_base_url=llm_base,
+        ark_model=llm_model,
         volume=_env_float("OC2_VOICE_VOLUME", 0.7, 0.3, 1.2),
         vad_threshold_db=_env_float(
             "OC2_VOICE_VAD_DB", DEFAULTS["OC2_VOICE_VAD_DB"], 2.0, 20.0),
@@ -160,8 +183,10 @@ def _require(settings, kinds):
     checks = {
         "asr": [("VOLC_ASR_API_KEY", settings.asr_key)],
         "tts": [("VOLC_TTS_API_KEY", settings.tts_key)],
-        "llm": [("ARK_API_KEY", settings.ark_key),
-                ("ARK_MODEL", settings.ark_model)],
+        "llm": [("MIMO_API_KEY" if _use_mimo() else "ARK_API_KEY",
+                 settings.ark_key),
+                ("MIMO_MODEL" if _use_mimo() else "ARK_MODEL",
+                 settings.ark_model)],
     }
     missing = []
     for kind in kinds:
@@ -465,8 +490,10 @@ def cmd_doctor(settings, args):
             "语音依赖缺失：python3 -m pip install -r requirements-voice.txt")
 
     print("\n== 2. 环境变量 ==")
-    for name in ("VOLC_ASR_API_KEY", "VOLC_TTS_API_KEY", "ARK_API_KEY",
-                 "ARK_MODEL"):
+    llm_key_name = "MIMO_API_KEY" if _use_mimo() else "ARK_API_KEY"
+    llm_model_name = "MIMO_MODEL" if _use_mimo() else "ARK_MODEL"
+    for name in ("VOLC_ASR_API_KEY", "VOLC_TTS_API_KEY",
+                 llm_key_name, llm_model_name):
         value = _env_text(name)
         print("  %s %-22s %s"
               % ("[ok]" if value else "[--]", name,
@@ -475,7 +502,8 @@ def cmd_doctor(settings, args):
             ("VOLC_ASR_RESOURCE_ID", DEFAULTS["VOLC_ASR_RESOURCE_ID"]),
             ("VOLC_TTS_RESOURCE_ID", DEFAULTS["VOLC_TTS_RESOURCE_ID"]),
             ("VOLC_TTS_VOICE", DEFAULTS["VOLC_TTS_VOICE"]),
-            ("ARK_BASE_URL", DEFAULTS["ARK_BASE_URL"])):
+            (("MIMO_BASE_URL" if _use_mimo() else "ARK_BASE_URL"),
+             DEFAULTS["MIMO_BASE_URL" if _use_mimo() else "ARK_BASE_URL"])):
         print("  [i ] %-22s %s" % (name, _env_text(name, default)))
 
     print("\n== 3. 音频设备 ==")

@@ -275,23 +275,15 @@ def test_render_ledger_text_with_action():
     assert render_ledger([]) == "（空）"
 
 
-def test_tool_schemas_action_enum_excludes_fetch_and_throw():
+def test_tool_schemas_new_protocol():
     tools = tool_schemas()
+    names = [t["function"]["name"] for t in tools]
+    assert names == ["check_action", "execute_action", "cancel_action", "speak"]
     props = tools[0]["function"]["parameters"]["properties"]
-    enum = props["action"]["enum"]
-    assert set(enum) == {"切", "下锅", "拌", "装盘", "送餐", "洗盘"}
-    assert "FetchToBoard" not in enum and "ThrowBatch" not in enum
-    assert props["mode"]["enum"] == ["now", "assign", "stop"]
-    assert props["direction"]["enum"] == ["P2", "P1"]
-
-
-def test_tool_schemas_drops_target_and_id():
-    tools = tool_schemas()
-    fn = tools[0]["function"]
-    props = fn["parameters"]["properties"]
-    assert "target" not in props and "id" not in props
-    assert props["op"]["enum"] == ["add", "cancel"]
-    assert set(fn["parameters"]["required"]) == {"op", "mode", "action"}
+    assert set(props["action"]["enum"]) == {
+        "chop", "cook", "mix", "plate", "deliver", "wash", "fetch"}
+    assert "target" in props
+    assert set(tools[0]["function"]["parameters"]["required"]) == {"action"}
 
 
 def test_ledger_help_request_compiles_to_action_claim():

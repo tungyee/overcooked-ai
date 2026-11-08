@@ -54,6 +54,7 @@ VOICE_DEFAULTS = {
     "VOLC_TTS_VOICE": "zh_female_vv_uranus_bigtts",
     "VOLC_TTS_RESOURCE_ID": "seed-tts-2.0",
     "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MIMO_BASE_URL": "https://api.xiaomimimo.com/v1",
     "OC2_VOICE_RATE": 1.05,
     "OC2_VOICE_VOLUME": 0.7,
     "OC2_VOICE_VAD_DB": 9.0,
@@ -103,6 +104,34 @@ def _env_text(env, key, default=""):
         return default
     raw = str(raw).strip()
     return raw or default
+
+
+def _use_mimo(env):
+    # type: (dict) -> bool
+    """LLM provider 选择：显式 LLM_PROVIDER 优先，否则有 MIMO key 就用 MIMO。"""
+    provider = _env_text(env, "LLM_PROVIDER", "").strip().lower()
+    if provider == "mimo":
+        return True
+    if provider == "ark":
+        return False
+    return bool(_env_text(env, "MIMO_API_KEY"))
+
+
+def _llm_env(env):
+    # type: (dict) -> tuple
+    """返回当前 provider 的 (api_key, base_url, model)。"""
+    if _use_mimo(env):
+        return (
+            _env_text(env, "MIMO_API_KEY"),
+            _env_text(env, "MIMO_BASE_URL",
+                      VOICE_DEFAULTS["MIMO_BASE_URL"]),
+            _env_text(env, "MIMO_MODEL"),
+        )
+    return (
+        _env_text(env, "ARK_API_KEY"),
+        _env_text(env, "ARK_BASE_URL", VOICE_DEFAULTS["ARK_BASE_URL"]),
+        _env_text(env, "ARK_MODEL"),
+    )
 
 
 def _env_float(env, key, default, min_value=None, max_value=None):
@@ -158,7 +187,13 @@ def _build_voice_config(args, env):
     if args.voice is None and not _auto_voice_requested(env):
         return None
 
-    missing = [key for key in VOICE_REQUIRED_KEYS if not _env_text(env, key)]
+    llm_key, llm_base, llm_model = _llm_env(env)
+    missing = [key for key in ("VOLC_ASR_API_KEY", "VOLC_TTS_API_KEY")
+               if not _env_text(env, key)]
+    if not llm_key:
+        missing.append("MIMO_API_KEY" if _use_mimo(env) else "ARK_API_KEY")
+    if not llm_model:
+        missing.append("MIMO_MODEL" if _use_mimo(env) else "ARK_MODEL")
     if missing:
         if args.voice is True:
             raise VoiceConfigError(
@@ -179,10 +214,9 @@ def _build_voice_config(args, env):
             env, "VOLC_TTS_VOICE", VOICE_DEFAULTS["VOLC_TTS_VOICE"]),
         tts_resource_id=_env_text(
             env, "VOLC_TTS_RESOURCE_ID", VOICE_DEFAULTS["VOLC_TTS_RESOURCE_ID"]),
-        ark_key=_env_text(env, "ARK_API_KEY"),
-        ark_base_url=_env_text(
-            env, "ARK_BASE_URL", VOICE_DEFAULTS["ARK_BASE_URL"]),
-        ark_model=_env_text(env, "ARK_MODEL"),
+        ark_key=llm_key,
+        ark_base_url=llm_base,
+        ark_model=llm_model,
         rate=_env_float(
             env, "OC2_VOICE_RATE", VOICE_DEFAULTS["OC2_VOICE_RATE"],
             min_value=0.5, max_value=2.0),

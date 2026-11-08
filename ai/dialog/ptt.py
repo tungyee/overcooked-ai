@@ -52,9 +52,10 @@ class PushToTalk(object):
     """
 
     def __init__(self, keycode, tap_factory=None, ready_timeout=3.0,
-                 platform=None, state_reader=None):
-        # type: (int, object, float, object, object) -> None
+                 platform=None, state_reader=None, on_event=None):
+        # type: (int, object, float, object, object, object) -> None
         self.keycode = int(keycode)
+        self._on_event = on_event
         self._tap_factory = tap_factory
         self._ready_timeout = float(ready_timeout)
         self._events = queue.Queue()
@@ -88,6 +89,15 @@ class PushToTalk(object):
             error = self._error
             self.stop()
             raise RuntimeError(error)
+
+    def _emit(self, event):
+        # type: (str) -> None
+        self._events.put(event)
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:
+                pass
 
     def poll(self):
         # type: () -> list
@@ -154,9 +164,9 @@ class PushToTalk(object):
                 repeat = Quartz.CGEventGetIntegerValueField(
                     event, Quartz.kCGKeyboardEventAutorepeat)
                 if not repeat:
-                    self._events.put("down")
+                    self._emit("down")
             elif event_type == Quartz.kCGEventKeyUp:
-                self._events.put("up")
+                self._emit("up")
             return event
 
         try:
@@ -204,7 +214,7 @@ class PushToTalk(object):
             while not self._stop_event.is_set():
                 down = bool(read(self.keycode) & 0x8000)
                 if down != pressed:
-                    self._events.put('down' if down else 'up')
+                    self._emit('down' if down else 'up')
                     pressed = down
                 self._ready.set()
                 self._stop_event.wait(.01)

@@ -238,20 +238,15 @@ def test_system_message_carries_rules_and_dag():
     msg = system_message("本关菜：\n  Sushi_Cucumber = Cucumber")
     assert msg["role"] == "system"
     text = msg["content"]
-    assert "你是 Overcooked 2 里的 P2" in text
-    assert "now" in text and "assign" in text and "stop" in text
-    assert "action" in text and "动作" in text
+    assert "AI 队友" in text
+    assert "check_action" in text and "execute_action" in text
+    assert "cancel_action" in text and "speak" in text
+    assert "chop" in text and "cook" in text and "fetch" in text
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
-    # 口头答应不算数：P1 说「你去X」「你负责X」必须落 now，不要 assign
-    assert "口头答应不算数" in text
-    assert "assign_action(mode=now)" in text
-    assert "不要用 assign" in text
-    assert "你负责X" in text
-    # 步骤语义来自目录渲染（task 的 DESC），prompt 里不手写类型清单、不写关卡物料
-    assert "DAG 节点类型" not in text
-    assert "BoiledSushiRice" not in text.split("本关目录")[0]
+    # 模型可见文本里不能出现内部代号，否则会被念出来
+    assert "P1" not in text and "P2" not in text
 
 
 def test_render_state_is_readable_and_in_seconds():
@@ -271,10 +266,8 @@ def test_render_state_is_readable_and_in_seconds():
     assert "剩余 99.0 秒" in text
     assert "#1 Sushi_Fish 剩 18.1 秒" in text
     assert "在煮，40%" in text
-    assert "P1：手持 cucumber" in text
+    assert "队友：手持 cucumber" in text
     assert "Chop:SushiFish" in text
-    assert "[a1] P1 负责 下锅  来源「下锅我来」" in text
-    assert "此刻：挡住了你 2 个可做的活" in text
 
 
 def test_speech_message_is_plain_transcript_on_one_line():
@@ -318,7 +311,7 @@ def test_render_state_includes_reachable_division():
         "division": {"p2_actions": ["切"], "p1_actions": ["下锅", "装盘", "送餐"]},
     })
     assert "你能做的动作（够得着的）：切" in text
-    assert "P1 能做的动作：下锅、装盘、送餐" in text
+    assert "队友能做的动作：下锅、装盘、送餐" in text
 
 
 def test_render_state_omits_division_when_none():

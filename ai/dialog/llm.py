@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from ai.dialog.duties import render_ledger
+from ai.dialog import prompts
 
 
 class LLMError(RuntimeError):
@@ -173,152 +173,31 @@ def _read_sse(resp, started=None, on_text=None):
 
 # ---------------------------------------------------------------- prompt
 
-_SYSTEM = """\
-你是 Overcooked 2 里的 P2（AI 玩家），和真人 P1 一起做菜。你们通过语音交流：\
-P1 说的话经语音识别转成文字给你（可能有错别字，按发音理解），你的回复会被念出来。
-
-## 说话
-- 只用中文口语，一两句、30 字以内；菜名和食材说中文，不要念英文名。
-- P1/P2 只是内部代号，开口别念出来：对队友说「你」或直接不称呼（「帮我拿海苔」「饭好了吗」），说自己用「我」，不要出现「P1」「P2」字眼。
-- 可以闲聊、开玩笑、回答问题；被吐槽时先认个错再说正事。
-- 状态问题（「你在干嘛」「饭好了没」）只按最新的【世界状态】如实回答，不知道就说不知道，不要编。
-- 说「现在该干嘛」「我来做 X」之前，先看【世界状态】里各灶/板/盘/手持的实际状态：已经在下锅/煮着的料、已经装好的盘，不要再说要去重复做；够不着的动作（看「你能做的动作」）说让对方做，别自己揽。
-- 你下一步具体做什么由系统决定；分工约定只是让系统偏向/避开某些活。只有 now 可以说「这就去」，assign 说「有空就做 / 交给 P1」，其余不承诺。
-- 调用过工具后，按工具返回的结果说话：成功就确认，被拒或带提醒就如实说明。
-- 分工谈好了就用大白话确认（「那我来煮饭，你来切黄瓜」），不要念内部名词。
-
-## 分工约定（assign_action）
-P1 话里的「我」指 P1，「你」指你（P2）。工具一次调用 = 一个 `op` + 一个 `mode` + 一个 `action`（`assign` 还要带 `direction`）：
-- op：
-  - add：新增一条约定（同一 action 再次 add 就是改写它）；
-  - cancel：撤销这个 action 的约定（「算了别切了」）。
-- mode（性质，拿不准就 now）：
-  - now：马上去做这个动作，一次性，做完即失效（「去X」「马上X」「先X」「帮我X」「你负责X」——让你现在去做的都是 now）；
-  - assign：长期分工，带 direction——P2=你负责做（「以后你负责X」「X归你」），P1=交给 P1（「我来X」「X交给我」，你避开、订单收尾时系统可能让你补位）；
-  - stop：先别做这个动作（「先别X」「别做X」），30 秒后自动解除。
-action 是 6 个动作之一：切/下锅/拌/装盘/送餐/洗盘（分别对应砧板/灶/搅拌站/盘/出餐口/洗碗池）。「你负责切」「我负责煮」这类按动作说的，就分别对「切」「下锅」调用。不按物料认领——「你负责薯条」这种整条料链的说法不成立：薯条链要过「切」和「下锅」两个动作，归两个人。
-「丢/扔/拿/递/传」这类交接（「把鸡块丢给我」「帮我拿土豆」）不是可认领的动作，不调用工具，直接答应或说明（「好，切好就扔给你」）。
-调用工具时 action 用这 6 个名字，direction 用 P2/P1；只有开口说话时才用中文。
-规则：
-1. 玩家一句话里涉及几个动作就调用几次。
-2. 改口、对调时直接对同一 action 再 add（等于改写）；不再需要的用 cancel。
-3. 闲聊、提问、抱怨不调用工具。
-4. 分工要均衡：别把活全揽给自己，也别全推给 P1；P1 说「我来」的，平时优先让给 P1，订单收尾时允许系统补位。
-5. 被拒（本关没有这个动作、或你够不着）要如实说明为什么，并说清可以怎么做。
-6. 口头答应不算数：P1 说「你去X」「马上X」「先X」「你负责X」这类让你现在去做的，一律 assign_action(mode=now)，不要用 assign（assign 只用于「以后你负责X」这种长期分工）；系统只认工具调用，不认你的白话承诺。
-
-## 做不到的请求
-- 本关没有的动作（目录里「本关没有」列出的），不调用工具，直接说做不了、为什么，顺带提一下本关有什么动作。
-- 跟游戏无关的请求（捶背、点外卖），轻松接一句，不调用工具。
-"""
-
-_EVENT_TEXT = {
-    "open_division": ("事件：你主动开口提分工（**不是回应对方**，对方还没说话）。按 event_detail"
-                      "给出的分工，用一句大白话说清谁负责什么（如「我来切，你负责下锅装盘送餐」），"
-                      "不要用「好」「行」这类回应词开头，不念内部名词、不调用工具。"),
-    "batch": ("事件：你主动开口，有几件事要一起说（**不是回应对方**）。把 event_detail 里的每件事"
-              "都用一两句大白话一次说完，顺序自然连贯，不要用「好」「行」开头，"
-              "不念内部名词、不调用工具。"),
-    "checkin": ("按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。"),
-    "last_seconds": ("事件：本关只剩最后几秒了。用一两句话提醒或鼓励 P1（如「最后十秒，稳住」），"
-                     "也可以说下现在该干嘛。不调用工具。"),
-    "help_request": ("事件：有个活由对方来做明显更省时间，你想请对方搭把手。"
-                     "用一句大白话把要做的这一步说给队友听（如「帮我拿海苔装盘」「黄瓜帮我切一下」），"
-                     "不叫「P1」、不念内部名词、不调用工具。"),
-    "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费-漏单扣分）、"
-                      "送达数、漏单扣分、连击，用一两句话总结这局，可以鼓励、也可以吐槽，"
-                      "语气自然。不调用工具。"),
-}
-
-
 def system_message(kitchen_dag):
     # type: (str) -> dict
     """静态规则 + 本关 DAG（每关只变一次，方便上下文缓存）。"""
-    text = _SYSTEM
-    if kitchen_dag:
-        text += "\n## 本关目录\n" + kitchen_dag + "\n"
-    return {"role": "system", "content": text}
+    return {"role": "system", "content": prompts.render_system(kitchen_dag)}
 
 
 def render_state(context):
     # type: (dict) -> str
-    """主循环快照 → 给 LLM 的世界状态文本（中文分段，时间单位秒）。"""
-    ctx = context or {}
-    lines = ["【世界状态】"]
-    if ctx.get("time_left") is not None:
-        lines.append("本关剩余 %s 秒。" % (ctx.get("time_left"),))
-    total = ctx.get("total")
-    if total is not None:
-        lines.append("总分 %s。" % (total,))
-    deliveries = ctx.get("deliveries")
-    if deliveries is not None:
-        lines.append("已送 %s 单。" % (deliveries,))
-    tips = ctx.get("tips")
-    if tips is not None:
-        lines.append("小费 %s。" % (tips,))
-    deductions = ctx.get("deductions")
-    if deductions:
-        lines.append("漏单扣 %s 分。" % (abs(deductions),))
-    orders = ctx.get("orders") or []
-    if orders:
-        lines.append("订单：")
-        for o in orders:
-            eta = o.get("eta")
-            lines.append("- #%s %s 剩 %s 秒%s" % (
-                o.get("id"), o.get("dish"), o.get("remaining"),
-                "，预计 %s 秒能出" % (eta,) if eta is not None else ""))
-    else:
-        lines.append("订单：无")
-    for cooker in ctx.get("cookers") or ():
-        lines.append("%s：%s" % (cooker.get("name"), cooker.get("text")))
-    plates = ctx.get("plates")
-    if plates:
-        lines.append("盘子：%s" % (plates,))
-    boards = ctx.get("boards") or []
-    if boards:
-        lines.append("切菜板：%s" % ("；".join(boards),))
-    idle = ctx.get("idle_cookers")
-    if idle:
-        lines.append("空闲灶 %s 个" % (idle,))
-    combo = ctx.get("combo")
-    if combo:
-        lines.append("连击 %s" % (combo,))
-    expiring = ctx.get("expiring_orders") or []
-    if expiring:
-        lines.append("快过期的订单：")
-        for o in expiring:
-            lines.append("- #%s %s（剩 %s 秒）" % (
-                o.get("id"), o.get("dish"), o.get("remaining")))
-    p1 = ctx.get("p1") or {}
-    lines.append("P1：手持 %s" % (p1.get("holding") or "空",))
-    p2 = ctx.get("p2") or {}
-    doing = p2.get("doing") or "没事做"
-    lines.append("你（P2）：正在 %s" % (doing,))
-    if p2.get("stuck"):
-        lines.append("你卡住的原因：%s" % (p2.get("stuck"),))
-    division = ctx.get("division")
-    if division:
-        p2_acts = division.get("p2_actions") or []
-        p1_acts = division.get("p1_actions") or []
-        lines.append("你能做的动作（够得着的）：%s" % ("、".join(p2_acts) or "无"))
-        lines.append("P1 能做的动作：%s" % ("、".join(p1_acts) or "无"))
-    nxt = ctx.get("p2_options") or []
-    if nxt:
-        lines.append("你接下来可做的（按规划器打分）：" + "；".join(nxt))
-    lines.append("分工：")
-    lines.append(render_ledger(ctx.get("duties") or []))
-    return "\n".join(lines)
+    """主循环快照 → 给模型的世界状态文本。"""
+    return prompts.render_state(context)
 
 
-def state_message(event, context, new_dishes_dag="", event_detail=""):
-    # type: (str, dict, str, str) -> dict
+def state_message(event, context, new_dishes_dag="", event_detail="",
+                  failed=False):
+    # type: (str, dict, str, str, bool) -> dict
     """本轮末尾的 system 消息：世界状态 + 事件说明（不进历史）。"""
-    parts = [render_state(context)]
+    parts = [prompts.render_state(context)]
     if event == "new_order" and new_dishes_dag:
         parts.append("【新菜】\n" + new_dishes_dag)
-    if event in _EVENT_TEXT:
-        parts.append(_EVENT_TEXT[event])
-    if event_detail:
+    if event in ("speech", "command_result", "last_seconds", "round_summary",
+                 "open_division", "help_request", "checkin", "batch"):
+        event_text = prompts.render_event(event, event_detail, failed=failed)
+        if event_text.strip():
+            parts.append(event_text)
+    elif event_detail:
         parts.append(event_detail)
     return {"role": "system", "content": "\n\n".join(parts)}
 
@@ -333,7 +212,7 @@ def speech_message(transcript):
 def event_note(event):
     # type: (str) -> dict
     """事件回合写进历史的占位（让下一轮知道上一句是主动说的）。"""
-    return {"role": "system", "content": "（%s 事件，P2 主动开口）" % (event,)}
+    return {"role": "system", "content": "（%s 事件，你主动开口）" % (event,)}
 
 
 def assistant_message(reply):

@@ -391,9 +391,9 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["assign_action"]
+    assert names == ["check_action", "execute_action", "cancel_action", "speak"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
-    assert "切" in props["action"]["enum"]
+    assert "chop" in props["action"]["enum"]
 
 
 def test_build_dialog_context_live_false_when_paused(dagent, world):
@@ -711,6 +711,7 @@ def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
     with gzip.open(fixture, "rt", encoding="utf8") as fh:
         frame = json.loads(next(l for l in fh if l.strip()))
     monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
     w = World(frame)
     book = RecipeBook(w.recipes, w.stations)
     a = Agent(dialog_worker=fake_worker)
@@ -768,6 +769,7 @@ def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
     with gzip.open(fixture, "rt", encoding="utf8") as fh:
         frame = json.loads(next(l for l in fh if l.strip()))
     monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
     w = World(frame)
     book = RecipeBook(w.recipes, w.stations)
     a = Agent(dialog_worker=fake_worker)
@@ -906,6 +908,7 @@ def test_service_dialog_lands_open_division_duties(monkeypatch, fake_worker):
     with gzip.open(fixture, "rt", encoding="utf8") as fh:
         frame = json.loads(next(l for l in fh if l.strip()))
     monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
     w = World(frame)
     book = RecipeBook(w.recipes, w.stations)
     a = Agent(dialog_worker=fake_worker)

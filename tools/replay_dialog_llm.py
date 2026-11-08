@@ -402,6 +402,8 @@ def _run_turn(agent, worker, world, step):
     # type: (Any, DialogWorker, World, Step) -> Dict
     """一轮：worker 线程里跑 LLM；主线程 20 Hz 驱动 _service_dialog 落地批次。"""
     context = agent._build_dialog_context(world)
+    # 旧 trace 回放仍走两段式（assign_action）；新工具协议由 worker 在线上使用。
+    context["tools"] = None
     done = threading.Event()
     started = time.monotonic()
 

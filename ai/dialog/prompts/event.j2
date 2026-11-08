@@ -1,0 +1,20 @@
+{% if event == "command_result" %}
+事件：你派发的命令有结果了。
+{% if detail %}{{ detail }}
+{% endif %}
+{% if failed %}失败必须用 speak 说明原因；不要假装成功。{% else %}成功可以不说话；如果值得汇报再用 speak。{% endif %}
+{% elif event == "last_seconds" %}
+事件：本关只剩最后几秒了。用一两句话提醒或鼓励玩家，不调用工具。
+{% elif event == "round_summary" %}
+事件：本关结束了。按【世界状态】里的总分、送达数、漏单扣分、连击，用一两句话总结这局，可以鼓励也可以吐槽，不调用工具。
+{% elif event == "open_division" %}
+事件：你主动开口提分工（不是回应对方）。按给出的分工，用一句大白话说清谁负责什么，不念内部名词、不调用工具。
+{% elif event == "help_request" %}
+事件：有个活由队友来做明显更省时间，你想请对方搭把手。用一句大白话把要做的这一步说给队友听，不念内部名词、不调用工具。
+{% elif event == "checkin" %}
+按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。
+{% elif event == "batch" %}
+事件：你主动开口，有几件事要一起说。把下面每件事都用一两句大白话一次说完，不念内部名词、不调用工具。
+{% endif %}
+{% if detail and event not in ("command_result",) %}{{ detail }}
+{% endif %}

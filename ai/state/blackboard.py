@@ -127,6 +127,11 @@ class Blackboard:
     dialog: DialogState = field(default_factory=DialogState)
     # 截止闸上一次抢单后的冷却结束拍（spec §4.6）。
     rescue_cooldown_until: int = 0
+    # 对话层临时命令：hold_until 之前 planner 不选任务（cancel_action 后停手）。
+    hold_until: int = 0
+    # 当前命令的 task scope / id；planner 只在这个 scope 内选任务。
+    command_scope: Any = None
+    command_id: Optional[str] = None
 
     # ---------- 认领 ----------
     def claim(self, resource_id, action, owner, order_id, tick,

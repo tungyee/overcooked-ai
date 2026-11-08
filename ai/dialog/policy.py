@@ -8,6 +8,8 @@
   它自己维护 1 秒合并窗口，返回「本拍是否该发事件」和完整批次。返回
   `True` 后批次即被清空，调用方必须负责投递，不能丢单。
 """
+import queue
+import threading
 from typing import Any, List, Tuple
 
 from ai.dialog.schema import DialogState
@@ -108,3 +110,61 @@ def merge_new_orders(order_ids, state, tick):
         pending.extend(fresh)
 
     return False, list(pending)
+
+
+def event_priority(event):
+    # type: (Any) -> int
+    """事件优先级：数字越小越先处理。玩家语音不在此队列。"""
+    if not isinstance(event, (tuple, list)) or len(event) != 2:
+        return 3
+    name, payload = event
+    if name == "command_result":
+        return 0 if isinstance(payload, dict) and payload.get("status") == "failed" else 2
+    if name in ("last_seconds", "round_summary"):
+        return 2
+    if name in ("open_division", "help_request", "checkin"):
+        return 3
+    if name == "batch":
+        return 3
+    return 3
+
+
+class EventQueue(object):
+    """有界事件队列：满了丢最低优先级的，新事件也参与比较。
+
+    `DialogWorker._drain_events` 只依赖 `put_nowait` / `get_nowait` /
+    `empty`，因此可以和普通 `queue.Queue` 互换。
+    """
+
+    def __init__(self, maxsize=3):
+        # type: (int) -> None
+        self.maxsize = max(1, int(maxsize))
+        self._items = []  # type: List[Tuple[int, int, Any]]
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def put_nowait(self, event):
+        # type: (Any) -> None
+        with self._lock:
+            self._seq += 1
+            self._items.append((event_priority(event), self._seq, event))
+            self._items.sort(key=lambda row: (row[0], row[1]))
+            if len(self._items) > self.maxsize:
+                self._items = self._items[:self.maxsize]
+
+    def get_nowait(self):
+        # type: () -> Any
+        with self._lock:
+            if not self._items:
+                raise queue.Empty
+            return self._items.pop(0)[2]
+
+    def empty(self):
+        # type: () -> bool
+        with self._lock:
+            return not self._items
+
+    def qsize(self):
+        # type: () -> int
+        with self._lock:
+            return len(self._items)

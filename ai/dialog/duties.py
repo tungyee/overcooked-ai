@@ -597,29 +597,112 @@ def render_ledger(rows):
     return "\n".join(lines) if lines else "（空）"
 
 
+# 旧的分工工具暂时保留代码，但不再暴露给模型（注释掉的是旧 schema）。
+ENABLE_LEGACY_TOOLS = False
+# 旧工具调用仍可被 handler 接受（回放/旧测试）；不暴露给模型。
+ACCEPT_LEGACY_TOOL_CALLS = True
+
+# 新工具的动作枚举（英文标识，内部翻译成中文 key）。
+TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch"]
+
+
 def tool_schemas(targets=None, duty_ids=None):
     # type: (Any, Any) -> List[dict]
-    """动作级 OpenAI tool schema（替换旧物料/步骤/共享 target 枚举）。
+    """新工具协议：check_action / execute_action / cancel_action / speak。
 
-    `targets`/`duty_ids` 参数保留签名兼容、不再使用：动作枚举是静态的 6 个
-    动作，不随关卡/账本变化。
+    `targets`/`duty_ids` 保留签名兼容、不再使用；target 由本关 DAG 的英文名
+    自由填写，check 失败时返回 valid_targets 让模型改口。
     """
-    props = {
-        "op": {"type": "string", "enum": list(OPS),
-               "description": "add 新增（同一 action 已有约定时就是改写它）；cancel 撤销这个 action 的约定"},
-        "mode": {"type": "string", "enum": list(MODES),
-                 "description": "now=马上去（一次性）；assign=分工（持续，带 direction）；stop=先别做（30 秒自动解除）"},
-        "action": {"type": "string", "enum": list(ACTION_TASK_TYPES),
-                   "description": "动作（绑定站点）：切/下锅/拌/装盘/送餐/洗盘"},
-        "direction": {"type": "string", "enum": ["P2", "P1"],
-                      "description": "assign 用：P2=你负责做，P1=交给 P1（你避开、收尾可补位）"},
+    action_prop = {
+        "type": "string",
+        "enum": list(TOOL_ACTIONS),
+        "description": "动作：chop 切 / cook 煮炸烤下锅 / mix 拌 / plate 装盘 / deliver 送餐 / wash 洗盘 / fetch 取料",
     }
-    return [{
-        "type": "function",
-        "function": {
-            "name": "assign_action",
-            "description": "修改你（P2）的分工约定。玩家一句话里涉及几个动作就调用几次；闲聊、提问不要调用。",
-            "parameters": {"type": "object", "properties": props,
-                           "required": ["op", "mode", "action"]},
+    target_prop = {
+        "type": "string",
+        "description": "物料名或菜名，使用本关目录里的英文名（Cucumber、Seaweed、BoiledSushiRice、Sushi_Cucumber）。省略时由系统选最合适的一个。",
+    }
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "check_action",
+                "description": "只读检查：此刻能不能做这个动作、实际会作用到哪个物料或菜。玩家让你做事时先调用；它不执行任何动作。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"action": action_prop, "target": target_prop},
+                    "required": ["action"],
+                },
+            },
         },
-    }]
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_action",
+                "description": "把动作排成持久命令并执行。没有命令在跑时立即开始；已有命令时按顺序排队（最多 3 条待执行）。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"action": action_prop, "target": target_prop},
+                    "required": ["action"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "cancel_action",
+                "description": "撤销当前命令和所有排队命令，并停手约 5 秒。玩家说“停下 / 算了 / 别做了”时调用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": list(TOOL_ACTIONS),
+                            "description": "可选：只撤销这个动作；不填则撤销当前命令和整个队列。",
+                        }
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "speak",
+                "description": "对玩家说话。这是唯一发言通道，不调用就不会出声。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "一两句中文口语，30 字以内；不要念内部名词，不要出现内部代号。",
+                        }
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+    ]
+    return schemas
+
+
+# ---------------------------------------------------------------- 旧工具（停用）
+#
+# def _legacy_tool_schemas():
+#     props = {
+#         "op": {"type": "string", "enum": list(OPS),
+#                "description": "add 新增；cancel 撤销这个 action 的约定"},
+#         "mode": {"type": "string", "enum": list(MODES),
+#                  "description": "now=马上去；assign=分工；stop=先别做"},
+#         "action": {"type": "string", "enum": list(ACTION_TASK_TYPES)},
+#         "direction": {"type": "string", "enum": ["P2", "P1"]},
+#     }
+#     return [{
+#         "type": "function",
+#         "function": {
+#             "name": "assign_action",
+#             "description": "修改分工约定。",
+#             "parameters": {"type": "object", "properties": props,
+#                            "required": ["op", "mode", "action"]},
+#         },
+#     }]

@@ -14,6 +14,7 @@ import pytest
 
 from ai.dialog import worker as worker_mod
 from ai.dialog.llm import LLMReply, ToolCall
+from ai.dialog.duties import tool_schemas
 from ai.dialog.schema import VoiceConfig
 from ai.dialog.worker import DialogClients, DialogWorker, DutyBatch
 
@@ -276,6 +277,7 @@ def wait_until(predicate, timeout=2.0):
 # ------------------------------------------------------- speech pipeline
 
 TOOLS = [{"type": "function", "function": {"name": "assign_action"}}]
+TOOLS_NEW = tool_schemas()
 
 
 def ack_for(bundle, results):
@@ -1036,3 +1038,66 @@ def test_round_summary_does_not_schedule_next_checkin():
     worker._handle_event(("round_summary", None),
                          {"tick": 1000, "live": False, "round_finished": True})
     assert worker._next_checkin_at is None
+
+
+# ------------------------------------------------------- 新工具协议
+
+
+def test_new_protocol_check_then_execute_and_speak():
+    llm = FakeLLM(
+        reply("", ("check_action", {"action": "chop", "target": "Cucumber"})),
+        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"}),
+              ("speak", {"text": "好，这就去切黄瓜"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch1 = bundle.cmd_q.get(timeout=2)
+    assert [c[0] for c in batch1.calls] == ["check_action"]
+    bundle.ack_q.put({"batch_id": batch1.batch_id,
+                      "results": [{"ok": True}]})
+    batch2 = bundle.cmd_q.get(timeout=2)
+    assert [c[0] for c in batch2.calls] == ["execute_action"]
+    bundle.ack_q.put({"batch_id": batch2.batch_id,
+                      "results": [{"ok": True, "status": "running"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，这就去切黄瓜"]
+
+
+def test_new_protocol_rejection_suppresses_optimistic_speak():
+    llm = FakeLLM(
+        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"}),
+              ("speak", {"text": "好，这就去切黄瓜"})),
+        reply("", ("speak", {"text": "砧板被占了，切不了"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch1 = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch1.batch_id,
+                      "results": [{"ok": False, "reason": "砧板被占了"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["砧板被占了，切不了"]
+
+
+def test_ptt_down_stops_active_tts():
+    """最小 barge-in：PTT 按下时停掉正在播的 TTS。"""
+    worker, _bundle = make_worker()
+
+    class FakeStream(object):
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    stream = FakeStream()
+    worker._active_stream = stream
+    worker._on_ptt_event("down")
+    assert stream.stopped is True
+    worker._on_ptt_event("up")
+    assert stream.stopped is True

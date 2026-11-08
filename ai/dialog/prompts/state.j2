@@ -1,0 +1,31 @@
+【世界状态】{{ '\n' }}
+{% if time_left is not none %}本关剩余 {{ time_left }} 秒。{{ '\n' }}{% endif %}
+{% if total is not none %}总分 {{ total }}。{{ '\n' }}{% endif %}
+{% if deliveries is not none %}已送 {{ deliveries }} 单。{{ '\n' }}{% endif %}
+{% if tips is not none %}小费 {{ tips }}。{{ '\n' }}{% endif %}
+{% if deductions %}漏单扣 {{ deductions }} 分。{{ '\n' }}{% endif %}
+{% if orders %}订单：{{ '\n' }}
+{% for o in orders %}- #{{ o.id }} {{ o.dish }} 剩 {{ o.remaining }} 秒{% if o.eta is not none %}，预计 {{ o.eta }} 秒能出{% endif %}{{ '\n' }}
+{% endfor %}{% else %}订单：无{{ '\n' }}{% endif %}
+{% for c in cookers %}{{ c.name }}：{{ c.text }}{{ '\n' }}{% endfor %}
+{% if plates %}盘子：{{ plates }}{{ '\n' }}{% endif %}
+{% if boards %}切菜板：{{ boards|join('；') }}{{ '\n' }}{% endif %}
+{% if idle_cookers %}空闲灶 {{ idle_cookers }} 个{{ '\n' }}{% endif %}
+{% if combo %}连击 {{ combo }}{{ '\n' }}{% endif %}
+{% if expiring_orders %}快过期的订单：{{ '\n' }}
+{% for o in expiring_orders %}- #{{ o.id }} {{ o.dish }}（剩 {{ o.remaining }} 秒）{{ '\n' }}
+{% endfor %}{% endif %}
+你：手持 {{ you.holding or '空' }}；{% if you.doing %}正在{{ you.doing }}{% else %}暂时没事做{% endif %}{{ '\n' }}
+{% if you.stuck %}你卡住的原因：{{ you.stuck }}{{ '\n' }}{% endif %}
+队友：手持 {{ teammate.holding or '空' }}{{ '\n' }}
+{% if reachable.you or reachable.teammate %}你能做的动作（够得着的）：{{ reachable.you|join('、') or '无' }}{{ '\n' }}
+队友能做的动作：{{ reachable.teammate|join('、') or '无' }}{{ '\n' }}{% endif %}
+{% if options %}你接下来可做的：{{ options|join('；') }}{{ '\n' }}{% endif %}
+你的当前命令：{{ '\n' }}
+{% if command %}- {{ command.label }}{% if command.target %} {{ command.target }}{% endif %}（{{ command.status }}{% if command.wait_reason %}：{{ command.wait_reason }}{% endif %}）{{ '\n' }}
+{% else %}- 无{{ '\n' }}{% endif %}
+排队中的命令：{{ '\n' }}
+{% if queue %}{% for c in queue %}- {{ c.label }}{% if c.target %} {{ c.target }}{% endif %}{{ '\n' }}
+{% endfor %}{% else %}- 无{{ '\n' }}{% endif %}
+{% if last_result %}上一条命令结果：{{ last_result.label }}{% if last_result.target %} {{ last_result.target }}{% endif %} -> {{ last_result.status }}{% if last_result.reason %}（{{ last_result.reason }}）{% endif %}{{ '\n' }}{% endif %}
+{% if responsibilities %}分工（只作参考）：{{ '\n' }}{{ responsibilities }}{{ '\n' }}{% endif %}

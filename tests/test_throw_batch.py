@@ -747,6 +747,25 @@ def _throw_shroom():
                         "Mushroom")
 
 
+def test_split_board_still_feasible_via_throw_batch(frame_offcenter):
+    """不连通地图的砧板：FetchToBoard 被 veto，ThrowBatch(split) 仍可行。
+
+    跨区送料一直走 ThrowBatch（自己走到出手格投到对面地上），不经过
+    FetchToBoard 的投掷；去掉砧板的 ThrowOntoStation 不影响对面收货
+    （trace-20261108-200713：3~5m 投上板必飞过头，改为一律走过去放）。
+    """
+    from ai.space import reachability
+    w, book, bb, ctx = _ctx(frame_offcenter)
+    task = _throw_shroom()
+    st = task._state(ctx)
+    assert st is not None and st[1] == TS.MODE_SPLIT
+    assert task.feasible(ctx) is True
+    assert TS.launch_plan(w, st[0], st[1], bb) is not None
+
+    fetch = T.FetchToBoard(None, (SHROOM_BOARD,), "Mushroom")
+    assert reachability.task_veto(fetch, ctx) == "unreachable"
+
+
 def _offcenter_ctx(frame, x=None):
     f = json.loads(json.dumps(frame))
     if x is not None:

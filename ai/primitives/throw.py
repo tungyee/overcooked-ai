@@ -1,7 +1,13 @@
-"""投掷原语：ThrowTo（朝目标投出）与 ThrowOntoStation（下锅/上砧板最后几步改成投上站）。
+"""投掷原语：ThrowTo（朝目标投出）与 ThrowOntoStation（下锅最后几步改成投上站）。
 
 投掷键 = chop，持可投掷物（食材）时按它就是投掷（spec §7.9）。锅/盘不可投掷，
 走 EnsureHandsFree 走近放下，不进这里。
+
+投掷射程固定 ≈7.5m，落点只由出手点 + 朝向决定。ThrowOntoStation 只用于锅：
+锅有飞行中接料的触发器（ServerAttachmentCatchingProxy），料在 3~5m 的带内
+穿过即可；砧板/台面是 ServerAttachStation，只接非飞行物，3~5m 投过去会从
+板上空飞过落在地上（trace-20261108-200713 t=659/1414），所以砧板一律走过去放，
+跨区/远距送料由 tasks.relay.ThrowBatch 自己投到对面地上。
 
 只校验「手空」（离手成功）：投掷物有飞行时间，落地要到下一帧 items[] 才
 体现。落点偏差 / 落地结果由 Planner 无状态重算接管，不在原语里猜。
@@ -123,21 +129,25 @@ POT_THROW_SAVE_CELLS = 3
 
 
 class ThrowOntoStation(Node):
-    """下锅/上砧板的最后几步改成投：手上拿着料、离目标站还远时，走到 3~5m
-    外一个能直线投进站的格子，精准对准后投出，等站收下。
+    """下锅的最后几步改成投：手上拿着料、离锅还远时，走到 3~5m 外一个能
+    直线投进锅的格子，精准对准后投出，等锅收下。
 
-    锅与砧板共用这一套投掷几何与冷却（POT_* 常量是共享的投掷参数）。门槛
-    （任一不满足 → 立刻 FAILURE，调用方 Selector 退回走过去放）：
-      - 这口站不在投掷冷却里（bb.pot_throw_cooldown）；
-      - 手上拿着要下的料、站还没收到这份；
-      - 有出手位（space.throw.plan_pot_throw），且比走到站旁至少省
+    **只用于锅，不用于砧板**：锅有飞行中接料的触发器，料穿过就收；砧板是
+    普通台面（ServerAttachStation），只接非飞行物，而投掷射程固定 ≈7.5m，
+    3~5m 投过去会从板上空飞过落在板外（trace-20261108-200713 t=659/1414）。
+    砧板一律走过去放，跨区/远距送料由 tasks.relay.ThrowBatch 负责。
+
+    门槛（任一不满足 → 立刻 FAILURE，调用方 Selector 退回走过去放）：
+      - 这口锅不在投掷冷却里（bb.pot_throw_cooldown）；
+      - 手上拿着要下的料、锅还没收到这份；
+      - 有出手位（space.throw.plan_pot_throw），且比走到锅旁至少省
         POT_THROW_SAVE_CELLS 格。
 
-    投出后 POT_CATCH_WAIT_TICKS 内站没收到（投偏落地 / 没对准没投 / 走位
+    投出后 POT_CATCH_WAIT_TICKS 内锅没收到（投偏落地 / 没对准没投 / 走位
     失败）→ 写冷却、FAILURE。料若已落地，调用方下一步从地上捡回来再放。
 
-    station(ctx) -> 目标站站点 dict（灶/砧板）；holding / placed 是调用方的
-    手上 / 已到位谓词；cooldown_key 是写冷却用的站资源 id。
+    station(ctx) -> 目标锅站点 dict；holding / placed 是调用方的手上 /
+    已到位谓词；cooldown_key 是写冷却用的站资源 id。
     """
 
     def __init__(self, station, holding, placed, cooldown_key):

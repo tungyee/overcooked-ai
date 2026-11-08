@@ -1407,10 +1407,12 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     分支2 曾是「RepeatUntil 批量取+投 N 份，再捡散落上板」，与
     FetchToCooker 单料同构、也同样坏：必须投满 N 份才轮到 drop()，一轮
     取+投约 80 拍而整树只有 TASK_TIMEOUT_TICKS=200，第二轮没结束就被砍
-    → 料全堆在地上、板上一直空着。砧板一次只放一根（feasible 要求板上
-    为空），批量投更没有意义。现在钉住它**不再有**批量循环；单次投上板
-    走 ThrowOntoStation（crate/held 分支末尾先试投、不成就走），散落分支
-    不投。
+    → 料全堆在地上、板上一直空着。现在钉住它**不再有**批量循环。
+
+    投上板也不再有 ThrowOntoStation：投掷射程固定 ≈7.5m，砧板又是只接
+    非飞行物的普通台面，3~5m 投过去必然飞过头落地上（trace-20261108-200713
+    t=659/1414）。三个分支都以走过去 placement 收尾；跨区/远距送料由
+    ThrowBatch 负责，不在这里。
     """
     tree = T.FetchToBoard("9", ("board_01",), "Cucumber").build()
     assert isinstance(tree, PR.Timeout)
@@ -1443,19 +1445,14 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     assert not any(isinstance(n, RepeatUntil) for n in nodes), \
         "投满 N 份才上板必然超时，drop 永远执行不到"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes)
+    assert not any(isinstance(n, PR.ThrowOntoStation) for n in nodes), \
+        "砧板只接非飞行物，3~5m 投过去必飞过头；一律走过去放"
 
-    # 散落分支（料已在板边）直接往板上放；crate/held 两分支末尾是
-    # Selector[ThrowOntoStation, 走过去 placement]：先试投上板，不成就走。
-    last = loose.children[-1]
-    assert isinstance(last, PR.InteractWith)
-    assert last.kind == "placement"
-    for branch in (crate, held):
+    # 三个分支都以「往板上放」收尾
+    for branch in (loose, crate, held):
         last = branch.children[-1]
-        assert isinstance(last, Selector)
-        assert isinstance(last.children[0], PR.ThrowOntoStation)
-        fallback = last.children[-1]
-        assert isinstance(fallback, PR.InteractWith)
-        assert fallback.kind == "placement"
+        assert isinstance(last, PR.InteractWith)
+        assert last.kind == "placement"
 
     # 分支3 无 Condition，是「已在手/兜底」单次路径
     assert isinstance(held, Sequence)

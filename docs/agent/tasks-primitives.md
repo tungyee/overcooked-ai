@@ -63,7 +63,7 @@
 | `InteractWith` | 复合 = Approach + (Face) + Tap + Confirm。（`expect` 必传，漏给即 TypeError） |
 | `GoToCell` | 走到指定格（投掷出手位），首拍定格、move 回 ok 即成功。（不是「目标旁交互位」，与 `Approach` 区分；站在漂流平台上不追每拍新格） |
 | `ThrowTo` | `throw` 命令投掷手持可投掷物，只校验离手。插件 0.21 起朝向闭环（`dot>0.97` 才按、0.6s 内确认手空）。射程固定 ≈7.5m，落点由出手站位决定（`ai/space/throw.py`），不由原语控制。可选 `aim_dot` / `strict` / `face_timeout_ms`（插件 0.23.2+）：更严的朝向门槛、没对准就失败不投、转向时限 |
-| `ThrowOntoStation` | 下锅/上砧板最后几步改成投：拿着料、离目标站（灶/砧板）远时走到 3~5m（`space.throw.POT_THROW_MIN/MAX`）外一个直线无遮挡（只过可走地板、无别的厨师）的格，`ThrowTo(aim_dot=0.996≈5°, strict)` 投出，`WaitUntil` 站收下。锅接料靠触发器（飞行中穿过、能收这种料就收），不必落进锅；砧板同理。门槛：不在冷却、手上有料且站还没收、比走到站旁至少省 `POT_THROW_SAVE_CELLS` 格。投偏/没对准 → 写 `bb.pot_throw_cooldown[站]`（20s）并 FAILURE，调用方先捡回地上那份再走过去放 |
+| `ThrowOntoStation` | 下锅最后几步改成投：拿着料、离锅远时走到 3~5m（`space.throw.POT_THROW_MIN/MAX`）外一个直线无遮挡（只过可走地板、无别的厨师）的格，`ThrowTo(aim_dot=0.996≈5°, strict)` 投出，`WaitUntil` 锅收下。锅接料靠触发器（飞行中穿过、能收这种料就收），不必落进锅。**只用于锅，不用于砧板**：砧板是 `ServerAttachStation`，只接非飞行物，投掷射程又固定 ≈7.5m，3~5m 投过去会从板上空飞过落在地上（`trace-20261108-200713` t=659/1414）；`FetchToBoard` 一律走到板旁放下，跨区/远距送料由 `ThrowBatch` 自己投到对面地上。门槛：不在冷却、手上有料且锅还没收、比走到锅旁至少省 `POT_THROW_SAVE_CELLS` 格。投偏/没对准 → 写 `bb.pot_throw_cooldown[锅]`（20s）并 FAILURE，调用方先捡回地上那份再走过去放 |
 | `Timeout` | task 级超时装饰，超时 halt 子树转 FAILURE 交还 Planner |
 | `MarkBlocked` / `AbandonTarget` | 三级脱困的 L1/L3，**这两个节点本身仍预留未接线**（但 L1 的拉黑机制已有消费方：`AlignToCell` 写 `scratch.bad_pairs`、`Approach` 读它，是第一条真正接线的脱困路径）。实际脱困靠两处：`HoldUntil` 的位置自愈，以及 Agent 的连续失败计数（同一 task 连败 `ABANDON_FAIL_STREAK=3` → 写 `scratch.abandoned`，`filter_feasible` 跳过该候选，TTL 200 拍）。**灭火是例外**：`Extinguish` 声明 `NO_ABANDON`、`plan_firefighting` 传 `ignore_abandon=True`——拉黑按资源 id 记，别的 task 在同一口灶上反复失败会把着火的那口灶也写进去 |
 

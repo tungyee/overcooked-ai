@@ -173,17 +173,12 @@ class FetchToBoard(Task):
                 lambda x: ingredient_source(x, raw), "pickup", holding,
                 face=True)
 
+        # 不投上板：投掷射程固定 ≈7.5m，而砧板是普通台面（ServerAttachStation，
+        # 只接非飞行物），从 3~5m 的投锅带扔过去必然飞过头落地上——实机
+        # trace-20261108-200713 t=659/1414 两次都从板上空 ~1m 飞过、落在板外 ~3m。
+        # 跨区/远距送料由 ThrowBatch 自己投到对面地上，不经过这里。
         def drop():
             return PR.InteractWith(board, "placement", placed)
-
-        def place_or_throw():
-            # 手里有料、离砧板还远时先试投上板（ThrowOntoStation），门槛不过
-            # （冷却中 / 省不了几步 / 没出手位）或投偏 → 退回走过去放。与下锅
-            # 的 ThrowOntoStation 同构：投偏退行走，不额外跑去捡散料。
-            return Selector([
-                PR.ThrowOntoStation(board, holding, placed, board_id),
-                drop(),
-            ])
 
         def board_empty(c):
             return not P.board_item(c["w"].workstations, str(board_id))
@@ -223,13 +218,13 @@ class FetchToBoard(Task):
                 Condition(source_is_crate),
                 PR.EnsureHandsFree(keep=holding),
                 PR.InteractWith(crate, "pickup", holding),
-                place_or_throw(),
+                drop(),
             ]),
             # 分支3：生料已在手上（pickup 靠 expect 短路）→ 直接放上砧板
             Sequence([
                 PR.EnsureHandsFree(keep=holding),
                 pickup(),
-                place_or_throw(),
+                drop(),
             ]),
         ])]), TASK_TIMEOUT_TICKS)
 

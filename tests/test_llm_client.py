@@ -355,3 +355,18 @@ def test_state_warns_when_game_paused():
 def test_state_does_not_warn_when_live():
     msg = state_message("speech", {"live": True})
     assert "游戏当前已暂停" not in msg["content"]
+
+
+def test_state_warns_ready_plate_but_unreachable():
+    msg = state_message("speech", {
+        "deliver_status": {"ready": ["#1 Pasta"], "feasible": False},
+    })
+    assert "送餐：#1 Pasta" in msg["content"]
+    assert "够不着" in msg["content"]
+
+
+def test_state_marks_ready_plate_deliverable():
+    msg = state_message("speech", {
+        "deliver_status": {"ready": ["#1 Pasta"], "feasible": True},
+    })
+    assert "可以送餐" in msg["content"]

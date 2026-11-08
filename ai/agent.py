@@ -335,6 +335,22 @@ def _duty_tools(kitchen, ledger):
     return tool_schemas(kitchen.targets(), ledger.ids())
 
 
+def _ready_plates(world, book, live_orders):
+    # type: (World, Any, Any) -> List[str]
+    """已经配齐、可以送的盘（按订单去重）。"""
+    out = []  # type: List[str]
+    for order in live_orders or ():
+        for plate in getattr(world, "plates", None) or ():
+            try:
+                if book is not None and book.missing(order, plate) == ():
+                    out.append("#%s %s" % (order.get("id"),
+                                           order.get("dish")))
+                    break
+            except Exception:                   # noqa: BLE001
+                continue
+    return out
+
+
 def _probe_command(action, resolved, display, scope, world, mode="material",
                    done_item=None):
     # type: (str, Optional[str], Optional[str], Any, World, str, Optional[str]) -> Command
@@ -693,6 +709,17 @@ class Agent:
                     return order.get("id")
         return None
 
+    def _deliver_reason(self, world, book):
+        # type: (World, Any) -> str
+        live = planner._dialog_live_orders(world, self.bb)
+        ready = _ready_plates(world, book, live)
+        if ready:
+            return ("盘子已经装好（%s），但出餐口/篮子现在够不着，"
+                    "让队友送或等篮子回来" % "、".join(ready))
+        if not live:
+            return "现在没有可送的订单"
+        return "还没有装好的盘可送"
+
     @staticmethod
     def _fetch_destination(feasible):
         # type: (List[Any]) -> str
@@ -741,9 +768,7 @@ class Agent:
             world, self.bb, self.book, command_scope=scope)
         if not feasible:
             if action == "deliver":
-                reason = ("还没有装好的盘可送"
-                          if planner._dialog_live_orders(world, self.bb)
-                          else "现在没有可送的订单")
+                reason = self._deliver_reason(world, self.book)
             else:
                 labels = {
                     "wash": "现在没有脏盘",
@@ -812,9 +837,7 @@ class Agent:
                 world, self.bb, self.book, command_scope=scope)
             if not feasible:
                 if action == "deliver":
-                    reason = ("还没有装好的盘可送"
-                              if planner._dialog_live_orders(world, self.bb)
-                              else "现在没有可送的订单")
+                    reason = self._deliver_reason(world, self.book)
                 else:
                     labels = {"wash": "现在没有脏盘",
                               "fetch": "现在没有可取的料"}
@@ -830,11 +853,18 @@ class Agent:
                     scope, resolved, display = scope2, resolved2, display2 or resolved
         if action == "wash" and dirty_count(world) == 0:
             return {"ok": False, "action": action, "reason": "现在没有脏盘"}
+        if action == "deliver":
+            feasible, _cands, _ctx, _pm, _cm = planner.feasible_candidates(
+                world, self.bb, self.book, command_scope=scope)
+            if not feasible:
+                return {"ok": False, "action": action,
+                        "target": display or resolved,
+                        "reason": self._deliver_reason(world, self.book)}
         order_id = self._command_order_id(world, action, resolved)
         if action == "deliver" and order_id is None:
             return {"ok": False, "action": action,
                     "target": display or resolved,
-                    "reason": "现在没有可送的订单"}
+                    "reason": self._deliver_reason(world, self.book)}
         tick = self.bb.tick or 0
         done_item = resolve_done_item(kitchen, action, resolved,
                                       target_raw or resolved)
@@ -1281,6 +1311,16 @@ class Agent:
             "remaining": order.get("remaining"),
             "eta": _seconds(getattr(rows.get(order.get("id")), "eta", None)),
         } for order in live_orders]
+        # 送餐状态：有装好的盘，但出餐口/篮子够不着时要说清。
+        ready_plates = _ready_plates(world, book, live_orders)
+        try:
+            deliver_feasible = bool(planner.feasible_candidates(
+                world, self.bb, book,
+                command_scope=frozenset({("DeliverPlate", None)}))[0])
+        except Exception:                       # noqa: BLE001
+            deliver_feasible = False
+        deliver_status = {"ready": ready_plates,
+                          "feasible": deliver_feasible}
         # P2 接下来可做的：planner 最近一拍的打分前几名（节点 + 说明）。
         # 有当前命令时只显示 scope 内的步骤，避免模型看到无关选项。
         current_command = self.commands.active()
@@ -1318,6 +1358,7 @@ class Agent:
                 "stuck": _stuck_text(_stuck_info(self.bb, world)),
             },
             "p2_options": options,
+            "deliver_status": deliver_status,
             "current_command": current_command,
             "queue": self.commands.pending(),
             "last_result": self._last_command_result,

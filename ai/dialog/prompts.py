@@ -114,7 +114,6 @@ def state_view(context, commands=None, last_result=None):
             "teammate": (ctx.get("division") or {}).get("p1_actions") or [],
         },
         "options": ctx.get("p2_options") or [],
-        "deliver_status": ctx.get("deliver_status"),
         "command": command_view(current),
         "queue": [command_view(c) for c in queue],
         "last_result": last,

@@ -311,8 +311,12 @@ def _expiring_orders(orders):
 
 def _plates_text(world, book):
     # type: (World, Any) -> str
-    """盘子概况：空盘数、装了料的盘各装了什么（token 归一后可读）、待洗脏盘。"""
-    empty, filled = 0, []
+    """盘子概况：只给数量，不给内容。
+
+    盘子内容变化快，2 Hz 快照容易滞后；具体能不能送、缺什么，以
+    `execute_action` 的返回为准，避免模型拿旧内容自己推断。
+    """
+    empty, filled = 0, 0
     for plate in getattr(world, "plates", None) or ():
         try:
             tokens = sorted(book.plate_tokens(plate)) if book is not None \
@@ -320,12 +324,12 @@ def _plates_text(world, book):
         except Exception:                       # noqa: BLE001
             tokens = []
         if tokens:
-            filled.append("[" + "、".join(_token_text(t) for t in tokens) + "]")
+            filled += 1
         else:
             empty += 1
     parts = ["空盘 %d 个" % (empty,)]
     if filled:
-        parts.append("装了料的盘 " + " ".join(filled))
+        parts.append("装了料的盘 %d 个" % (filled,))
     parts.append("脏盘 %d 个" % (_dirty_plate_count(world),))
     return "；".join(parts)
 
@@ -1311,16 +1315,6 @@ class Agent:
             "remaining": order.get("remaining"),
             "eta": _seconds(getattr(rows.get(order.get("id")), "eta", None)),
         } for order in live_orders]
-        # 送餐状态：有装好的盘，但出餐口/篮子够不着时要说清。
-        ready_plates = _ready_plates(world, book, live_orders)
-        try:
-            deliver_feasible = bool(planner.feasible_candidates(
-                world, self.bb, book,
-                command_scope=frozenset({("DeliverPlate", None)}))[0])
-        except Exception:                       # noqa: BLE001
-            deliver_feasible = False
-        deliver_status = {"ready": ready_plates,
-                          "feasible": deliver_feasible}
         # P2 接下来可做的：planner 最近一拍的打分前几名（节点 + 说明）。
         # 有当前命令时只显示 scope 内的步骤，避免模型看到无关选项。
         current_command = self.commands.active()
@@ -1358,7 +1352,6 @@ class Agent:
                 "stuck": _stuck_text(_stuck_info(self.bb, world)),
             },
             "p2_options": options,
-            "deliver_status": deliver_status,
             "current_command": current_command,
             "queue": self.commands.pending(),
             "last_result": self._last_command_result,

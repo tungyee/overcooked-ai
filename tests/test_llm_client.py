@@ -356,17 +356,10 @@ def test_state_does_not_warn_when_live():
     msg = state_message("speech", {"live": True})
     assert "游戏当前已暂停" not in msg["content"]
 
-
-def test_state_warns_ready_plate_but_unreachable():
+def test_state_does_not_render_plate_contents():
+    """盘子只给数量；具体内容以 execute_action 结果为准，避免滞后误导。"""
     msg = state_message("speech", {
-        "deliver_status": {"ready": ["#1 Pasta"], "feasible": False},
+        "plates": "空盘 1 个；装了料的盘 1 个；脏盘 0 个",
     })
-    assert "送餐：#1 Pasta" in msg["content"]
-    assert "够不着" in msg["content"]
-
-
-def test_state_marks_ready_plate_deliverable():
-    msg = state_message("speech", {
-        "deliver_status": {"ready": ["#1 Pasta"], "feasible": True},
-    })
-    assert "可以送餐" in msg["content"]
+    assert "装了料的盘 1 个" in msg["content"]
+    assert "pasta(熟)" not in msg["content"]

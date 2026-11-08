@@ -22,7 +22,6 @@
 队友：手持 {{ teammate.holding or '空' }}{{ '\n' }}
 {% if reachable.you or reachable.teammate %}你能做的动作（够得着的）：{{ reachable.you|join('、') or '无' }}{{ '\n' }}
 队友能做的动作：{{ reachable.teammate|join('、') or '无' }}{{ '\n' }}{% endif %}
-{% if deliver_status and deliver_status.ready %}送餐：{{ deliver_status.ready|join('、') }}{% if deliver_status.feasible %}，可以送餐{% else %}，但出餐口/篮子现在够不着，让队友送或等篮子回来{% endif %}{{ '\n' }}{% endif %}
 {% if options %}你接下来可做的：{{ options|join('；') }}{{ '\n' }}{% endif %}
 你的当前命令：{{ '\n' }}
 {% if command %}- {{ command.label }}{% if command.target %} {{ command.target }}{% endif %}（{{ command.status }}{% if command.wait_reason %}：{{ command.wait_reason }}{% endif %}）{{ '\n' }}

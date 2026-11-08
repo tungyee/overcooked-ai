@@ -375,7 +375,7 @@ def _tool_nudge(results):
         elif result.get("ok") is False:
             if result.get("valid_targets"):
                 notes.append("target 不在本关目录：改用 valid_targets 里的名字，"
-                             "或先 speak 问玩家；不要重复同一个 target。")
+                             "或先 speak 问玩家；不要重复同一个无效 target。")
             else:
                 notes.append("工具返回失败：必须调用 speak 说明原因，"
                              "不要用 content 回答。")

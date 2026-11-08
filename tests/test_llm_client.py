@@ -251,6 +251,17 @@ def test_system_message_carries_rules_and_dag():
     assert "P1" not in text and "P2" not in text
 
 
+def test_system_prompt_allows_retry_after_state_change():
+    """ok=false 后世界状态变了（例如现在有脏盘）要允许重试同一个动作。
+
+    旧规则“不要重复同一个 target”会让模型在 wash 刚失败两次后，即使
+    玩家说“切完洗碗”、场上已经有脏盘，也不敢再调 execute_action(wash)。
+    """
+    text = system_message("本关菜：\n  Sushi_Cucumber = Cucumber")["content"]
+    assert "不要重复同一个 target" not in text
+    assert "可以重新 execute_action" in text
+
+
 def test_render_state_is_readable_and_in_seconds():
     text = render_state({
         "time_left": 99.0, "score": 40,

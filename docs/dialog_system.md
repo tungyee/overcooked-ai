@@ -169,6 +169,7 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 | `start` / `stop` | `debug`、`log_path` |
 | `turn_start` | `event`、`stage`、`source`、`text`（截断的 ASR 原文） |
 | `turn_stall` | `stage`（asr/llm/tools/tts）、`event`、`elapsed_ms`、`vad_paused`、`player_playing`、`producer_done`、`stream_cancelled` |
+| `worker_dead` | `stage`、`event`（worker 线程已退出；看前面的 `worker_error`） |
 | `ptt` / `ptt_cb` | `event`（down/up）、`vad_paused`、`recording`、`utterance`、`stage`、`active_stream` |
 | `barge_in` | `ptt`、`stage`（PTT 按下打断 TTS 时写） |
 | `level_start` | `level`（Agent 第一次看到关卡 / 换关时写；`since_level_ms` 的分母） |

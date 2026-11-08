@@ -759,8 +759,24 @@ class DialogWorker(object):
             return True
         merged = _merge_asr_texts(utterance.texts)
         if merged:
-            self._handle_transcript(
-                merged, self._latest_context(), timing=utterance.timing)
+            try:
+                self._handle_transcript(
+                    merged, self._latest_context(), timing=utterance.timing)
+            except Exception as exc:            # noqa: BLE001
+                # 单轮异常不能杀死 worker，否则后续语音全部收不到。
+                log.exception("处理 ASR 文本失败")
+                self._log_event("worker_error", where="transcript",
+                                error=str(exc))
+                stream = self._active_stream
+                if stream is not None:
+                    try:
+                        stream.cancel()
+                    except Exception:           # noqa: BLE001
+                        pass
+                self._active_stream = None
+                self._turn_started_at = None
+                self._turn_stage = "idle"
+                self._turn_event = ""
         else:
             self._log_event(
                 "turn_latency",
@@ -1214,6 +1230,12 @@ class DialogWorker(object):
         """回合卡住时每 2 秒写一条 turn_stall，定位卡在 ASR/LLM/TTS。"""
         last_log = 0.0
         while not self._watchdog_stop.wait(2.0):
+            thread = self._thread
+            if thread is not None and not thread.is_alive():
+                self._log_event("worker_dead", stage=self._turn_stage,
+                                event=self._turn_event)
+                self._turn_started_at = None
+                return
             started = self._turn_started_at
             if started is None:
                 continue
@@ -1424,10 +1446,17 @@ class DialogWorker(object):
         self._active_stream = stream
         turn_messages = [opener]
         last_results = []
+        force_speak = False
         for turn_index in range(MAX_AGENT_TURNS):
+            forced = force_speak
+            force_speak = False
+            choice = "auto"
+            if forced:
+                # 工具失败后模型有时用 content 回答；强制它走 speak。
+                choice = {"type": "function", "function": {"name": "speak"}}
             reply = self._chat(messages, tools, event,
                                "turn%d" % turn_index,
-                               tool_choice="auto", timing=timing)
+                               tool_choice=choice, timing=timing)
             if reply is None or self.state is not state_obj:
                 stream.cancel()
                 self._active_stream = None
@@ -1478,8 +1507,12 @@ class DialogWorker(object):
                 for text in texts:
                     stream.feed(text)
             if rejected:
-                # 不播“好，这就去”这类乐观台词；下一轮看真实结果再说。
+                # 不播“好，这就去”这类乐观台词；下一轮强制 speak 说真实原因。
+                force_speak = True
                 continue
+            if forced and not speak_calls:
+                # 已经强制过一次 speak，模型仍不调；避免死循环，安静结束。
+                break
             if not action_calls:
                 break
             if any(c.name in ("execute_action", "cancel_action")
@@ -1487,13 +1520,14 @@ class DialogWorker(object):
                 # 动作已落地；这一轮没有 speak 就安静结束。
                 break
             # 只有 check_action：继续下一轮，让模型决定 execute/speak。
-        self._active_stream = None
         turn = turn_messages
         self._remember(state_obj, turn)
         timing.llm_done_at = time.monotonic()
+        # 播放期间保持 _active_stream，PTT 按下才能真正打断 TTS。
         self._turn_stage = "tts"
         stream.finish()
         stream.wait()
+        self._active_stream = None
         self._turn_started_at = None
         self._turn_stage = "idle"
         self._turn_event = ""

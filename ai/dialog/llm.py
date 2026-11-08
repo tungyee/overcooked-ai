@@ -99,7 +99,8 @@ class LLMClient(object):
                 raise LLMError("LLM 请求失败 HTTP %s：%s"
                                % (resp.status_code, str(body)[:200]))
             try:
-                return _read_sse(resp, started, on_text)
+                return _read_sse(resp, started, on_text,
+                                 timeout=self.timeout)
             except LLMError:
                 raise
             except requests.RequestException as exc:
@@ -110,17 +111,20 @@ class LLMClient(object):
                 close()
 
 
-def _read_sse(resp, started=None, on_text=None):
-    # type: (Any, Optional[float], Any) -> LLMReply
+def _read_sse(resp, started=None, on_text=None, timeout=None):
+    # type: (Any, Optional[float], Any, Optional[float]) -> LLMReply
     """按 SSE 协议拼 content 与按 index 累积的 tool_calls，直到 [DONE]。"""
     if started is None:
         started = time.monotonic()
+    deadline = None if timeout is None else started + float(timeout)
     first_token_ms = None
     chunks = []  # type: List[str]
     calls = {}   # type: Dict[int, Dict[str, str]]
     # 必须自己按 UTF-8 解码：部分兼容端点的 SSE 响应头没有 charset，
     # requests 会退回 Latin-1，中文会被 splitlines 在字符中间断开。
     for raw in resp.iter_lines(decode_unicode=False):
+        if deadline is not None and time.monotonic() > deadline:
+            raise LLMError("LLM 流超时（%.1fs）" % float(timeout))
         if not raw:
             continue
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw

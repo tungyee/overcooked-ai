@@ -66,6 +66,15 @@ def state_view(context, commands=None, last_result=None):
             current = active
         if not queue:
             queue = commands.pending()
+    last = last_result or ctx.get("last_result")
+    if isinstance(last, dict):
+        # 成功结果没有 reason；模板用 StrictUndefined，必须补齐。
+        last = {
+            "label": last.get("label", ""),
+            "target": last.get("target", ""),
+            "status": last.get("status", ""),
+            "reason": last.get("reason", ""),
+        }
     return {
         "time_left": ctx.get("time_left"),
         "total": ctx.get("total"),
@@ -105,7 +114,7 @@ def state_view(context, commands=None, last_result=None):
         "options": ctx.get("p2_options") or [],
         "command": command_view(current),
         "queue": [command_view(c) for c in queue],
-        "last_result": last_result or ctx.get("last_result"),
+        "last_result": last,
         "responsibilities": ctx.get("responsibilities"),
     }
 

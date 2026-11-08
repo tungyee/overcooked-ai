@@ -317,3 +317,30 @@ def test_render_state_includes_reachable_division():
 def test_render_state_omits_division_when_none():
     text = render_state({})
     assert "你能做的动作" not in text
+
+
+def test_state_renders_success_last_result_without_reason():
+    """成功结果没有 reason；模板不能因 StrictUndefined 抛异常。"""
+    msg = state_message("speech", {
+        "last_result": {"label": "切", "target": "BurritoMeat",
+                        "status": "succeeded"},
+    })
+    assert "上一条命令结果" in msg["content"]
+
+
+def test_stream_total_timeout_raises(monkeypatch):
+    """服务端持续发 keepalive/慢帧时，requests 的单次 read timeout 不会
+    结束整个流；必须用总时长硬上限。"""
+    import time
+
+    class SlowSSE(FakeSSE):
+        def iter_lines(self, decode_unicode=False):
+            yield _chunk("a")
+            time.sleep(0.2)
+            yield _chunk("b")
+
+    monkeypatch.setattr(llm.requests, "post",
+                        lambda *a, **k: SlowSSE([]))
+    client = LLMClient("key", "http://127.0.0.1:9", "model", timeout=0.05)
+    with pytest.raises(llm.LLMError, match="流超时"):
+        client.chat([{"role": "user", "content": "hi"}])

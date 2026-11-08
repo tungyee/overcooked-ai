@@ -1169,3 +1169,23 @@ def test_tts_wait_total_timeout_resumes_vad():
 
     assert elapsed < 1.0
     assert bundle.vad.paused is False
+
+
+def test_failed_check_forces_a_speak_turn():
+    """check 失败后模型若只回 content，下一轮必须强制走 speak。"""
+    llm = FakeLLM(
+        reply("", ("check_action", {"action": "chop", "target": "BurritoMeat"})),
+        reply("", ("speak", {"text": "我现在够不着砧板，切不了肉。"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "你去切肉",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": False, "reason": "够不着砧板"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["我现在够不着砧板，切不了肉。"]
+    assert llm.choices[1] == {"type": "function",
+                              "function": {"name": "speak"}}

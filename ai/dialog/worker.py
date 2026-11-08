@@ -412,6 +412,11 @@ _SPEAK_TAG_EVENTS = frozenset((
     "last_seconds", "round_summary", "checkin", "batch",
     "command_result", "new_order", "division", "division_review",
 ))
+# 纯闲聊/播报回合：模型忘了调 speak 时，content 直接兜底念出来。
+# 分工/复核不在此列：没调 set_division 就不能先念一个没落地的分工。
+_CONTENT_FALLBACK_EVENTS = frozenset((
+    "speech", "checkin", "last_seconds", "round_summary", "batch",
+))
 
 
 def _speak_tag_text(content):
@@ -1534,18 +1539,28 @@ class DialogWorker(object):
                 return
             calls = list(reply.tool_calls)
             if not calls:
-                # 新协议：content 不播。模型漏调工具时只告警，不强制补轮；
-                # 纯播报类事件若把台词写成 <speak> 标签，仍按标签内容播出。
-                tag_text = _speak_tag_text(reply.content) \
-                    if event in _SPEAK_TAG_EVENTS else ""
-                if tag_text:
-                    log.warning("模型把发言写成了 <speak> 标签"
-                                "（event=%s stage=turn%d）：%r",
-                                event, turn_index, reply.content)
-                    if silent_review:
-                        buffered_speech.append(tag_text)
+                # 闲聊/播报不强制工具：模型漏调 speak 时用 content 兜底，
+                # 避免玩家完全听不到反馈；分工/复核不兜底。
+                tag_any = _speak_tag_text(reply.content)
+                tag_text = tag_any if event in _SPEAK_TAG_EVENTS else ""
+                # 玩家命令回合把台词写成 <speak> 标签时仍不播（防止绕过
+                # execute_actions 先答应）；只有纯 content 的闲聊才兜底。
+                plain = (reply.content or "").strip() \
+                    if event in _CONTENT_FALLBACK_EVENTS and not tag_any else ""
+                text = tag_text or plain
+                if text:
+                    if tag_text:
+                        log.warning("模型把发言写成了 <speak> 标签"
+                                    "（event=%s stage=turn%d）：%r",
+                                    event, turn_index, reply.content)
                     else:
-                        stream.feed(tag_text)
+                        log.debug("模型没调 speak，按 content 兜底播报"
+                                  "（event=%s stage=turn%d）",
+                                  event, turn_index)
+                    if silent_review:
+                        buffered_speech.append(text)
+                    else:
+                        stream.feed(text)
                 else:
                     log.warning("本轮没有调用任何工具"
                                 "（event=%s stage=turn%d）：%r",

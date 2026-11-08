@@ -1173,8 +1173,8 @@ def test_failed_execute_forces_a_speak_turn():
                               "function": {"name": "speak"}}
 
 
-def test_content_only_speech_turn_warns_without_retry(caplog):
-    """模型只回 content 时不播、不强制补轮，只打 warning。"""
+def test_content_only_speech_turn_is_spoken(caplog):
+    """模型只回 content 的闲聊也要出声，不能静默；不强制补轮。"""
     caplog.set_level(logging.WARNING, logger="ai.dialog")
     llm = FakeLLM(reply("现在没有装好的盘能送。"))
     worker, bundle = make_worker(llm=llm)
@@ -1185,8 +1185,8 @@ def test_content_only_speech_turn_warns_without_retry(caplog):
 
     assert not thread.is_alive()
     assert llm.choices == ["auto"]
-    assert bundle.tts.spoken == []
-    assert "没有调用任何工具" in caplog.text
+    assert bundle.tts.spoken == ["现在没有装好的盘能送。"]
+    assert "没有调用任何工具" not in caplog.text
 
 
 def test_speak_tag_content_is_spoken_for_proactive_event(caplog):
@@ -1281,3 +1281,15 @@ def test_execute_actions_batch_sent_to_main_loop():
     thread.join(2)
     assert not thread.is_alive()
     assert bundle.tts.spoken == ["好，先切再洗"]
+
+
+def test_speech_content_without_tools_is_spoken():
+    """闲聊/拒绝类回复没调 speak 时，content 兜底播报，不能静默。"""
+    llm = FakeLLM(reply("抱歉，递东西我做不了，得你自己去拿。"))
+    worker, bundle = make_worker(llm=llm)
+
+    worker._handle_transcript("把盘子拿过来。", {"tick": 100,
+                                                "tools": TOOLS_NEW})
+
+    assert bundle.tts.spoken == ["抱歉，递东西我做不了，得你自己去拿。"]
+    assert bundle.cmd_q.empty()

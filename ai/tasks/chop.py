@@ -298,5 +298,6 @@ class Chop(Task):
             PR.Face(board_target),
             # target 让 HoldUntil 每拍校验还在砧板前：被传送带推走时松键 FAILURE，
             # Sequence 重置重新 Approach，而不是空按 chop 卡死（实机复现）。
-            PR.HoldUntil("chop", done, timeout=timeout, target=board_target),
+            PR.HoldUntil("chop", done, timeout=timeout, target=board_target,
+                         guard=lambda c: P.hands_free(c["chef"])),
         ]), TASK_TIMEOUT_TICKS)

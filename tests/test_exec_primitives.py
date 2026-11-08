@@ -140,6 +140,22 @@ def test_hold_spray_issues_spray_kind():
     assert ex.issued[0]["target"]["name"] == "workstation_cooker_01 (3)"
 
 
+def test_hold_guard_fails_and_halts():
+    """守卫每拍复检：手不空就松键 FAILURE，交给树首重新清手。"""
+    ex = FakeExec()
+    ctx = make_ctx(W, CHEF, ex)
+    ok = {"v": True}
+    hold = PR.HoldUntil(
+        "chop", lambda c: False, 100,
+        target=lambda c: {"gx": 1, "gz": 0, "n": "board"},
+        guard=lambda c: ok["v"])
+    assert hold.tick(ctx) == Status.RUNNING
+    assert ex.issued[-1]["cmd"] == "hold"
+    ok["v"] = False
+    assert hold.tick(ctx) == Status.FAILURE
+    assert ex.issued[-1]["cmd"] == "halt"
+
+
 def test_hold_early_exits_on_pred():
     ex = FakeExec()
     ctx = make_ctx(W, CHEF, ex)

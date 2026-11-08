@@ -1590,6 +1590,8 @@ def test_chop_tree_holds_chop_key_with_explicit_timeout():
     assert len(holds) == 1
     assert holds[0].key == "chop"
     assert isinstance(holds[0].timeout, int) and holds[0].timeout > 0
+    # 手里被旧树命令晚到的盘子塞住时，HoldUntil 每拍复检、失败回树首清手。
+    assert holds[0].guard is not None
 
 
 def test_chop_timeout_covers_max_stages():

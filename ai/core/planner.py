@@ -1279,6 +1279,26 @@ def feasible_candidates(world, bb, book, command_scope=None):
     return feasible, candidates, ctx, plate_match, cooker_match
 
 
+# 命令 scope 之外仍允许抢占命令的动作：它们会随时间恶化，晚一步就糊/着火。
+# 其它任务（取料/切/装盘等）仍然严格受命令 scope 约束，避免把用户指令饿死。
+PREEMPT_COMMAND_TYPES = ("RescueCooked", "TakeCookedToPlate", "Extinguish")
+
+
+def _preempts_command(task):
+    # type: (Any) -> bool
+    return getattr(task, "TYPE", None) in PREEMPT_COMMAND_TYPES
+
+
+def _scope_with_preemption(feasible, command_scope):
+    # type: (List[Candidate], Any) -> List[Candidate]
+    """命令 scope 内候选 + 允许抢占的恶化型候选（去重：scoped 优先）。"""
+    scoped = [c for c in feasible if scope_matches(command_scope, c.task)]
+    urgent = [c for c in feasible
+              if _preempts_command(c.task)
+              and not scope_matches(command_scope, c.task)]
+    return scoped + urgent
+
+
 def plan(world, bb, order, book):
     # type: (World, Blackboard, Optional[Any], RecipeBook) -> Tuple[Optional[Any], Dict]
     """select_task 的完整版：额外返回候选/打分明细（供 trace 记录）。
@@ -1355,9 +1375,10 @@ def plan(world, bb, order, book):
 
     # ③.4 对话层临时命令：只在 scope 内选任务。没有可行任务时返回空记录，
     # 由 Agent 把命令标 waiting、尝试下一条命令。
+    # 例外：会随时间恶化的动作（熟锅/快糊锅/火）允许在 scope 外抢占当前命令，
+    # 端完/救完后自动回到命令 scope；这不是取消命令。
     if command_scope:
-        feasible = [c for c in feasible
-                    if scope_matches(command_scope, c.task)]
+        feasible = _scope_with_preemption(feasible, command_scope)
         if not feasible:
             record_cands = []
             for cand in candidates:

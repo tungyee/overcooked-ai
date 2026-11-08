@@ -39,6 +39,7 @@ get_world_state()                   按需读取最新世界状态
 - `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/commands.py` 里做一次归一化。
 - 动作是**目标状态**：`cook(Tomato)` 会自动补取料、切；`plate(dish)` 会自动补上游。命令带 `scope` 和 `done`，不会因为第一个子任务成功就被消费。
 - 命令队列最多 3 条待执行；满了丢最后一条待执行项，新指令照收。当前命令 waiting（煎/煮/资源被占）时，下一条有可行任务的命令可以跑；依赖由 scope 可行性天然表达。
+- 命令 scope 是硬过滤，但会随时间恶化的动作允许越过 scope 抢占当前命令：`TakeCookedToPlate`（锅已熟/快熟）、`RescueCooked`（快糊/烧焦）、`Extinguish`（灭火）。端完/救完自动回到命令 scope，不取消命令。
 - 永久不可行（订单过期/目标不再需要）、连续任务失败、waiting 超时 → 命令 failed，队列暂停；失败事件让模型解释/重试/跳过。成功默认不打扰，失败必须说。
 - 模型可见文本（system prompt、工具 description、状态/事件模板、工具结果 reason）统一用「你 / 队友 / 玩家」，不出现 P1/P2，避免被念出来。
 - prompt 用 Jinja2 模板管理：`ai/dialog/prompts/system.j2`、`state.j2`、`event.j2`，渲染入口 `ai/dialog/prompts.py`。`requirements-voice.txt` 已加 `jinja2>=3.1,<4`。

@@ -23,14 +23,18 @@ class HoldUntil(Primitive):
     位置重验 + timeout FAILURE，所以语义完成由 Python 侧判 pred 后发 halt。
     """
 
-    def __init__(self, key, pred, timeout, target=None, kind=None):
-        # type: (str, Callable[[Dict], bool], int, Any, Optional[str]) -> None
+    def __init__(self, key, pred, timeout, target=None, kind=None, guard=None):
+        # type: (str, Callable[[Dict], bool], int, Any, Optional[str], Optional[Callable[[Dict], bool]]) -> None
         Primitive.__init__(self)
         self.key = key
         self.pred = pred
         self.timeout = timeout
         self.target = target
         self.kind = kind
+        # 每拍前置守卫（可选）：例如切菜要求空手。旧树的 tap/pickup 可能
+        # 在新树 EnsureHandsFree 之后才落地；守卫在 HoldUntil 每拍复检，
+        # 手不空就 FAILURE，Sequence 回到树首重新清手。
+        self.guard = guard
 
     def reset(self):
         # type: () -> None
@@ -43,6 +47,12 @@ class HoldUntil(Primitive):
 
     def _tick_delegated(self, ctx, ex):
         # type: (Dict, Any) -> str
+        # 守卫不成立（例如手不空了）：松键并 FAILURE，让 Sequence 回树首
+        # 重新 EnsureHandsFree；不能继续按 chop 假装在切。
+        if self.guard is not None and not self.guard(ctx):
+            if self._pending_cmd is not None:
+                self._exec_halt()
+            return Status.FAILURE
         # 语义早停：切/洗/喷的 done 就写在 self.pred 里，pred 成立即松键 SUCCESS
         #（C# HoldCommand 不做 pred，只负责按住 + 位置重验 + timeout FAILURE）。
         if self.pred(ctx):

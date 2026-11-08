@@ -248,6 +248,30 @@ def build_scope(kitchen, action, target, mode):
     return frozenset(scope), ""
 
 
+def item_scope(kitchen, action, raw):
+    # type: (Any, str, Any) -> Optional[Tuple[Scope, str]]
+    """具体物料名 → 只含该 item 的步骤级 scope。
+
+    `chop Dough` / `chop Tomato` 都属于同一道披萨的 material；如果只按
+    material 建 scope，两条命令会被去重成一条，后一种料永远轮不到。
+    """
+    action = str(action or "")
+    if action not in ("chop", "fetch", "mix"):
+        return None
+    item = _norm(raw)
+    if not item:
+        return None
+    task_types = ACTION_TASK_TYPES.get(action) or ()
+    for mat in (getattr(kitchen, "materials", {}) or {}).values():
+        scope = set()
+        for task_type, step_item in (getattr(mat, "steps", ()) or ()):
+            if task_type in task_types and step_item and _norm(step_item) == item:
+                scope.add((task_type, item))
+        if scope:
+            return frozenset(scope), item
+    return None
+
+
 def resolve_done_item(kitchen, action, material, raw=None):
     # type: (Any, str, Optional[str], Optional[str]) -> Optional[str]
     """动作 done 判定用的具体 item。
@@ -312,8 +336,9 @@ class Command:
 
     @property
     def key(self):
-        # type: () -> Tuple[str, Any, Any]
-        return (self.action, self.resolved_target, self.order_id)
+        # type: () -> Tuple[str, Any, Any, Any]
+        return (self.action, self.resolved_target, self.order_id,
+                self.done_item)
 
     def terminal(self):
         # type: () -> bool
@@ -368,7 +393,7 @@ class CommandQueue:
         if self.paused:
             self.commands = [c for c in self.commands if not c.terminal()]
             self.paused = False
-        key = (str(action), resolved_target, order_id)
+        key = (str(action), resolved_target, order_id, done_item)
         for command in self.commands:
             if command.key == key and not command.terminal():
                 return {"ok": True, "status": command.status,

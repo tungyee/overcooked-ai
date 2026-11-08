@@ -308,3 +308,30 @@ def test_scope_empty_yields_when_active_task_out_of_scope(agent, world):
     assert agent.bb.command_scope is None
     assert agent.bb.command_id is None
     assert agent.commands.get(cmd_id).status == "waiting"
+
+
+def test_pizza_chop_targets_are_item_scoped(monkeypatch):
+    """同一道披萨的不同料不能被 material 级去重合并成一条命令。"""
+    import gzip
+
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "wizard",
+                           "wizard32-20261101-170754-cooked-pizza.ndjson.gz")
+    with gzip.open(fixture, "rt", encoding="utf8") as fh:
+        world = World(json.loads(fh.readline()))
+    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    agent = Agent(voice=None)
+    agent.bb.tick = 100
+    agent.book = RecipeBook(world.recipes, world.stations)
+
+    out = agent._execute_actions(world, {"actions": [
+        {"action": "chop", "target": "Dough"},
+        {"action": "chop", "target": "Tomato"},
+        {"action": "chop", "target": "Cheese"},
+    ]})
+
+    ids = [row["command_id"] for row in out["results"]]
+    assert len(set(ids)) == 3
+    scopes = {c.id: c.scope for c in agent.commands.commands}
+    assert ("Chop", "dough") in scopes["cmd1"]
+    assert ("Chop", "tomato") in scopes["cmd2"]
+    assert ("Chop", "cheese") in scopes["cmd3"]

@@ -15,8 +15,8 @@ from ai.core import arbiter, executor, planner
 from ai.dialog.actions import ACTION_STATION_TYPES
 from ai.dialog.commands import (Command, CommandQueue, build_scope,
                                 command_done, command_failed, deliveries,
-                                dirty_count, resolve_done_item, resolve_target,
-                                scope_matches_task)
+                                dirty_count, item_scope, resolve_done_item,
+                                resolve_target, scope_matches_task)
 from ai.dialog.cookbook import default_cookbook
 from ai.dialog.duties import (Kitchen, TaskMeta, TOOL_ACTIONS, node_key,
                               tool_schemas)
@@ -970,11 +970,20 @@ class Agent:
         if reason and not resolved:
             return {"ok": False, "action": action, "target": target_raw,
                     "reason": reason, "valid_targets": valid}
-        scope, scope_reason = build_scope(kitchen, action, resolved, mode)
-        if scope is None:
-            return {"ok": False, "action": action,
-                    "target": display or resolved or target_raw,
-                    "reason": scope_reason, "valid_targets": valid}
+        item_result = item_scope(kitchen, action, target_raw)
+        if item_result is not None:
+            # 具体物料（Dough / Tomato / Cheese）只作用于该 item，避免同一
+            # 道菜的不同料被 material 级 dedupe 合并成一条命令。
+            scope, item_name = item_result
+            mode = "item"
+            done_item = item_name
+        else:
+            scope, scope_reason = build_scope(kitchen, action, resolved, mode)
+            if scope is None:
+                return {"ok": False, "action": action,
+                        "target": display or resolved or target_raw,
+                        "reason": scope_reason, "valid_targets": valid}
+            done_item = None
         if not resolved:
             feasible, _cands, _ctx, _pm, _cm = planner.feasible_candidates(
                 world, self.bb, self.book, command_scope=scope)
@@ -1010,8 +1019,9 @@ class Agent:
                     "target": display or resolved,
                     "reason": self._deliver_reason(world, self.book)}
         tick = self.bb.tick or 0
-        done_item = resolve_done_item(kitchen, action, resolved,
-                                      target_raw or resolved)
+        if done_item is None:
+            done_item = resolve_done_item(kitchen, action, resolved,
+                                          target_raw or resolved)
         result = self.commands.add(
             action, resolved, scope, tick, order_id=order_id,
             display_target=display or resolved,

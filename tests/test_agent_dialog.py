@@ -391,7 +391,8 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["execute_action", "cancel_action", "speak"]
+    assert names == ["execute_action", "cancel_action", "speak",
+                     "get_world_state"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
     assert "chop" in props["action"]["enum"]
 
@@ -436,13 +437,34 @@ def test_build_dialog_context_has_grounding_fields(dagent, world):
 
     from ai.dialog.llm import render_state
     state_text = render_state(ctx)
-    # 细节（灶内容/板内容/连击/临期单）不再进 state；只留摘要。
+    # 明细（订单/灶/板/盘/连击/临期单）都不再进快照；需要时用 get_world_state。
     assert "总分 135" in state_text
-    assert "灶：1 个在用，1 个空" in state_text
-    assert "砧板：0 块空，1 块有料" in state_text
+    assert "订单：1 个" in state_text
+    assert "灶：" not in state_text
+    assert "砧板：" not in state_text
+    assert "盘子：" not in state_text
     assert "切菜板" not in state_text
     assert "连击" not in state_text
     assert "快过期" not in state_text
+    assert "get_world_state" in state_text
+
+
+def test_world_state_tool_returns_fresh_details(agent, world):
+    """get_world_state 读当前帧的明细，不复用 2 Hz 快照。"""
+    world.plates = [{"n": "plate_01", "x": 1.0, "z": 2.0,
+                     "contents": []}]
+    results = agent._apply_duty_batch(
+        world, _batch(("get_world_state", {})))
+    assert len(results) == 1
+    out = results[0]
+    assert out["ok"] is True and out["observation"] is True
+    state = out["state"]
+    assert state["orders"][0]["dish"] == "CucumberSushi"
+    assert state["plates"][0]["n"] == "plate_01"
+    assert isinstance(state["cookers"], list)
+    assert isinstance(state["deliver"]["ready"], list)
+    assert state["deliver"]["feasible"] is False
+    assert isinstance(state["commands"], list)
 
 
 def test_context_p2_doing_uses_dag_node(dagent, world):

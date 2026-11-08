@@ -278,7 +278,8 @@ def test_render_ledger_text_with_action():
 def test_tool_schemas_new_protocol():
     tools = tool_schemas()
     names = [t["function"]["name"] for t in tools]
-    assert names == ["execute_action", "cancel_action", "speak"]
+    assert names == ["execute_action", "cancel_action", "speak",
+                     "get_world_state"]
     props = tools[0]["function"]["parameters"]["properties"]
     assert set(props["action"]["enum"]) == {
         "chop", "cook", "mix", "plate", "deliver", "wash", "fetch"}

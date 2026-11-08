@@ -367,6 +367,9 @@ def _tool_nudge(results):
     for result in results or ():
         if not isinstance(result, dict):
             continue
+        if result.get("observation"):
+            # get_world_state 的观察结果：只提供信息，不催 execute/speak。
+            continue
         if result.get("already_done"):
             notes.append("这一步已经完成；用 speak 告诉玩家。")
         elif result.get("ok") is False:

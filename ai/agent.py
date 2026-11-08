@@ -667,6 +667,8 @@ class Agent:
             elif name == "speak":
                 # 发言由 worker 播放；主循环只确认收到。
                 results.append({"ok": True})
+            elif name == "get_world_state":
+                results.append(self._world_state_result(world))
             elif name == "assign_action" and ACCEPT_LEGACY_TOOL_CALLS:
                 results.append(self._legacy_apply_action(world, args, batch))
             else:
@@ -723,6 +725,62 @@ class Agent:
         if not live:
             return "现在没有可送的订单"
         return "还没有装好的盘可送"
+
+    def _plates_detail(self, world, book):
+        # type: (World, Any) -> List[Dict]
+        """盘子明细（按需查询用）：数量少、只在 get_world_state 里给。"""
+        out = []  # type: List[Dict]
+        for plate in getattr(world, "plates", None) or ():
+            try:
+                tokens = sorted(book.plate_tokens(plate)) if book is not None \
+                    else [str(c).lower() for c in plate.get("contents") or ()]
+            except Exception:                   # noqa: BLE001
+                tokens = [str(c) for c in plate.get("contents") or ()]
+            out.append({
+                "n": plate.get("n"),
+                "contents": [_token_text(t) for t in tokens],
+                "x": plate.get("x"),
+                "z": plate.get("z"),
+                "held_by": plate.get("held_by"),
+            })
+        return out
+
+    def _world_state_result(self, world):
+        # type: (World) -> Dict
+        """get_world_state：直接读当前帧，不复用 2 Hz 的上下文快照。"""
+        book = self.book or RecipeBook(world.recipes, world.stations)
+        ctx = self._build_dialog_context(world)
+        deliver_ok = False
+        try:
+            feasible, _c, _ctx, _pm, _cm = planner.feasible_candidates(
+                world, self.bb, book,
+                command_scope=frozenset({("DeliverPlate", None)}))
+            deliver_ok = bool(feasible)
+        except Exception:                       # noqa: BLE001
+            log.exception("get_world_state：送餐可行性计算失败")
+        state = {
+            "time_left": ctx.get("time_left"),
+            "score": ctx.get("total"),
+            "deliveries": ctx.get("deliveries"),
+            "tips": ctx.get("tips"),
+            "orders": (ctx.get("orders") or [])[:8],
+            "cookers": (ctx.get("cookers") or [])[:8],
+            "plates": self._plates_detail(world, book)[:8],
+            "dirty_plates": ctx.get("dirty_plates"),
+            "boards": (ctx.get("boards") or [])[:8],
+            "you": ctx.get("p2"),
+            "teammate": ctx.get("p1"),
+            "you_can_do": (ctx.get("p2_options") or [])[:6],
+            "deliver": {
+                "ready": _ready_plates(
+                    world, book,
+                    planner._dialog_live_orders(world, self.bb))[:6],
+                "feasible": deliver_ok,
+            },
+            "commands": self.commands.snapshot(),
+            "last_result": self._last_command_result,
+        }
+        return {"ok": True, "observation": True, "state": state}
 
     @staticmethod
     def _fetch_destination(feasible):

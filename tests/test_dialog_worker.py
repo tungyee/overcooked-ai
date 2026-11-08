@@ -1222,3 +1222,11 @@ def test_execute_without_speak_forces_ack():
     assert bundle.tts.spoken == ["好，这就去切黄瓜"]
     assert llm.choices[1] == {"type": "function",
                               "function": {"name": "speak"}}
+
+
+def test_tool_nudge_ignores_world_state_observation():
+    """get_world_state 只提供信息：不能被当成 check 通过去催 execute。"""
+    assert worker_mod._tool_nudge(
+        [{"ok": True, "observation": True, "state": {}}]) == ""
+    # 普通 ok:true 仍按旧协议催 execute（check_action 启用时）。
+    assert "execute_action" in worker_mod._tool_nudge([{"ok": True}])

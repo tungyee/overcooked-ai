@@ -1,4 +1,4 @@
-【世界状态】（最近快照，可能滞后；动作是否可行、盘里有什么，以 execute_action 返回为准）{{ '\n' }}
+【世界状态】（最近快照，可能滞后；订单/灶/盘里有什么等明细用 get_world_state 查询，动作是否可行以 execute_action 返回为准）{{ '\n' }}
 {% if live is sameas false %}注意：游戏当前已暂停或不在关卡，你不能行动；只回话，不要调用动作工具。{{ '\n' }}{% endif %}
 {% if round_finished %}注意：本关已经结束。{{ '\n' }}{% endif %}
 {% if time_left is not none %}本关剩余 {{ time_left }} 秒。{{ '\n' }}{% endif %}
@@ -6,16 +6,10 @@
 {% if deliveries is not none %}已送 {{ deliveries }} 单。{{ '\n' }}{% endif %}
 {% if tips is not none %}小费 {{ tips }}。{{ '\n' }}{% endif %}
 {% if deductions %}漏单扣 {{ deductions }} 分。{{ '\n' }}{% endif %}
-{% if orders %}订单：{{ '\n' }}
-{% for o in orders %}- #{{ o.id }} {{ o.dish }} 剩 {{ o.remaining }} 秒{% if o.eta is not none %}，预计 {{ o.eta }} 秒能出{% endif %}{{ '\n' }}
-{% endfor %}{% else %}订单：无{{ '\n' }}{% endif %}
-{% if cookers %}灶：{{ cookers|length - (idle_cookers or 0) }} 个在用，{{ idle_cookers or 0 }} 个空{{ '\n' }}{% endif %}
-{% if boards %}砧板：{{ boards_empty }} 块空，{{ boards_busy }} 块有料{{ '\n' }}{% endif %}
-{% if plates %}盘子：{{ plates }}{{ '\n' }}{% endif %}
+订单：{{ orders|length }} 个{{ '\n' }}
 你：{% if you.doing %}正在{{ you.doing }}{% else %}暂时没事做{% endif %}{{ '\n' }}
 {% if you.stuck %}你卡住的原因：{{ you.stuck }}{{ '\n' }}{% endif %}
-{% if reachable.you or reachable.teammate %}你能做的动作（够得着的）：{{ reachable.you|join('、') or '无' }}{{ '\n' }}
-队友能做的动作：{{ reachable.teammate|join('、') or '无' }}{{ '\n' }}{% endif %}
+{% if reachable.you %}你能做的动作（够得着的）：{{ reachable.you|join('、') }}{{ '\n' }}{% endif %}
 你的当前命令：{{ '\n' }}
 {% if command %}- {{ command.label }}{% if command.target %} {{ command.target }}{% endif %}（{{ command.status }}{% if command.wait_reason %}：{{ command.wait_reason }}{% endif %}）{{ '\n' }}
 {% else %}- 无{{ '\n' }}{% endif %}

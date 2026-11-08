@@ -241,6 +241,7 @@ def test_system_message_carries_rules_and_dag():
     assert "AI 队友" in text
     assert "execute_action" in text
     assert "cancel_action" in text and "speak" in text
+    assert "get_world_state" in text
     assert "check_action" not in text
     assert "chop" in text and "cook" in text and "fetch" in text
     assert "Sushi_Cucumber = Cucumber" in text
@@ -265,11 +266,12 @@ def test_render_state_is_readable_and_in_seconds():
                     "impact": "挡住了你 2 个可做的活，已 12.0 秒；P1 手上：空手"}],
     })
     assert "剩余 99.0 秒" in text
-    assert "#1 Sushi_Fish 剩 18.1 秒" in text
-    assert "灶：1 个在用" in text
-    assert "在煮，40%" not in text          # 灶的详细内容不再进 state
-    assert "队友：手持" not in text
+    # 订单明细 / 灶 / 盘都容易滞后，不再进快照；用 get_world_state 查。
+    assert "订单：1 个" in text
+    assert "Sushi_Fish" not in text
+    assert "灶：" not in text and "砧板：" not in text and "盘子：" not in text
     assert "Chop:SushiFish" in text
+    assert "get_world_state" in text
 
 
 def test_speech_message_is_plain_transcript_on_one_line():
@@ -308,12 +310,13 @@ def test_assistant_and_tool_messages_round_trip():
 
 
 def test_render_state_includes_reachable_division():
-    """世界状态里要有「你能做的动作 / P1 能做的动作」，防止 LLM 抢够不着的活。"""
+    """世界状态里要有「你能做的动作」，防止 LLM 抢够不着的活。"""
     text = render_state({
         "division": {"p2_actions": ["切"], "p1_actions": ["下锅", "装盘", "送餐"]},
     })
     assert "你能做的动作（够得着的）：切" in text
-    assert "队友能做的动作：下锅、装盘、送餐" in text
+    # 队友能做什么同样是快照，容易被滞后信息误导，不再进 state。
+    assert "队友能做的动作" not in text
 
 
 def test_render_state_omits_division_when_none():
@@ -358,9 +361,10 @@ def test_state_does_not_warn_when_live():
     assert "游戏当前已暂停" not in msg["content"]
 
 def test_state_does_not_render_plate_contents():
-    """盘子只给数量；具体内容以 execute_action 结果为准，避免滞后误导。"""
+    """盘子明细容易滞后，不再进快照；需要时用 get_world_state。"""
     msg = state_message("speech", {
         "plates": "空盘 1 个；装了料的盘 1 个；脏盘 0 个",
     })
-    assert "装了料的盘 1 个" in msg["content"]
+    assert "空盘" not in msg["content"]
+    assert "装了料的盘" not in msg["content"]
     assert "pasta(熟)" not in msg["content"]

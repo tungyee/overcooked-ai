@@ -684,6 +684,18 @@ def tool_schemas(targets=None, duty_ids=None):
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_world_state",
+                "description": "读取最新世界状态：订单、灶、盘子内容、砧板、双方手持/动作、可做的动作。需要判断“好了没/还有什么/现在该做什么”时调用；不要每轮都调。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        },
     ]
     if not ENABLE_CHECK_ACTION:
         schemas = [s for s in schemas

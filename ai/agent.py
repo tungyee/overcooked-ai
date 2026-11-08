@@ -17,12 +17,16 @@ from ai.dialog.commands import (Command, CommandQueue, build_scope,
                                 command_done, command_failed, deliveries,
                                 dirty_count, resolve_done_item, resolve_target,
                                 scope_matches_task)
-from ai.dialog.duties import (ACCEPT_LEGACY_TOOL_CALLS, ENABLE_LEGACY_TOOLS,
-                              Kitchen, Ledger, TaskMeta, TOOL_ACTIONS,
-                              node_key, tool_schemas)
-from ai.dialog.help import cost_to, top_help_request
+from ai.dialog.cookbook import default_cookbook
+from ai.dialog.duties import (Kitchen, TaskMeta, TOOL_ACTIONS, node_key,
+                              tool_schemas)
+from ai.dialog.division import (DIVISION_ACTIONS, TOOL_ACTION_NAMES,
+                                TOOL_OWNER_NAMES, diff_entries,
+                                reach_signature, station_signature,
+                                tool_actions, validate_entry)
+from ai.dialog.help import cost_to
 from ai.dialog.policy import EventQueue
-from ai.dialog.schema import DialogState, preference_matches_task
+from ai.dialog.schema import DialogState
 from ai.revenue import eta as ETA
 from ai.space import (navigation, portals, reachability, regions, seam_clock,
                       seams, shuttle)
@@ -138,7 +142,6 @@ def _build_task_meta():
             shared=bool(getattr(cls, "SHARED", False)),
             station=getattr(cls, "STATION", None),
             rescue=planner._is_rescue_action(cls),
-            allowed_modes=getattr(cls, "DUTY_MODES", None),
         )
     return out
 
@@ -335,11 +338,6 @@ def _plates_text(world, book):
     return "；".join(parts)
 
 
-def _duty_tools(kitchen, ledger):
-    # type: (Kitchen, Ledger) -> List[dict]
-    return tool_schemas(kitchen.targets(), ledger.ids())
-
-
 def _ready_plates(world, book, live_orders):
     # type: (World, Any, Any) -> List[str]
     """已经配齐、可以送的盘（按订单去重）。"""
@@ -385,15 +383,12 @@ def _validate_action(kitchen, action, direction, world, bb):
     return True, ""
 
 
-# 就近不明确时的兜底分工：P2 守灶/盘（煮+装），P1 守砧板/搅拌（备）。
-_P2_DEFAULT_ACTIONS = ("下锅", "装盘")
-
-# 洗碗、送餐不进开局分工：它们被 assign 给 P1 会落 claim(-6)，P2 就避开了；
-# 保持「谁近谁做」，交给 planner 自由选。
-_OPEN_DIVISION_SKIP_ACTIONS = ("送餐", "洗盘")
-
-# 动作站点离一边近多少步才算「明显归这边」；否则走兜底默认分工。
-OPEN_DIVISION_PROXIMITY_STEPS = 6
+# 动态复核：每 1 秒检查一次。站点真的移动 → 连续 2 次确认；只是路被挡
+# → 连续 8 次确认。两次 review 至少隔 8 秒。
+DIVISION_CHECK_TICKS = 20
+DIVISION_FAST_CONFIRM = 2
+DIVISION_SLOW_CONFIRM = 8
+DIVISION_REVIEW_COOLDOWN_TICKS = 20 * 8
 
 
 def _min_interact_cost(world, bb, name, stations):
@@ -404,11 +399,11 @@ def _min_interact_cost(world, bb, name, stations):
     return min(costs) if costs else None
 
 
-def _reachable_actions(world, bb):
-    # type: (World, Blackboard) -> List[str]
-    """P2 够得着的动作（不看分工；送餐、洗盘也在内）。
+def _reachable_actions(world, bb, name=P.P2_NAME):
+    # type: (World, Blackboard, str) -> List[str]
+    """某位厨师够得着的动作（不看分工；送餐、洗盘也在内）。
 
-    只判「站点在本关存在且 P2 够得着」，不判此刻有没有活可干——
+    只判「站点在本关存在且够得着」，不判此刻有没有活可干——
     有没有脏盘、有没有装好的盘，由 get_world_state 和 execute_actions 返回。
     """
     out = []
@@ -416,61 +411,10 @@ def _reachable_actions(world, bb):
         stations = [st for st in world.stations if st.get("t") == station_type]
         if not stations:
             continue
-        if _min_interact_cost(world, bb, P.P2_NAME, stations) is None:
+        if _min_interact_cost(world, bb, name, stations) is None:
             continue
         out.append(action)
     return out
-
-
-def _open_division_payload(world, bb):
-    # type: (World, Blackboard) -> Optional[Dict[str, List[str]]]
-    """本关「动作→边」切分；只有不到两个可分工动作时才返回 None。
-
-    就近聚类为主：一边够不着归另一边（硬分裂）；两边都够得着时，明显近的一边
-    认领；就近不明确的动作用兜底默认分工（P2 煮装、P1 切拌），保证连通图
-    也总能开一次分工。洗碗、送餐不参与分工（谁近谁做）。
-    """
-    p1_actions, p2_actions = [], []
-    for action, station_type in ACTION_STATION_TYPES.items():
-        if action in _OPEN_DIVISION_SKIP_ACTIONS:
-            continue
-        stations = [st for st in world.stations if st.get("t") == station_type]
-        if not stations:
-            continue
-        p1 = _min_interact_cost(world, bb, P.P1_NAME, stations)
-        p2 = _min_interact_cost(world, bb, P.P2_NAME, stations)
-        if p1 is None and p2 is None:
-            continue
-        if p1 is None:
-            p2_actions.append(action)
-        elif p2 is None:
-            p1_actions.append(action)
-        elif p1 + OPEN_DIVISION_PROXIMITY_STEPS <= p2:
-            p1_actions.append(action)
-        elif p2 + OPEN_DIVISION_PROXIMITY_STEPS <= p1:
-            p2_actions.append(action)
-        else:
-            target = p2_actions if action in _P2_DEFAULT_ACTIONS else p1_actions
-            target.append(action)
-    if p1_actions and p2_actions:
-        return {"p1_actions": p1_actions, "p2_actions": p2_actions}
-    # 只有一边有活：至少两个动作时硬挪一个过去，保证两边都有分工。
-    if len(p1_actions) + len(p2_actions) >= 2:
-        if not p1_actions:
-            p1_actions.append(p2_actions.pop())
-        else:
-            p2_actions.append(p1_actions.pop())
-        return {"p1_actions": p1_actions, "p2_actions": p2_actions}
-    return None
-
-
-def _maybe_open_division(world, bb):
-    # type: (World, Blackboard) -> Optional[Tuple[str, Dict]]
-    """开局分工事件：有切分返回 ("open_division", payload)，否则 None。"""
-    payload = _open_division_payload(world, bb)
-    if payload is None:
-        return None
-    return ("open_division", payload)
 
 
 def _option_text(task):
@@ -607,8 +551,14 @@ class Agent:
         self._round_summary_fired = False  # 结束总结只发一次
         self._round_started = False        # 计时器是否跑过（区分未开局/已结束）
         self._last_ranked = []         # 上一拍 planner 打分前几名（给 LLM 看）
-        # 分工账本：旧持久分工保留代码；新工具不再暴露 assign_action。
-        self.ledger = Ledger()
+        # 分工：只由 LLM 的 set_division 工具写入；这里只存本关攻略和复核状态。
+        self._guide = None
+        self._division_station_sig = None
+        self._division_reach_sig = None
+        self._division_pending = 0
+        self._division_last_review_tick = 0
+        self._division_last_check_tick = 0
+        self._division_initial_fired = False
         # 临时命令队列（新工具协议）：planner 只跑当前命令的 scope。
         self.commands = CommandQueue()
         self._last_command_result = None
@@ -669,9 +619,8 @@ class Agent:
         # type: (World, Any) -> List[Dict]
         """一轮 LLM 工具调用 → 逐条落地，返回给 LLM 的结果。
 
-        新协议：execute_actions / cancel_action / speak / get_world_state。
-        旧 execute_action 保留 handler 兼容旧 trace/回放，不再暴露给模型。
-        旧的 assign_action 保留代码，只在 ENABLE_LEGACY_TOOLS 时可用。
+        新协议：execute_actions / cancel_action / speak / get_world_state /
+        set_division / read_cookbook。
         """
         results = []  # type: List[Dict]
         for name, args in getattr(batch, "calls", None) or ():
@@ -692,28 +641,101 @@ class Agent:
                 results.append({"ok": True})
             elif name == "get_world_state":
                 results.append(self._world_state_result(world))
-            elif name == "assign_action" and ACCEPT_LEGACY_TOOL_CALLS:
-                results.append(self._legacy_apply_action(world, args, batch))
+            elif name == "set_division":
+                results.append(self._set_division(world, args))
+            elif name == "read_cookbook":
+                results.append(self._read_cookbook(args))
             else:
                 results.append({"ok": False, "reason": "未知工具：%s" % (name,)})
-        self._sync_duty_preferences()
+        self._sync_division_preferences()
         return results
 
-    def _legacy_apply_action(self, world, args, batch):
-        # type: (World, Any, Any) -> Dict
-        """旧 assign_action 的落地逻辑，保留给回滚/回放。"""
+    def _division_tool_actions(self, world):
+        # type: (World) -> List[str]
+        return tool_actions(world.stations)
+
+    def _set_division(self, world, args):
+        # type: (World, Any) -> Dict
+        """LLM 的 set_division 落地：校验、写入、返回变更。"""
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "参数必须是对象"}
+        allowed = self._division_tool_actions(world)
+        if not allowed:
+            return {"ok": False, "reason": "本关没有可分工的动作"}
         kitchen = self._kitchen(world)
-        tick = self.bb.tick or 0
-        if isinstance(args, dict) and args.get("op") != "cancel":
-            action = args.get("action")
-            direction = args.get("direction") or "P2"
-            if action is not None:
-                ok, reason = _validate_action(kitchen, action, direction,
-                                              world, self.bb)
-                if not ok:
-                    return {"ok": False, "reason": reason}
-        return self.ledger.apply(args, None, tick,
-                                 source=getattr(batch, "source", ""))
+        book = self.book or RecipeBook(world.recipes, world.stations)
+        before = self.bb.division.copy()
+        rejected = []  # type: List[Dict]
+        applied = []  # type: List[Dict]
+
+        def _clear(action_tool):
+            action = TOOL_ACTION_NAMES.get(str(action_tool or "").strip())
+            if action not in DIVISION_ACTIONS:
+                rejected.append({"action": action_tool,
+                                 "reason": "本关不开放这个分工动作"})
+                return
+            self.bb.division.clear(action)
+
+        if args.get("clear_all") is True:
+            self.bb.division.clear_all()
+        clear = args.get("clear") or []
+        if isinstance(clear, str):
+            clear = [clear]
+        for action_tool in clear:
+            _clear(action_tool)
+
+        assignments = args.get("assignments") or []
+        if isinstance(assignments, dict):
+            assignments = [assignments]
+        for row in assignments:
+            if not isinstance(row, dict):
+                rejected.append({"reason": "assignments 里每项必须是对象"})
+                continue
+            action_tool = row.get("action")
+            owner_tool = row.get("owner")
+            item = row.get("item")
+            ok, reason, warning = validate_entry(
+                world, self.bb, kitchen, book, action_tool, owner_tool, item)
+            action = TOOL_ACTION_NAMES.get(str(action_tool or "").strip())
+            if not ok:
+                rejected.append({"action": action_tool,
+                                 "owner": owner_tool, "item": item,
+                                 "reason": reason})
+                continue
+            owner = TOOL_OWNER_NAMES.get(str(owner_tool or "").strip())
+            self.bb.division.set(action, owner, item)
+            row_out = {"ok": True, "action": action_tool,
+                       "owner": owner_tool, "item": item or None}
+            if warning:
+                row_out["warning"] = warning
+            applied.append(row_out)
+
+        changed = diff_entries(before, self.bb.division)
+        self._sync_division_preferences()
+        out = {
+            "tool": "set_division",
+            "ok": bool(applied) or not rejected,
+            "division": self.bb.division.snapshot(),
+            "changed": changed,
+            "division_changed": bool(changed),
+            "results": applied,
+            "rejected": rejected,
+        }
+        if rejected:
+            out["reason"] = "；".join(r.get("reason") or "" for r in rejected)
+        return out
+
+    def _read_cookbook(self, args):
+        # type: (Any) -> Dict
+        if self._guide is None:
+            return {"ok": False, "reason": "本关没有攻略"}
+        section = str((args or {}).get("section") or "summary").strip()
+        text = self._guide.section(section)
+        if not text:
+            return {"tool": "read_cookbook", "ok": False,
+                    "reason": "攻略没有这一节：%s" % (section,)}
+        return {"tool": "read_cookbook", "ok": True,
+                "section": section, "text": text}
 
     # ------------------------------------------------------------ 新工具
 
@@ -1020,47 +1042,104 @@ class Agent:
             self.bb.hold_until = (self.bb.tick or 0) + 5 * 20
         return result
 
-    def _sync_duty_preferences(self):
+    def _sync_division_preferences(self):
         # type: () -> None
-        """账本是唯一事实来源：重编 `bb.preferences`，并让新约定立刻作用到承诺。
+        """分工表是唯一事实来源：重编 `bb.preferences`。"""
+        self.bb.preferences[:] = self.bb.division.preferences()
 
-        新的 stop 命中 P2 当前承诺 → 清承诺（救援动作豁免，与 planner
-        `_clear_claimed_commitment` 同口径）。leave_to_p1 是软偏好，不中断
-        已经在做的差事，后续重规划时自然倾向别的活。
-        """
-        prefs = self.ledger.preferences()
-        self.bb.preferences[:] = prefs
-        commitment = self.bb.commitment
-        active = getattr(commitment, "active_task", None) if commitment else None
-        # 救援动作不清承诺：与 planner `_clear_claimed_commitment` 同一口径。
-        if active is None or planner._is_rescue_action(active):
+    def _load_guide(self, level):
+        # type: (Any) -> None
+        """换关加载攻略；失败不影响主循环。"""
+        try:
+            self._guide = default_cookbook().resolve(level)
+        except Exception:                       # noqa: BLE001
+            log.exception("加载攻略失败：%s", level)
+            self._guide = None
+        if self._guide is None:
+            log.info("本关没有攻略：%s", level)
+
+    def _reset_division_state(self):
+        # type: () -> None
+        """换关/首次观察：清空分工与复核状态。"""
+        self.bb.division = self.bb.division.__class__()
+        self.bb.preferences[:] = []
+        self._division_station_sig = None
+        self._division_reach_sig = None
+        self._division_pending = 0
+        self._division_last_review_tick = 0
+        self._division_last_check_tick = 0
+        self._division_initial_fired = False
+
+    def _division_facts(self, world):
+        # type: (World) -> str
+        """开局/复核事件里的站位与可达动作事实（不是建议）。"""
+        p1 = _reachable_actions(world, self.bb, P.P1_NAME)
+        p2 = _reachable_actions(world, self.bb, P.P2_NAME)
+        parts = ["你能做：%s。" % ("、".join(p2) or "无"),
+                 "玩家能做：%s。" % ("、".join(p1) or "无")]
+        p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
+        p2_chef = P.chef_by_name(world.chefs, P.P2_NAME)
+        if p1_chef and p2_chef:
+            parts.append("你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
+                float(p2_chef.get("x") or 0), float(p2_chef.get("z") or 0),
+                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0)))
+        return "".join(parts)
+
+    def _reach_change_text(self, old_sig, new_sig):
+        # type: (Any, Any) -> str
+        old_map = {row[0]: (row[1], row[2]) for row in (old_sig or ())}
+        new_map = {row[0]: (row[1], row[2]) for row in (new_sig or ())}
+        changes = []  # type: List[str]
+        for action in sorted(set(old_map) | set(new_map)):
+            before = old_map.get(action, (False, False))
+            after = new_map.get(action, (False, False))
+            if before == after:
+                continue
+            changes.append("%s：玩家%s、你%s" % (
+                action,
+                "能" if after[0] else "不能",
+                "能" if after[1] else "不能"))
+        return "；".join(changes)
+
+    def _update_division(self, world, events, tick):
+        # type: (World, list, int) -> None
+        """开局分工 + 动态复核；可达性不变就不叫 LLM。"""
+        if not self._division_initial_fired:
+            self._division_initial_fired = True
+            self._division_station_sig = station_signature(world)
+            self._division_reach_sig = reach_signature(world, self.bb)
+            self._division_last_check_tick = tick
+            events.append(("division", {"facts": self._division_facts(world)}))
             return
-        if planner._rescue_hold_live(self.bb, active):
+        if tick - self._division_last_check_tick < DIVISION_CHECK_TICKS:
             return
-        for pref in prefs:
-            if pref.kind == "stop" and \
-                    preference_matches_task(pref, active):
-                commitment.active_task = None
-                commitment.infeasible_streak = 0
-                return
-
-    def _land_open_division(self, payload, tick):
-        # type: (Dict, int) -> None
-        """把开局分工直接写进账本：P2 动作 assign(P2)、P1 动作 assign(P1)。
-
-        open_division 之前只是「口头建议」，等 P1 确认才落地；现在一开口就
-        落成软偏好（P2 direct、P1 claim），planner 本拍立刻跟着分工走。
-        """
-        for action in (payload.get("p2_actions") or []):
-            self.ledger.apply(
-                {"op": "add", "mode": "assign", "action": action,
-                 "direction": "P2"},
-                None, tick, source="open_division")
-        for action in (payload.get("p1_actions") or []):
-            self.ledger.apply(
-                {"op": "add", "mode": "assign", "action": action,
-                 "direction": "P1"},
-                None, tick, source="open_division")
+        self._division_last_check_tick = tick
+        station_sig = station_signature(world)
+        reach_sig = reach_signature(world, self.bb)
+        if reach_sig == self._division_reach_sig:
+            self._division_pending = 0
+            self._division_station_sig = station_sig
+            return
+        self._division_pending += 1
+        station_moved = station_sig != self._division_station_sig
+        need = DIVISION_FAST_CONFIRM if station_moved else DIVISION_SLOW_CONFIRM
+        if self._division_pending < need:
+            return
+        if tick - self._division_last_review_tick < DIVISION_REVIEW_COOLDOWN_TICKS:
+            return
+        old_sig = self._division_reach_sig
+        self._division_pending = 0
+        self._division_station_sig = station_sig
+        self._division_reach_sig = reach_sig
+        self._division_last_review_tick = tick
+        change = self._reach_change_text(old_sig, reach_sig)
+        facts = ("%s。%s" % (change, self._division_facts(world))
+                 if change else self._division_facts(world))
+        events.append(("division_review", {
+            "facts": facts,
+            "current": self.bb.division.render() or "（空）",
+            "station_moved": bool(station_moved),
+        }))
 
     def _dialog_matches(self, world, book):
         # type: (World, RecipeBook) -> Tuple[list, Dict, Dict]
@@ -1071,27 +1150,6 @@ class Agent:
         cooker_match = planner._match_cookers_to_orders(
             world, self.bb, book, plate_match, orders=live_orders)
         return live_orders, plate_match, cooker_match
-
-    def _maybe_request_help(self, world, book):
-        # type: (World, RecipeBook) -> Optional[Dict]
-        """P2 做不了/赶不及的步骤 → 落挪走 duty，返回 help_request 事件 payload。
-
-        4 秒冷却（每次最多一条）；top_help_request 已按账本里 help_request
-        duty 去重，所以同 (料/站) 不重复喊。触发只两类：结构性（P2 够不着）
-        与赶不及救锅，见 `ai/dialog/help.py`。
-        """
-        tick = self.bb.tick or 0
-        if tick - getattr(self, "_last_help_request_tick", 0) < 80:
-            return None
-        live_orders, plate_match, cooker_match = self._dialog_matches(world, book)
-        step = top_help_request(world, self.bb, book, live_orders,
-                                plate_match, cooker_match, self.ledger)
-        if step is None:
-            return None
-        self.ledger.add_help_request(step.task_type, step.item, tick)
-        self._sync_duty_preferences()      # 挪走立刻落成 claim 偏好，本拍规划可见
-        self._last_help_request_tick = tick
-        return {"task_type": step.task_type, "item": step.item}
 
     def _maybe_reset_dialog_level(self, world):
         # type: (World) -> None
@@ -1110,19 +1168,21 @@ class Agent:
         key = (raw.get("session_id"), raw.get("scene_epoch"), level)
         if self._dialog_scene_key is None:
             self._dialog_scene_key = key
+            self._load_guide(level)
+            self._reset_division_state()
             self._log_dialog_level_start(level)
             return
         if key == self._dialog_scene_key:
             return
         self._dialog_scene_key = key
         self._log_dialog_level_start(level)
-        self.ledger.clear()
+        self._load_guide(level)
+        self._reset_division_state()
         self.commands.clear()
         self._last_command_result = None
         self.bb.command_scope = None
         self.bb.command_id = None
         self.bb.hold_until = 0
-        self.bb.preferences[:] = []
         self.bb.dialog = DialogState()
         self.bb.abandoned_orders = {}
         self.bb.rescue_cooldown_until = 0
@@ -1130,7 +1190,6 @@ class Agent:
         self._last_seconds_fired = False
         self._round_summary_fired = False
         self._round_started = False
-        self._open_division_fired = False
         # 上一关遗留的批次和 ack 必须丢掉：它们代表旧 World 上的决定。
         self._drain_dialog_queues()
         reset = getattr(self.dialog_worker, "reset_state", None)
@@ -1319,16 +1378,7 @@ class Agent:
         events = []  # type: list
         tick = self.bb.tick or 0
 
-        # 开局分工：旧的持久分工入口，暂不暴露给模型。
-        if ENABLE_LEGACY_TOOLS and not getattr(self, "_open_division_fired", False):
-            self._open_division_fired = True
-            event = _maybe_open_division(world, self.bb)
-            if event is not None:
-                self._land_open_division(event[1], tick)
-                self._sync_duty_preferences()
-                events.append(event)
-
-        # ② drain 工具批次 → 账本落地 → 逐条结果回 worker
+        # ② drain 工具批次 → 分工落地 → 逐条结果回 worker
         while True:
             try:
                 batch = self.cmd_q.get_nowait()
@@ -1348,19 +1398,14 @@ class Agent:
                 "batch_id": getattr(batch, "batch_id", None),
                 "results": results,
                 "commands": self.commands.snapshot(),
-                "duties": self.ledger.snapshot(tick),
+                "division": self.bb.division.snapshot(),
             })
 
-        # ③ 到期：stop 30 秒解除；放弃订单 60 秒恢复。
-        if self.ledger.prune(tick):
-            self._sync_duty_preferences()
+        # ③ 放弃订单 60 秒恢复。
         self.bb.abandoned_orders = {
             oid: expiry for oid, expiry in self.bb.abandoned_orders.items()
             if expiry > tick
         }
-
-        # ④ 新菜谱事件已移除（open_division 取代它：分工由开局切分 + 求助覆盖）。
-        book = self.book or RecipeBook(world.recipes, world.stations)
 
         # ④.5 临结束提醒：最后 10 秒发一次（结束总结在 _tick_once 的等待分支里，
         # 因为 round_finished 时本函数已不会被执行）。
@@ -1370,11 +1415,8 @@ class Agent:
             self._last_seconds_fired = True
             events.append(("last_seconds", None))
 
-        # ④.6 求助：旧的持久分工入口，暂不暴露给模型。
-        if ENABLE_LEGACY_TOOLS:
-            help_payload = self._maybe_request_help(world, book)
-            if help_payload is not None:
-                events.append(("help_request", help_payload))
+        # ④.6 开局分工 / 动态复核：只在需要时叫 LLM。
+        self._update_division(world, events, tick)
 
         # 同一拍的事件合成一段对话：单个直接发，多个合并成 batch，worker 一次说完。
         if events:
@@ -1397,7 +1439,7 @@ class Agent:
         if events:
             record["event"] = events[-1] if len(events) == 1 else events
         record["commands"] = self.commands.snapshot()
-        record["duties"] = self.ledger.snapshot(tick)
+        record["division"] = self.bb.division.snapshot()
         return record
 
     def _put_ack(self, ack):
@@ -1464,7 +1506,11 @@ class Agent:
                       if scope_matches_task(current_command.scope, task)]
         options = [_option_text(task) for task in ranked[:6]]
 
-        tools = tool_schemas()
+        p2_reachable = _reachable_actions(world, self.bb)
+        p1_reachable = _reachable_actions(world, self.bb, P.P1_NAME)
+        tools = tool_schemas(
+            self._division_tool_actions(world),
+            with_cookbook=self._guide is not None)
         return {
             "level": getattr(world, "level", None),
             "live": bool(getattr(world, "phase", None) == "level"
@@ -1496,19 +1542,16 @@ class Agent:
             "queue": self.commands.pending(),
             "last_result": self._last_command_result,
             "commands": self.commands.snapshot(),
-            "duties": self.ledger.snapshot(tick),
             "dag": kitchen.render(),
-            "division": _open_division_payload(world, self.bb),
-            "p2_reachable_actions": _reachable_actions(world, self.bb),
+            "guide": self._guide.summary() if self._guide is not None else "",
+            "division_text": self.bb.division.render(),
+            "reachable_actions": {"p2_actions": p2_reachable,
+                                  "p1_actions": p1_reachable},
+            "p2_reachable_actions": p2_reachable,
             "dish_dags": {dish: kitchen.render([dish], shared=False)
                           for dish in kitchen.dags},
             "tools": tools,
         }
-
-    def _duty_rows(self, world, kitchen, tick):
-        # type: (World, Optional[Kitchen], int) -> List[Dict]
-        """账本快照，供 LLM 看到当前分工。"""
-        return self.ledger.snapshot(tick)
 
     def _tick_once(self, world):
         # type: (World) -> None
@@ -1729,11 +1772,6 @@ class Agent:
         if status == "success":
             success_task = chosen_task  # 保存成功的 task（trace 记录用）
             self._note_success(chosen_task)
-            # 「做」（now）落实成功才消费：失败不删，now 的紧迫性保留到下次重试。
-            # 执行期间由 planner 层去抖兜住（当前承诺命中 now 时闸不再抢选），
-            # 这里只做终态消费（一次性删除，不持久）。
-            if chosen_task and self.ledger.consume_now(chosen_task):
-                self.bb.preferences[:] = self.ledger.preferences()
             if chosen_task and hasattr(chosen_task, "claims"):
                 for res_id, action in chosen_task.claims():
                     self.bb.claims.pop((res_id, action), None)
@@ -1831,9 +1869,6 @@ class Agent:
         if self._scene_key is not None and (key != self._scene_key or self._left_level):
             self.executor_inst.halt_and_discard()
             self.bb = Blackboard()
-            # 黑板整体换新：账本是 bb.preferences 的唯一来源，必须一起清，
-            # 否则下一次同步会把上一局的约定编回新黑板。
-            self.ledger.clear()
             self.commands.clear()
             self._last_command_result = None
             self._failures = FailureHistory(ABANDON_FAIL_STREAK, ABANDON_TTL_TICKS)

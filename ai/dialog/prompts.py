@@ -25,9 +25,10 @@ def action_label(action):
     return ACTION_LABELS.get(str(action or ""), str(action or ""))
 
 
-def render_system(dag):
-    # type: (str) -> str
-    return _ENV.get_template("system.j2").render(dag=dag or "")
+def render_system(dag, guide=""):
+    # type: (str, str) -> str
+    return _ENV.get_template("system.j2").render(
+        dag=dag or "", guide=guide or "")
 
 
 def command_view(command):
@@ -66,9 +67,10 @@ def state_view(context, commands=None, last_result=None):
             current = active
         if not queue:
             queue = commands.pending()
+    reachable = ctx.get("reachable_actions") or {}
     reachable_you = ctx.get("p2_reachable_actions")
     if reachable_you is None:
-        reachable_you = (ctx.get("division") or {}).get("p2_actions") or []
+        reachable_you = reachable.get("p2_actions") or []
     last = last_result or ctx.get("last_result")
     if isinstance(last, dict):
         # 成功结果没有 reason；模板用 StrictUndefined，必须补齐。
@@ -118,13 +120,14 @@ def state_view(context, commands=None, last_result=None):
         },
         "reachable": {
             "you": list(reachable_you),
-            "teammate": (ctx.get("division") or {}).get("p1_actions") or [],
+            "teammate": reachable.get("p1_actions") or [],
         },
         "options": ctx.get("p2_options") or [],
         "command": command_view(current),
         "queue": [command_view(c) for c in queue],
         "last_result": last,
         "responsibilities": ctx.get("responsibilities"),
+        "division": ctx.get("division_text"),
     }
 
 

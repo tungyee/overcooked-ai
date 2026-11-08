@@ -52,6 +52,20 @@ ACTION_STATION_TYPES = {
     "洗盘": "washing",
 }  # type: Dict[str, str]
 
+# 工具协议里的英文动作名；只用于 LLM 可见的 schema/返回值。
+ACTION_TOOL_NAMES = {
+    "切": "chop",
+    "下锅": "cook",
+    "拌": "mix",
+    "装盘": "plate",
+    "送餐": "deliver",
+    "洗盘": "wash",
+}  # type: Dict[str, str]
+TOOL_ACTION_NAMES = {name: action for action, name in ACTION_TOOL_NAMES.items()}
+
+# 送餐/洗盘不落分工：谁近谁做，交给 planner 自由选。
+DIVISION_ACTIONS = ("切", "下锅", "拌", "装盘")  # type: Tuple[str, ...]
+
 _TASK_TO_ACTION = {}  # type: Dict[str, str]
 for _action, _types in ACTION_TASK_TYPES.items():
     for _t in _types:

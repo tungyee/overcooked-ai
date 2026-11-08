@@ -10,7 +10,6 @@ import pytest
 
 from ai import tasks as T
 from ai.core import planner
-from ai.dialog.duties import WEIGHT_NOW, Kitchen, Ledger
 from ai.dialog.schema import Preference
 from ai.query.recipes import RecipeBook
 from ai.state.blackboard import Blackboard

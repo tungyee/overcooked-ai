@@ -496,18 +496,3 @@ def sushi_world():
     with gzip.open(DIALOG_FIXTURE, "rt") as fh:
         frame = [json.loads(line) for line in fh][-1]
     return World(frame)
-
-
-def test_open_division_on_split_map(rapids_world):
-    from ai.agent import _maybe_open_division
-    event = _maybe_open_division(rapids_world, Blackboard())
-    assert event is not None
-    assert event[0] == "open_division"
-    assert "切" in event[1]["p2_actions"]
-    assert "下锅" in event[1]["p1_actions"]
-
-
-def test_no_open_division_on_connected_map(sushi_world):
-    from ai.agent import _maybe_open_division
-    event = _maybe_open_division(sushi_world, Blackboard())
-    assert event is None

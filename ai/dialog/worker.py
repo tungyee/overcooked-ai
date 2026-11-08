@@ -379,6 +379,12 @@ def _tool_nudge(results):
         if result.get("observation"):
             # get_world_state 的观察结果：只提供信息，不催 execute/speak。
             continue
+        if result.get("tool") in ("set_division", "read_cookbook"):
+            # 分工/攻略查询不是执行动作；成功时不要催 execute_actions。
+            if result.get("ok") is False:
+                notes.append("工具返回失败：必须调用 speak 说明原因，"
+                             "不要用 content 回答。")
+            continue
         if result.get("already_done"):
             notes.append("这一步已经完成；用 speak 告诉玩家。")
         elif result.get("ok") is False:
@@ -400,8 +406,8 @@ _SPEAK_TAG_RE = re.compile(r"<speak>\s*(.*?)\s*</speak>", re.S)
 # 只有纯播报类事件才兜底播放标签内容；speech 回合仍只告警——那里
 # 「好，我去洗碗」可能对应根本没派发的动作，不能念出去。
 _SPEAK_TAG_EVENTS = frozenset((
-    "last_seconds", "round_summary", "open_division", "help_request",
-    "checkin", "batch", "command_result", "new_order",
+    "last_seconds", "round_summary", "checkin", "batch",
+    "command_result", "new_order", "division", "division_review",
 ))
 
 
@@ -434,13 +440,12 @@ def _event_detail(name, payload):
             return "你派发的命令失败了：%s %s，原因：%s" % (
                 label, target, reason or "执行失败")
         return "你派发的命令完成了：%s %s" % (label, target)
-    if name == "open_division":
-        return "开局分工建议：你负责 %s；队友负责 %s" % (
-            "、".join(payload.get("p2_actions") or []),
-            "、".join(payload.get("p1_actions") or []))
-    if name == "help_request":
-        return "要请队友帮忙的这一步：%s（%s）" % (
-            payload.get("task_type"), payload.get("item") or "")
+    if name == "division":
+        return payload.get("facts") or ""
+    if name == "division_review":
+        facts = payload.get("facts") or ""
+        current = payload.get("current") or ""
+        return "变化：%s 当前分工：%s" % (facts, current or "（空）")
     return ""
 
 
@@ -1242,13 +1247,15 @@ class DialogWorker(object):
             detail = "\n".join(_event_detail(n, p) for n, p in (payload or []))
             failed = any(isinstance(p, dict) and p.get("status") == "failed"
                          for _n, p in (payload or []))
+            silent = any(n == "division_review" for n, _p in (payload or []))
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
             self._run_llm(context, name, "", timing=timing,
-                          event_detail=detail, failed=failed)
+                          event_detail=detail, failed=failed,
+                          silent_review=silent)
             return
-        if name in ("open_division", "help_request"):
+        if name in ("division", "division_review"):
             detail = _event_detail(name, payload)
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
@@ -1349,7 +1356,8 @@ class DialogWorker(object):
                                 started=time.monotonic())
         else:
             timing.event = event
-        head = [system_message(context.get("dag") or "")]
+        head = [system_message(context.get("dag") or "",
+                               context.get("guide") or "")]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)
@@ -1433,8 +1441,9 @@ class DialogWorker(object):
 
 
     def _run_llm(self, context, event, transcript, new_orders=None,
-                 timing=None, event_detail="", failed=False):
-        # type: (dict, str, str, Any, Any, str, bool) -> None
+                 timing=None, event_detail="", failed=False,
+                 silent_review=None):
+        # type: (dict, str, str, Any, Any, str, bool, Any) -> None
         """一轮对话：多轮工具调用，直到模型不再需要动作或给出 speak。
 
         新协议：
@@ -1447,8 +1456,8 @@ class DialogWorker(object):
         """
         tools = (context or {}).get("tools") or None
         if not tools or _tools_include(tools, "assign_action"):
-            # 兼容旧测试/回放：没带新工具或仍带旧 assign_action 时走两段式。
-            # 线上每轮都带新工具（tool_schemas），不会走这里。
+            # 兼容旧 trace/回放：没有工具定义或仍带旧 assign_action 时走两段式；
+            # 线上每轮都带 tool_schemas，不会走这里。
             return self._run_llm_legacy(
                 context, event, transcript, new_orders=new_orders,
                 timing=timing, event_detail=event_detail, failed=failed)
@@ -1465,7 +1474,8 @@ class DialogWorker(object):
                                 started=time.monotonic())
         else:
             timing.event = event
-        head = [system_message(context.get("dag") or "")]
+        head = [system_message(context.get("dag") or "",
+                               context.get("guide") or "")]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)
@@ -1486,6 +1496,13 @@ class DialogWorker(object):
         turn_messages = [opener]
         last_results = []
         force_speak = False
+        # 动态分工复核：模型不改分工就不该出声。台词先缓冲，只有
+        # set_division 真的改了分工才交给 TTS。batch 里含 review 也一样。
+        if silent_review is None:
+            silent_review = event == "division_review"
+        silent_review = bool(silent_review)
+        buffered_speech = []  # type: list
+        division_changed = False
         for turn_index in range(MAX_AGENT_TURNS):
             forced = force_speak
             force_speak = False
@@ -1516,7 +1533,10 @@ class DialogWorker(object):
                     log.warning("模型把发言写成了 <speak> 标签"
                                 "（event=%s stage=turn%d）：%r",
                                 event, turn_index, reply.content)
-                    stream.feed(tag_text)
+                    if silent_review:
+                        buffered_speech.append(tag_text)
+                    else:
+                        stream.feed(tag_text)
                 else:
                     log.warning("本轮没有调用任何工具"
                                 "（event=%s stage=turn%d）：%r",
@@ -1538,6 +1558,9 @@ class DialogWorker(object):
                     messages.append(tool_msg)
                     turn_messages.append(tool_msg)
                 last_results = action_results
+                for result in action_results:
+                    if isinstance(result, dict) and result.get("division_changed"):
+                        division_changed = True
             for call in speak_calls:
                 tool_msg = tool_message(call.id, {"ok": True})
                 messages.append(tool_msg)
@@ -1555,8 +1578,11 @@ class DialogWorker(object):
                 isinstance(result, dict) and result.get("ok") is False
                 for result in action_results)
             if texts and not rejected:
-                for text in texts:
-                    stream.feed(text)
+                if silent_review:
+                    buffered_speech.extend(texts)
+                else:
+                    for text in texts:
+                        stream.feed(text)
             if rejected:
                 # 不播“好，这就去”这类乐观台词；下一轮强制 speak 说真实原因。
                 force_speak = True
@@ -1579,6 +1605,9 @@ class DialogWorker(object):
                     continue
                 break
             # 只有 check_action：继续下一轮，让模型决定 execute/speak。
+        if silent_review and division_changed:
+            for text in buffered_speech:
+                stream.feed(text)
         turn = turn_messages
         self._remember(state_obj, turn)
         timing.llm_done_at = time.monotonic()
@@ -1597,6 +1626,8 @@ class DialogWorker(object):
             outcome = "tts_error"
         elif stream.text_seen.strip():
             outcome = "ok"
+        elif silent_review and buffered_speech and not division_changed:
+            outcome = "silent"
         elif last_results and any(
                 isinstance(result, dict) and result.get("ok") is False
                 for result in last_results):

@@ -1,0 +1,299 @@
+# -*- coding: utf-8 -*-
+"""分工表：动作/物料 → 谁负责。
+
+分工的唯一写入入口是 LLM 的 `set_division` 工具；主循环不再自己猜。
+本模块只做三件事：
+
+- `DivisionState`：存 `(动作, 物料)` 的归属，编译成 planner 的 `Preference`；
+- `station_signature` / `reach_signature`：动态地图复核用的两级签名；
+- `validate_entry`：工具落地的物理校验（动作/物料/可达性）。
+
+送餐和洗盘不在分工里：它们谁近谁做，交给 planner 自由选。
+"""
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from ai.dialog.actions import (ACTION_STATION_TYPES, ACTION_TOOL_NAMES,
+                               DIVISION_ACTIONS, TOOL_ACTION_NAMES,
+                               action_scope)
+from ai.dialog.schema import Preference
+from ai.query import predicates as P
+
+OWNER_YOU = "P2"
+OWNER_PLAYER = "P1"
+OWNER_BOTH = "BOTH"
+
+OWNER_TOOL_NAMES = {
+    OWNER_YOU: "you",
+    OWNER_PLAYER: "player",
+    OWNER_BOTH: "both",
+}  # type: Dict[str, str]
+TOOL_OWNER_NAMES = {v: k for k, v in OWNER_TOOL_NAMES.items()}
+
+WEIGHT_DO = 1.0          # you 负责：P2 优先做
+WEIGHT_CLAIM = -6.0      # player 负责：P2 避开，订单要崩时仍可补位
+
+
+def _key(action, item=None):
+    # type: (str, Optional[str]) -> str
+    action = str(action)
+    item = str(item or "").strip().lower()
+    return "%s:%s" % (action, item) if item else action
+
+
+@dataclass(frozen=True)
+class Entry(object):
+    """一条分工：某个动作（可限定物料）归谁。"""
+    action: str              # 中文动作名（切/下锅/拌/装盘）
+    owner: str               # P2 / P1 / BOTH
+    item: str = ""           # 小写物料名；空 = 动作级
+
+    @property
+    def key(self):
+        # type: () -> str
+        return _key(self.action, self.item)
+
+    def tool_action(self):
+        # type: () -> str
+        return ACTION_TOOL_NAMES.get(self.action, self.action)
+
+
+@dataclass
+class DivisionState(object):
+    """当前分工；顺序即最后一次写入顺序（同 key 覆盖）。"""
+    entries: List[Entry] = field(default_factory=list)
+
+    def set(self, action, owner, item=""):
+        # type: (str, str, str) -> bool
+        """写入一条；同 (action, item) 覆盖。返回是否真的变了。"""
+        entry = Entry(str(action), str(owner), str(item or "").strip().lower())
+        for index, old in enumerate(self.entries):
+            if old.key == entry.key:
+                if old == entry:
+                    return False
+                self.entries[index] = entry
+                return True
+        self.entries.append(entry)
+        return True
+
+    def clear(self, action=None, item=None):
+        # type: (Optional[str], Optional[str]) -> bool
+        """清一条/一类/全部。返回是否有改动。"""
+        before = list(self.entries)
+        if action is None:
+            self.entries = []
+            return bool(before)
+        action = str(action)
+        item_l = str(item or "").strip().lower()
+        kept = []  # type: List[Entry]
+        for entry in self.entries:
+            if entry.action != action:
+                kept.append(entry)
+            elif item is not None and entry.item != item_l:
+                kept.append(entry)
+            # item is None：删掉这个动作的所有条目（含物料级）
+        self.entries = kept
+        return len(kept) != len(before)
+
+    def clear_all(self):
+        # type: () -> bool
+        return self.clear()
+
+    def snapshot(self):
+        # type: () -> Dict[str, List[str]]
+        """给 prompt / trace 的分工视图。"""
+        out = {"you": [], "player": [], "both": []}  # type: Dict[str, List[str]]
+        for entry in self.entries:
+            bucket = out.get(OWNER_TOOL_NAMES.get(entry.owner, "you"))
+            if bucket is None:
+                continue
+            label = entry.tool_action()
+            if entry.item:
+                label += ":%s" % (entry.item,)
+            bucket.append(label)
+        return out
+
+    def render(self):
+        # type: () -> str
+        """一行中文说明；没分工时返回空串。"""
+        parts = []  # type: List[str]
+        snap = self.snapshot()
+        for owner, label in (("you", "你"), ("player", "玩家"), ("both", "两人")):
+            actions = snap.get(owner) or []
+            if actions:
+                parts.append("%s负责 %s" % (label, "、".join(actions)))
+        return "；".join(parts)
+
+    def preferences(self):
+        # type: () -> List[Preference]
+        """编译成 planner 的偏好；BOTH 不产生偏好。"""
+        out = []  # type: List[Preference]
+        for entry in self.entries:
+            if entry.owner == OWNER_BOTH:
+                continue
+            scope = action_scope(entry.action, entry.item or None)
+            if entry.owner == OWNER_YOU:
+                out.append(Preference(kind="direct", owner=OWNER_YOU,
+                                      weight=WEIGHT_DO, scope=scope))
+            else:
+                out.append(Preference(kind="claim", owner=OWNER_PLAYER,
+                                      weight=WEIGHT_CLAIM, scope=scope))
+        return out
+
+    def copy(self):
+        # type: () -> "DivisionState"
+        return DivisionState(list(self.entries))
+
+
+def diff_entries(old, new):
+    # type: (DivisionState, DivisionState) -> List[Dict[str, Any]]
+    """两条分工表的差异；给 review 事件 / 硬静音判断用。"""
+    old_map = {entry.key: entry for entry in (old.entries if old else [])}
+    new_map = {entry.key: entry for entry in (new.entries if new else [])}
+    out = []  # type: List[Dict[str, Any]]
+    for key in sorted(set(old_map) | set(new_map)):
+        before = old_map.get(key)
+        after = new_map.get(key)
+        if before == after:
+            continue
+        out.append({
+            "action": (after or before).tool_action(),
+            "item": (after or before).item or None,
+            "from": OWNER_TOOL_NAMES.get(before.owner) if before else None,
+            "to": OWNER_TOOL_NAMES.get(after.owner) if after else None,
+        })
+    return out
+
+
+def tool_actions(stations):
+    # type: (Any) -> List[str]
+    """本关可分工的英文动作名；没有对应站点的不进 enum，送餐/洗盘永不进。"""
+    present = {str(s.get("t")) for s in (stations or ())
+               if isinstance(s, dict)}
+    return [ACTION_TOOL_NAMES[action] for action in DIVISION_ACTIONS
+            if ACTION_STATION_TYPES[action] in present]
+
+
+def _q(value, scale=1.0):
+    # type: (Any, float) -> Any
+    try:
+        return int(round(float(value) / scale))
+    except (TypeError, ValueError):
+        return None
+
+
+def station_signature(world):
+    # type: (Any) -> Tuple
+    """站点拓扑签名：站点所属网格 + 量化位置。
+
+    梯子/转盘这类移动障碍不改变站点，签名不变；热气球篮/木筏把站点
+    带走时签名变化。
+    """
+    parts = []  # type: List[Tuple]
+    for action in DIVISION_ACTIONS:
+        station_type = ACTION_STATION_TYPES[action]
+        for station in getattr(world, "stations", None) or ():
+            if not isinstance(station, dict) or station.get("t") != station_type:
+                continue
+            parts.append((
+                action,
+                str(station.get("grid") or ""),
+                _q(station.get("gx"), 1.2),
+                _q(station.get("gz"), 1.2),
+                _q(station.get("x"), 1.2),
+                _q(station.get("z"), 1.2),
+            ))
+    return tuple(sorted(parts, key=repr))
+
+
+def reach_signature(world, bb):
+    # type: (Any, Any) -> Tuple
+    """每个可分工动作的 (P1可达, P2可达)；不变就不该叫 LLM。"""
+    from ai.dialog.help import cost_to
+
+    out = []  # type: List[Tuple[str, bool, bool]]
+    for action in DIVISION_ACTIONS:
+        station_type = ACTION_STATION_TYPES[action]
+        stations = [s for s in (getattr(world, "stations", None) or ())
+                    if isinstance(s, dict) and s.get("t") == station_type]
+        if not stations:
+            continue
+        p1 = any(cost_to(world, bb, P.P1_NAME, s) is not None
+                 for s in stations)
+        p2 = any(cost_to(world, bb, P.P2_NAME, s) is not None
+                 for s in stations)
+        out.append((action, bool(p1), bool(p2)))
+    return tuple(sorted(out))
+
+
+def _reachable(world, bb, owner, action):
+    # type: (Any, Any, str, str) -> bool
+    from ai.dialog.help import cost_to
+
+    station_type = ACTION_STATION_TYPES[action]
+    stations = [s for s in (getattr(world, "stations", None) or ())
+                if isinstance(s, dict) and s.get("t") == station_type]
+    if not stations:
+        return False
+    names = [P.P2_NAME] if owner == OWNER_YOU else [P.P1_NAME]
+    if owner == OWNER_BOTH:
+        names = [P.P1_NAME, P.P2_NAME]
+    return any(cost_to(world, bb, name, s) is not None
+               for name in names for s in stations)
+
+
+def _known_materials(kitchen):
+    # type: (Any) -> set
+    known = set()  # type: set
+    for name, material in (getattr(kitchen, "materials", None) or {}).items():
+        known.add(str(name).lower())
+        for item in getattr(material, "items", None) or ():
+            known.add(str(item).lower())
+    return known
+
+
+def validate_entry(world, bb, kitchen, book, action_tool, owner_tool,
+                   item=None):
+    # type: (Any, Any, Any, Any, str, str, Optional[str]) -> Tuple[bool, str, str]
+    """校验一条工具写入。返回 (ok, reason, warning)。
+
+    - 动作/物料/归属不合法 → ok=False；
+    - 结构上可行、但此刻够不着 → ok=True + warning（动态地图可能只是临时挡路）。
+    """
+    action = TOOL_ACTION_NAMES.get(str(action_tool or "").strip())
+    if action not in DIVISION_ACTIONS:
+        return False, "本关不开放这个分工动作：%s" % (action_tool,), ""
+    owner = TOOL_OWNER_NAMES.get(str(owner_tool or "").strip())
+    if owner is None:
+        return False, "owner 只能是 you / player / both", ""
+    station_type = ACTION_STATION_TYPES[action]
+    stations = [s for s in (getattr(world, "stations", None) or ())
+                if isinstance(s, dict) and s.get("t") == station_type]
+    if not stations:
+        return False, "本关没有%s这个动作" % (action,), ""
+
+    item_l = str(item or "").strip().lower()
+    if item_l:
+        known = _known_materials(kitchen)
+        if known and item_l not in known:
+            return False, "本关没有物料 %s" % (item,), ""
+        if action == "切" and book is not None:
+            try:
+                needed = bool(book.needs_chopping(item))
+            except Exception:                # noqa: BLE001
+                needed = True
+            if not needed:
+                return False, "%s 不需要切" % (item,), ""
+        if action == "下锅" and book is not None:
+            try:
+                needed = bool(book.needs_cooking(item))
+            except Exception:                # noqa: BLE001
+                needed = True
+            if not needed:
+                return False, "%s 不需要下锅" % (item,), ""
+
+    if not _reachable(world, bb, owner, action):
+        who = {"P2": "你", "P1": "玩家", "BOTH": "两人"}.get(owner, owner)
+        return True, "", "%s现在够不着%s的站点（可能只是暂时挡路）" % (
+            who, action)
+    return True, "", ""

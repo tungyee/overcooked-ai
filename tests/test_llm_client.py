@@ -324,7 +324,8 @@ def test_assistant_and_tool_messages_round_trip():
 def test_render_state_includes_reachable_division():
     """世界状态里要有「你能做的动作」，防止 LLM 抢够不着的活。"""
     text = render_state({
-        "division": {"p2_actions": ["切"], "p1_actions": ["下锅", "装盘", "送餐"]},
+        "reachable_actions": {"p2_actions": ["切"],
+                              "p1_actions": ["下锅", "装盘", "送餐"]},
     })
     assert "你能做的动作（够得着的）：切" in text
     # 队友能做什么同样是快照，容易被滞后信息误导，不再进 state。
@@ -335,7 +336,7 @@ def test_render_state_prefers_reachable_actions_over_division():
     """够得着的动作不再受分工排除限制：送餐 / 洗盘也要列出来。"""
     text = render_state({
         "p2_reachable_actions": ["切", "装盘", "送餐", "洗盘"],
-        "division": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
+        "reachable_actions": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
     })
     assert "你能做的动作（够得着的）：切、装盘、送餐、洗盘" in text
 
@@ -364,7 +365,7 @@ def test_state_renders_success_last_result_without_reason():
 
 
 @pytest.mark.parametrize("event", ["last_seconds", "round_summary",
-                                   "open_division", "help_request",
+                                   "division", "division_review",
                                    "checkin", "batch"])
 def test_proactive_event_prompts_require_speak(event):
     """新协议 content 不播：主动开口的事件必须明确要求调用 speak。"""

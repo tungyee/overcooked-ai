@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-"""P1 求助触发：P1/P2 成本比较、订单 DAG 前沿扫描与候选排名（spec §5.1–§5.2）。
+"""P1/P2 成本比较与订单 DAG 前沿扫描（spec §5.1–§5.2）。
 
-本模块由主循环（`agent._service_dialog`）调用，只读 `World` / `Blackboard`，
-不写；产出的是「P2 做不了（够不着料源）或赶不及（锅要糊）→ 需 P1 搭手」的
-判定，最终经 `help_request` 事件交给对话 worker 措辞。与投掷机制的区别：这里
-只算「该不该请 P1」，真正发令（扔/取/切/煮/盛/装）仍是 P1（人类）或 P2 自己
-的规划，不由本模块控制。
+只读 `World` / `Blackboard`，不写。`cost_to` 现在是分工校验和动态复核的
+物理判据；`frontier_steps` / `p1_saves_enough` 保留给后续协作逻辑，不再
+产生 help_request 账本条目。
 """
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from ai.dialog.actions import FETCH_TASK_TYPES
-from ai.dialog.schema import RESCUE_TYPES, scope_matches
+from ai.dialog.schema import RESCUE_TYPES
 from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.revenue import eta as ETA
@@ -205,75 +202,3 @@ def frontier_steps(world, bb, book, orders, plate_match, cooker_match):
                 order_id=getattr(task, "order_id", None),
             ))
     return out
-
-
-def _help_rank_key(step, slack_map=None):
-    # type: (FrontierStep, Optional[Dict[Any, float]]) -> tuple
-    """求助候选排序键：赶不及救锅最优先，其次 P2 够不着（blocking），再按
-    订单紧迫度（solo_slack 小 = 更急 = 先喊）、P1 优势步数，最后 (task_type, item)
-    稳定兜底。slack 缺失的订单排最后（视为不紧）。"""
-    slack_map = slack_map or {}
-    if _burn_rescue_needed(step):
-        urgency = 0                      # 锅要糊了，最急
-    elif step.p2_cost is None:
-        urgency = 1                      # P2 够不着（结构性）
-    else:
-        urgency = 2
-    adv = (step.p2_cost - step.p1_cost) if (step.p1_cost is not None
-                                            and step.p2_cost is not None) else 0
-    slack = slack_map.get(step.order_id)
-    if slack is None:
-        slack = float("inf")
-    return (urgency, slack, -adv, step.task_type, step.item or "")
-
-
-def top_help_request(world, bb, book, orders, plate_match, cooker_match, ledger):
-    # type: (Any, Any, Any, List[Dict], Dict, Dict, Any) -> Optional[FrontierStep]
-    """P2 做不了/赶不及、需 P1 搭手的前沿步骤里最紧急的一个；无则 None。
-
-    排除已存在 help_request duty 的 (task_type, item)；排序：赶不及救锅最优先，
-    其次 P2 够不着（blocking），再按 solo_slack、P1 优势、(task_type, item)。
-    """
-    steps = frontier_steps(world, bb, book, orders, plate_match, cooker_match)
-    # 剪枝依据是「步骤仍需做」，不是「此刻 P1 更划算」：后者随厨师位置/
-    # 手持状态每拍波动，用它剪会把求助 duty 反复删掉又重发（一直喊装盘）。
-    needed = {(s.task_type, s.item) for s in steps}
-    prune = getattr(ledger, "prune_help_requests", None)
-    if callable(prune):
-        prune(needed)
-    requested_scopes = [getattr(d, "scope", None) for d in
-                        (getattr(ledger, "duties", None) or ())
-                        if getattr(d, "source", "") == "help_request"]
-    tick = getattr(bb, "tick", 0) or 0
-
-    def _already_requested(step):
-        # 动作级 help duty 的 scope 是 {(type, None)}，节点级是 {(type, item)}；
-        # 统一用 scope_matches 判覆盖，避免动作级 scope 被节点级精确匹配漏掉。
-        task = type("T", (), {"TYPE": step.task_type, "item": step.item})()
-        return any(scope_matches(scope, task) for scope in requested_scopes)
-
-    def _needs_help(step):
-        # 两类触发：
-        # 1) 结构性：P2 够不着料源（分割图），且是取料类交接 → 必喊；
-        # 2) 赶不及救锅：盛盘的锅快糊/已糊，P2 走过去的耗时超过剩余烧糊时间。
-        if step.source is None:
-            return False
-        structural = (step.task_type in FETCH_TASK_TYPES
-                      and p1_saves_enough(step.p1_cost, step.p2_cost))
-        return structural or _burn_rescue_needed(step)
-
-    candidates = [s for s in steps
-                  if _needs_help(s)
-                  and not _already_requested(s)
-                  and not ledger.help_request_recent(s.task_type, s.item, tick)]
-    if not candidates:
-        return None
-
-    try:
-        slack_map = ETA.solo_slack_by_order(world, book, plate_match,
-                                            cooker_match, orders=orders)
-    except Exception:                       # noqa: BLE001
-        # 紧迫度只是增强信号；算不出（空匹配/异常）时退回「都不紧」的旧行为。
-        slack_map = {}
-    candidates.sort(key=lambda s: _help_rank_key(s, slack_map))
-    return candidates[0]

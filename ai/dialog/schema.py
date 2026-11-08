@@ -1,4 +1,4 @@
-"""对话层 schema：账本偏好、作用域匹配与对话状态（spec §4.3–4.5）。
+"""对话层 schema：分工偏好、作用域匹配与对话状态（spec §4.3–4.5）。
 
 本模块**只允许导入标准库**：`ai/state/blackboard.py` 要引用这里的
 `Preference` / `DialogState`，若这里反向导入 `ai.*` 会形成
@@ -24,13 +24,13 @@ NO_BRANCH_TYPES = {
 
 @dataclass
 class Preference(object):
-    """一条分工偏好：候选打分上的加法项，由账本编译（ai/dialog/duties.py）。
+    """一条分工偏好：候选打分上的加法项，由分工表编译（ai/dialog/division.py）。
 
     - `kind`：direct（P2 优先做，正分）/ now（马上去，正分，权重 WEIGHT_NOW）
       / claim（P1 优先做，负分；P2 仍可按订单价值补位）
       / stop（硬压制，权重 0，`planner._is_stopped` 读）；
     - `scope`：`{(task 类型或 None, item 小写或 None)}`，见 `scope_matches`；
-    - `exclude`：从 scope 里扣掉的部分（被更新的账本条目接管）；
+    - `exclude`：从 scope 里扣掉的部分（被更新的分工条目接管）；
     - `expires_tick`：0 = 长期；非零时 `tick >= expires_tick` 即失效。
     空 scope 不匹配任何候选（不会退化成「影响全部」）。
     """
@@ -40,7 +40,7 @@ class Preference(object):
     owner: str = "P1"
     weight: float = 0.0
     expires_tick: int = 0
-    # 编译出该偏好的账本条目 id（trace / rescue 事件里报给 LLM）。
+    # 编译出该偏好的分工条目 id（trace / rescue 事件里报给 LLM）。
     duty_id: Optional[str] = None
 
 
@@ -102,7 +102,7 @@ def scope_matches(scope, task):
     """作用域是否覆盖该候选。
 
     作用域元素是 `(task 类型或 None, item 小写或 None)`：
-    - `(None, item)`：物料——任意 task 类型、这个 item（账本按物料认领）；
+    - `(None, item)`：物料——任意 task 类型、这个 item（分工按物料限定）；
     - `(类型, None)`：共享动作——这个类型、任意 item；
     - `(类型, item)`：精确到一个节点（测试/诊断用）。
     """

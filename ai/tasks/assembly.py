@@ -232,7 +232,6 @@ class DeliverPlate(Task):
     # 不分菜的共享节点（ai/dialog/duties.py）。
     SHARED = True
     # 送餐不开放「交给 P1 / 先别做」：谁在旁边谁送，只能让 P2 马上去或优先做。
-    DUTY_MODES = ("now", "do")
     HANDS = "empty"       # 要空手去端盘；手里有东西时打分加腾手代价（spec §6.1(b)）
 
     @property

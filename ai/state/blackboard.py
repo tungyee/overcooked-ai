@@ -12,6 +12,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ai.dialog.division import DivisionState
 from ai.dialog.schema import DialogState, Preference
 
 DEFAULT_TTL = 100          # 拍。20 Hz 下约 5 秒
@@ -121,6 +122,8 @@ class Blackboard:
     # ---------- 对话层（spec §4.5–4.7）----------
     # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。
     preferences: List[Preference] = field(default_factory=list)
+    # 当前分工：动作/物料 → 谁负责；只由 LLM 的 set_division 工具写入。
+    division: DivisionState = field(default_factory=DivisionState)
     # 玩家「别管这单」：order id → 失效拍号（spec §4.6）。
     abandoned_orders: Dict[Any, int] = field(default_factory=dict)
     # 对话跨回合状态（最近回合、待播报事件等，spec §6.2）。

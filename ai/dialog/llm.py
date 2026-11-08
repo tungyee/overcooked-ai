@@ -1,17 +1,15 @@
-"""火山方舟 OpenAI 兼容接口的 LLM 客户端与消息构建（v2：function calling）。
+"""火山方舟 OpenAI 兼容接口的 LLM 客户端与消息构建（function calling）。
 
-一轮说话按标准两段式：
-1. 第一段带 tools：模型决定是否调用 `assign_action`；
-2. 有调用时，主循环权威校验并落地，结果以 tool 消息回填；
-3. 第二段（`tool_choice="none"`）模型看到真实结果后再说最终那句话——
-   被拒的调用会如实告诉 P1，而不是先答应再落空。
-没有调用时第一段的 content 就是回复（闲聊/提问只请求一次）。
+主路径由 `worker._run_llm` 驱动多轮工具调用：`execute_actions` /
+`cancel_action` / `speak` / `get_world_state` / `set_division` /
+`read_cookbook`。工具结果由主循环权威校验后回填，模型据此继续下一轮或收尾。
+`_run_llm_legacy` 保留给旧 trace/回放的两段式调用。
 
 消息分工：
-- 开头 system：人设、账本规则、本关配方 DAG（每关只变一次）；
-- 历史：user（P1 原话）/ assistant（含 tool_calls）/ tool（落地结果）；
+- 开头 system：人设、本关配方 DAG、攻略摘要（每关只变一次）；
+- 历史：user（玩家原话）/ assistant（含 tool_calls）/ tool（落地结果）；
 - 末尾 system：本轮世界状态 + 事件说明（不进历史）；
-- user 只放 P1 的原话，事件回合没有 user 消息。
+- user 只放玩家的原话，事件回合没有 user 消息。
 
 `requests.post` 是模块级引用，测试直接 monkeypatch 它，不会发真实请求。
 """
@@ -208,10 +206,11 @@ def _read_sse(resp, started=None, on_text=None, timeout=None):
 
 # ---------------------------------------------------------------- prompt
 
-def system_message(kitchen_dag):
-    # type: (str) -> dict
-    """静态规则 + 本关 DAG（每关只变一次，方便上下文缓存）。"""
-    return {"role": "system", "content": prompts.render_system(kitchen_dag)}
+def system_message(kitchen_dag, guide=""):
+    # type: (str, str) -> dict
+    """静态规则 + 本关 DAG + 攻略摘要（每关只变一次，方便上下文缓存）。"""
+    return {"role": "system",
+            "content": prompts.render_system(kitchen_dag, guide)}
 
 
 def render_state(context):
@@ -228,7 +227,7 @@ def state_message(event, context, new_dishes_dag="", event_detail="",
     if event == "new_order" and new_dishes_dag:
         parts.append("【新菜】\n" + new_dishes_dag)
     if event in ("speech", "command_result", "last_seconds", "round_summary",
-                 "open_division", "help_request", "checkin", "batch"):
+                 "checkin", "batch", "division", "division_review"):
         event_text = prompts.render_event(event, event_detail, failed=failed)
         if event_text.strip():
             parts.append(event_text)

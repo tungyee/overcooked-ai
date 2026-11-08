@@ -119,8 +119,8 @@ class _RecordingWorker(object):
 
 
 def _apply(agent, world, **args):
-    """落一条 assign_action；返回该条结果 dict。"""
-    batch = DutyBatch(batch_id="t", calls=[("assign_action", args)])
+    """落一条 set_division；返回该条结果 dict。"""
+    batch = DutyBatch(batch_id="t", calls=[("set_division", args)])
     return agent._apply_duty_batch(world, batch)[0]
 
 
@@ -146,11 +146,11 @@ def test_action_division_reaches_planner(monkeypatch):
     world = World(frame)
     agent = _make_agent(monkeypatch, world)
 
-    # P2 负责切、P1 负责下锅
-    assert _apply(agent, world, op="add", mode="assign", action="切",
-                  direction="P2")["ok"] is True
-    assert _apply(agent, world, op="add", mode="assign", action="下锅",
-                  direction="P1")["ok"] is True
+    # 你负责切、玩家负责下锅
+    assert _apply(agent, world, assignments=[
+        {"action": "chop", "owner": "you"},
+        {"action": "cook", "owner": "player"},
+    ])["ok"] is True
 
     # 偏好编译：切=direct(+1)、下锅=claim(-6)
     kinds = {p.kind: p.weight for p in agent.bb.preferences}

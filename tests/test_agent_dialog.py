@@ -120,71 +120,6 @@ def _duty(**args):
 # ---------------------------------------------------------- 账本落地
 
 
-def test_batch_applies_duties_and_compiles_preferences(agent, world):
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="切", direction="P1"),
-        _duty(op="add", mode="assign", action="洗盘", direction="P2"),
-        source="我来切，你洗盘"))
-
-    assert [r["ok"] for r in results] == [True, True]
-    assert [r["id"] for r in results] == ["a1", "a2"]
-    kinds = {p.duty_id: (p.kind, p.weight) for p in agent.bb.preferences}
-    assert kinds == {"a1": ("claim", -6.0), "a2": ("direct", 1.0)}
-    assert agent.ledger.get("a1").source == "我来切，你洗盘"
-
-
-def test_batch_rejects_bad_calls_individually(agent, world):
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="下锅", direction="P2"),
-        ("assign_action", None),
-        ("teleport", {}),
-        _duty(op="add", mode="assign", action="切", direction="P2")))
-
-    assert [r["ok"] for r in results] == [False, False, False, True]
-    assert "下锅" in results[0]["reason"]
-    assert "JSON" in results[1]["reason"]
-    assert "未知工具" in results[2]["reason"]
-    assert agent.ledger.ids() == ["a1"]
-
-
-def test_wash_rejected_without_sink(agent):
-    world = make_world()
-    world.stations = [st for st in world.stations if st.get("t") != "washing"]
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
-    assert results[0]["ok"] is False and "洗盘" in results[0]["reason"]
-
-
-def test_leave_to_p1_keeps_matching_commitment(agent, world):
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
-    agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
-
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="切", direction="P1")))
-
-    assert agent.bb.commitment.active_task == active
-
-
-def test_do_keeps_commitment(agent, world):
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
-    agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
-
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
-
-    assert agent.bb.commitment.active_task == active
-
-
-
-
-def test_first_level_observation_does_not_clear_ledger(agent, world):
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
-    agent._maybe_reset_dialog_level(world)
-    assert agent.ledger.ids() == ["a1"]
-    assert len(agent.bb.preferences) == 1
-
-
 # ------------------------------------------------------- service
 
 class FakeDialogWorker(object):
@@ -248,22 +183,6 @@ def dagent(monkeypatch, book, fake_worker):
     return a
 
 
-def test_service_dialog_drains_batches_and_acks(dagent, world, fake_worker):
-    fake_worker.cmd_q.put(_batch(
-        _duty(op="add", mode="assign", action="切", direction="P1")))
-
-    record = dagent._service_dialog(world)
-
-    ack = fake_worker.ack_q.get_nowait()
-    assert ack["batch_id"] == "b1"
-    assert ack["results"][0]["ok"] is True
-    assert ack["duties"][0]["action"] == "切"
-    assert record["batches"][0]["results"] == ack["results"]
-    assert record["duties"][0]["id"] == "a1"
-    # 落地本拍立刻发一份新上下文：worker 下一轮看到的是新账本
-    assert fake_worker.contexts[-1]["duties"][0]["id"] == "a1"
-
-
 def test_service_dialog_survives_crashing_batch(dagent, world, fake_worker,
                                                 monkeypatch):
     def boom(*_a, **_k):
@@ -275,13 +194,6 @@ def test_service_dialog_survives_crashing_batch(dagent, world, fake_worker,
 
     ack = fake_worker.ack_q.get_nowait()
     assert ack["results"][0]["ok"] is False
-
-
-def test_service_dialog_has_no_help_event(dagent, world, fake_worker):
-    for tick in range(100, 160):
-        dagent.tick = dagent.bb.tick = tick
-        dagent._service_dialog(world)
-    assert [e for e in fake_worker.events if e[0] == "help"] == []
 
 
 def test_service_dialog_prunes_abandoned_orders(dagent, world):
@@ -304,41 +216,13 @@ def test_level_start_is_logged_on_first_observation_and_change(
     ]
 
 
-def test_level_change_clears_ledger_history_and_queues(dagent, fake_worker):
-    world = make_world("Sushi_1_4_2P")
-    dagent._service_dialog(world)
-    dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
-    dagent.bb.dialog = DialogState(last_rescue_tick=3)
-    dagent.bb.abandoned_orders = {1: 1300}
-    dagent.bb.rescue_cooldown_until = 150
-    fake_worker.cmd_q.put(_batch())
-    fake_worker.ack_q.put({"batch_id": "old"})
-
-    # 暂停不算换关
-    paused = make_world("Sushi_1_4_2P")
-    paused.phase = "paused"
-    dagent._maybe_reset_dialog_level(paused)
-    assert fake_worker.reset_count == 0
-    assert dagent.ledger.ids() == ["a1"]
-
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P"))
-
-    assert fake_worker.reset_count == 1
-    assert dagent.ledger.ids() == []
-    assert dagent.bb.preferences == []
-    assert dagent.bb.dialog.last_rescue_tick == 0
-    assert dagent.bb.abandoned_orders == {}
-    assert dagent.bb.rescue_cooldown_until == 0
-    assert fake_worker.cmd_q.empty() and fake_worker.ack_q.empty()
-
-
 def test_level_replay_same_name_clears_history(dagent, fake_worker):
     # 同一关重开：level 名不变、scene_epoch 变，也必须走完整重置。
     world = make_world("Sushi_1_4_2P", session_id="s1", scene_epoch=1)
     dagent._service_dialog(world)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="洗盘", direction="P2")))
+        ("set_division", {"assignments": [
+            {"action": "chop", "owner": "player"}]})))
     dagent.bb.dialog = DialogState(last_rescue_tick=3)
     dagent.bb.abandoned_orders = {1: 1300}
     dagent.bb.rescue_cooldown_until = 150
@@ -349,14 +233,14 @@ def test_level_replay_same_name_clears_history(dagent, fake_worker):
     # 第一次观察只记账，不重置。
     dagent._maybe_reset_dialog_level(world)
     assert fake_worker.reset_count == 0
-    assert dagent.ledger.ids() == ["a1"]
+    assert dagent.bb.division.entries
 
-    # 同名重开：scene_epoch 变 → 完整重置（账本/偏好/对话态/弃单/救援/见单/队列）。
+    # 同名重开：scene_epoch 变 → 完整重置（分工/偏好/对话态/弃单/救援/见单/队列）。
     dagent._maybe_reset_dialog_level(
         make_world("Sushi_1_4_2P", session_id="s1", scene_epoch=2))
 
     assert fake_worker.reset_count == 1
-    assert dagent.ledger.ids() == []
+    assert dagent.bb.division.entries == []
     assert dagent.bb.preferences == []
     assert dagent.bb.dialog.last_rescue_tick == 0
     assert dagent.bb.abandoned_orders == {}
@@ -372,8 +256,8 @@ def test_build_dialog_context_fields(dagent, world):
     active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 0)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="assign", action="切", direction="P1"),
-        source="黄瓜我来"))
+        ("set_division", {"assignments": [
+            {"action": "chop", "owner": "player"}]})))
     world.chefs[0]["held"] = "Plate"
 
     ctx = dagent._build_dialog_context(world)
@@ -385,14 +269,14 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["p1"] == {"holding": "plate"}
     assert ctx["orders"][0]["id"] == 1
     assert ctx["orders"][0]["dish"] == "CucumberSushi"
-    assert ctx["duties"][0]["source"] == "黄瓜我来"
+    assert ctx["division_text"].startswith("玩家负责")
     assert "切" in ctx["dag"] and "下锅" in ctx["dag"]
     assert "CucumberSushi" in ctx["dish_dags"]
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
     assert names == ["execute_actions", "cancel_action", "speak",
-                     "get_world_state"]
+                     "get_world_state", "set_division"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
     assert "chop" in props["actions"]["items"]["properties"]["action"]["enum"]
 
@@ -499,7 +383,8 @@ def test_context_p2_options_come_from_planner_ranking(dagent, world):
 
 def test_tick_once_includes_dialog_record(dagent, world):
     fake_worker = dagent.dialog_worker
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="assign", action="洗盘", direction="P2")))
+    fake_worker.cmd_q.put(_batch(("set_division", {"assignments": [
+        {"action": "chop", "owner": "player"}]})))
 
     from unittest.mock import patch
     with patch("ai.agent.arbiter.select_mode",
@@ -511,7 +396,7 @@ def test_tick_once_includes_dialog_record(dagent, world):
 
     record = emit.call_args[0][0]
     assert record["dialog"]["batches"][0]["id"] == "b1"
-    assert record["dialog"]["duties"][0]["action"] == "洗盘"
+    assert record["dialog"]["division"]["player"] == ["chop"]
 
 
 def test_tick_once_publishes_paused_context(dagent, world):
@@ -527,7 +412,9 @@ def test_tick_once_publishes_paused_context(dagent, world):
 
 
 def test_service_dialog_emits_last_seconds_once(dagent, world, fake_worker):
-    # 最后 10 秒内：last_seconds 只发一次。
+    # 最后 10 秒内：last_seconds 只发一次。先发掉开局分工，避免同拍合成 batch。
+    dagent._service_dialog(world)
+    fake_worker.events.clear()
     world.raw["timer"] = {"server": {"left": 5, "limit": 130}}
     dagent._service_dialog(world)
     dagent._service_dialog(world)
@@ -725,64 +612,6 @@ def test_build_dialog_context_marks_round_finished(dagent, world):
     assert dagent._build_dialog_context(world).get("round_finished") is False
 
 
-def test_service_dialog_emits_help_request_when_p1_blocked(monkeypatch,
-                                                           fake_worker):
-    import gzip
-    import json
-    import os
-    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
-                           "rapids21-20261028.ndjson.gz")
-    with gzip.open(fixture, "rt", encoding="utf8") as fh:
-        frame = json.loads(next(l for l in fh if l.strip()))
-    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
-    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
-    w = World(frame)
-    book = RecipeBook(w.recipes, w.stations)
-    a = Agent(dialog_worker=fake_worker)
-    a.bb.tick = 100
-    a.book = book
-    a._service_dialog(w)
-    # 事件现在合成 batch：help_request 可能在 batch 里，也可能单独发。
-    assert any(
-        e[0] == "help_request"
-        or (e[0] == "batch" and any(sub[0] == "help_request" for sub in e[1]))
-        for e in fake_worker.events)
-    assert a.ledger.help_request_ids()
-    assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
-
-
-# ------------------------------------------------------- help_request 触发门槛
-
-def _fake_help_step(**kw):
-    from ai.dialog.help import FrontierStep
-    defaults = dict(task_type="FetchToBoard", item="cucumber",
-                    source={"t": "crate"}, p1_cost=5, p2_cost=20,
-                    order_id="1")
-    defaults.update(kw)
-    return FrontierStep(**defaults)
-
-
-def _patch_help_trigger(monkeypatch, dagent, step):
-    monkeypatch.setattr("ai.agent.top_help_request", lambda *a, **k: step)
-    monkeypatch.setattr(dagent, "_dialog_matches", lambda *a, **k: ([], {}, {}))
-    dagent._last_help_request_tick = 0
-
-
-def test_maybe_request_help_fires_structural_without_p2_top(dagent, world,
-                                                            book, monkeypatch):
-    """结构性（P2 够不着）取料仍必喊，不看 P2 是否 #1。"""
-    step = _fake_help_step(item="potato", p2_cost=None)
-    _patch_help_trigger(monkeypatch, dagent, step)
-    dagent._last_ranked = []  # 没有 #1 也喊
-
-    payload = dagent._maybe_request_help(world, book)
-
-    assert payload == {"task_type": "FetchToBoard", "item": "potato"}
-    assert dagent.ledger.help_request_ids()
-
-
-
-
 def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
     """同一拍多个主动事件 → 合成一个 batch，而不是各自发（避免队列挤掉）。"""
     import gzip
@@ -793,17 +622,17 @@ def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
     with gzip.open(fixture, "rt", encoding="utf8") as fh:
         frame = json.loads(next(l for l in fh if l.strip()))
     monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
-    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
     w = World(frame)
     book = RecipeBook(w.recipes, w.stations)
     a = Agent(dialog_worker=fake_worker)
     a.bb.tick = 100
     a.book = book
+    w.raw["timer"] = {"server": {"left": 5, "limit": 130}}
     a._service_dialog(w)
     assert len(fake_worker.events) == 1
     assert fake_worker.events[0][0] == "batch"
     assert {e[0] for e in fake_worker.events[0][1]} == \
-        {"open_division", "help_request"}
+        {"division", "last_seconds"}
 
 
 # ------------------------------------------------------- open_division 就近聚类
@@ -811,97 +640,6 @@ def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
 def _with_stations(w, *stations):
     w.stations = list(w.stations) + list(stations)
     return w
-
-
-def test_open_division_payload_proximity_split(monkeypatch):
-    """连通图（两边都够得着）也按就近产出分工。"""
-    import ai.agent as A
-    w = _with_stations(
-        make_world(),
-        {"t": "cooking", "n": "cooker_s1", "gx": 12, "gz": 0},
-        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 12},
-    )
-
-    def fake_cost(world, bb, name, source):
-        t = source.get("t")
-        p1 = name == "Player 1"
-        if t in ("chopping", "washing"):
-            return 1 if p1 else 12
-        if t in ("cooking", "plate_station"):
-            return 12 if p1 else 1
-        return None
-
-    monkeypatch.setattr(A, "cost_to", fake_cost)
-    payload = A._open_division_payload(w, None)
-
-    assert payload is not None
-    assert set(payload["p1_actions"]) == {"切"}
-    assert set(payload["p2_actions"]) == {"下锅", "装盘"}
-
-
-def test_open_division_payload_falls_back_when_equidistant(monkeypatch):
-    """就近不明确（等距）也兜底分工：P2 煮装送、P1 切洗。"""
-    import ai.agent as A
-    w = _with_stations(
-        make_world(),
-        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
-        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
-    )
-    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 5)  # 全部等距
-
-    payload = A._open_division_payload(w, None)
-
-    assert payload is not None
-    assert set(payload["p1_actions"]) == {"切"}
-    assert set(payload["p2_actions"]) == {"下锅", "装盘"}
-
-
-def test_open_division_skips_deliver_and_wash(monkeypatch):
-    """洗碗、送餐不进开局分工：不 assign 给 P1，避免 P2 因此避开。"""
-    import ai.agent as A
-    w = _with_stations(
-        make_world(),
-        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
-        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
-        {"t": "mixing", "n": "mixer_s1", "gx": 3, "gz": 3},
-    )
-    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 5)  # 全部等距
-
-    payload = A._open_division_payload(w, None)
-
-    assert payload is not None
-    all_actions = set(payload["p1_actions"]) | set(payload["p2_actions"])
-    assert "送餐" not in all_actions
-    assert "洗盘" not in all_actions
-    # 其余动作仍参与分工
-    assert "切" in all_actions
-    assert "下锅" in all_actions
-    assert "装盘" in all_actions
-
-
-def test_open_division_payload_keeps_unreachable_split(monkeypatch):
-    """一边够不着仍是硬分裂（保留旧行为）。"""
-    import ai.agent as A
-    w = _with_stations(
-        make_world(),
-        {"t": "cooking", "n": "cooker_s1", "gx": 12, "gz": 0},
-    )
-
-    def fake_cost(world, bb, name, source):
-        t = source.get("t")
-        p1 = name == "Player 1"
-        if t == "chopping":
-            return 3 if p1 else None      # P2 够不着切板
-        if t == "cooking":
-            return None if p1 else 3      # P1 够不着灶
-        return 5                          # 其余共享
-
-    monkeypatch.setattr(A, "cost_to", fake_cost)
-    payload = A._open_division_payload(w, None)
-
-    assert payload is not None
-    assert "切" in payload["p1_actions"]
-    assert "下锅" in payload["p2_actions"]
 
 
 def test_reachable_actions_include_deliver_and_wash(monkeypatch):
@@ -933,49 +671,3 @@ def test_reachable_actions_skip_unreachable_station(monkeypatch):
 
     assert "送餐" not in labels
     assert "洗盘" in labels
-
-
-def test_land_open_division_adds_assign_duties(dagent):
-    dagent._land_open_division(
-        {"p1_actions": ["切", "下锅"], "p2_actions": ["装盘", "送餐"]}, 100)
-    dagent._sync_duty_preferences()
-
-    duties = dagent.ledger.snapshot(100)
-    by_action = {d["action"]: d for d in duties}
-    assert by_action["切"]["direction"] == "P1"
-    assert by_action["下锅"]["direction"] == "P1"
-    assert by_action["装盘"]["direction"] == "P2"
-    assert by_action["送餐"]["direction"] == "P2"
-    assert all(d["source"] == "open_division" for d in duties)
-
-    kinds = {(p.owner, p.kind) for p in dagent.bb.preferences}
-    assert ("P1", "claim") in kinds
-    assert ("P2", "direct") in kinds
-
-
-def test_service_dialog_lands_open_division_duties(monkeypatch, fake_worker):
-    """open_division 一开口就把分工落进账本，而不是只说话。"""
-    import gzip
-    import json
-    import os
-    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
-                           "rapids21-20261028.ndjson.gz")
-    with gzip.open(fixture, "rt", encoding="utf8") as fh:
-        frame = json.loads(next(l for l in fh if l.strip()))
-    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
-    monkeypatch.setattr("ai.agent.ENABLE_LEGACY_TOOLS", True)
-    w = World(frame)
-    book = RecipeBook(w.recipes, w.stations)
-    a = Agent(dialog_worker=fake_worker)
-    a.bb.tick = 100
-    a.book = book
-
-    a._service_dialog(w)
-
-    assign = [d for d in a.ledger.snapshot(100)
-              if d["mode"] == "assign" and d["source"] == "open_division"]
-    assert assign
-    assert any(d.get("direction") == "P1" for d in assign)
-    assert any(d.get("direction") == "P2" for d in assign)
-    assert any(p.kind == "claim" and p.owner == "P1" for p in a.bb.preferences)
-    assert any(p.kind == "direct" and p.owner == "P2" for p in a.bb.preferences)

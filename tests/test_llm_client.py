@@ -344,3 +344,13 @@ def test_stream_total_timeout_raises(monkeypatch):
     client = LLMClient("key", "http://127.0.0.1:9", "model", timeout=0.05)
     with pytest.raises(llm.LLMError, match="流超时"):
         client.chat([{"role": "user", "content": "hi"}])
+
+
+def test_state_warns_when_game_paused():
+    msg = state_message("speech", {"live": False})
+    assert "游戏当前已暂停" in msg["content"]
+
+
+def test_state_does_not_warn_when_live():
+    msg = state_message("speech", {"live": True})
+    assert "游戏当前已暂停" not in msg["content"]

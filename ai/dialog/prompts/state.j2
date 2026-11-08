@@ -1,4 +1,6 @@
 【世界状态】{{ '\n' }}
+{% if live is sameas false %}注意：游戏当前已暂停或不在关卡，你不能行动；只回话，不要调用动作工具。{{ '\n' }}{% endif %}
+{% if round_finished %}注意：本关已经结束。{{ '\n' }}{% endif %}
 {% if time_left is not none %}本关剩余 {{ time_left }} 秒。{{ '\n' }}{% endif %}
 {% if total is not none %}总分 {{ total }}。{{ '\n' }}{% endif %}
 {% if deliveries is not none %}已送 {{ deliveries }} 单。{{ '\n' }}{% endif %}

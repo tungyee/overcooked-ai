@@ -76,6 +76,8 @@ def state_view(context, commands=None, last_result=None):
             "reason": last.get("reason", ""),
         }
     return {
+        "live": ctx.get("live"),
+        "round_finished": ctx.get("round_finished"),
         "time_left": ctx.get("time_left"),
         "total": ctx.get("total"),
         "deliveries": ctx.get("deliveries"),

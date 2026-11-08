@@ -574,6 +574,29 @@ namespace Oc2AI
             return i < _anchors.Count ? Now(_anchors[i]) : Now(_goalAnchor);
         }
 
+        /// <summary>
+        /// 共线路点：已经越过它的垂面就算到达，不要求回到格心。
+        ///
+        /// 路径是格子中心的序列，原判据 WAYPOINT_EPS=0.15m 要求精确到点。厨师被
+        /// 推离格心 0.4m 时，这一点会变成一次额外的「对正」移动——实机
+        /// trace-20261109-011932 t=1926~2072：在 3-3 楼梯顶朝南对正 0.4m，手持
+        /// 披萨顶住南墙，8s 后 move timeout。前后两段近似共线（直行穿过该格）时，
+        /// 只要已越过该路点的垂面就直接推进；拐角仍保持 0.15m 精确到点，避免
+        /// 切角穿墙。门洞/传送门段不参与（它们有自己的跨缝判据）。
+        /// </summary>
+        private bool PassedStraightWaypoint(Vector2 pos)
+        {
+            if (_idx < 1 || _idx + 1 >= _path.Count) return false;
+            bool isExit;
+            if (GateAt(_idx, out isExit) != null || GateAt(_idx + 1, out isExit) != null) return false;
+            if (HopAt(_idx, out isExit) != null || HopAt(_idx + 1, out isExit) != null) return false;
+            Vector2 cur = PointAt(_idx), prev = PointAt(_idx - 1), next = PointAt(_idx + 1);
+            Vector2 inDir = cur - prev, outDir = next - cur;
+            if (inDir.sqrMagnitude < 1e-6f || outDir.sqrMagnitude < 1e-6f) return false;
+            if (Vector2.Dot(inDir.normalized, outDir.normalized) < 0.98f) return false;
+            return Vector2.Dot(pos - cur, outDir.normalized) >= 0f;
+        }
+
         // 靠近 goal 时用游戏交互句柄判「已就位」：句柄命中目标即算到达，
         // 不必卡在精确格心（散料/障碍挡住精确位置时仍能停住）。
         private bool InteractReady(ChefFrame f)
@@ -711,7 +734,7 @@ namespace Oc2AI
             float dist = Vector2.Distance(pos, target);
 
             // 走点推进；门洞入/出点按跨缝坐标判（沿缝坐标一直在动，按距离可能永远差一点）
-            bool reached = dist <= WAYPOINT_EPS;
+            bool reached = dist <= WAYPOINT_EPS || PassedStraightWaypoint(pos);
             if (gate != null && _idx == gate.Enter) reached = reached || (gateOpen && gate.PastEnter(pos));
             if (gate != null && _idx == gate.Exit) reached = reached || gate.PastExit(pos);
             if (_idx < _path.Count && reached)

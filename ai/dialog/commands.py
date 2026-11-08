@@ -53,6 +53,7 @@ ACTION_TASK_TYPES = {
 }  # type: Dict[str, Optional[Tuple[str, ...]]]
 
 # 中文口语 → DAG 英文名。只覆盖常见料；查不到时 check 会返回 valid_targets。
+# 中文口语 → DAG 英文名（精确别名，先查）。
 TARGET_ALIASES = {
     "黄瓜": "Cucumber", "海苔": "Seaweed", "紫菜": "Seaweed",
     "米饭": "BoiledSushiRice", "熟米饭": "BoiledSushiRice",
@@ -64,6 +65,18 @@ TARGET_ALIASES = {
     "肉": "BurritoMeat", "牛肉": "BurritoMeat",
     "洋葱": "Onion", "生菜": "Lettuce", "面包": "Bread",
     "土豆": "Potato", "奶酪": "Cheese", "芝士": "Cheese",
+}  # type: Dict[str, str]
+
+# 中文口语 → 英文词根：跨关卡匹配 material / 物料链里的 item。
+# 精确别名命中不了时（例如本关叫 PanFriedPrawns 而不是 SushiPrawn），用词根找。
+TARGET_ROOTS = {
+    "黄瓜": "cucumber", "海苔": "seaweed", "紫菜": "seaweed",
+    "米饭": "rice", "米": "rice",
+    "鱼": "fish", "虾": "prawn", "肉": "meat", "牛肉": "meat",
+    "番茄": "tomato", "西红柿": "tomato",
+    "意面": "pasta", "面": "pasta",
+    "洋葱": "onion", "生菜": "lettuce", "面包": "bread",
+    "土豆": "potato", "奶酪": "cheese", "芝士": "cheese",
 }  # type: Dict[str, str]
 
 
@@ -110,7 +123,12 @@ def _catalogs(kitchen):
 def valid_targets(kitchen):
     # type: (Any) -> List[str]
     materials, dishes = _catalogs(kitchen)
-    return sorted(set(materials.values()) | set(dishes.values()))
+    out = set(materials.values()) | set(dishes.values())
+    for mat in (getattr(kitchen, "materials", {}) or {}).values():
+        for _task_type, item in getattr(mat, "steps", ()) or ():
+            if item:
+                out.add(str(item))
+    return sorted(out)
 
 
 def resolve_target(kitchen, action, raw):
@@ -127,15 +145,40 @@ def resolve_target(kitchen, action, raw):
     if not text:
         return None, None, None, "", []
     materials, dishes = _catalogs(kitchen)
-    candidates = [text, TARGET_ALIASES.get(text, ""), TARGET_ALIASES.get(_norm(text), "")]
-    for candidate in candidates:
-        key = _norm(candidate)
-        if not key:
-            continue
-        if key in dishes:
-            return "dish", dishes[key], text, "", []
-        if key in materials:
-            return "material", materials[key], text, "", []
+    key = _norm(text)
+    if key in dishes:
+        return "dish", dishes[key], text, "", []
+    if key in materials:
+        return "material", materials[key], text, "", []
+
+    # 物料链里的具体 item（生料/熟料/中间产物）→ 它所属的 material。
+    step_matches = []
+    for name, mat in (getattr(kitchen, "materials", {}) or {}).items():
+        for _task_type, item in getattr(mat, "steps", ()) or ():
+            if item and _norm(item) == key:
+                if name not in step_matches:
+                    step_matches.append(name)
+    if step_matches:
+        return "material", str(step_matches[0]), text, "", []
+
+    # 中文词根：跨关卡匹配 material 名或物料链 item。
+    root = TARGET_ROOTS.get(text) or TARGET_ROOTS.get(_norm(text))
+    if not root:
+        alias = TARGET_ALIASES.get(text) or TARGET_ALIASES.get(_norm(text))
+        root = _norm(alias) if alias else ""
+    if root:
+        material_hits = [name for name in materials if root in _norm(name)]
+        if material_hits:
+            return "material", materials[material_hits[0]], text, "", []
+        item_hits = []
+        for name, mat in (getattr(kitchen, "materials", {}) or {}).items():
+            if any(root in _norm(item) for _t, item in
+                   (getattr(mat, "steps", ()) or ()) if item):
+                if name not in item_hits:
+                    item_hits.append(name)
+        if item_hits:
+            return "material", str(item_hits[0]), text, "", []
+
     reason = "本关没有「%s」" % text
     return None, None, text, reason, valid_targets(kitchen)
 
@@ -199,6 +242,42 @@ def build_scope(kitchen, action, target, mode):
     return frozenset(scope), ""
 
 
+def resolve_done_item(kitchen, action, material, raw=None):
+    # type: (Any, str, Optional[str], Optional[str]) -> Optional[str]
+    """动作 done 判定用的具体 item。
+
+    chop/fetch 用物料链里的生料/中间产物（例如 Prawn），而不是最终熟料名
+    （PanFriedPrawns）；cook/plate 用 material 本身。
+    """
+    action = str(action or "")
+    if action not in ("chop", "fetch"):
+        return material
+    mat = None
+    for name, value in (getattr(kitchen, "materials", {}) or {}).items():
+        if _norm(name) == _norm(material):
+            mat = value
+            break
+    if mat is None:
+        return raw or material
+    if raw:
+        for _t, item in getattr(mat, "steps", ()) or ():
+            if item and _norm(item) == _norm(raw):
+                return str(item)
+    for task_type, item in getattr(mat, "steps", ()) or ():
+        if not item:
+            continue
+        if action == "chop" and task_type == "Chop":
+            return str(item)
+        if action == "fetch" and task_type in (
+                "FetchToBoard", "FetchToCooker", "FetchToPlate",
+                "FetchToCarrier", "Prefetch"):
+            return str(item)
+    for _t, item in getattr(mat, "steps", ()) or ():
+        if item:
+            return str(item)
+    return material
+
+
 @dataclass
 class Command:
     id: str
@@ -208,6 +287,7 @@ class Command:
     display_target: Optional[str]
     scope: Scope
     mode: str = "material"
+    done_item: Optional[str] = None
     status: str = "queued"          # queued / running / waiting / succeeded / failed / cancelled
     created_tick: int = 0
     started_tick: int = 0
@@ -277,8 +357,8 @@ class CommandQueue:
 
     def add(self, action, resolved_target, scope, tick, order_id=None,
             display_target=None, start_deliveries=0, start_dirty=0,
-            mode="material"):
-        # type: (str, Optional[str], Scope, int, Any, Optional[str], int, int, str) -> Dict[str, Any]
+            mode="material", done_item=None):
+        # type: (str, Optional[str], Scope, int, Any, Optional[str], int, int, str, Optional[str]) -> Dict[str, Any]
         if self.paused:
             self.commands = [c for c in self.commands if not c.terminal()]
             self.paused = False
@@ -298,7 +378,7 @@ class CommandQueue:
             id="cmd%d" % self._seq, action=str(action),
             target=resolved_target, resolved_target=resolved_target,
             display_target=display_target or resolved_target,
-            scope=scope, mode=mode, created_tick=tick,
+            scope=scope, mode=mode, done_item=done_item, created_tick=tick,
             order_id=order_id, start_deliveries=start_deliveries,
             start_dirty=start_dirty,
         )
@@ -638,9 +718,10 @@ def command_done(world, book, command):
                        for o in _world_list(world, "orders"))
         return False
     if action == "chop":
-        if not target or not book:
+        chop_target = command.done_item or target
+        if not chop_target or not book:
             return False
-        return item_present(world, book.chop_target(target))
+        return item_present(world, book.chop_target(chop_target))
     if action == "cook":
         if not target:
             return False
@@ -658,7 +739,8 @@ def command_done(world, book, command):
             return _plate_has_all(world, _dish_plate_forms(book, target))
         return _plate_has_all(world, _plate_forms(book, target))
     if action in ("mix", "fetch", "prepare"):
-        if not target:
+        item = command.done_item or target
+        if not item:
             return False
-        return item_present(world, target)
+        return item_present(world, item)
     return False

@@ -134,3 +134,44 @@ def test_expired_order_fails_and_pauses_queue(agent, world):
     assert "过期" in cmd.reason
     assert agent.commands.paused is True
     assert agent.bb.command_scope is None
+
+
+def test_raw_item_resolves_to_material_for_balloon_level():
+    """Balloon 关的物料名是熟料名（PanFriedPrawns），玩家/模型说生料名
+    （Prawn / 虾）时必须能归一到对应 material。"""
+    from ai.dialog.commands import (build_scope, resolve_done_item,
+                                    resolve_target, valid_targets)
+    from ai.dialog.duties import Kitchen, Material
+
+    kitchen = Kitchen({}, {})
+    kitchen.materials = {
+        "PanFriedPrawns": Material(
+            "PanFriedPrawns", items={"prawn", "panfriedprawns"},
+            types={"FetchToBoard", "Chop", "FetchToCooker"},
+            steps=[("FetchToBoard", "Prawn"), ("Chop", "Prawn"),
+                   ("FetchToCooker", "PanFriedPrawns")]),
+        "FriedBurritoMeat": Material(
+            "FriedBurritoMeat", items={"burritomeat", "friedburritomeat"},
+            types={"FetchToBoard", "Chop", "FetchToCooker"},
+            steps=[("FetchToBoard", "BurritoMeat"), ("Chop", "BurritoMeat"),
+                   ("FetchToCooker", "FriedBurritoMeat")]),
+    }
+    kitchen.dish_materials = {
+        "Pasta_Marinara_New": ["PanFriedPrawns"],
+        "Pasta_MeatOnly_New": ["FriedBurritoMeat"],
+    }
+
+    targets = valid_targets(kitchen)
+    assert "Prawn" in targets and "BurritoMeat" in targets
+
+    mode, resolved, display, reason, _valid = resolve_target(
+        kitchen, "chop", "Prawn")
+    assert (mode, resolved, display, reason) == (
+        "material", "PanFriedPrawns", "Prawn", "")
+    scope, _ = build_scope(kitchen, "chop", resolved, mode)
+    assert ("FetchToBoard", "prawn") in scope
+    assert ("Chop", "prawn") in scope
+    assert resolve_done_item(kitchen, "chop", resolved, "Prawn") == "Prawn"
+
+    mode, resolved, _d, reason, _v = resolve_target(kitchen, "chop", "肉")
+    assert (mode, resolved, reason) == ("material", "FriedBurritoMeat", "")

@@ -15,7 +15,8 @@ from ai.core import arbiter, executor, planner
 from ai.dialog.actions import ACTION_STATION_TYPES
 from ai.dialog.commands import (Command, CommandQueue, build_scope,
                                 command_done, command_failed, deliveries,
-                                dirty_count, resolve_target, scope_matches_task)
+                                dirty_count, resolve_done_item, resolve_target,
+                                scope_matches_task)
 from ai.dialog.duties import (ACCEPT_LEGACY_TOOL_CALLS, ENABLE_LEGACY_TOOLS,
                               Kitchen, Ledger, TaskMeta, TOOL_ACTIONS,
                               node_key, tool_schemas)
@@ -334,12 +335,14 @@ def _duty_tools(kitchen, ledger):
     return tool_schemas(kitchen.targets(), ledger.ids())
 
 
-def _probe_command(action, resolved, display, scope, world, mode="material"):
-    # type: (str, Optional[str], Optional[str], Any, World, str) -> Command
+def _probe_command(action, resolved, display, scope, world, mode="material",
+                   done_item=None):
+    # type: (str, Optional[str], Optional[str], Any, World, str, Optional[str]) -> Command
     """只用于 check_action 的 done 探测，不进队列。"""
     return Command(
         id="probe", action=action, target=resolved, resolved_target=resolved,
         display_target=display or resolved, scope=scope, mode=mode,
+        done_item=done_item,
         start_deliveries=deliveries(world), start_dirty=dirty_count(world))
 
 
@@ -725,7 +728,10 @@ class Agent:
                     "reason": scope_reason, "valid_targets": valid}
         if action == "wash" and dirty_count(world) == 0:
             return {"ok": False, "action": action, "reason": "现在没有脏盘"}
-        probe = _probe_command(action, resolved, display, scope, world, mode)
+        done_item = resolve_done_item(kitchen, action, resolved,
+                                      target_raw or resolved)
+        probe = _probe_command(action, resolved, display, scope, world, mode,
+                               done_item=done_item)
         if command_done(world, self.book, probe):
             out = {"ok": True, "action": action,
                    "target": display or resolved or target_raw,
@@ -818,11 +824,14 @@ class Agent:
                     "target": display or resolved,
                     "reason": "现在没有可送的订单"}
         tick = self.bb.tick or 0
+        done_item = resolve_done_item(kitchen, action, resolved,
+                                      target_raw or resolved)
         result = self.commands.add(
             action, resolved, scope, tick, order_id=order_id,
             display_target=display or resolved,
             start_deliveries=deliveries(world),
-            start_dirty=dirty_count(world), mode=mode or "material")
+            start_dirty=dirty_count(world), mode=mode or "material",
+            done_item=done_item)
         if result.get("status") == "running":
             self.bb.commitment = Commitment()
             self.bb.hold_until = 0

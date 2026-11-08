@@ -348,7 +348,12 @@ def _tool_nudge(results):
         if result.get("already_done"):
             notes.append("这一步已经完成；用 speak 告诉玩家。")
         elif result.get("ok") is False:
-            notes.append("工具返回失败：必须调用 speak 说明原因，不要用 content 回答。")
+            if result.get("valid_targets"):
+                notes.append("target 不在本关目录：改用 valid_targets 里的名字，"
+                             "或先 speak 问玩家；不要重复同一个 target。")
+            else:
+                notes.append("工具返回失败：必须调用 speak 说明原因，"
+                             "不要用 content 回答。")
         elif result.get("status") in ("running", "queued") or result.get("dispatched"):
             notes.append("动作已派发；如果要说话必须调用 speak，content 不会播出去。")
         elif result.get("ok") is True:

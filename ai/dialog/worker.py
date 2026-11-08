@@ -62,6 +62,8 @@ PREROLL_FRAMES = 2
 PTT_PREROLL_FRAMES = 6
 PTT_TAIL_FRAMES = 4
 PTT_MIN_FRAMES = 4
+# 音频电平调试日志的间隔（秒）：2s 一条在语音调试时太吵，改成 10s。
+LEVEL_LOG_INTERVAL_S = 10.0
 # 流式 ASR：录音结束后等最终文本的上限（服务端可能还在收尾）。
 ASR_FINISH_TIMEOUT_S = 15.0
 # LLM 文本按句号/问号/感叹号/分号/换行切句，逐句交给 TTS。
@@ -916,7 +918,7 @@ class DialogWorker(object):
                     level = level_fn(frame) if callable(level_fn) else None
                     floor = getattr(self.clients.vad, "floor_db", None)
                     now = time.monotonic()
-                    if now - last_level_log >= 2.0:
+                    if now - last_level_log >= LEVEL_LOG_INTERVAL_S:
                         last_level_log = now
                         log.debug(
                             "音频帧 #%d level=%s floor=%s paused=%s",

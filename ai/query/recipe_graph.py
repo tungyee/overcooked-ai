@@ -435,9 +435,21 @@ def _in_flight_cook_claim(ctx, item=None):
 
     认领没记 item（老认领 / 非烹饪路径）时退化回整单作用域：宁可少发一个
     候选，也不要重复下锅。
+
+    **只看别人的认领**：P2 自己上一拍写的认领不能压掉这一拍的候选，否则
+    同一个 task 会隔拍消失/出现，Executor 的树每拍重建（实机 t=1480~1559
+    同一口灶的 order#3/#6 候选互换）。同一 agent 的重复下锅本来由
+    `used_cookers` 与 cooker 状态兜住。
     """
     want = str(item).lower() if item is not None else None
     for (_res, action), claim in ctx["bb"].claims.items():
+        if getattr(claim, "owner", None) == T.OWNER:
+            # P2 自己的在途认领不压候选：下一拍规划还要继续生成同一个
+            # task，好让 Executor 复用同一棵树。压掉会让候选在「有认领 /
+            # 没认领」之间每拍翻转（trace-20261108-161828 t=1480~1559：
+            # 同一口灶的 order#3 / order#6 候选隔拍互换，task key 变、
+            # 树每拍重建，P2 在原地冻住）。
+            continue
         if getattr(claim, "order_id", None) != ctx["order_id"]:
             continue
         if action not in ("fetch_to", "take_cooked", "rescue"):

@@ -63,10 +63,10 @@ def test_both_cooked_items_emitted_without_claims():
 
 
 def test_claim_on_one_cooked_item_does_not_suppress_the_other():
-    """米已下锅，熟鱼的候选必须还在——这才是本条修复的全部内容。"""
+    """队友已把米下锅，熟鱼的候选必须还在——这才是本条修复的全部内容。"""
     w = _world()
     bb = Blackboard()
-    bb.claim("c1", "fetch_to", "P2", "o1", 0, item="BoiledSushiRice")
+    bb.claim("c1", "fetch_to", "P1", "o1", 0, item="BoiledSushiRice")
     assert _cook_items(_emit(w, bb)) == {"GrilledFish"}
 
 
@@ -74,7 +74,7 @@ def test_claim_still_suppresses_the_same_cooked_item():
     """同一份熟料不能重复下锅——原有保护不能丢。"""
     w = _world()
     bb = Blackboard()
-    bb.claim("c1", "fetch_to", "P2", "o1", 0, item="BoiledSushiRice")
+    bb.claim("c1", "fetch_to", "P1", "o1", 0, item="BoiledSushiRice")
     assert "BoiledSushiRice" not in _cook_items(_emit(w, bb))
 
 
@@ -82,5 +82,18 @@ def test_claim_without_item_falls_back_to_order_scope():
     """老认领（没记 item）退化为整单抑制：宁可少发也不要重复下锅。"""
     w = _world()
     bb = Blackboard()
-    bb.claim("c1", "fetch_to", "P2", "o1", 0)
+    bb.claim("c1", "fetch_to", "P1", "o1", 0)
     assert _cook_items(_emit(w, bb)) == set()
+
+
+def test_own_claim_does_not_suppress_the_same_cooked_item():
+    """P2 自己上一拍的认领不能压掉这一拍的候选。
+
+    否则同一个 task 隔拍消失/出现，Executor 每拍重建树：实机
+    trace-20261108-161828 t=1480~1559 同一口灶的 order#3/#6 候选互换，
+    P2 在灶前冻住，命令一直 running。
+    """
+    w = _world()
+    bb = Blackboard()
+    bb.claim("c1", "fetch_to", "P2", "o1", 0, item="BoiledSushiRice")
+    assert "BoiledSushiRice" in _cook_items(_emit(w, bb))

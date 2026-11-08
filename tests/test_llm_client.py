@@ -369,8 +369,14 @@ def test_state_renders_success_last_result_without_reason():
 def test_proactive_event_prompts_require_speak(event):
     """新协议 content 不播：主动开口的事件必须明确要求调用 speak。"""
     msg = state_message(event, {})
-    assert "speak" in msg["content"]
+    assert "调用 speak 工具" in msg["content"]
     assert "不调用工具" not in msg["content"]
+
+
+def test_system_prompt_says_speak_is_a_tool_call():
+    """模型会把 speak 当成文本标签；system 里要明确是工具调用。"""
+    text = system_message("")["content"]
+    assert "这是工具调用，不是文本格式" in text
 
 
 def test_stream_total_timeout_raises(monkeypatch):

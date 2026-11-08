@@ -395,6 +395,23 @@ def _tool_nudge(results):
     return " ".join(dict.fromkeys(notes))
 
 
+# 模型偶尔把台词写成 <speak>...</speak>，而不是调用 speak 工具。
+_SPEAK_TAG_RE = re.compile(r"<speak>\s*(.*?)\s*</speak>", re.S)
+# 只有纯播报类事件才兜底播放标签内容；speech 回合仍只告警——那里
+# 「好，我去洗碗」可能对应根本没派发的动作，不能念出去。
+_SPEAK_TAG_EVENTS = frozenset((
+    "last_seconds", "round_summary", "open_division", "help_request",
+    "checkin", "batch", "command_result", "new_order",
+))
+
+
+def _speak_tag_text(content):
+    # type: (str) -> str
+    """取出 content 里 <speak> 标签内的台词；没有返回空串。"""
+    return " ".join(m.strip() for m in _SPEAK_TAG_RE.findall(str(content or ""))
+                    if m.strip())
+
+
 def _tools_include(tools, name):
     # type: (Any, str) -> bool
     for tool in tools or ():
@@ -1239,7 +1256,7 @@ class DialogWorker(object):
             self._run_llm(context, name, "", timing=timing, event_detail=detail)
             return
         if name in ("last_seconds", "round_summary"):
-            # 主循环一次性触发（各只发一次），直接说，不调工具、不再套限频闸。
+            # 主循环一次性触发（各只发一次），直接说（用 speak），不再套限频闸。
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
@@ -1491,9 +1508,19 @@ class DialogWorker(object):
                 return
             calls = list(reply.tool_calls)
             if not calls:
-                # 新协议：content 不播。模型漏调工具时只告警，不强制补轮。
-                log.warning("本轮没有调用任何工具（event=%s stage=turn%d）：%r",
-                            event, turn_index, reply.content)
+                # 新协议：content 不播。模型漏调工具时只告警，不强制补轮；
+                # 纯播报类事件若把台词写成 <speak> 标签，仍按标签内容播出。
+                tag_text = _speak_tag_text(reply.content) \
+                    if event in _SPEAK_TAG_EVENTS else ""
+                if tag_text:
+                    log.warning("模型把发言写成了 <speak> 标签"
+                                "（event=%s stage=turn%d）：%r",
+                                event, turn_index, reply.content)
+                    stream.feed(tag_text)
+                else:
+                    log.warning("本轮没有调用任何工具"
+                                "（event=%s stage=turn%d）：%r",
+                                event, turn_index, reply.content)
                 break
             speak_calls = [c for c in calls if c.name == "speak"]
             action_calls = [c for c in calls if c.name != "speak"]

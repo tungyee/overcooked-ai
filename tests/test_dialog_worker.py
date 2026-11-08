@@ -1203,6 +1203,33 @@ def test_content_only_speech_turn_warns_without_retry(caplog):
     assert "没有调用任何工具" in caplog.text
 
 
+def test_speak_tag_content_is_spoken_for_proactive_event(caplog):
+    """主动播报事件里模型把台词写成 <speak> 标签：仍按标签内容播出。"""
+    caplog.set_level(logging.WARNING, logger="ai.dialog")
+    llm = FakeLLM(reply("<speak>只剩最后几秒啦，冲一把！</speak>"))
+    worker, bundle = make_worker(llm=llm)
+
+    worker._handle_event(("last_seconds", None),
+                         {"tick": 1000, "live": True, "tools": TOOLS_NEW})
+
+    assert bundle.tts.spoken == ["只剩最后几秒啦，冲一把！"]
+    assert "<speak>" in caplog.text
+
+
+def test_speak_tag_content_is_not_spoken_for_player_command():
+    """玩家命令回合不能靠 <speak> 标签绕过 execute_actions。"""
+    llm = FakeLLM(reply("<speak>好，我去洗碗。</speak>"))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "你去洗碗吧",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == []
+    assert llm.choices == ["auto"]
+
+
 def test_execute_without_speak_forces_ack():
     """直接 execute 后模型没 speak，必须强制补一句短确认。"""
     llm = FakeLLM(

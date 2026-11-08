@@ -1356,8 +1356,12 @@ class DialogWorker(object):
                                 started=time.monotonic())
         else:
             timing.event = event
-        head = [system_message(context.get("dag") or "",
-                               context.get("guide") or "")]
+        tools = context.get("tools") or None
+        head = [system_message(
+            context.get("dag") or "",
+            context.get("guide") or "",
+            division=_tools_include(tools, "set_division"),
+            cookbook=_tools_include(tools, "read_cookbook"))]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)
@@ -1367,7 +1371,6 @@ class DialogWorker(object):
         # 世界状态放在本轮开口之前：它描述「此刻」，模型读完状态再看 P1 的话。
         turn = [opener]
         history = list(state_obj.history)
-        tools = context.get("tools") or None
         choice = "auto" if event in ("speech", "new_order") else "none"
 
         # 一整轮的流式 TTS。第一段先不喂：有工具调用时第一段可能"先答应"，
@@ -1474,8 +1477,11 @@ class DialogWorker(object):
                                 started=time.monotonic())
         else:
             timing.event = event
-        head = [system_message(context.get("dag") or "",
-                               context.get("guide") or "")]
+        head = [system_message(
+            context.get("dag") or "",
+            context.get("guide") or "",
+            division=_tools_include(tools, "set_division"),
+            cookbook=_tools_include(tools, "read_cookbook"))]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)

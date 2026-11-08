@@ -206,11 +206,12 @@ def _read_sse(resp, started=None, on_text=None, timeout=None):
 
 # ---------------------------------------------------------------- prompt
 
-def system_message(kitchen_dag, guide=""):
-    # type: (str, str) -> dict
+def system_message(kitchen_dag, guide="", division=False, cookbook=False):
+    # type: (str, str, bool, bool) -> dict
     """静态规则 + 本关 DAG + 攻略摘要（每关只变一次，方便上下文缓存）。"""
     return {"role": "system",
-            "content": prompts.render_system(kitchen_dag, guide)}
+            "content": prompts.render_system(
+                kitchen_dag, guide, division=division, cookbook=cookbook)}
 
 
 def render_state(context):

@@ -152,6 +152,25 @@ def test_set_division_applies_and_weights(agent, worker):
     assert kinds == {("direct", "P2", 1.0), ("claim", "P1", -6.0)}
 
 
+def test_set_division_is_resident_and_editable_mid_level(agent, worker):
+    """set_division 不是开局一次性：后续对话轮仍带它，玩家中途可改。"""
+    world = make_world()
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)          # 开局事件
+    first = [t["function"]["name"] for t in worker.contexts[-1]["tools"]]
+    assert "set_division" in first
+
+    result = agent._apply_duty_batch(world, _batch(
+        ("set_division", {"assignments": [
+            {"action": "cook", "owner": "player"}]})
+    ))[0]
+    assert result["division_changed"] is True
+
+    ctx = agent._build_dialog_context(world)
+    assert "set_division" in [t["function"]["name"] for t in ctx["tools"]]
+    assert agent.bb.division.snapshot()["player"] == ["cook"]
+
+
 def test_set_division_rejects_deliver_and_unknown_item(agent):
     world = make_world()
     agent.book = RecipeBook(world.recipes, world.stations)

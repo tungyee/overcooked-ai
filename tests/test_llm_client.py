@@ -380,6 +380,21 @@ def test_system_prompt_says_speak_is_a_tool_call():
     assert "这是工具调用，不是文本格式" in text
 
 
+def test_system_prompt_lists_division_tools_when_available():
+    text = system_message("", guide="本关攻略", division=True,
+                          cookbook=True)["content"]
+    assert "set_division(assignments=" in text
+    assert "read_cookbook(section)" in text
+    assert "按攻略里「玩家 / 你」的对应关系" in text
+    assert "送餐和洗盘不在分工里" in text
+
+
+def test_system_prompt_omits_division_tools_when_absent():
+    text = system_message("")["content"]
+    assert "set_division" not in text
+    assert "read_cookbook" not in text
+
+
 def test_stream_total_timeout_raises(monkeypatch):
     """服务端持续发 keepalive/慢帧时，requests 的单次 read timeout 不会
     结束整个流；必须用总时长硬上限。"""

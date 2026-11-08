@@ -103,6 +103,23 @@ def test_kitchen_render_is_action_oriented(kitchen):
     assert "物料（target" not in text
 
 
+def test_kitchen_render_includes_material_processing_order(kitchen):
+    """给 LLM 的目录要带每样料的加工顺序，不能只列菜名+动作枚举。"""
+    text = kitchen.render()
+    assert "物料处理顺序" in text
+    assert "Seaweed：装盘" in text
+    assert "BoiledSushiRice：下锅 → 盛盘" in text
+    assert "Cucumber：取料上砧板 → 切 → 装盘" in text
+    assert "SushiFish：取料上砧板 → 切 → 装盘" in text
+
+
+def test_kitchen_render_single_dish_limits_materials(kitchen):
+    """单菜渲染只列这道菜的物料，别把别的菜的料也塞进来。"""
+    text = kitchen.render(["Sushi_Fish"])
+    assert "SushiFish：" in text
+    assert "Cucumber：" not in text
+
+
 def test_kitchen_render_single_dish(kitchen):
     text = kitchen.render(["Sushi_Fish"], shared=False)
     assert "Sushi_Fish" in text and "Sushi_Cucumber" not in text

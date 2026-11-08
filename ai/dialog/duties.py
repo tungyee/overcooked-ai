@@ -283,10 +283,24 @@ class Kitchen(object):
         """
         wanted = None if dishes is None else set(dishes)
         lines = ["本关菜："]
+        wanted_materials = []  # type: List[str]
         for dish, mats in self.dish_materials.items():
             if wanted is not None and dish not in wanted:
                 continue
             lines.append("  %s = %s" % (dish, " + ".join(mats)))
+            for name in mats:
+                if name not in wanted_materials:
+                    wanted_materials.append(name)
+        lines.append("物料处理顺序（从上到下；最后一步是装盘）：")
+        for name in (wanted_materials if wanted is not None
+                     else list(self.materials)):
+            mat = self.materials.get(name)
+            if mat is None:
+                continue
+            steps = [self._step_text(name, task_type, item)
+                     for task_type, item in mat.steps
+                     if not self._meta(task_type).shared]
+            lines.append("  %s：%s" % (name, " → ".join(steps) or "直接装盘"))
         lines.append("本关动作（分工用这些名字，对应一类站点）：")
         for action in ACTION_TASK_TYPES:
             st = ACTION_STATION_TYPES[action]
@@ -618,7 +632,7 @@ def tool_schemas(targets=None, duty_ids=None):
     action_prop = {
         "type": "string",
         "enum": list(TOOL_ACTIONS),
-        "description": "动作：chop 切 / cook 煮炸烤下锅 / mix 拌 / plate 装盘 / deliver 送餐 / wash 洗盘 / fetch 取料",
+        "description": "动作：chop 切 / cook 煮炸烤下锅 / mix 拌 / plate 装盘（铺/放/摆料也是 plate）/ deliver 送餐 / wash 洗盘 / fetch 取料",
     }
     target_prop = {
         "type": "string",

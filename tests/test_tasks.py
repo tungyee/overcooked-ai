@@ -1398,6 +1398,27 @@ def test_fetch_to_board_done_binds_specific_board():
         .done(ctx) is True
 
 
+def test_fetch_to_board_yields_to_inflight_throw_batch():
+    """进行中的 ThrowBatch 把料拿在手上时，FetchToBoard 不能把同一份料抢回去。
+
+    trace-20261108-233353 t=742~1382：ThrowBatch(Tomato→对面板) pickup 成功
+    的那一拍板恰好变空，FetchToBoard(Tomato, 同一块板) 由不可行翻成可行、
+    分数 2.25 vs -0.5 越过承诺惯性，把刚拿起的料放回原处；板一满
+    ThrowBatch 又可行……来回 20+ 次、一次也没投出去。
+    """
+    w = FakeWorld(stations=[BOARD, CUKE_CRATE], recipes=RECIPES,
+                  orders=[ORDER_CHOP], workstations=[board("board_01")])
+    chef = {"name": "Player 2", "x": 0, "z": 0, "held": "Cucumber",
+            "interactions": inter()}
+    bb = Blackboard()
+    bb.commitment.active_task = T.ThrowBatch(
+        None, ("board_01 (2)", "board", "Cucumber", "Sushi_Cucumber"),
+        "Cucumber")
+    ctx, _ = make_ctx(w, chef=chef, bb=bb)
+    assert T.FetchToBoard("9", ("board_01",), "Cucumber") \
+        .feasible(ctx) is False
+
+
 def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     """切料上板树 = Selector 三分支：散落优先 / 箱子取 / 已在手兜底。
 

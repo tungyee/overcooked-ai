@@ -95,6 +95,25 @@ def board_drop_station(ctx):
     return placement.find_drop_station(ctx["w"], field)
 
 
+def _held_for_throw(ctx, item):
+    # type: (Dict, Any) -> bool
+    """手里这份料正由一个进行中的 ThrowBatch 搬运。
+
+    ThrowBatch 取到料后还要走到出手位再投；这一拍板恰好变空，FetchToBoard
+    的 done 由 True 翻成 False、feasible 由 False 翻成 True，又带着
+    async_resource / combo_head 的高分，会把刚拿起的料抢去放回同一块板
+    （trace-20261108-233353 t=742~1382：ThrowBatch ↔ FetchToBoard 来回
+    20+ 次，番茄始终没投出去）。投掷树自带 timeout，失败后承诺清空，
+    这里自然放开。
+    """
+    if not P.held_matches(ctx.get("chef"), item):
+        return False
+    bb = ctx.get("bb")
+    active = getattr(getattr(bb, "commitment", None), "active_task", None)
+    return getattr(active, "TYPE", None) == "ThrowBatch" \
+        and str(getattr(active, "item", "") or "").lower() == str(item).lower()
+
+
 @_register
 class FetchToBoard(Task):
     """第 7 号：把生料放到切菜板上。
@@ -130,6 +149,8 @@ class FetchToBoard(Task):
         if not ctx["book"].needs_chopping(self.item):
             return False       # 不可切的料没理由放板上
         if self.done(ctx):
+            return False
+        if _held_for_throw(ctx, self.item):
             return False
         if P.board_item(ctx["w"].workstations, str(self.board_id)):
             # 板上已有东西：能挪走、且有地方放才行（先腾板，见 build）

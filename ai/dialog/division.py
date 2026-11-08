@@ -208,7 +208,11 @@ def station_signature(world):
 
 def reach_signature(world, bb):
     # type: (Any, Any) -> Tuple
-    """每个可分工动作的 (P1可达, P2可达)；不变就不该叫 LLM。"""
+    """每个可分工动作的 (P1可达, P2可达)，仅诊断用。
+
+    单网格寻路对 3-3 左半场/旋转桌不准，不能拿它决定分工复核；
+    动态复核只看站点拓扑签名。
+    """
     from ai.dialog.help import cost_to
 
     out = []  # type: List[Tuple[str, bool, bool]]

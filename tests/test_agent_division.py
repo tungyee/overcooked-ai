@@ -223,54 +223,28 @@ def test_level_change_clears_division(agent, worker):
     assert worker.reset_count == 1
 
 
-def test_review_only_when_reach_changes_and_stable(agent, worker, monkeypatch):
+def test_review_only_when_station_topology_changes(agent, worker, monkeypatch):
+    """转盘/梯子的纯路径变化不触发；站点真的移动才 review。"""
     world = make_world()
     agent.book = RecipeBook(world.recipes, world.stations)
-    agent._service_dialog(world)          # 开局：记下签名
+    agent._service_dialog(world)          # 开局：记下站点签名
     worker.events.clear()
 
-    sig_a = (("下锅", True, True), ("切", True, True))
-    sig_b = (("下锅", False, True), ("切", True, True))
-    station_a = ("a",)
-    station_b = ("b",)
-    monkeypatch.setattr("ai.agent.reach_signature", lambda w, b: sig_a)
+    station_a = (("切", "G", 1, 1, 1, 1),)
+    station_b = (("切", "G", 2, 1, 2, 1),)
     monkeypatch.setattr("ai.agent.station_signature", lambda w: station_a)
-    agent._division_reach_sig = sig_a
     agent._division_station_sig = station_a
 
-    # 可达性不变：再检查也不发 review。
+    # 站点没变：再检查也不发 review。
     agent.bb.tick += 20
     agent._service_dialog(world)
     assert [e[0] for e in worker.events] == []
 
-    # 站点移动 + 可达性变化：连续 2 次确认后发 review。
-    monkeypatch.setattr("ai.agent.reach_signature", lambda w, b: sig_b)
+    # 站点移动：连续 2 次确认后发 review。
     monkeypatch.setattr("ai.agent.station_signature", lambda w: station_b)
     agent.bb.tick += 20
     agent._service_dialog(world)
     assert [e[0] for e in worker.events] == []
-    agent.bb.tick += 20
-    agent._service_dialog(world)
-    assert [e[0] for e in worker.events] == ["division_review"]
-
-
-def test_review_slow_path_for_temporary_block(agent, worker, monkeypatch):
-    world = make_world()
-    agent.book = RecipeBook(world.recipes, world.stations)
-    agent._service_dialog(world)
-    worker.events.clear()
-
-    sig_a = (("下锅", True, True), ("切", True, True))
-    sig_b = (("下锅", False, True), ("切", True, True))
-    agent._division_reach_sig = sig_a
-    agent._division_station_sig = ("same",)
-    monkeypatch.setattr("ai.agent.reach_signature", lambda w, b: sig_b)
-    monkeypatch.setattr("ai.agent.station_signature", lambda w: ("same",))
-
-    for _ in range(7):
-        agent.bb.tick += 20
-        agent._service_dialog(world)
-        assert [e[0] for e in worker.events] == []
     agent.bb.tick += 20
     agent._service_dialog(world)
     assert [e[0] for e in worker.events] == ["division_review"]

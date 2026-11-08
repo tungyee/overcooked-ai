@@ -22,8 +22,8 @@ from ai.dialog.duties import (Kitchen, TaskMeta, TOOL_ACTIONS, node_key,
                               tool_schemas)
 from ai.dialog.division import (DIVISION_ACTIONS, TOOL_ACTION_NAMES,
                                 TOOL_OWNER_NAMES, diff_entries,
-                                reach_signature, station_signature,
-                                tool_actions, validate_entry)
+                                station_signature, tool_actions,
+                                validate_entry)
 from ai.dialog.help import cost_to
 from ai.dialog.policy import EventQueue
 from ai.dialog.schema import DialogState
@@ -383,11 +383,10 @@ def _validate_action(kitchen, action, direction, world, bb):
     return True, ""
 
 
-# 动态复核：每 1 秒检查一次。站点真的移动 → 连续 2 次确认；只是路被挡
-# → 连续 8 次确认。两次 review 至少隔 8 秒。
+# 动态复核：每 1 秒比较一次站点拓扑；连续 2 次确认才 review，两次之间
+# 至少隔 8 秒。转盘/梯子这类纯路径变化不触发。
 DIVISION_CHECK_TICKS = 20
-DIVISION_FAST_CONFIRM = 2
-DIVISION_SLOW_CONFIRM = 8
+DIVISION_CONFIRM = 2
 DIVISION_REVIEW_COOLDOWN_TICKS = 20 * 8
 
 
@@ -554,7 +553,6 @@ class Agent:
         # 分工：只由 LLM 的 set_division 工具写入；这里只存本关攻略和复核状态。
         self._guide = None
         self._division_station_sig = None
-        self._division_reach_sig = None
         self._division_pending = 0
         self._division_last_review_tick = 0
         self._division_last_check_tick = 0
@@ -1086,7 +1084,6 @@ class Agent:
         self.bb.division = self.bb.division.__class__()
         self.bb.preferences[:] = []
         self._division_station_sig = None
-        self._division_reach_sig = None
         self._division_pending = 0
         self._division_last_review_tick = 0
         self._division_last_check_tick = 0
@@ -1094,42 +1091,43 @@ class Agent:
 
     def _division_facts(self, world):
         # type: (World) -> str
-        """开局/复核事件里的站位与可达动作事实（不是建议）。"""
-        p1 = _reachable_actions(world, self.bb, P.P1_NAME)
-        p2 = _reachable_actions(world, self.bb, P.P2_NAME)
-        parts = ["你能做：%s。" % ("、".join(p2) or "无"),
-                 "玩家能做：%s。" % ("、".join(p1) or "无")]
+        """开局/复核事件里的站位事实（不是建议）。
+
+        不再列「你能做/玩家能做」：单网格寻路对 3-3 左半场/旋转桌不准，
+        会把「能装盘」误报成「够不着」。可达性以 execute_actions 返回为准。
+        """
         p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
         p2_chef = P.chef_by_name(world.chefs, P.P2_NAME)
         if p1_chef and p2_chef:
-            parts.append("你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
+            return "你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
                 float(p2_chef.get("x") or 0), float(p2_chef.get("z") or 0),
-                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0)))
-        return "".join(parts)
+                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0))
+        return ""
 
-    def _reach_change_text(self, old_sig, new_sig):
+    def _station_change_text(self, old_sig, new_sig):
         # type: (Any, Any) -> str
-        old_map = {row[0]: (row[1], row[2]) for row in (old_sig or ())}
-        new_map = {row[0]: (row[1], row[2]) for row in (new_sig or ())}
-        changes = []  # type: List[str]
-        for action in sorted(set(old_map) | set(new_map)):
-            before = old_map.get(action, (False, False))
-            after = new_map.get(action, (False, False))
-            if before == after:
-                continue
-            changes.append("%s：玩家%s、你%s" % (
-                action,
-                "能" if after[0] else "不能",
-                "能" if after[1] else "不能"))
-        return "；".join(changes)
+        """站点拓扑签名差异 → 哪些动作的站点动了。"""
+        old = {}  # type: Dict[str, Any]
+        new = {}  # type: Dict[str, Any]
+        for row in (old_sig or ()):
+            old[row[0]] = row[1:]
+        for row in (new_sig or ()):
+            new[row[0]] = row[1:]
+        changed = [action for action in sorted(set(old) | set(new))
+                   if old.get(action) != new.get(action)]
+        return "、".join(changed)
 
     def _update_division(self, world, events, tick):
         # type: (World, list, int) -> None
-        """开局分工 + 动态复核；可达性不变就不叫 LLM。"""
+        """开局分工 + 动态复核；只在站点拓扑变化时叫 LLM。
+
+        转盘/梯子这类纯路径变化不算：可达性对 3-3 的旋转桌并不准（
+        左半场在单网格寻路之外），用它去改分工会把「能装盘」误报成
+        「够不着」。站点位置真的变了（平台把站点带走/永久换边）才复核。
+        """
         if not self._division_initial_fired:
             self._division_initial_fired = True
             self._division_station_sig = station_signature(world)
-            self._division_reach_sig = reach_signature(world, self.bb)
             self._division_last_check_tick = tick
             events.append(("division", {"facts": self._division_facts(world)}))
             return
@@ -1137,30 +1135,23 @@ class Agent:
             return
         self._division_last_check_tick = tick
         station_sig = station_signature(world)
-        reach_sig = reach_signature(world, self.bb)
-        if reach_sig == self._division_reach_sig:
+        if station_sig == self._division_station_sig:
             self._division_pending = 0
-            self._division_station_sig = station_sig
             return
         self._division_pending += 1
-        station_moved = station_sig != self._division_station_sig
-        need = DIVISION_FAST_CONFIRM if station_moved else DIVISION_SLOW_CONFIRM
-        if self._division_pending < need:
+        if self._division_pending < DIVISION_CONFIRM:
             return
         if tick - self._division_last_review_tick < DIVISION_REVIEW_COOLDOWN_TICKS:
             return
-        old_sig = self._division_reach_sig
+        old_sig = self._division_station_sig
         self._division_pending = 0
         self._division_station_sig = station_sig
-        self._division_reach_sig = reach_sig
         self._division_last_review_tick = tick
-        change = self._reach_change_text(old_sig, reach_sig)
-        facts = ("%s。%s" % (change, self._division_facts(world))
-                 if change else self._division_facts(world))
+        change = self._station_change_text(old_sig, station_sig)
         events.append(("division_review", {
-            "facts": facts,
+            "facts": "站点位置变了：%s。" % (change or "站点",),
             "current": self.bb.division.render() or "（空）",
-            "station_moved": bool(station_moved),
+            "station_moved": True,
         }))
 
     def _dialog_matches(self, world, book):

@@ -327,7 +327,7 @@ def test_render_state_includes_reachable_division():
         "reachable_actions": {"p2_actions": ["切"],
                               "p1_actions": ["下锅", "装盘", "送餐"]},
     })
-    assert "你能做的动作（够得着的）：切" in text
+    assert "你能做的动作（单网格估计" in text and "：切" in text
     # 队友能做什么同样是快照，容易被滞后信息误导，不再进 state。
     assert "队友能做的动作" not in text
 
@@ -338,7 +338,7 @@ def test_render_state_prefers_reachable_actions_over_division():
         "p2_reachable_actions": ["切", "装盘", "送餐", "洗盘"],
         "reachable_actions": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
     })
-    assert "你能做的动作（够得着的）：切、装盘、送餐、洗盘" in text
+    assert "你能做的动作（单网格估计" in text and "切、装盘、送餐、洗盘" in text
 
 
 def test_render_state_does_not_fall_back_when_reachable_is_empty():

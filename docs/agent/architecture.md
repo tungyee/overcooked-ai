@@ -79,5 +79,5 @@ World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
 - `ai/dialog/cookbook.py` 读取 `docs/guides`：先按「内部关卡名」精确匹配，主线再按 `{主题}_{世界}_{关}` 回退到 `story/{世界}-{关}.md`。攻略里的人称已统一为「你（AI）/ 玩家（人类）」，运行时不再转换。
 - 开局把「关卡机制 / 打法与分工 / 陷阱」摘要注入 system prompt（稳定前缀，随关卡只变一次）；模型需要细节时调用 `read_cookbook(section)`。
 - 分工的唯一写入入口是 `set_division`：`action` 枚举按本关站点动态生成（切/下锅/拌/装盘，送餐/洗盘不进分工），可选 `item` 做物料级细分，`owner` 为 `you/player/both`。主循环校验后写入 `bb.division`，编译成 planner 的 `Preference`（`you` direct +1、`player` claim -6、`both` 不加权）。
-- 动态复核：每 1 秒比较一次可达性签名；签名不变就不调 LLM。站点拓扑变化稳定 2 秒、纯路径变化稳定 8 秒才发 `division_review`，两次 review 至少隔 8 秒。review 回合的 `speak` 先缓冲，只有 `set_division` 真的改了分工才播放。
+- 动态复核：每 1 秒比较一次站点拓扑签名；签名不变就不调 LLM。站点移动/出现/消失连续 2 秒确认才发 `division_review`，两次 review 至少隔 8 秒。转盘、梯子这类纯路径变化不触发——3-3 的左半场在单网格寻路之外，用路径可达性改分工会把「能装盘」误报成「够不着」。review 回合的 `speak` 先缓冲，只有 `set_division` 真的改了分工才播放。
 - 3-2 这类「两人都要切不同物料」的关：模型应按 `item` 分别写 `chop Meat→玩家`、`chop Lettuce/Cheese→你`；分不清就整个动作不写，避免把某一侧切菜能力误压掉。

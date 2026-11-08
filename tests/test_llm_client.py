@@ -266,8 +266,9 @@ def test_render_state_is_readable_and_in_seconds():
     })
     assert "剩余 99.0 秒" in text
     assert "#1 Sushi_Fish 剩 18.1 秒" in text
-    assert "在煮，40%" in text
-    assert "队友：手持 cucumber" in text
+    assert "灶：1 个在用" in text
+    assert "在煮，40%" not in text          # 灶的详细内容不再进 state
+    assert "队友：手持" not in text
     assert "Chop:SushiFish" in text
 
 

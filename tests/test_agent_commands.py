@@ -118,7 +118,7 @@ def test_prompt_has_no_internal_codes(world):
         "orders": [{"id": "1", "dish": "Sushi_Cucumber", "remaining": 60}],
         "p1": {"holding": "Seaweed"}, "p2": {"doing": "切"},
     })["content"]
-    assert "队友" in state and "你" in state
+    assert "你" in state
     assert "P1" not in state and "P2" not in state
 
 

@@ -436,11 +436,13 @@ def test_build_dialog_context_has_grounding_fields(dagent, world):
 
     from ai.dialog.llm import render_state
     state_text = render_state(ctx)
-    assert "切菜板" in state_text
-    assert "空闲灶 1 个" in state_text
-    assert "连击 3" in state_text
-    assert "快过期" in state_text
+    # 细节（灶内容/板内容/连击/临期单）不再进 state；只留摘要。
     assert "总分 135" in state_text
+    assert "灶：1 个在用，1 个空" in state_text
+    assert "砧板：0 块空，1 块有料" in state_text
+    assert "切菜板" not in state_text
+    assert "连击" not in state_text
+    assert "快过期" not in state_text
 
 
 def test_context_p2_doing_uses_dag_node(dagent, world):

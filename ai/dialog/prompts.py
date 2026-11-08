@@ -92,6 +92,10 @@ def state_view(context, commands=None, last_result=None):
             {"name": c.get("name"), "text": c.get("text")}
             for c in (ctx.get("cookers") or ())
         ],
+        "boards_empty": sum(
+            1 for b in (ctx.get("boards") or ()) if "空" in str(b)),
+        "boards_busy": sum(
+            1 for b in (ctx.get("boards") or ()) if "空" not in str(b)),
         "plates": ctx.get("plates"),
         "boards": ctx.get("boards") or [],
         "idle_cookers": ctx.get("idle_cookers"),

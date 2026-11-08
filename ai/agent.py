@@ -753,6 +753,18 @@ class Agent:
             return {"ok": False, "action": action,
                     "target": display or resolved or target_raw,
                     "reason": reason, "valid_targets": valid}
+        if action == "deliver" and not resolved:
+            targets = []
+            live = planner._dialog_live_orders(world, self.bb)
+            for cand in feasible:
+                order_id = getattr(cand.task, "order_id", None)
+                for order in live:
+                    if str(order.get("id")) != str(order_id):
+                        continue
+                    dish = order.get("dish")
+                    if dish and str(dish) not in targets:
+                        targets.append(str(dish))
+            return {"ok": True, "action": action, "targets": targets[:6]}
         if resolved:
             out = {"ok": True, "action": action,
                    "target": display or resolved,

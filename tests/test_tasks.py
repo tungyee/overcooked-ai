@@ -890,6 +890,36 @@ def test_take_cooked_feasible_while_cooking():
     assert t.feasible(ctx) is True
 
 
+def test_take_cooked_infeasible_when_just_started_cooking():
+    """刚下锅（离熟还远）不去端盘等，先让别的命令跑。"""
+    w = FakeWorld(stations=[COOKER, COUNTER], recipes=RECIPES,
+                  orders=[ORDER],
+                  cookers=[cooker("workstation_cooker_01",
+                                  isCooking=True, cooked=False,
+                                  cooking_time=12.0,
+                                  cooking_progress=2.0)],
+                  plates=[plate("p1", 7, 0, ["Seaweed"])])
+    ctx, _ = make_ctx(w)
+    t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
+                            "BoiledSushiRice")
+    assert t.feasible(ctx) is False
+
+
+def test_take_cooked_feasible_near_done():
+    """离熟 4s 以内放行：留够取盘+走位，避免熟了才去端。"""
+    w = FakeWorld(stations=[COOKER, COUNTER], recipes=RECIPES,
+                  orders=[ORDER],
+                  cookers=[cooker("workstation_cooker_01",
+                                  isCooking=True, cooked=False,
+                                  cooking_time=12.0,
+                                  cooking_progress=9.0)],
+                  plates=[plate("p1", 7, 0, ["Seaweed"])])
+    ctx, _ = make_ctx(w)
+    t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
+                            "BoiledSushiRice")
+    assert t.feasible(ctx) is True
+
+
 def test_take_cooked_infeasible_when_plate_has_foreign_ingredient():
     """P1 往 P2 要盛饭的盘里放了别的料 → 盘不再匹配原单，task 不可行。
 

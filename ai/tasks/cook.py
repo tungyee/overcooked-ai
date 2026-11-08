@@ -26,6 +26,11 @@ WAIT_COOKED_TIMEOUT_TICKS = 300
 # task 长，超时上限单独放宽（20s，比默认 TASK_TIMEOUT_TICKS=200 的 10s 翻倍）。
 TAKE_COOKED_TIMEOUT_TICKS = 400
 
+# 端盘取熟料的提前量（秒）：锅里的料离熟还有这么多秒以内才去端盘/走近。
+# 再早去（例如刚下锅）就只能端着盘子在锅边干等，把后面的命令（洗碗等）
+# 全堵住；留 4s 给取盘+走位，既不会从 0% 开始等，也不会晚到烧糊。
+TAKE_COOKED_LEAD_S = 4.0
+
 # 传送带拦截等料的最长拍数（15s）。米/鱼/海苔在传送带上循环移动，走到锁定
 # 段旁等它经过；一轮循环实测约 30~40 秒但场上同时有多份料，等到下一份的
 # 间隔远短于此。超时交还 Planner，而不是无限等一份可能永远不来的料。
@@ -441,6 +446,27 @@ class FillCooker(FetchToCooker):
                    for r in raws)
 
 
+def _cooker_ready_to_take(c):
+    # type: (Dict) -> bool
+    """端盘取熟料的时机：已熟，或煮到离熟 TAKE_COOKED_LEAD_S 秒以内。
+
+    旧帧没有 cooking_progress / cooking_time 时退回旧行为（煮中即可去），
+    避免因为缺字段把 TakeCookedToPlate 永久判成不可行。
+    """
+    if P.cooker_cooked(c):
+        return True
+    if not P.cooker_started(c):
+        return False
+    try:
+        total = float(c.get("cooking_time") or 0)
+        progress = float(c.get("cooking_progress") or 0)
+    except (TypeError, ValueError):
+        return True
+    if total <= 0:
+        return True
+    return total - progress <= TAKE_COOKED_LEAD_S
+
+
 @_register
 class TakeCookedToPlate(Task):
     """第 4 号：端着盘子去熟料源把熟料盛进缺此料的盘。
@@ -490,7 +516,9 @@ class TakeCookedToPlate(Task):
         # type: (Dict) -> bool
         """可行性分两段（spec §6.1 第 4 号 + §6.5）：
 
-          - **启动看源**：灶上熟料 / 台面散熟锅才值得去取；
+          - **启动看源 + 时机**：灶上熟料 / 台面散熟锅才值得去取；灶上还在
+            煮时只等到「离熟 TAKE_COOKED_LEAD_S 秒以内」才放行，避免刚下锅
+            就端盘去锅边干等、把队列里后面的命令堵住；
           - **执行中看手**：本 task 第一步就是把盘从原位拿起，盘随即离开
             原位。若可行性绑死在"盘还在原位"，它一动手就把自己判成不可行 →
             被承诺惯性抛弃 → 死循环（实机复现）。故"目标盘已在手上"也算可行。
@@ -507,7 +535,14 @@ class TakeCookedToPlate(Task):
             return False                       # 盘内容与该单不再兼容（P1 放错料）
         if _holding_plate(ctx, self.plate_id):
             return True                        # 执行中：目标盘已在手上
-        return self._source(ctx) is not None
+        s = self._source(ctx)
+        if s is None:
+            return False
+        if s["kind"] == "cooker":
+            c = cooker_state(ctx, self.cooker_id)
+            if not _cooker_ready_to_take(c):
+                return False                   # 还早：先去做别的，别端盘干等
+        return True
 
     def resource_target(self, rid, ctx):
         # type: (Any, Dict) -> Optional[Dict]

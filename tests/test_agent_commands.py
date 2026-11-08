@@ -335,3 +335,29 @@ def test_pizza_chop_targets_are_item_scoped(monkeypatch):
     assert ("Chop", "dough") in scopes["cmd1"]
     assert ("Chop", "tomato") in scopes["cmd2"]
     assert ("Chop", "cheese") in scopes["cmd3"]
+
+
+def test_execute_actions_rejected_on_autonomous_event(agent, world):
+    """自主事件（division/review/command_result）不能自己派活。"""
+    from ai.dialog.worker import DutyBatch
+
+    batch = DutyBatch(
+        batch_id="b", origin="division",
+        calls=[("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})])
+    out = agent._apply_duty_batch(world, batch)[0]
+    assert out["ok"] is False and out["silent"] is True
+    assert "planner" in out["reason"]
+    assert agent.commands.commands == []
+
+
+def test_execute_actions_allowed_on_player_speech(agent, world):
+    from ai.dialog.worker import DutyBatch
+
+    batch = DutyBatch(
+        batch_id="b", origin="speech",
+        calls=[("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})])
+    out = agent._apply_duty_batch(world, batch)[0]
+    assert out["ok"] is True
+    assert len(agent.commands.commands) == 1

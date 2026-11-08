@@ -382,7 +382,7 @@ def tool_schemas(division_actions=None, with_cookbook=False):
             "type": "function",
             "function": {
                 "name": "execute_actions",
-                "description": "把动作数组按顺序排成持久命令并执行。单动作也传长度为 1 的数组。没有命令在跑时第一条立即开始；已有命令时按顺序排队（最多 3 条待执行）。每条返回 ok/status/reason；不可行的那条不影响后面的条目。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
+                "description": "只在玩家明确要求做某件事时调用：把动作数组按顺序排成持久命令并执行。自主干活不要用这个工具派活，planner 会按分工自动选活。单动作也传长度为 1 的数组。没有命令在跑时第一条立即开始；已有命令时按顺序排队（最多 3 条待执行）。每条返回 ok/status/reason；不可行的那条不影响后面的条目。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
                 "parameters": {
                     "type": "object",
                     "properties": {

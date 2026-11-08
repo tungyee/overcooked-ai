@@ -630,7 +630,16 @@ class Agent:
             if name == "check_action":
                 results.append(self._check_action(world, args))
             elif name == "execute_actions":
-                results.append(self._execute_actions(world, args))
+                origin = getattr(batch, "origin", "") or "speech"
+                if origin != "speech":
+                    # 自主干活交给 planner：分工/复核/命令结果/定时事件都不该
+                    # 由模型自己派活，否则会把分工变成逐条任务派发。
+                    results.append({
+                        "ok": False, "silent": True,
+                        "reason": "自主干活不要用 execute_actions；planner 会按分工选活。",
+                    })
+                else:
+                    results.append(self._execute_actions(world, args))
             elif name == "execute_action":
                 # 旧工具名：handler 保留，兼容旧 trace/回放；新 prompt 不再暴露。
                 results.append(self._execute_action(world, args))

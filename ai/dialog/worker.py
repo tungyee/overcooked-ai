@@ -379,6 +379,9 @@ def _tool_nudge(results):
         if result.get("observation"):
             # get_world_state 的观察结果：只提供信息，不催 execute/speak。
             continue
+        if result.get("silent"):
+            # 内部闸门（例如自主事件误用 execute_actions）：不用向玩家解释。
+            continue
         if result.get("tool") in ("set_division", "read_cookbook"):
             # 分工/攻略查询不是执行动作；成功时不要催 execute_actions。
             if result.get("ok") is False:
@@ -1582,6 +1585,7 @@ class DialogWorker(object):
                 messages.append({"role": "system", "content": nudge})
             rejected = any(
                 isinstance(result, dict) and result.get("ok") is False
+                and not result.get("silent")
                 for result in action_results)
             if texts and not rejected:
                 if silent_review:

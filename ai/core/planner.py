@@ -2318,8 +2318,8 @@ def _placed_plates(world):
 
     与 ai/tasks/base.placed_plates(ctx) 同口径，但按 world 重写：拼装格由
     stations 里 t=="counter" 且带 gx/gz 的站点给出，盘用 to_grid 反解网格
-    坐标后比对。只认 world.plates（非手持）：还在盘堆/晾干架/手上的盘不算
-    「已就位」，不能往上倒料。
+    坐标后比对。只认落在 counter 拼装格上的盘；盘堆顶层由 `_usable_plate`
+    另行判定（堆顶能直接接料），晾干架/手上的盘仍不算。
     """
     from ai.query.recipe_graph import _counter_cells
     counters = set(_counter_cells(world))   # 主网格坐标，篮子台面按 x/z 投影
@@ -2328,6 +2328,22 @@ def _placed_plates(world):
         if x is None or z is None:
             continue
         if world.to_grid(x, z) in counters:
+            return True
+    return False
+
+
+def _usable_plate(world):
+    # type: (Any) -> bool
+    """是否已有可直接接料的盘：counter 拼装格上的盘，或干净盘堆顶层。
+
+    `_placed_plates` 只认 counter 格；盘堆顶层虽然不在 counter 上，
+    `_match_plates_to_orders` 也把它当作可用盘，`FetchToPlate` 可以直接把
+    料放上去（实机确认）。这时 `PlaceCleanPlate` 不该再以 L4 解卡身份抢先。
+    """
+    if _placed_plates(world):
+        return True
+    for p in getattr(world, "plates", None) or ():
+        if p.get("stack_top") and p.get("stack_clean"):
             return True
     return False
 

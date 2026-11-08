@@ -59,14 +59,19 @@ LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                     "TakeCookedToPlate", "ThrowBatch", "MergePlates")
 
 
-def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):
-    # type: (Callable, Callable, Callable) -> Tuple
+def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
+                usable_plate_fn=None):
+    # type: (Callable, Callable, Callable, Optional[Callable]) -> Tuple
     """构造层序规则表。
 
     表可替换（重排 / 删条），谓词不可替换——谓词里的曲线是实测定标过的，
-    不开放给策略层改（spec §5.1）。三条曲线由调用方注入，让本模块不 import
+    不开放给策略层改（spec §5.1）。曲线由调用方注入，让本模块不 import
     planner（避免环），也让单测能喂固定值。
+
+    `usable_plate_fn`：是否已有可直接接料的盘（台面盘或干净盘堆顶层）。
+    缺省退回 `placed_plates_fn`，保持旧调用点语义。
     """
+    usable_plate_fn = usable_plate_fn or placed_plates_fn
     return (
         (L_FIRE,         lambda t, w: t.TYPE == "Extinguish"),
         (L_IRREVERSIBLE, lambda t, w: pressure_fn(t, w) >= PRESSURE_IRREVERSIBLE),
@@ -76,7 +81,11 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):
             (t.TYPE == "WashPlate"
              and plate_pressure_fn(w) >= 2.0
              and not placed_plates_fn(w))
-            or (t.TYPE == "PlaceCleanPlate" and plate_pressure_fn(w) > 0)
+            # 已有可直接接料的盘（台面盘 / 干净盘堆顶层）时，摆盘不再是
+            # 「解卡」：FetchToPlate 可以直接把料放上去，不该被 L4 结构性
+            # 抢走（trace-20261108-225713 t=612：盘堆顶已匹配仍被逼着搬盘）。
+            or (t.TYPE == "PlaceCleanPlate" and plate_pressure_fn(w) > 0
+                and not usable_plate_fn(w))
             # 跨区送盘：只在对面缺盘时才是候选（cross_supply.send_deficit），
             # 缺盘就是拼装被卡住，同摆盘一层
             or t.TYPE == "SendAcross"
@@ -90,8 +99,8 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn):
 
 
 def layer_of(task, world, pressure_fn=None, plate_pressure_fn=None,
-             placed_plates_fn=None, rules=None):
-    # type: (Any, Any, Optional[Callable], Optional[Callable], Optional[Callable], Optional[Tuple]) -> int
+             placed_plates_fn=None, usable_plate_fn=None, rules=None):
+    # type: (Any, Any, Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable], Optional[Tuple]) -> int
     """这个候选属于哪一层。遍历规则表取第一个命中，无命中则 L_CLEANUP。
 
     纯函数，**不读 bb**：策略覆盖由调用方决定传哪张 rules，层判定本身只认
@@ -100,7 +109,8 @@ def layer_of(task, world, pressure_fn=None, plate_pressure_fn=None,
     """
     if rules is None:
         rules = build_rules(pressure_fn, plate_pressure_fn,
-                            placed_plates_fn or (lambda w: False))
+                            placed_plates_fn or (lambda w: False),
+                            usable_plate_fn)
     for layer, pred in rules:
         if pred(task, world):
             return layer
@@ -109,16 +119,18 @@ def layer_of(task, world, pressure_fn=None, plate_pressure_fn=None,
 
 def layer_of_task(task, world):
     # type: (Any, Any) -> int
-    """生产路径的层判定入口：接上 planner 的三条实测谓词。
+    """生产路径的层判定入口：接上 planner 的实测谓词。
 
     import 放在函数内是**防御性**的：今天 `ai/planner.py` 并不 import 本模块，
     所以模块级 import 也能过；但 planner 将来若在模块级消费本模块（Task 5 的
-    消费点目前也在 `plan()` 函数内），两边就会成环。这三条谓词是纯函数、调用
+    消费点目前也在 `plan()` 函数内），两边就会成环。这些谓词是纯函数、调用
     开销可忽略，保持局部 import 最省心。
     """
-    from ai.core.planner import _placed_plates, _plate_pressure, _time_pressure
+    from ai.core.planner import (_placed_plates, _plate_pressure,
+                                 _time_pressure, _usable_plate)
     return layer_of(task, world, rules=build_rules(
-        _time_pressure, lambda w: _plate_pressure(w), _placed_plates))
+        _time_pressure, lambda w: _plate_pressure(w), _placed_plates,
+        _usable_plate))
 
 
 def layer_filter(candidates, world, layer_fn=None):

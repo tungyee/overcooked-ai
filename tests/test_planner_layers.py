@@ -259,6 +259,23 @@ def test_plate_pressure_counts_held_plates():
     assert PL.layer_of_task(t, _W(plates=[], held_plates=[])) == PL.L_UNBLOCK
 
 
+def test_place_clean_plate_yields_to_usable_stack_top():
+    """干净盘堆顶层已经能直接接料时，PlaceCleanPlate 不该再以 L4 抢先。
+
+    实机确认：盘堆顶可以放料（trace-20261108-225713 t=612 的
+    FetchToPlate 对 stack_top 盘 ok=True）。旧规则只看 plate_pressure>0，
+    会在只剩这一块干净盘时把 L6 的 FetchToPlate 结构性压掉，逼 P2 先搬盘。
+    """
+    t = _T("PlaceCleanPlate")
+    stack_top = {"n": "p1", "contents": [],
+                 "stack_top": True, "stack_clean": True}
+    # 唯一一块干净盘在盘堆顶、可直接接料 → 不进 L4
+    assert PL.layer_of_task(t, _W(plates=[stack_top])) == PL.L_CLEANUP
+    # 同一块盘但旧帧/脏标记缺失 → 仍按「只剩一块干净盘」升 L4
+    assert PL.layer_of_task(
+        t, _W(plates=[{"n": "p1", "contents": []}])) == PL.L_UNBLOCK
+
+
 def test_missing_cooking_progress_falls_back_to_binary():
     """旧帧/残帧没有 cooking_progress 时，_time_pressure 退回二进制
     （cooked 或 burning → 1.0）。于是「熟锅」进 L2 而不是 L6。

@@ -16,6 +16,7 @@
 `requests.post` 是模块级引用，测试直接 monkeypatch 它，不会发真实请求。
 """
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -61,6 +62,36 @@ class LLMClient(object):
         self.base_url = (base_url or "").rstrip("/")
         self.model = model
         self.timeout = float(timeout)
+
+    def warmup(self):
+        # type: () -> None
+        """后台发一个极小请求，吸收服务端冷启动（实测首 token 可到 7–8s）。
+
+        不影响主链路；失败静默（真正请求时再报错）。
+        """
+        url = self.base_url + "/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 1,
+            "thinking": {"type": "disabled"},
+        }
+        headers = {
+            "Authorization": "Bearer " + str(self.api_key),
+            "Content-Type": "application/json",
+        }
+        timeout = max(5.0, float(self.timeout))
+
+        def run():
+            try:
+                requests.post(url, headers=headers, json=payload,
+                              timeout=timeout)
+            except Exception:                   # noqa: BLE001
+                pass
+
+        threading.Thread(target=run, name="dialog-llm-warmup",
+                         daemon=True).start()
 
     def chat(self, messages, tools=None, tool_choice="auto", on_text=None):
         # type: (List[dict], Optional[List[dict]], str, Any) -> LLMReply

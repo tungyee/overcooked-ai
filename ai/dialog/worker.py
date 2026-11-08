@@ -584,6 +584,13 @@ class DialogWorker(object):
                 warmup()
             except Exception:               # noqa: BLE001
                 log.debug("TTS 预连失败（不影响后续逐句建连）", exc_info=True)
+        # LLM 也预热一次，吸收服务端冷启动（实测首 token 可到 7–8s）。
+        llm_warmup = getattr(self.clients.llm, "warmup", None)
+        if callable(llm_warmup):
+            try:
+                llm_warmup()
+            except Exception:               # noqa: BLE001
+                log.debug("LLM 预热失败（不影响正常请求）", exc_info=True)
         self._stop.clear()
         self._watchdog_stop.clear()
         if self._watchdog_thread is None or not self._watchdog_thread.is_alive():

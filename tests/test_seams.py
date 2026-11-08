@@ -150,3 +150,38 @@ def test_sunk_stairs_not_merged_into_ground():
     # 旧帧（无高度）照旧并入
     flat = [{"layer": 9, "boxes": [[0, 1, 0, 1]]}, {"layer": 28, "boxes": [[1, 2, 0, 1]]}]
     assert len(occupancy.parse_terrain(flat)[9]) == 2
+
+
+def test_gate_exit_detours_around_wall_when_holding_plate():
+    """端盘从缝口出来，下一格贴墙时先绕到安全行，不直着顶墙。
+
+    trace-20261108-155517 t=1367：P2 端盘在缝口出口格 (12,-10.8) 前被墙顶住
+    （body 停在 z=-11.43，盘子在身前），旧路点直接奔该格中心。
+    """
+    f = _frame()
+    # 东侧出口格 (5,1) 正北贴一堵厚墙（与实机 [11.19,12.81,-10.41,-8.79] 同形）
+    f["terrain"][1]["boxes"].append([13.2, 14.4, -10.41, -8.79])
+    f["chefs"][0]["held"] = "equipment_plate_01"
+    w = World(f)
+    field = reachability.field_for(w)
+    path = navigation.trace_back(field, (6, 1), w.belt_dir, None,
+                                 seams.nav_predicates(w)[1])
+    points, gates = seams.path_points(w, path)
+    (g,) = gates
+    # 出口后：向南到安全行 → 沿该行到下一格正下方 → 北上回原路径
+    assert points[g["exit"] + 1] == [14.4, -12.0]
+    assert points[g["exit"] + 2] == [15.6, -12.0]
+    assert points[g["exit"] + 3] == [15.6, -10.8]
+
+
+def test_gate_exit_no_detour_when_empty_handed():
+    """空手时身体能过贴墙格，不额外绕路。"""
+    f = _frame()
+    f["terrain"][1]["boxes"].append([13.2, 14.4, -10.41, -8.79])
+    w = World(f)
+    field = reachability.field_for(w)
+    path = navigation.trace_back(field, (6, 1), w.belt_dir, None,
+                                 seams.nav_predicates(w)[1])
+    points, gates = seams.path_points(w, path)
+    (g,) = gates
+    assert points[g["exit"] + 1] == [14.4, -10.8]

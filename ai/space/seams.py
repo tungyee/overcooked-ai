@@ -34,6 +34,11 @@ SEC_PER_CROSS = 0.6
 # 插件缝口等门上限：没有时间表时 4s；有预测等待时 = 预测 + 3s 余量。
 GATE_WAIT_DEFAULT = 4.0
 GATE_WAIT_MARGIN = 3.0
+# 手持物在身前，比身体先碰墙：缝口出口后的第一格若贴墙，直走会把盘子顶在墙上。
+# 盘子从身体中心到前沿约 1.0m；锅/铲等炊具约 0.8m；其它手持物取 0.5m。
+HOLD_REACH_PLATE = 1.0
+HOLD_REACH_COOKWARE = 0.8
+HOLD_REACH_ITEM = 0.5
 # 接缝判定：两块地板边缘差这么多以内算贴边。
 EDGE_EPS = 0.05
 # 墙离接缝线这么近（含）算贴着接缝的墙（篮子墙厚 0.6）。
@@ -175,6 +180,37 @@ def free_bands(seam, radius=GATE_RADIUS):
         if b1 - b0 >= MIN_BAND:
             bands.append((b0, b1))
     return bands
+
+
+def _box_clearance(x, z, box):
+    # type: (float, float, Box) -> float
+    """点到 AABB 的 2D 距离；点在盒内为 0。"""
+    minx, maxx, minz, maxz = box[:4]
+    dx = max(minx - x, 0.0, x - maxx)
+    dz = max(minz - z, 0.0, z - maxz)
+    return math.hypot(dx, dz)
+
+
+def _wall_clearance(seam, x, z):
+    # type: (Seam, float, float) -> float
+    """点到这道接缝旁所有阻挡盒的最近距离。"""
+    return min((_box_clearance(x, z, b) for b in seam.walls),
+               default=float("inf"))
+
+
+def _held_reach(world):
+    # type: (object) -> float
+    """P2 手里东西的前伸距离；空手 0。盘子 1.0m，锅/铲 0.8m，其它 0.5m。"""
+    from ai.query import predicates as P
+    chef = P.chef_by_name(getattr(world, "chefs", None), P.P2_NAME)
+    held = str((chef or {}).get("held") or "").lower()
+    if not held:
+        return 0.0
+    if "plate" in held:
+        return HOLD_REACH_PLATE
+    if "pot" in held or "pan" in held or "utensil" in held:
+        return HOLD_REACH_COOKWARE
+    return HOLD_REACH_ITEM
 
 
 class SeamGates(object):
@@ -321,8 +357,9 @@ class SeamGates(object):
 
         return blocked
 
-    def path_points(self, path, clock=None, waits=None):
-        # type: (List[Tuple[int, int]], Optional[object], Optional[Dict]) -> Tuple[List[List[float]], List[Dict]]
+    def path_points(self, path, clock=None, waits=None,
+                    hold_reach=0.0, walkable=None):
+        # type: (List[Tuple[int, int]], Optional[object], Optional[Dict], float, Optional[Callable]) -> Tuple[List[List[float]], List[Dict]]
         """格子路径 → (世界坐标路点, gates 描述)。
 
         路径中间连续的门洞格（同一接缝）换成「缝口入点 + 缝口出点」两个路点，
@@ -330,6 +367,10 @@ class SeamGates(object):
         门洞格在路径两端（人正站在缝里 / 目标格落在缝里）时不改写，按格中心走。
         门洞此刻关着（按时间表要等）时中线取这格上次开时的中线，max_wait 按
         距离场里这一步的等门时长 + GATE_WAIT_MARGIN 给插件。
+
+        hold_reach > 0（P2 手里有东西）：缝口出口后的第一格若贴墙，直走会让
+        手持物先顶墙（身体能站、盘子过不去）；此时绕到离墙最远的相邻格，再沿
+        那一行走到下一格的正交位置后拐回，避免斜穿墙角。
         """
         m = self.mapping
         points = []  # type: List[List[float]]
@@ -371,7 +412,51 @@ class SeamGates(object):
                 if w > 0:
                     gates[-1]["max_wait"] = round(max(GATE_WAIT_DEFAULT, w + GATE_WAIT_MARGIN), 2)
             i = j + 1
+            if hold_reach > 0 and i + 1 < len(path) \
+                    and self.gates.get(tuple(path[i])) is None:
+                detour = self._gate_exit_detour(
+                    seam, tuple(path[i]), tuple(path[i + 1]),
+                    walkable, hold_reach)
+                if detour:
+                    points.extend(detour)
+                    i += 1
         return points, gates
+
+    def _gate_exit_detour(self, seam, cell, after, walkable, hold_reach):
+        # type: (Seam, Tuple[int, int], Tuple[int, int], Optional[Callable], float) -> Optional[List[List[float]]]
+        """缝口出口第一格贴墙时，给手持物绕一条不顶墙的拐点。
+
+        返回 [离墙最远的相邻格, 沿该行到下一格正下方的拐点]；不需要/绕不出去
+        返回 None。只改路点、不改格子路径，插件仍按 move 走。
+        """
+        if walkable is None:
+            return None
+        m = self.mapping
+        x, z = m.to_world(*cell)
+        tight = _wall_clearance(seam, x, z)
+        if tight >= hold_reach:
+            return None
+        best, best_clear = None, tight
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            cand = (cell[0] + dx, cell[1] + dz)
+            if cand == after or self.gates.get(cand) is not None \
+                    or not walkable(*cand):
+                continue
+            cx, cz = m.to_world(*cand)
+            clear = _wall_clearance(seam, cx, cz)
+            if clear > best_clear:
+                best, best_clear = cand, clear
+        if best is None:
+            return None
+        bx, bz = m.to_world(*best)
+        points = [[bx, bz]]
+        nx, nz = m.to_world(*after)
+        runout = (nx, bz) if seam.axis == "x" else (bx, nz)
+        rc = m.to_grid(runout[0], runout[1])
+        if rc is not None and walkable(*rc) and \
+                abs(runout[0] - nx) + abs(runout[1] - nz) > 0.05:
+            points.append([runout[0], runout[1]])
+        return points
 
 
 def _pt(axis, cross, along):
@@ -465,7 +550,9 @@ def path_points(world, path, field=None, bb=None):
     if sg is None:
         return [list(world.to_world(*c)) for c in path], []
     clock, _ = _clock_of(bb)
-    return sg.path_points(path, clock, getattr(field, "waits", None))
+    return sg.path_points(path, clock, getattr(field, "waits", None),
+                          hold_reach=_held_reach(world),
+                          walkable=getattr(world, "walkable", None))
 
 
 def gates_wait_seconds(gates):

@@ -1165,7 +1165,8 @@ class DialogWorker(object):
             asr_ms=self._ms_since(timing.asr_started, timing.asr_done),
             end_to_asr_ms=self._ms_since(timing.started, timing.asr_done))
         log.debug("ASR 文本: %r（tick=%s）", text, tick)
-        if not should_trigger("speech", self.state, tick, text):
+        if not should_trigger("speech", self.state, tick, text,
+                              now=time.monotonic()):
             self._log_event("turn_latency",
                             **self._latency_fields(timing, outcome="suppressed"))
             return
@@ -1447,6 +1448,7 @@ class DialogWorker(object):
         turn_messages = [opener]
         last_results = []
         force_speak = False
+        spoke = False
         for turn_index in range(MAX_AGENT_TURNS):
             forced = force_speak
             force_speak = False
@@ -1469,8 +1471,15 @@ class DialogWorker(object):
                 return
             calls = list(reply.tool_calls)
             if not calls:
-                # 新协议：content 不播；没有 speak 就保持安静。
-                break
+                # 新协议：content 不播。模型偶尔会忘记调 speak；强制补一轮。
+                if forced or spoke:
+                    break
+                force_speak = True
+                messages.append({
+                    "role": "system",
+                    "content": "本轮必须调用 speak 把要说的话说出来；content 不会播出去。",
+                })
+                continue
             speak_calls = [c for c in calls if c.name == "speak"]
             action_calls = [c for c in calls if c.name != "speak"]
             assistant_msg = assistant_message(reply)
@@ -1506,6 +1515,7 @@ class DialogWorker(object):
             if texts and not rejected:
                 for text in texts:
                     stream.feed(text)
+                spoke = True
             if rejected:
                 # 不播“好，这就去”这类乐观台词；下一轮强制 speak 说真实原因。
                 force_speak = True

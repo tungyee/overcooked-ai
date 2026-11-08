@@ -143,3 +143,14 @@ def test_checkin_requires_schedule_orders_level_live():
     assert should_checkin(now - 1, now, True, True, False) is False
 
 
+
+
+def test_identical_speech_uses_wall_clock_when_available():
+    """tick 可能滞后；有墙钟时按墙钟去重，避免 12 秒后同一句仍被吞。"""
+    state = DialogState()
+    assert should_trigger("speech", state, tick=160, transcript="去送餐吧",
+                          now=1.0) is True
+    assert should_trigger("speech", state, tick=170, transcript="去送餐吧",
+                          now=13.0) is True
+    assert should_trigger("speech", state, tick=175, transcript="去送餐吧",
+                          now=14.0) is False

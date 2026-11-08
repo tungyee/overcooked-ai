@@ -1189,3 +1189,20 @@ def test_failed_check_forces_a_speak_turn():
     assert bundle.tts.spoken == ["我现在够不着砧板，切不了肉。"]
     assert llm.choices[1] == {"type": "function",
                               "function": {"name": "speak"}}
+
+
+def test_content_only_speech_turn_forces_speak():
+    """模型偶尔只回 content；单轮 speech 必须强制补一轮 speak。"""
+    llm = FakeLLM(
+        reply("现在没有装好的盘能送。"),
+        reply("", ("speak", {"text": "现在没有装好的盘能送。"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "去送餐吧",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["现在没有装好的盘能送。"]
+    assert llm.choices[1] == {"type": "function",
+                              "function": {"name": "speak"}}

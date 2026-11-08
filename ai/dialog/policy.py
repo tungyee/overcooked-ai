@@ -16,7 +16,8 @@ from ai.dialog.schema import DialogState
 
 
 # 20 Hz 下的拍数。
-SPEECH_DEDUPE_TICKS = 80        # 4 秒：同一句话的去重窗口
+SPEECH_DEDUPE_TICKS = 80        # 4 秒：同一句话的去重窗口（旧 tick 口径）
+SPEECH_DEDUPE_S = 4.0           # 同一窗口的墙钟口径（推荐）
 PROACTIVE_MIN_INTERVAL_TICKS = 80  # 4 秒：rescue 的最短间隔
 ORDER_BATCH_TICKS = 20          # 1 秒：新单合并窗口
 
@@ -48,8 +49,8 @@ def should_checkin(next_checkin_at, now, has_orders, in_level, live):
     return now >= next_checkin_at
 
 
-def should_trigger(event, state, tick, transcript=""):
-    # type: (str, DialogState, int, str) -> bool
+def should_trigger(event, state, tick, transcript="", now=None):
+    # type: (str, DialogState, int, str, Any) -> bool
     """本拍是否应就该事件调一次 LLM。
 
     - `speech`：玩家触发，不受 4 秒主动开口限频；只对 4 秒内重复的同一句
@@ -65,10 +66,15 @@ def should_trigger(event, state, tick, transcript=""):
             # 空/纯标点的 final 不是一句话：不触发，也不能覆盖去重锚点，
             # 否则紧跟其后的同一句话会被误放行。
             return False
-        if (norm == state.last_transcript
-                and tick - state.last_speech_tick < SPEECH_DEDUPE_TICKS):
-            return False
+        if norm == state.last_transcript:
+            if now is not None and state.last_speech_at:
+                if now - state.last_speech_at < SPEECH_DEDUPE_S:
+                    return False
+            elif tick - state.last_speech_tick < SPEECH_DEDUPE_TICKS:
+                return False
         state.last_transcript = norm
+        if now is not None:
+            state.last_speech_at = now
         return True
     if event == "rescue":
         return tick - state.last_rescue_tick >= PROACTIVE_MIN_INTERVAL_TICKS

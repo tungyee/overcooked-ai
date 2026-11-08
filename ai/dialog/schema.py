@@ -48,6 +48,7 @@ class Preference(object):
 class DialogState(object):
     """对话层的跨回合状态；由主循环持有（spec §6.2）。"""
     last_speech_tick: int = 0
+    last_speech_at: float = 0.0
     last_order_tick: int = 0
     last_rescue_tick: int = 0
     # 新单合并窗口（spec §5.1）：1 秒内到达的订单攒成一批，由

@@ -146,16 +146,21 @@ def resolve_target(kitchen, action, raw):
         return None, None, None, "", []
     materials, dishes = _catalogs(kitchen)
     key = _norm(text)
-    if key in dishes:
-        return "dish", dishes[key], text, "", []
-    if key in materials:
-        return "material", materials[key], text, "", []
+    keys = [key]
+    # 模型偶尔把生料说成复数（Prawns / Cucumbers）；做一次单数兜底。
+    if len(key) > 3 and key.endswith("s"):
+        keys.append(key[:-1])
+    for candidate in keys:
+        if candidate in dishes:
+            return "dish", dishes[candidate], text, "", []
+        if candidate in materials:
+            return "material", materials[candidate], text, "", []
 
     # 物料链里的具体 item（生料/熟料/中间产物）→ 它所属的 material。
     step_matches = []
     for name, mat in (getattr(kitchen, "materials", {}) or {}).items():
         for _task_type, item in getattr(mat, "steps", ()) or ():
-            if item and _norm(item) == key:
+            if item and _norm(item) in keys:
                 if name not in step_matches:
                     step_matches.append(name)
     if step_matches:

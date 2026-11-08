@@ -576,7 +576,9 @@ class DialogWorker(object):
         if self.config.log_path and self._log_fh is None:
             self._open_log()
         self._log_event("start", debug=bool(self.config.debug),
-                        log_path=self.config.log_path)
+                        log_path=self.config.log_path,
+                        model=getattr(self.config, "ark_model", ""),
+                        base_url=getattr(self.config, "ark_base_url", ""))
         # 预连 TTS：后台建好 WebSocket/StartConnection，等第一句文本一好就少一次握手。
         warmup = getattr(self.clients.tts, "warmup", None)
         if callable(warmup):

@@ -175,3 +175,7 @@ def test_raw_item_resolves_to_material_for_balloon_level():
 
     mode, resolved, _d, reason, _v = resolve_target(kitchen, "chop", "肉")
     assert (mode, resolved, reason) == ("material", "FriedBurritoMeat", "")
+
+    # 模型偶尔输出复数 Prawns；单数兜底到同一 material。
+    mode, resolved, _d, _r, _v = resolve_target(kitchen, "chop", "Prawns")
+    assert (mode, resolved) == ("material", "PanFriedPrawns")

@@ -230,10 +230,12 @@ def _compile_node(book, name):
         children = [_compile_node(book, c) for c in book.components(name)]
         # wrap 类（卷饼）：在盘装路径之外，额外给一条「卷饼直接装熟料」的路径
         # （FillCarrier 链 → 装好料的卷饼端进盘）。盘装仍是 fallback，谁可行/
-        # 谁分高由 planner 选。
+        # 谁分高由 planner 选。wrap 节点排在**最前**：与 TakeCookedToPlate 同为
+        # 「盛熟料救锅」、同分时（L1/L2 只比 pressure），stable sort 按候选顺序
+        # 定胜负，排在前面让装馅压过装盘（trace-20261108-195728）。
         wrap = _wrap_node(book, name)
         if wrap is not None:
-            children.append(wrap)
+            children.insert(0, wrap)
         return {"type": "DeliverPlate", "item": name, "children": children}
     return None
 

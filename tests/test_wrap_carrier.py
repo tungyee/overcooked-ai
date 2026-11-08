@@ -14,7 +14,7 @@ import os
 import pytest
 
 from ai import tasks as T
-from ai.core import planner
+from ai.core import planner, planner_layers
 from ai.query import carriers as CR
 from ai.query import recipe_graph
 from ai.query.recipes import RecipeBook
@@ -188,6 +188,56 @@ def test_emit_includes_fill_carrier_for_burrito(frames):
     assert fills, [str(t) for t in tasks]
     # 第一样馅（饭）前置内容为空
     assert any(t.item == "BoiledRice" and t.pre_contents == () for t in fills)
+
+
+def test_fill_carrier_gets_time_pressure_like_take_cooked(frames):
+    """锅里熟了/快糊了，FillCarrier 要与 TakeCookedToPlate 同层竞争（救料层）。
+
+    否则 FillCarrier 恒落 L_PREP，被「端盘盛熟」结构性压住、永不选中
+    （trace-20261108-195728）。
+    """
+    frame = copy.deepcopy(frames[0])
+    for c in frame["cookers"]:
+        if c.get("n") == "workstation_cooker_01 (6)":
+            c["pot_contents"] = [RICE_D]
+            c["cooked"] = True
+            c["cooking_progress"] = 24.0
+            c["cooking_time"] = 12.0
+    w, book = _wb(frame)
+    fill = _fill(frame, "4", ("GridManager", "workstation_cooker_01 (6)"),
+                 "BoiledRice")
+    take = T.TakeCookedToPlate(
+        "4", (("GridManager", "workstation_cooker_01 (6)"), "-16194"),
+        "BoiledRice")
+    assert planner._time_pressure(fill, w) == planner._time_pressure(take, w) > 0
+    assert planner._is_rescue_action(fill) is True
+    assert planner_layers.layer_of_task(fill, w) == \
+        planner_layers.layer_of_task(take, w)
+
+
+def test_planner_prefers_fill_carrier_over_plate_when_tied(frames):
+    """锅已熟、盘和空卷饼都在：FillCarrier 与 TakeCookedToPlate 同分时，装馅优先。
+
+    两者同为「盛熟料救锅」，L1/L2 只比 pressure（同分），靠候选顺序定胜负；
+    wrap 节点排在盘装路径之前，所以装馅压过装盘（trace-20261108-195728）。
+    """
+    frame = copy.deepcopy(frames[1])
+    frame["orders"] = [o for o in frame["orders"] if o["id"] == "4"]
+    for it in frame["items"]:
+        if it.get("n") == "Tortilla":
+            it["detail"] = []
+    for p in frame["plates"]:
+        p["detail"] = []; p["contents"] = []; p["count"] = 0
+    for c in frame["cookers"]:
+        if c.get("n") == "workstation_cooker_01 (6)":
+            c["pot_contents"] = [RICE_D]
+            c["cooked"] = True
+            c["isCooking"] = True
+            c["cooking_progress"] = 24.0
+            c["cooking_time"] = 12.0
+    w, book = _wb(frame)
+    task, _rec = planner.plan(w, make_bb(100), None, book)
+    assert task is not None and task.TYPE == "FillCarrier", task
 
 
 def test_planner_keeps_plate_path_as_fallback(frames):

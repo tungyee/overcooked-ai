@@ -1285,7 +1285,8 @@ def feasible_candidates(world, bb, book, command_scope=None):
 
 # 命令 scope 之外仍允许抢占命令的动作：它们会随时间恶化，晚一步就糊/着火。
 # 其它任务（取料/切/装盘等）仍然严格受命令 scope 约束，避免把用户指令饿死。
-PREEMPT_COMMAND_TYPES = ("RescueCooked", "TakeCookedToPlate", "Extinguish")
+PREEMPT_COMMAND_TYPES = ("RescueCooked", "TakeCookedToPlate", "FillCarrier",
+                         "Extinguish")
 
 
 def _preempts_command(task):
@@ -1962,7 +1963,7 @@ def _is_rescue_action(task):
     """
     task_type = getattr(task, "TYPE", None)
     return task_type in RESCUE_TYPES or task_type in (
-        "Extinguish", "TakeCookedToPlate")
+        "Extinguish", "TakeCookedToPlate", "FillCarrier")
 
 
 def _score_candidate(world, bb, candidate, book=None, plate_match=None,
@@ -2480,10 +2481,16 @@ def _time_pressure(task, world):
     （ratio 0.25）起又加一段 0→1.0 的「快熟」渐变，让端盘盛饭能提前去准备。
     """
     task_type = getattr(task, "TYPE", "")
-    # 只有"取熟料 / 救熟料 / 清糊锅"这类灶状态相关任务才吃时间压力
-    if task_type not in ("TakeCookedToPlate", "RescueCooked", "Discard"):
+    # 只有"取熟料 / 救熟料 / 清糊锅"这类灶状态相关任务才吃时间压力。
+    # FillCarrier 也是「端着容器去盛熟料」（换成卷饼），与 TakeCookedToPlate
+    # 同一时间敏感性——锅里熟了/快糊了它同样要进救料层，否则会被端盘盛熟
+    # 结构性压住、永不选中（trace-20261108-195728）。
+    if task_type not in ("TakeCookedToPlate", "RescueCooked", "Discard",
+                         "FillCarrier"):
         return 0.0
     cid = getattr(task, "cooker_id", None)
+    if cid is None:
+        cid = getattr(task, "source_id", None)   # FillCarrier 的灶 id 叫 source_id
     if cid is None:
         return 0.0
     c = _cooker_lookup(world, cid)

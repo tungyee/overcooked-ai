@@ -11,6 +11,7 @@
 import json
 import socket
 import threading
+import time
 from typing import Dict, Optional
 
 from ai.exec.commands import parse_result
@@ -96,6 +97,31 @@ class ExecClient(object):
                 return parse_result(line)
             except ValueError:
                 self._dropped += 1
+
+    def ping(self, timeout=2.0):
+        # type: (float) -> Optional[Dict]
+        """发一条 ping 并等匹配结果；超时/断线返回 None。
+
+        TCP 连接成功只说明内核里有人监听，不代表对面插件还活着——卡死的
+        旧游戏进程会一直占着 27412，连接能进 backlog 但永远没人处理命令。
+        启动时用本方法确认 exec 通道真的在跑；旧插件回 `not implemented`
+        也算活着（能回包就说明是活进程）。
+        """
+        cmd_id = self.issue({"cmd": "ping"})
+        if cmd_id < 0:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            r = self.poll()
+            if r is not None:
+                if r.get("cmd_id") == cmd_id:
+                    return r
+                continue
+            if not self._connected:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.01)
 
     def close(self):
         # type: () -> None

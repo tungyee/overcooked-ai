@@ -1187,11 +1187,10 @@ def test_failed_execute_forces_a_speak_turn():
                               "function": {"name": "speak"}}
 
 
-def test_content_only_speech_turn_forces_speak():
-    """模型偶尔只回 content；单轮 speech 必须强制补一轮 speak。"""
-    llm = FakeLLM(
-        reply("现在没有装好的盘能送。"),
-        reply("", ("speak", {"text": "现在没有装好的盘能送。"})))
+def test_content_only_speech_turn_warns_without_retry(caplog):
+    """模型只回 content 时不播、不强制补轮，只打 warning。"""
+    caplog.set_level(logging.WARNING, logger="ai.dialog")
+    llm = FakeLLM(reply("现在没有装好的盘能送。"))
     worker, bundle = make_worker(llm=llm)
 
     thread = run_async(worker._handle_transcript, "去送餐吧",
@@ -1199,9 +1198,9 @@ def test_content_only_speech_turn_forces_speak():
     thread.join(2)
 
     assert not thread.is_alive()
-    assert bundle.tts.spoken == ["现在没有装好的盘能送。"]
-    assert llm.choices[1] == {"type": "function",
-                              "function": {"name": "speak"}}
+    assert llm.choices == ["auto"]
+    assert bundle.tts.spoken == []
+    assert "没有调用任何工具" in caplog.text
 
 
 def test_execute_without_speak_forces_ack():

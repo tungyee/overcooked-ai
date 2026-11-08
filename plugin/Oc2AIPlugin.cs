@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.3")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.4")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -75,7 +75,7 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.24.3 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.24.4 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             BindWalkProbe();
             StartSocket();
@@ -1160,7 +1160,7 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.24.3\",\"protocol_version\":8,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.24.4\",\"protocol_version\":8,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))

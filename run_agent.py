@@ -30,7 +30,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ai.agent import Agent
 from ai.exec.client import NullExec
@@ -278,6 +278,28 @@ def _load_env(args):
           % (path, added), file=sys.stderr)
 
 
+EXEC_PING_TIMEOUT = 2.0
+
+
+def _check_exec_channel(exec_client, timeout=EXEC_PING_TIMEOUT):
+    # type: (Any, float) -> Optional[str]
+    """确认 27412 对面是活插件；正常返回 None，否则返回给用户看的错误。
+
+    TCP 连接成功不代表对面活着：卡死的旧游戏进程会一直占着监听端口，
+    连接能进 backlog，但命令永远没人处理。启动时发 ping 拿回包，
+    避免 agent 空转、P2 一动不动却没有任何报错。
+    """
+    try:
+        exec_client.connect()
+    except OSError:
+        pass
+    if exec_client.ping(timeout) is not None:
+        return None
+    return ("exec 通道 127.0.0.1:27412 无响应：端口可能被卡死的旧游戏进程占着，"
+            "或插件版本过旧。先运行 lsof -nP -iTCP:27412 -sTCP:LISTEN 看占用者，"
+            "结束它后重启游戏。")
+
+
 def main(argv=None):
     args = _parse_args(argv)
 
@@ -302,6 +324,14 @@ def main(argv=None):
         print("[run] 连接游戏失败（插件没起？127.0.0.1:27411）: %s" % exc,
               file=sys.stderr)
         return 1
+
+    if not args.dry_run:
+        exec_error = _check_exec_channel(agent.exec_client)
+        if exec_error:
+            print("[run] %s" % exec_error, file=sys.stderr)
+            agent.exec_client.close()
+            agent.client.close()
+            return 1
 
     def _stop(signum, frame):
         sys.exit(0)

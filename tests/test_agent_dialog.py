@@ -904,6 +904,37 @@ def test_open_division_payload_keeps_unreachable_split(monkeypatch):
     assert "下锅" in payload["p2_actions"]
 
 
+def test_reachable_actions_include_deliver_and_wash(monkeypatch):
+    """够得着的动作不看分工：送餐、洗盘只要站点可达就列出。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+    )
+    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 3)
+
+    assert A._reachable_actions(w, None) == ["切", "下锅", "装盘", "送餐", "洗盘"]
+
+
+def test_reachable_actions_skip_unreachable_station(monkeypatch):
+    """站点够不着就不列；其余动作不受影响。"""
+    import ai.agent as A
+    w = _with_stations(
+        make_world(),
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+    )
+
+    def fake_cost(world, bb, name, source):
+        return None if source.get("t") == "plate_station" else 3
+
+    monkeypatch.setattr(A, "cost_to", fake_cost)
+    labels = A._reachable_actions(w, None)
+
+    assert "送餐" not in labels
+    assert "洗盘" in labels
+
+
 def test_land_open_division_adds_assign_duties(dagent):
     dagent._land_open_division(
         {"p1_actions": ["切", "下锅"], "p2_actions": ["装盘", "送餐"]}, 100)

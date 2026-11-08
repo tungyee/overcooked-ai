@@ -206,3 +206,37 @@ def test_handle_desc_none_is_none():
     旧实现发全 None 的字典，插件当成有目标校验、必然 handle mismatch。"""
     assert handle_desc(None) is None
     assert handle_desc({}) is None
+
+
+def test_handle_desc_carries_stack():
+    """盘堆里的盘把 stack 带给插件。
+
+    盘在盘堆（沥水架/回盘台）上时 grid 为 null，世界坐标换算出的格心是
+    DryingPart(-7,0)，但游戏的 placement 句柄可能被同一沥水架的洗碗池抢走
+    （trace-20261108-174744 t=2117：句柄 WashingPart(-7,-1)）→ 旧插件
+    HandleMatches 两个字段都对不上、tap 从不按键。带 stack 让插件改用
+    朝向句柄 m_gridLocation 兜底。
+    """
+    d = handle_desc({"n": "-38364", "name": "equipment_plate_01",
+                     "x": 6.0, "z": -6.0, "grid": None,
+                     "stack": "CleanPlateStack", "stack_top": True})
+    assert d["stack"] == "CleanPlateStack"
+    # 台面上的盘不在堆里 → 不触发兜底
+    d2 = handle_desc({"n": "-19312", "name": "equipment_plate_01",
+                      "x": 21.6, "z": -2.4, "grid": "GridManager"})
+    assert d2["stack"] is None
+
+
+def test_tap_command_carries_stack_for_stack_plate():
+    """堆顶盘 tap：命令里带 stack，插件才能放宽 placement 句柄校验。"""
+    ex = FakeExec()
+    ctx = make_ctx(W, CHEF, ex)
+    plate = {"n": "-38364", "name": "equipment_plate_01",
+             "x": 6.0, "z": -6.0, "grid": None, "count": 0,
+             "contents": [], "stack": "CleanPlateStack", "stack_top": True}
+    tap = PR.TapWhileHolding("pickup", None, lambda c: plate, "placement")
+    assert tap.tick(ctx) == Status.RUNNING
+    assert ex.issued[0]["cmd"] == "tap"
+    assert ex.issued[0]["kind"] == "placement"
+    assert ex.issued[0]["target"]["stack"] == "CleanPlateStack"
+    assert ex.issued[0]["target"]["gx"] is not None

@@ -59,6 +59,8 @@
 
 待实机确认：`m_stackItems` 元素确为盘 GameObject、端走顶层后下一块的 `stack_top` 当帧更新；沥碗架洗好的盘也是 `ServerCleanPlateStack`。已知限制：堆顶盘装了半份料后压住下面的干净盘，别的单要等它离堆。
 
+**2026-11-08 实机（`trace-20261108-174744`）**：堆顶层盘的 `stack`/`stack_top` 上报正确，端走顶层后下一块当帧变顶层；P1 在同一站位能把海苔直接放上堆顶盘，游戏侧确实支持。但 P2 卡在 `FetchToPlate`：盘在沥水架 `DryingPart(-7,0)` 上，游戏上报的 placement 句柄被同一沥水架的洗碗池抢走（`WashingPart(-7,-1)`），插件 `HandleMatches(kind="placement")` 名字/坐标都对不上，tap 从未真正按键（trace t=2117 `exec_failure.why="handle mismatch"`，P2 耗了约 47 秒）。修：`handle_desc` 把盘堆名 `stack` 随目标发给插件；插件只对带 `stack` 的目标，在 placement 句柄失配时用朝向句柄 `m_gridLocation` 的坐标兜底（`ServerWashingStation.CanHandlePlacement` 会把非盘物品转给 `m_dryingAttachStation`，按键仍落回盘堆）。普通台面/出餐口的 placement 校验不放宽。测试 `tests/test_exec_primitives.py::test_handle_desc_carries_stack` / `test_tap_command_carries_stack_for_stack_plate`；待实机复验。
+
 ## 已完成的 task 不再接着跑（2026-10-30）
 
 `trace-20261030-214824` t=1743~1795（Balloon_2_3）：P1 先把面下进 cooker_01，P2 的 `FillCooker.done()` 已为真。`agent._tick_once` ⑨.5 判「旧树后置条件已成立」把 planner 选的 DeliverPlate 压回 FillCooker，但 `Executor.tick` 不看 `done()`，树只认自己的 expect，照样走去面箱又拿一份面（52 拍），之后拿着多余的面去送餐失败。修：⑨.5 命中时设 `settle_active`，⑫ 直接 `halt_and_discard` 并按 success 走 ⑬（释放认领、清承诺），不再 tick 旧树；这一拍不开新树，下一拍 planner 重选。测试 `tests/test_agent.py::test_done_active_task_settles_instead_of_ticking`。

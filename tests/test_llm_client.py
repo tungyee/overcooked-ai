@@ -331,6 +331,24 @@ def test_render_state_includes_reachable_division():
     assert "队友能做的动作" not in text
 
 
+def test_render_state_prefers_reachable_actions_over_division():
+    """够得着的动作不再受分工排除限制：送餐 / 洗盘也要列出来。"""
+    text = render_state({
+        "p2_reachable_actions": ["切", "装盘", "送餐", "洗盘"],
+        "division": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
+    })
+    assert "你能做的动作（够得着的）：切、装盘、送餐、洗盘" in text
+
+
+def test_render_state_does_not_fall_back_when_reachable_is_empty():
+    """空列表是「一个都够不着」，不能回落到分工建议。"""
+    text = render_state({
+        "p2_reachable_actions": [],
+        "division": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
+    })
+    assert "你能做的动作" not in text
+
+
 def test_render_state_omits_division_when_none():
     text = render_state({})
     assert "你能做的动作" not in text
@@ -343,6 +361,16 @@ def test_state_renders_success_last_result_without_reason():
                         "status": "succeeded"},
     })
     assert "上一条命令结果" in msg["content"]
+
+
+@pytest.mark.parametrize("event", ["last_seconds", "round_summary",
+                                   "open_division", "help_request",
+                                   "checkin", "batch"])
+def test_proactive_event_prompts_require_speak(event):
+    """新协议 content 不播：主动开口的事件必须明确要求调用 speak。"""
+    msg = state_message(event, {})
+    assert "speak" in msg["content"]
+    assert "不调用工具" not in msg["content"]
 
 
 def test_stream_total_timeout_raises(monkeypatch):

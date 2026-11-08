@@ -45,9 +45,22 @@ namespace Oc2AI
             {
                 if (NameMatchesStrict(f.PlacementName, tname))
                     return true;
-                if (tgx.HasValue && tgz.HasValue && f.PlacementGx > -9000f)
-                    return Mathf.Abs(f.PlacementGx - (float)tgx.Value) < 0.1f
-                        && Mathf.Abs(f.PlacementGz - (float)tgz.Value) < 0.1f;
+                if (tgx.HasValue && tgz.HasValue && f.PlacementGx > -9000f
+                    && Mathf.Abs(f.PlacementGx - (float)tgx.Value) < 0.1f
+                    && Mathf.Abs(f.PlacementGz - (float)tgz.Value) < 0.1f)
+                    return true;
+                // 盘堆上的盘：placement 句柄可能被同一沥水架的洗碗池抢走
+                // （trace-20261108-174744 t=2117：目标盘在 DryingPart(-7,0)、
+                // 句柄 WashingPart(-7,-1)）。游戏 PlaceHeldItem 走
+                // WashingStation.CanHandlePlacement 时会转给 m_dryingAttachStation
+                // （沥水架），按键仍落回盘堆；这里用朝向句柄 m_gridLocation 的
+                // 坐标兜底。只对带 stack 标记的目标放宽，普通台面/出餐口的
+                // placement 校验不变（防误放）。
+                if (IsStackTarget(target) && tgx.HasValue && tgz.HasValue
+                    && f.GridGx > -9000f
+                    && Mathf.Abs(f.GridGx - (float)tgx.Value) < 0.1f
+                    && Mathf.Abs(f.GridGz - (float)tgz.Value) < 0.1f)
+                    return true;
                 return NamesMatch(f.PlacementName, tname);
             }
             // kind=null：通用朝向句柄（m_gridLocation）——盛饭/倒料等端盘面对
@@ -64,6 +77,13 @@ namespace Oc2AI
         public static bool UseMatches(ChefFrame f, Dictionary<string, object> target)
         {
             return NamesMatch(f.UseName, Req.Str(target, "name"));
+        }
+
+        // Python handle_desc 对盘堆里的盘带 stack（盘堆名）；只有这类目标
+        // 允许 placement 句柄失配时改用 m_gridLocation 兜底。
+        private static bool IsStackTarget(Dictionary<string, object> target)
+        {
+            return !string.IsNullOrEmpty(Req.Str(target, "stack"));
         }
 
         private static bool NamesMatch(string a, string b)

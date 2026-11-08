@@ -7,7 +7,7 @@
 - **语言/运行时**：Python 3.9.6（macOS 系统 Python）。无打包、无构建步骤，`ai/` 是纯库，通过 `pytest.ini` 的 `pythonpath = .` 直接 import。
 - **依赖**：运行时除标准库外无第三方依赖（决策与执行都是纯 Python + 本地 socket）。开发依赖仅 `pytest==7.4.4`（见 `requirements-dev.txt`）。语音对话为可选链路，额外依赖见 `requirements-voice.txt`（`sounddevice` / `numpy` / `websockets` / `requests`），只在启用语音时延迟加载。没有 `pyproject.toml` / `setup.py` / `package.json`。
 - **数据链路**：C# BepInEx 插件（`plugin/Oc2AIPlugin.cs`）5 Hz 推 NDJSON → `ai/state/world.py` 的 `StateClient` 按 `\n` 分帧 → `World` 解析快照。
-- **控制链路**：叶子原语经 `ctx["exec"]` 发命令（`ai/exec/commands.py` 的 move/tap/hold/throw/halt）→ `ExecClient`（`ai/exec/client.py`）写 27412 → C# 插件逐帧驱动 InControl 虚拟手柄控制 P2（无需 macOS「辅助功能」权限）。离线/测试用 `NullExec`（同文件，命令即时回 ok 不连 27412）。
+- **控制链路**：叶子原语经 `ctx["exec"]` 发命令（`ai/exec/commands.py` 的 move/tap/hold/throw/halt；另有 ping 仅用于启动时确认通道活着）→ `ExecClient`（`ai/exec/client.py`）写 27412 → C# 插件逐帧驱动 InControl 虚拟手柄控制 P2（无需 macOS「辅助功能」权限）。离线/测试用 `NullExec`（同文件，命令即时回 ok 不连 27412）。
 - **频率约定（关键，容易混淆）**：插件推送 **5 Hz**；Python 主循环 **20 Hz**（`TICK_INTERVAL = 0.05`）。代码里「拍」（tick）统一指 **Python 循环拍 = 50 ms**，所有按拍计的阈值都按 20 Hz 理解。实现上主循环用 `StateClient.read_latest()` **非阻塞读**、中间 4 拍复用最新帧重 tick——不能用阻塞的 `read()`，否则会被 5 Hz 推帧拖成 5 Hz（曾踩坑）。
 
 ## 2. 目录结构

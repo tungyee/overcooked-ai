@@ -203,7 +203,10 @@ def handle_desc(target, to_grid=None):
     跟柜台同格，所以按格匹配才对）。name 只做无网格时的兜底。
 
     网格优先用 target 自带的 gx/gz；缺失时（盘/散料只有 x/z）用 to_grid
-    从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。"""
+    从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。
+
+    `stack`（盘堆名）随目标带给插件：盘堆顶层的盘，游戏上报的 placement
+    句柄可能是同一沥水架的洗碗池，插件据此改用朝向句柄兜底（见下方注释）。"""
     if not target:
         # 无目标发 None，插件（tap/hold/move）走「不校验句柄」分支。
         # 旧实现发全 None 的字典，插件当成有目标去校验、必然 handle mismatch
@@ -217,7 +220,12 @@ def handle_desc(target, to_grid=None):
             if cell is not None:
                 gx, gz = cell
     return {"grid": target.get("grid"), "gx": gx, "gz": gz,
-            "name": target.get("name") or target.get("n")}
+            "name": target.get("name") or target.get("n"),
+            # 盘堆标记：盘在盘堆（沥水架/回盘台）上时 placement 句柄可能被
+            # 同一沥水架的洗碗池抢走（trace-20261108-174744 t=2117：
+            # 目标盘在 DryingPart(-7,0)，句柄 WashingPart(-7,-1)）。
+            # 插件据此允许用朝向句柄 m_gridLocation 兜底。
+            "stack": target.get("stack")}
 
 
 def target_world(target):

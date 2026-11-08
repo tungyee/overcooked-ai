@@ -66,6 +66,9 @@ def state_view(context, commands=None, last_result=None):
             current = active
         if not queue:
             queue = commands.pending()
+    reachable_you = ctx.get("p2_reachable_actions")
+    if reachable_you is None:
+        reachable_you = (ctx.get("division") or {}).get("p2_actions") or []
     last = last_result or ctx.get("last_result")
     if isinstance(last, dict):
         # 成功结果没有 reason；模板用 StrictUndefined，必须补齐。
@@ -114,7 +117,7 @@ def state_view(context, commands=None, last_result=None):
             "holding": (ctx.get("p1") or {}).get("holding"),
         },
         "reachable": {
-            "you": (ctx.get("division") or {}).get("p2_actions") or [],
+            "you": list(reachable_you),
             "teammate": (ctx.get("division") or {}).get("p1_actions") or [],
         },
         "options": ctx.get("p2_options") or [],

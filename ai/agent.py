@@ -404,6 +404,24 @@ def _min_interact_cost(world, bb, name, stations):
     return min(costs) if costs else None
 
 
+def _reachable_actions(world, bb):
+    # type: (World, Blackboard) -> List[str]
+    """P2 够得着的动作（不看分工；送餐、洗盘也在内）。
+
+    只判「站点在本关存在且 P2 够得着」，不判此刻有没有活可干——
+    有没有脏盘、有没有装好的盘，由 get_world_state 和 execute_actions 返回。
+    """
+    out = []
+    for action, station_type in ACTION_STATION_TYPES.items():
+        stations = [st for st in world.stations if st.get("t") == station_type]
+        if not stations:
+            continue
+        if _min_interact_cost(world, bb, P.P2_NAME, stations) is None:
+            continue
+        out.append(action)
+    return out
+
+
 def _open_division_payload(world, bb):
     # type: (World, Blackboard) -> Optional[Dict[str, List[str]]]
     """本关「动作→边」切分；只有不到两个可分工动作时才返回 None。
@@ -1481,6 +1499,7 @@ class Agent:
             "duties": self.ledger.snapshot(tick),
             "dag": kitchen.render(),
             "division": _open_division_payload(world, self.bb),
+            "p2_reachable_actions": _reachable_actions(world, self.bb),
             "dish_dags": {dish: kitchen.render([dish], shared=False)
                           for dish in kitchen.dags},
             "tools": tools,

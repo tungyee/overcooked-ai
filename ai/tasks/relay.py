@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """跨区交接 task：SendAcross / ThrowBatch。
 
-SendAcross：不可投掷的干净盘放到通道台面上交给对面（ai/space/channels.py：
-渡运篮子 / 两边都够得着的静态共享台面）。
+SendAcross：不可投掷的干净盘 / 脏盘 / 成品盘 / 生载体放到通道台面上交给
+对面（ai/space/channels.py：渡运篮子 / 两边都够得着的静态共享台面）。每种
+kind 的触发、取放与完成判定在 ai/revenue/handover.py 的规格表里。
 
 ThrowBatch：把一种可投掷料批量投向下一站消费站（砧板/灶）。两类触发：
   - 分割地图：消费站只有对面够得着（Rapids_2_1 木筏 ↔ 厨房）；
@@ -19,12 +20,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.exec.bt import Condition, Node, Selector, Sequence
+from ai.revenue import handover as HO
 from ai.revenue import throw_supply as TS
 from ai.space import regions as RG
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            _grid_matches, _station_for_item,
-                           _unpack_resource_id,
-                           plate_by_id)
+                           _unpack_resource_id)
 
 # 一轮「取 → 走到出手位 → 投」的拍数上限（20Hz）：取料 ~40 拍 + 走位 ~60 拍
 # + 转身投出 ~25 拍，留一倍余量。单轮超时 = 进度看门狗：一轮投不出去就交还
@@ -47,35 +48,13 @@ THROW_BATCH_TICKS = THROW_ROUND_TICKS * 12
 MAX_BATCH_UNITS = 1
 
 
-def _held_clean_plate(ctx):
-    # type: (Dict) -> bool
-    """P2 手里端着干净空盘（不认实例 id：盘从沥碗架拿起时实例可能换）。"""
-    chef = ctx["chef"]
-    if not P.held_is_plate(chef):
-        return False
-    held = [p for p in P.all_plates(ctx["w"]) if p.get("held_by") == P.P2_NAME]
-    return bool(held) and all(P.plate_count(p) == 0 for p in held)
-
-
-def _plate_on_channel(ctx, key):
-    # type: (Dict, str) -> bool
-    """某块干净空盘此刻就在这条通道的台面上（刚放上去）。"""
-    from ai.space import channels as CH
-    w, bb = ctx["w"], ctx.get("bb")
-    for p in P.all_plates(w):
-        if p.get("held_by") or P.plate_count(p) != 0:
-            continue
-        st = CH.slot_of(w, p, bb)
-        if st is not None and CH.channel_of_slot(w, st, bb) == key:
-            return True
-    return False
-
-
-def _channel_slot(ctx, key, lock):
-    # type: (Dict, str, Dict) -> Optional[Dict]
+def _channel_slot(ctx, key, lock, allow_boards=False):
+    # type: (Dict, str, Dict, bool) -> Optional[Dict]
     """往通道 key 上放的台面：锁住选中的那格（按站名跟着篮子走）；被占了重选。
 
-    选法：此刻够得着的空格里走得最近的；渡运台面都够不着时按预测等待最短的。
+    选法：此刻够得着的空格里走得最近的；静态通道优先普通台面、其次共享砧板
+    （只有载体允许放砧板，盘/脏盘不放，免得占住切菜位）。渡运台面都够不着时
+    按预测等待最短的。
     """
     from ai.query.placement import counter_key, counter_occupied
     from ai.space import channels as CH
@@ -87,7 +66,10 @@ def _channel_slot(ctx, key, lock):
         if st is not None and not counter_occupied(w, counter_key(w, st)):
             return st
         lock.clear()
-    free = CH.free_slots(w, key, bb)
+    if key == CH.STATIC and allow_boards:
+        free = CH.free_carrier_slots(w, bb)
+    else:
+        free = CH.free_slots(w, key, bb)
     if not free:
         return None
 
@@ -97,7 +79,9 @@ def _channel_slot(ctx, key, lock):
             if goals is True:
                 return (0, 0)
             got = [field[g] for g in goals or () if field and g in field]
-            return (0, min(got)) if got else (2, 1e9)
+            if not got:
+                return (2, 1e9)
+            return (0 if st.get("t") == "counter" else 1, min(got))
         now = shuttle.reachable_stances(w, st, field)
         if now:
             return (0, min(field[s["cell"]] for s in now) if field else 0)
@@ -116,17 +100,14 @@ class SendAcross(Task):
 
     身份 = item 种类（cross_supply.KIND_*）+ resources (来源实例 id, 通道 key)。
     通道 key：渡运网格名（篮子运过去）/ channels.STATIC（两边都够得着的台面）。
-    **通用送件**：送什么、送几份由 cross_supply.send_deficit 统一判，通道（哪条、
-    放哪一格）由本 task 选；取件一侧不需要新 task——通道台面上的东西对面所有
-    task 都能拿（等篮子在 move.Approach 里做）。
 
-    kind：
-      - 干净盘（source = 盘实例 id）：Balloon_2_2 脏盘回左边洗，右边装盘没盘可用
-        （trace-20261031-204801 t≈132~172）；Wizard_3_1 盘全在 P2 这边、烤箱在
-        P1 那边（trace-20261101-002050）。
-      - 可烹饪载体（source = 载体形态名，实例没有稳定 id）：料齐 / 我这边补不了
-        料的披萨饼，烤箱只在对面（trace-20261101-130851 t≈32s）。行为在
-        ai/tasks/carrier.py（send_carrier_*）。
+    本类只做「拿起来 → 放到通道格」；每种 kind 的“该不该送、从哪拿、怎么算
+    送完、能不能放共享砧板”在 ai/revenue/handover.py 的规格表里：
+      - clean_plate：对面缺干净盘；
+      - carrier：料齐的生载体，对应灶只在对面；
+      - dirty_plate：洗碗池只在对面；
+      - plated_dish：出餐口只在对面。
+    加新 kind 不需要改本类。
     """
 
     TYPE = "SendAcross"
@@ -142,81 +123,88 @@ class SendAcross(Task):
     def channel(self):
         return self._resources[1]
 
-    def claims(self):
-        # 载体没有稳定实例 id（拿起后不在 items 里），资源表查不到会被判
-        # missing_resource；同 FetchToCarrier 不认领，目标每拍现配。
-        if self._is_carrier():
-            return ()
-        return ((self.source_id, "send"),)
+    def _spec(self):
+        return HO.spec_for(self.item)
 
-    def _is_carrier(self):
-        from ai.revenue import cross_supply as XS
-        return self.item == XS.KIND_CARRIER
+    def claims(self):
+        spec = self._spec()
+        return spec.claims(self.source_id, self.order_id) if spec else ()
+
+    def _source(self, ctx):
+        spec = self._spec()
+        if spec is None:
+            return None
+        return spec.resolve(ctx, self.source_id, self.order_id)
 
     def wait_targets(self, ctx):
         # type: (Dict) -> List[Dict]
         """要等篮子的目标（reachability.task_*wait_seconds 读）：放哪一格。
         静态通道不用等。"""
         from ai.space import channels as CH
-        if self.channel == CH.STATIC or self._is_carrier():
+        if self.channel == CH.STATIC:
             return []
-        st = _channel_slot(ctx, self.channel, {})
+        spec = self._spec()
+        if spec is None:
+            return []
+        st = _channel_slot(ctx, self.channel, {}, spec.allow_boards)
         return [st] if st is not None else []
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        """手空了，且来源盘已在通道上（实例 id 跟着走）或已不在快照里（从沥碗架
-        拿起后实例换了）而通道上多了干净盘。"""
-        from ai.space import channels as CH
-        if self._is_carrier():
-            from ai.tasks.carrier import send_carrier_done
-            return send_carrier_done(self, ctx)
-        if not P.hands_free(ctx["chef"]):
+        spec = self._spec()
+        if spec is None:
             return False
-        w, bb = ctx["w"], ctx.get("bb")
-        p = plate_by_id(ctx, self.source_id)
-        if p is not None:
-            st = CH.slot_of(w, p, bb)
-            return st is not None and CH.channel_of_slot(w, st, bb) == self.channel
-        return _plate_on_channel(ctx, self.channel)
+        source = self._source(ctx)
+        if source is None:
+            source = HO.SendSource(self.item, self.source_id, self.order_id)
+        return spec.done(ctx, source, self.channel)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
-        from ai.revenue import cross_supply as XS
-        w, bb = ctx["w"], ctx.get("bb")
-        if self._is_carrier():
-            from ai.tasks.carrier import send_carrier_feasible
-            return send_carrier_feasible(self, ctx)
-        if self.item != XS.KIND_CLEAN_PLATE:
+        spec = self._spec()
+        if spec is None or self.done(ctx):
             return False
-        if XS.send_deficit(w, self.item, ctx.get("book"), bb) <= 0:
+        source = self._source(ctx)
+        if source is None:
             return False
-        if not XS.has_send_capacity(w, self.channel, bb):
+        if not spec.capacity(ctx, self.channel):
             return False
-        if not _held_clean_plate(ctx):
-            p = plate_by_id(ctx, self.source_id)
-            if p is None or P.plate_count(p) != 0 or P.plate_buried_in_stack(p):
-                return False
         # 至少有一格此刻够得着、或时间表能预测什么时候够得着
-        return _channel_slot(ctx, self.channel, {}) is not None
+        return _channel_slot(ctx, self.channel, {}, spec.allow_boards) is not None
 
     def build(self):
         # type: () -> Node
-        if self._is_carrier():
-            from ai.tasks.carrier import send_carrier_tree
-            return send_carrier_tree(self)
-        source_id, key = self.source_id, self.channel
+        spec = self._spec()
+        if spec is None:
+            return PR.Timeout(PR.EnsureHandsFree(), TASK_TIMEOUT_TICKS)
+        key = self.channel
         lock = {}  # type: Dict[str, Any]
 
+        def source(c):
+            return self._source(c)
+
+        def held(c):
+            s = source(c)
+            return spec.held(c, s) if s is not None else False
+
+        def pickup(c):
+            s = source(c)
+            return spec.pickup(c, s) if s is not None else None
+
         def placed(c):
-            return P.hands_free(c["chef"]) and _plate_on_channel(c, key)
+            if not P.hands_free(c["chef"]):
+                return False
+            s = source(c) or HO.SendSource(self.item, self.source_id,
+                                           self.order_id)
+            return spec.done(c, s, key)
 
         return PR.Timeout(Sequence([
-            PR.EnsureHandsFree(keep=_held_clean_plate),
-            PR.InteractWith(lambda c: plate_by_id(c, source_id), "pickup",
-                            _held_clean_plate),
+            PR.EnsureHandsFree(keep=held),
+            PR.InteractWith(pickup, "pickup", held),
             # 篮子不在口上时 Approach 原地等 / 先去候车格（不占本 task 超时预算）
-            PR.InteractWith(lambda c: _channel_slot(c, key, lock), "placement", placed),
+            PR.InteractWith(lambda c: _channel_slot(c, key, lock,
+                                                    spec.allow_boards),
+                            "placement", placed),
         ]), TASK_TIMEOUT_TICKS)
 
 

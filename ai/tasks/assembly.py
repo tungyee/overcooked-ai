@@ -274,7 +274,17 @@ class DeliverPlate(Task):
         order = self._order(ctx)
         if order is None:
             return False       # 订单没了 → 该走 ResetPlate
-        return ctx["book"].missing(order, p) == ()
+        if ctx["book"].missing(order, p) != ():
+            return False
+        # 出餐口全在对面时，本 task 走不过去；让 SendAcross(plated_dish)
+        # 先送到共享台面。拓扑未知（无 field）保持旧行为。
+        stations = [s for s in ctx["w"].stations or ()
+                    if isinstance(s, dict) and s.get("t") == S.PLATE_STATION]
+        if stations and ctx.get("field"):
+            from ai.space import reachability
+            if not any(reachability.can_interact(ctx, s) for s in stations):
+                return False
+        return True
 
     def build(self):
         # type: () -> Node

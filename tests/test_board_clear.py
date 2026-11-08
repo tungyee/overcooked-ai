@@ -97,9 +97,17 @@ def test_free_reachable_board_is_used_without_clearing(frames):
     assert task.TYPE == "FetchToBoard" and task.board_id == LEFT
 
 
+def _without_dirty(frame):
+    """去掉脏盘：本用例只验腾板，别让新增的 dirty_plate 中转抢走选择。"""
+    f = json.loads(json.dumps(frame))
+    f["items"] = [i for i in f["items"]
+                  if "dirty" not in str(i.get("n") or "").lower()]
+    return f
+
+
 def test_occupied_board_gets_fetch_candidates_when_no_free_board(frames):
     """t=2100：没有够得着的空板 → 给被饼占着的右板发切料候选（当局恒无）。"""
-    _w, _b, _bb, _c, task, rec = _plan(frames[3])
+    _w, _b, _bb, _c, task, rec = _plan(_without_dirty(frames[3]))
     ok = [c[0] for c in rec["candidates"]
           if c[0].TYPE == "FetchToBoard" and c[0].board_id == RIGHT and c[3]]
     assert {t.item for t in ok} >= {"Cheese", "Tomato"}

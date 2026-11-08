@@ -361,31 +361,14 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         # 第 13 号 StashHeld：手里有无用物（feasible 再判）
         cands.append(Candidate(T.StashHeld(), [], EST_FETCH))
 
-    # 跨区送件（SendAcross，ai/revenue/cross_supply.py）：对面区缺、我这边有富余，
-    # 经通道（ai/space/channels.py：渡运篮子 / 静态共享台面）送过去。每条通道 ×
-    # 每块能用的干净盘一个候选（feasible 再判缺口 / 空格 / 能不能放）。order_id
-    # 一律 None：送件是协作动作，不绑定特定订单（同 Prefetch）。
-    from ai.revenue import cross_supply as XS
-    from ai.space import channels as _CH
-    if XS.send_deficit(world, XS.KIND_CLEAN_PLATE, book, bb) > 0:
-        for key in _CH.channel_keys(world, bb):
-            for p in P.all_plates(world):
-                pid = p.get("n")
-                if (not pid or P.plate_count(p) != 0 or P.plate_buried_in_stack(p)
-                        or p.get("held_by") == P.P1_NAME
-                        or _CH.slot_of(world, p, bb) is not None):
-                    continue
-                task = T.SendAcross(item=XS.KIND_CLEAN_PLATE, resources=(pid, key))
-                cands.append(Candidate(task, [], EST_FETCH,
-                                       branch=branch_of_task(task, book)))
-    # 载体（披萨饼）：我这边补不了料、烤箱只在对面 → 经静态通道送过去
-    seen_forms = set()
-    for car in XS.stuck_carriers(world, book, bb):
-        if car["name"].lower() in seen_forms:
-            continue
-        seen_forms.add(car["name"].lower())
-        task = T.SendAcross(item=XS.KIND_CARRIER, resources=(car["name"], _CH.STATIC))
-        cands.append(Candidate(task, [], EST_FETCH, branch=branch_of_task(task, book)))
+    # 跨区送件（SendAcross）：规格表统一回答四种 kind 的来源/触发
+    # （ai/revenue/handover.py），这里只把每行请求翻成候选。
+    from ai.revenue import handover as HO
+    for req in HO.send_requests(world, book, bb):
+        task = T.SendAcross(req.source.order_id,
+                            (req.source.source_id, req.channel), req.kind)
+        cands.append(Candidate(task, [], EST_FETCH,
+                               branch=branch_of_task(task, book)))
 
     # 第 18 号 FillCooker：订单无关的填灶（第 1 组 1.1）。
     # 按单发射的 FetchToCooker 受「同单只发一个 + 灶↔单 1:1」限制，无法把
@@ -2036,12 +2019,15 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     elif task.TYPE == "SendAcross" and task.item == "carrier":
         # 料齐 / 补不了料的饼卡在我这边：不送这一单就做不出来，按最缺算
         terms["plate_pressure"] = W_PLATE_PRESSURE * 2.0
-    elif task.TYPE == "SendAcross":
+    elif task.TYPE == "SendAcross" and task.item == "clean_plate":
         # 对面缺盘的程度（同一条曲线：0 块=2.0、1 块=1.0），按对面的干净盘数算
         from ai.revenue import cross_supply as XS
         acc = XS.far_plate_need(world, book, bb)
         far = acc["far"]
         terms["plate_pressure"] = W_PLATE_PRESSURE * (2.0 if far <= 0 else 1.0 if far == 1 else 0.5)
+    elif task.TYPE == "SendAcross" and task.item == "dirty_plate":
+        # 把脏盘交给唯一能洗的对面：干净盘越少越该送，量级同 WashPlate。
+        terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
     else:
         terms["plate_pressure"] = 0.0
 

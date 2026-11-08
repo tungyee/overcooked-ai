@@ -7,15 +7,23 @@ task）。本模块回答通道无关的问题：
 
     send_deficit(world, kind) -> 这一种东西现在该往对面送几份（0 = 不送）
 
-kind 目前只有 KIND_CLEAN_PLATE：
-  - Balloon_2_2（游戏内 2-3）灶全在右边，装盘只能在右边做；脏盘回到左边洗，洗好
-    的干净盘只能经篮子送回右边（trace-20261031-204801 t≈132~172）。
-  - Wizard_3_1（游戏内 3-1）开局盘子全在 P2 这边、烤箱全在 P1 那边，熟披萨只能
-    在 P1 那边装盘（trace-20261101-002050 t≈7~44s 三块盘没动过）。
+kind：
+  - KIND_CLEAN_PLATE：对面缺干净盘（send_deficit / far_plate_need）。Balloon_2_2
+    （游戏内 2-3）灶全在右边，装盘只能在右边做；脏盘回到左边洗，洗好的干净盘
+    只能经篮子送回右边（trace-20261031-204801 t≈132~172）。Wizard_3_1
+    （游戏内 3-1）开局盘子全在 P2 这边、烤箱全在 P1 那边，熟披萨只能在 P1
+    那边装盘（trace-20261101-002050 t≈7~44s 三块盘没动过）。
+  - KIND_CARRIER：料齐 / 补不了料的生载体卡在 P2 这边（stuck_carriers）。
+  - KIND_DIRTY_PLATE：洗碗池只在对面，P2 这侧有脏盘（dirty_plate_sources）。
+  - KIND_PLATED_DISH：出餐口只在对面，P2 这侧有料齐的成品盘
+    （plated_dish_sources）。
+
+本模块只回答“该不该送、送什么”；取放/完成/落点策略在
+ai/revenue/handover.py 的规格表里。
 
 不读 Blackboard、不写 World；可达区用每帧缓存的可达场（regions.field_of）。
 """
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from ai.query import predicates as P
 from ai.space import channels as CH
@@ -26,7 +34,11 @@ KIND_CLEAN_PLATE = "clean_plate"
 #（trace-20261101-130851 t≈32s：料齐的饼在 P2 台面 (21) 上，烤箱在 P1 那边，
 # 没有任何 task 能把它交出去，P2 原地不动到局末）。
 KIND_CARRIER = "carrier"
-KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER)
+# 脏盘：洗碗池只在对面、P2 这侧有脏盘时，送到共享台面让 P1 洗。
+KIND_DIRTY_PLATE = "dirty_plate"
+# 成品盘：出餐口只在对面、P2 这侧有料齐的盘时，送到共享台面让 P1 送。
+KIND_PLATED_DISH = "plated_dish"
+KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH)
 
 # 对面最多备几块空盘（含在途）：P1 一般同时装 1~2 单，再多就是把盘从我这边
 # 搬去对面闲着，回头我这边要用（洗好的盘也在这边）还得送回来。
@@ -176,6 +188,80 @@ def stuck_carriers(world, book, bb=None):
         if any(_can_supply(ctx, book, m) for m in CR.prep_missing(book, c, dish)):
             continue
         out.append(c)
+    return out
+
+
+def _is_dirty_plate(entry):
+    # type: (Dict) -> bool
+    name = str(entry.get("n") or "").lower()
+    return "dirty" in name and "plate" in name
+
+
+def _station_sides(world, near, far, station_type, bb=None):
+    # type: (object, Dict, Dict, str, object) -> Tuple[List[Dict], bool, bool]
+    """某类站点 + (P2 能否交互, P1 能否交互)。"""
+    out = []
+    p2 = p1 = False
+    for st in getattr(world, "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != station_type:
+            continue
+        out.append(st)
+        p2 = p2 or _reach(world, near, st, P.P2_NAME)
+        p1 = p1 or _reach(world, far, st, P.P1_NAME)
+    return out, p2, p1
+
+
+def dirty_plate_sources(world, bb=None):
+    # type: (object, object) -> List[Dict]
+    """P2 这侧有脏盘、洗碗池只在对面时，该送过去的脏盘条目。
+
+    只要 P2 够得着任何一个洗碗池，就自己洗，不占中转台；对面也没有洗碗池
+    时同样不送。脏盘已经在通道上（在途）不算来源。
+    """
+    if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
+        return []
+    near, far = CH._fields(world, bb)
+    sinks, p2_can, p1_can = _station_sides(world, near, far, "washing", bb)
+    if not sinks or p2_can or not p1_can:
+        return []
+    out = []  # type: List[Dict]
+    for it in (list(getattr(world, "items", ()) or ())
+               + list(getattr(world, "held_items", ()) or ())):
+        if not isinstance(it, dict) or not _is_dirty_plate(it):
+            continue
+        if it.get("held_by") == P.P1_NAME:
+            continue
+        if _side_of(world, near, far, it, bb) == "near":
+            out.append(it)
+    return out
+
+
+def plated_dish_sources(world, book, bb=None):
+    # type: (object, object, object) -> List[Tuple[Dict, Dict]]
+    """P2 这侧有料齐的盘、出餐口只在对面时，该送过去的 (盘, 订单)。
+
+    只要 P2 够得着任何一个出餐口就自己送；盘已在通道上（在途）不算来源。
+    """
+    if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
+        return []
+    near, far = CH._fields(world, bb)
+    hatches, p2_can, p1_can = _station_sides(world, near, far, "plate_station", bb)
+    if not hatches or p2_can or not p1_can:
+        return []
+    out = []  # type: List[Tuple[Dict, Dict]]
+    for p in P.all_plates(world):
+        if p.get("held_by") == P.P1_NAME:
+            continue
+        if P.plate_count(p) <= 0:
+            continue
+        if CH.slot_of(world, p, bb) is not None:
+            continue
+        if _side_of(world, near, far, p, bb) != "near":
+            continue
+        for order in world.orders:
+            if book.missing(order, p) == ():
+                out.append((p, order))
+                break
     return out
 
 

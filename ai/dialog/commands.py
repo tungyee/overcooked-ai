@@ -36,6 +36,13 @@ MAX_PENDING = 3
 RESOURCE_WAIT_TIMEOUT_TICKS = 20 * TICKS_PER_SECOND
 TASK_FAIL_LIMIT = 3
 
+# 命令目标站只在对面时，允许先走中转台的送件 kind。字符串与
+# ai/revenue/cross_supply.KIND_* 一致；这里不 import tasks/state，避免循环。
+ACTION_SEND_KINDS = {
+    "wash": ("dirty_plate",),
+    "deliver": ("plated_dish",),
+}  # type: Dict[str, Tuple[str, ...]]
+
 # 英文动作 → task 类型。这里只描述“做到什么状态”需要哪些 task；
 # 具体命中哪个 item 由 build_scope 从本关 DAG 里取。
 ACTION_TASK_TYPES = {
@@ -189,6 +196,11 @@ def resolve_target(kitchen, action, raw):
     return None, None, text, reason, valid_targets(kitchen)
 
 
+def _send_scope(action):
+    # type: (str) -> Set[Pair]
+    return {("SendAcross", kind) for kind in ACTION_SEND_KINDS.get(action, ())}
+
+
 def build_scope(kitchen, action, target, mode):
     # type: (Any, str, Optional[str], Optional[str]) -> Tuple[Optional[Scope], str]
     """动作 + target → task scope；做不到时返回 (None, reason)。"""
@@ -197,9 +209,9 @@ def build_scope(kitchen, action, target, mode):
     if action not in ACTION_TASK_TYPES:
         return None, "未知动作：%s" % action
     if action == "wash":
-        return frozenset({("WashPlate", None)}), ""
+        return frozenset({("WashPlate", None)} | _send_scope(action)), ""
     if action == "deliver":
-        return frozenset({("DeliverPlate", None)}), ""
+        return frozenset({("DeliverPlate", None)} | _send_scope(action)), ""
     if not target:
         # 动作级：任意 item 的这个动作；由 planner 选具体料。
         if not task_types:

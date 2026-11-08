@@ -254,6 +254,13 @@ class WashPlate(Task):
         # t=6117~6193 与 7228~7370 共 220 拍选 WashPlate、0 拍按键。
         if self.done(ctx):
             return False
+        # 这个池子在对面时 P2 走不过去；让 SendAcross(dirty_plate) 先送过去。
+        # 拓扑未知（无 field）保持旧行为。
+        sink = sink_station(ctx, self.sink_id)
+        if sink is not None and ctx.get("field"):
+            from ai.space import reachability
+            if not reachability.can_interact(ctx, sink):
+                return False
         # 当前承诺就是洗这个池子 → 继续洗完，别中断。这里必须看「承诺」而
         # 不是只看「池子里有盘」：池子里有盘也可能是 P1 刚放进去的脏盘，那时
         # 场上还有干净盘/装配盘的话就不该去洗。只有 P2 自己已承诺在洗（含

@@ -2,9 +2,10 @@
 
 设计要点（与提示词里的工具协议对应）：
 
-- 一条命令不是单个 task，而是一个**目标状态**（切好 / 煮熟 / 装盘 /
-  送出 / 洗净 / 取到）。命令带 `scope`，只要没到 `done`，planner 就
-  优先在这个 scope 里选任务；不会因为第一个子任务成功就消费掉。
+- 一条命令不是单个 task，而是一个**目标状态**（切好 / 下锅 / 装盘 /
+  送出 / 洗净 / 取到）。煮、煎这类动作的目标就是「料进锅」，不等熟；
+  命令带 `scope`，只要没到 `done`，planner 就优先在这个 scope 里选任务；
+  不会因为第一个子任务成功就消费掉。
 - 队列最多 3 条待执行。满了丢最后一条待执行项，新指令照收。
 - 当前命令 waiting（煎/煮/资源被占）时，下一条有可行任务的命令可以跑；
   依赖关系由 scope 的可行性天然表达，不额外建依赖图。
@@ -552,6 +553,47 @@ def item_present(world, form, include_cookers=True):
     return False
 
 
+def _cooker_has_input(world, book, target):
+    # type: (Any, Any, Optional[str]) -> bool
+    """料是否已经下锅：锅里出现这道菜的进锅形态就算做完。
+
+    「下锅就算完成」是煮/煎命令的用户口径——不需要等熟、也不要求端上盘。
+    只认**名字命中**的料：锅里是别的料不算（避免「P2 一看到有锅在煮就
+    报完成」）。进锅形态取生料本身和它的切好产物（`cook_input_form`），
+    比较时把 `Chopped` 前缀抹掉——锅里报生料还是切好产物取决于本关配方
+    有没有 chop 字段，两者在「同一份料」这一点上是等价的。
+    """
+    if not book or not target:
+        return False
+
+    def canon(name):
+        # type: (Any) -> str
+        name = _norm(name)
+        return name[len("chopped"):] if name.startswith("chopped") else name
+
+    raws = list(book.raws_of(target) or ())
+    if book.needs_cooking(target):
+        raws.append(target)
+    forms = set()  # type: Set[str]
+    for raw in raws:
+        forms.add(canon(raw))
+        form = book.cook_input_form(raw)
+        if form:
+            forms.add(canon(form))
+    forms.discard("")
+    if not forms:
+        return False
+    from ai.query.plate_tokens import parse_pot_contents
+    for cooker in _world_list(world, "cookers"):
+        if not isinstance(cooker, dict):
+            continue
+        have = {canon(name)
+                for name in parse_pot_contents(cooker.get("pot_contents"))}
+        if have & forms:
+            return True
+    return False
+
+
 def on_plate(world, form):
     # type: (Any, Any) -> bool
     wanted = _norm(form)
@@ -743,8 +785,15 @@ def command_done(world, book, command):
             forms.extend(book.cooked_of_raw(target))
             for raw in book.raws_of(target) or ():
                 forms.extend(book.cooked_of_raw(raw))
-        return any(item_present(world, form, include_cookers=False)
-                   for form in forms if form)
+        if any(item_present(world, form, include_cookers=False)
+               for form in forms if form):
+            return True
+        # 「下锅即算做完」：煮/煎这类命令一看到料进锅就结束，不等它熟。
+        # 旧判据只认盘/台/手里的熟料，而本关盘内容只报复合 token
+        # （CookedCompositeAssembledNode），意面熟了上盘也认不出 →
+        # 命令永不结束、独占执行槽把后面排队的命令全饿死
+        # （实机 trace-20261108-182610：t=1959 已装盘，cmd1 一直跑）。
+        return _cooker_has_input(world, book, target)
     if action == "plate":
         if not book:
             return False

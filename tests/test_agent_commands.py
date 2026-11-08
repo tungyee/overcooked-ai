@@ -150,6 +150,41 @@ def test_wash_not_done_while_holding_dirty_plate(agent, world):
     assert command_done(world, agent.book, cmd) is True
 
 
+def _cook_cmd(target):
+    from ai.dialog.commands import Command
+    return Command(id="cmd1", action="cook", target=target,
+                   resolved_target=target, display_target=target,
+                   scope=frozenset())
+
+
+def test_cook_command_done_once_ingredient_is_in_the_pot(agent, world):
+    """煮/煎命令按「下锅」判完成：料进锅就结束，不等熟、不等端盘。
+
+    实机 trace-20261108-182610：熟意面 t=1959 已装盘，但盘内容只报
+    `CookedCompositeAssembledNode`，旧的 item_present 认不出来，cmd1 永远
+    不结束，独占执行槽把后面的「煮番茄」饿死。
+    """
+    world.cookers = [{"n": "cooker_01", "pot_contents": ["ing:Pasta"],
+                      "isCooking": True}]
+    assert command_done(world, agent.book, _cook_cmd("BoiledPasta")) is True
+
+
+def test_cook_command_done_once_chopped_ingredient_is_in_the_pan(agent, world):
+    """煎料：锅里是切好产物（ChoppedPastaTomato）也算下锅。"""
+    world.cookers = [{"n": "cooker_02",
+                      "pot_contents": ["ing:ChoppedPastaTomato"],
+                      "isCooking": True}]
+    assert command_done(world, agent.book,
+                        _cook_cmd("PanFriedTomatoes")) is True
+
+
+def test_cook_command_not_done_when_pot_has_other_ingredient(agent, world):
+    """锅里有别的东西不算做完（不能「看到锅在煮」就报完成）。"""
+    world.cookers = [{"n": "cooker_01", "pot_contents": ["ing:PastaTomato"],
+                      "isCooking": True}]
+    assert command_done(world, agent.book, _cook_cmd("BoiledPasta")) is False
+
+
 def test_prompt_has_no_internal_codes(world):
     text = llm.system_message("Sushi_Cucumber = Seaweed + Cucumber")["content"]
     assert "P1" not in text and "P2" not in text

@@ -1,11 +1,10 @@
 """打分权重完整集测试（Task 4）。
 
-重点验证 Plan 4 新增的 5 项权重：
+重点验证 Plan 4 新增的 4 项权重：
   1. 异步资源优先：FetchToCooker > FetchToPlate
   2. 完成度：盘里食材越接近完成优先级越高
-  3. 食材复用：一次取料满足多个订单
-  4. Combo 延续：连续送同类菜加分
-  5. 截止前瞻：会导致烧糊/超时的 task 惩罚
+  3. Combo 延续：连续送同类菜加分
+  4. 截止前瞻：会导致烧糊/超时的 task 惩罚
 """
 import pytest
 from ai.core import planner
@@ -164,102 +163,6 @@ def test_completion_bonus_beats_urgency_spread_at_two_thirds():
     """
     gap = planner._completion_bonus(2.0 / 3) - planner._completion_bonus(1.0 / 3)
     assert gap > 0.5, gap
-
-
-def test_ingredient_reuse_bonus_when_multiple_orders_need_same():
-    """食材复用：取一次黄瓜同时满足两个订单，加成。"""
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Salad", "remaining": 25, "composition": ["Cucumber"]},
-            {"id": "order2", "name": "Salad", "remaining": 28, "composition": ["Cucumber"]}
-        ],
-        stations=[
-            {"t": "plate", "n": "plate1", "item": [], "gx": 3, "gz": 3},
-            {"t": "plate", "n": "plate2", "item": [], "gx": 4, "gz": 4}
-        ]
-    )
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-    bb.plate_assignments = {"order1": ("plate1",), "order2": ("plate2",)}
-
-    # 候选：取黄瓜（可复用，满足 2 个订单）
-    cand = planner.Candidate(
-        task=T.FetchToBoard("order1", ("board1",), "Cucumber"),
-        preconditions=[],
-        estimated_steps=10
-    )
-
-    score, terms = planner._score_candidate(world, bb, cand)
-
-    # 断言：有复用加成
-    assert "ingredient_reuse" in terms
-    assert terms["ingredient_reuse"] > 0, "复用食材应有加成"
-
-
-def test_ingredient_reuse_excludes_plates_already_holding_it():
-    """已经放了该料的盘不该再计入复用（实机 trace-20261014-011202）。
-
-    根因：旧实现读 `plate["item"]`——帧里的字段叫 `contents`，于是"盘已有
-    该料"永不成立，Seaweed 的 reuse 恒等于「所有要海苔的订单数」，拿满
-    2.0 分压过 FetchToCooker 的异步 2.0 分。实测后果：4 个盘挨个摆海苔，
-    锅一直空着（trace t=800/1000/1230 海苔 1.05 恒压米饭 0.90）。
-    """
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Sushi", "remaining": 25,
-             "composition": ["Seaweed"]},
-            {"id": "order2", "name": "Sushi", "remaining": 28,
-             "composition": ["Seaweed"]},
-        ],
-    )
-    # 两只盘都已经摆好海苔 → 复用计数应为 0
-    world.plates = [
-        {"n": "plate1", "x": 6.0, "z": 6.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-        {"n": "plate2", "x": 7.0, "z": 7.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-    ]
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-
-    count = planner._ingredient_reuse_count(
-        T.FetchToPlate("order1", ("plate1",), "Seaweed"), world, bb,
-        plate_match={"plate1": "order1", "plate2": "order2"})
-    assert count == 0, "两只盘都已有海苔，不该再算复用"
-
-
-def test_ingredient_reuse_counts_only_plates_still_lacking():
-    """一只盘已有、一只盘还缺 → 复用计数为 1（不足以拿加成）。"""
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Sushi", "remaining": 25,
-             "composition": ["Seaweed"]},
-            {"id": "order2", "name": "Sushi", "remaining": 28,
-             "composition": ["Seaweed"]},
-        ],
-    )
-    world.plates = [
-        {"n": "plate1", "x": 6.0, "z": 6.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-        {"n": "plate2", "x": 7.0, "z": 7.0, "count": 0,
-         "contents": [], "detail": []},
-    ]
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-
-    count = planner._ingredient_reuse_count(
-        T.FetchToPlate("order2", ("plate2",), "Seaweed"), world, bb,
-        plate_match={"plate1": "order1", "plate2": "order2"})
-    assert count == 1, "只剩一只盘缺海苔"
 
 
 def test_wash_plate_tree_faces_the_sink_stack():
@@ -496,10 +399,9 @@ def test_all_weights_integrated():
 
     score, terms = planner._score_candidate(world, bb, cand)
 
-    # 断言：基础 3 项存在
+    # 断言：基础 2 项存在
     assert "urgency" in terms
     assert "pressure" in terms
-    assert "eta" in terms
 
     # 断言：总分是所有项的和（验证公式完整性）
     expected_total = sum(terms.values())

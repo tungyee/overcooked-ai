@@ -742,17 +742,10 @@ W_PRESSURE = 5.0
 # 问题。「不能压过快糊的锅」同理（L1 > L4）。若 W_NO_PLATE_PLACED 变动，
 # 上面那个区间要重算。
 W_PLATE_PRESSURE = 2.5
-# 任务成本（拍 → 分）。estimated_steps 来自 _CAND_META，是**类型常量**，
-# 所以 eta 表达的是「这类动作通常要几步」的先验，不是实时距离。
-# 它不能删：删掉后「填灶（15 步）」和「取料（10 步）」在同一层里变成纯收益
-# 比较，实测会让 test_loaded_carrier 的「取带料卷饼」（5.536）输给
-# 「FillCooker」（5.6），把那个实机 bug 放回来。
-W_ETA = 0.1
 
 # Plan 4 Task 4 权重（spec §6.8）
 W_ASYNC_RESOURCE = 2.0      # 异步资源优先（FetchToCooker > FetchToPlate）
 W_COMPLETION_RATIO = 1.0     # 完成度（盘里食材越接近完成优先级越高）
-W_INGREDIENT_REUSE = 0.5     # 食材复用（一次取料满足多个订单）
 # Combo 队首加分 / 跳单惩罚（第 3 组 3.3/3.4）。
 #
 # 量级依据（ai/economy.py 的实测收益函数）：小费档位最多差 5 分（3→8，相对
@@ -800,9 +793,8 @@ W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩
 # （见 _deadline_forecast 的 ② 已移除那段），备菜候选的净分被压到 -4 左右，
 # 4.0/4.8 不战而胜。删掉重复计分后，备菜的真实合计是 **4.97**
 # （urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，实测灶全空 3 单要米）。
-#
-# 5.6 只用于 L6 层内排序：刚熟/快糊的锅在 L1/L2，层序已经保证它们先于填灶，
-# 不再需要靠扣 eta 来做净值比较。
+# ingredient_reuse 与 eta 已删除：同场景备菜降到 ~3.97，5.6 仍是 L6 的最高毛收益；
+# 刚熟/快糊的锅在 L1/L2，层序保证它们先于填灶，不需要再做净值比较。
 W_COOKER_IDLE = 5.6
 # 缺口饱和点：缺 3 份以上就算"满额紧急"，再多不额外加分——否则开局 5 单
 # 全要米时填灶会盖过送餐和灭火。
@@ -1975,9 +1967,6 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # ② 时间压力
     terms["pressure"] = W_PRESSURE * _time_pressure(task, world)
 
-    # ②b 任务成本（类型先验，见 W_ETA 注释）
-    terms["eta"] = -W_ETA * candidate.estimated_steps
-
     # ③ 异步资源优先（Plan 4 Task 4）：加工链最终进灶才给（_feeds_cooker），
     # 取料上砧板与下锅同分，不进灶的切配不给。
     # 仅当订单已有盘就位时才给：没盘时它们的输出无处可去，
@@ -2000,14 +1989,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                                                plate_match, effective_order_id)
     terms["completion_ratio"] = _completion_bonus(completion_ratio)
 
-    # ⑤ 食材复用（Plan 4 Task 4）
-    reuse_count = _ingredient_reuse_count(task, world, bb, plate_match, book)
-    if reuse_count >= 2:
-        terms["ingredient_reuse"] = W_INGREDIENT_REUSE * (reuse_count - 1)
-    else:
-        terms["ingredient_reuse"] = 0.0
-
-    # ⑥ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
+    # ⑤ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
     # 旧实现判的是「连续送同类菜」（比较 order["name"]），与游戏机制无关。
     # 关键：combo 由「送的是哪种**菜**」决定，不由 task 绑的 order_id 决定。
     # 游戏把这一盘记给「同 dish 存活单里 remaining 最小」的那个（实测 55/0），
@@ -2035,7 +2017,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms["combo_head"] = combo_head
     terms["combo_break"] = combo_break
 
-    # ⑦ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
+    # ⑥ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
     # **必须乘 W_DEADLINE_LOOKAHEAD**：_deadline_forecast 返回 0~1 的系数，
     # 不乘权重的话这一项的实际量级是 1.0 而非 10.0，比 W_COOKER_IDLE=5.6
     # （Ruling 12 重标后的值，原文的 4.8 已过期）小一个数量级——等于这条
@@ -2044,7 +2026,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                                           cooker_match)
     terms["deadline_lookahead"] = -W_DEADLINE_LOOKAHEAD * deadline_penalty
 
-    # ⑧ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
+    # ⑦ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
     if task.TYPE == "WashPlate":
         terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
     elif task.TYPE == "SendAcross" and task.item == "carrier":
@@ -2059,7 +2041,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["plate_pressure"] = 0.0
 
-    # ⑨ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
+    # ⑧ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
     # FetchToCooker 已有 async_resource 加分，不重复给。
     if task.TYPE == "FillCooker":
         shortfall = CS.cooked_shortfall(world, book, task.item) \
@@ -2068,7 +2050,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["cooker_idle"] = 0.0
 
-    # ⑩ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
+    # ⑨ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
     # 判据用 plate_match 而不是「盘的数量」：盘在晾干架/盘堆里一样倒不进料，
     # 只有进了匹配表（落在 counter 拼装格或 P2 手上）的盘才算就位。
     # plate_match 为 None 是「没有匹配信息」而不是「没盘」（同
@@ -2080,10 +2062,10 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["no_plate_placed"] = 0.0
 
-    # ⑪ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
+    # ⑩ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
     # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；
     # layer=None（扁平老路）时照常全量求和。
-    # ⑫ 批量投掷：只有 ThrowBatch 非零（_score_throw_batch 覆写）。
+    # ⑪ 批量投掷：只有 ThrowBatch 非零（_score_throw_batch 覆写）。
     terms["batch_bonus"] = 0.0
     terms["pref"] = _preference_score(candidate, bb, layer)
     # 截止闸既要放行候选，也要撤销同一条 claim 的负分。只放行而保留
@@ -2492,8 +2474,8 @@ def _apply_commitment_inertia(scored, world, bb):
 
     # 熟/快糊/已糊的锅要第一时间去端/救，跳过承诺惯性。光靠把 pressure 加进
     # 分数不够：pressure 把 TakeCookedToPlate 拉到 ~1-2，但当前 FetchToCooker /
-    # FetchToPlate 也会被 async_resource / ingredient_reuse / completion_ratio
-    # 抬到 ~0.5-1.4，分差 < COMMITMENT_MARGIN，于是锅都熟了还赖在当前 task 上
+    # FetchToPlate 也会被 async_resource / completion_ratio 抬到 ~0.5-1.3，
+    # 分差 < COMMITMENT_MARGIN，于是锅都熟了还赖在当前 task 上
     # 不去端盘（实机复现：米熟了 P2 还在给下一单下锅，不去盛饭）。
     # pressure >= 1.0 即「已熟」（ratio 0.5），正是该立刻去盛饭的点。
     # 只有「当前任务本身不是在处理热锅」时才用这条紧急切换去救锅。若已经
@@ -2750,57 +2732,6 @@ def _order_completion_ratio(task, world, bb, book=None, plate_match=None,
             filled_count += 1
 
     return float(filled_count) / len(composition)
-
-
-def _ingredient_reuse_count(task, world, bb, plate_match=None, book=None):
-    # type: (Any, World, Blackboard, Optional[Dict[Any, Any]], Optional[Any]) -> int
-    """统计食材复用次数（spec §6.8 食材复用）。
-
-    返回：该食材**还能**同时满足多少个订单的需求（已经摆好的不算）。
-
-    这里踩过与 `_order_completion_ratio` 完全相同的两个坑，修法也相同：
-
-      1. 盘内容读的是 `plate["item"]`——帧里的字段叫 `contents`。于是
-         "盘已有该料"永不成立，计数恒等于「所有要这料的订单数」；
-      2. 字面比较对熟料不成立（盘里记的是装盘态词汇），故有 `book` 时
-         必须走 `book.plate_has`。
-
-    实机后果（trace-20261014-011202）：Seaweed 的 reuse 恒为 4，拿满
-    `W_INGREDIENT_REUSE*(4-1)=1.5~2.0` 分，压过 FetchToCooker 的异步
-    2.0 分（后者还要扣更高的 ETA）。于是 P2 挨个盘摆海苔、锅一直空着，
-    多个订单都要米饭却只下了第一锅。
-    """
-    task_type = getattr(task, "TYPE", "")
-
-    # 只对取料类任务计算复用
-    if "FetchToBoard" not in task_type and "FetchToPlate" not in task_type:
-        return 0
-
-    # 提取任务要取的食材
-    ingredient = getattr(task, "item", None)
-    if not ingredient:
-        return 0
-
-    if book is None:
-        from ai.query.recipes import RecipeBook
-        book = RecipeBook(world.recipes, world.stations)
-
-    # 统计有多少个订单还缺这个食材
-    count = 0
-    for order in world.orders:
-        composition = order.get("composition", [])
-        if ingredient not in composition:
-            continue
-        plate = _find_plate_for_order(order.get("id"), world, plate_match)
-        if plate is None:
-            # 没有盘也算需要：料取回来总有盘可放
-            count += 1
-            continue
-        # 只有盘子还缺这个食材时才计数（装盘态词汇，不做字面比较）
-        if not book.plate_has(plate, ingredient):
-            count += 1
-
-    return count
 
 
 def _current_combo(world):

@@ -107,7 +107,7 @@
 离线回放（每 10 帧抽一帧无状态 plan）：
 - Balloon_2_3（213506）：ThrowBatch(Pasta) 29→6、FillCooker(BoiledPasta) 29→20、ThrowBatch(BurritoMeat) 16→46、FetchToBoard(BurritoMeat) 0→5；（220619）FetchToBoard(Prawn) 28→37、FetchToBoard(UncookedFish) 8→12、ThrowBatch(Pasta) 21→15。
 - Mine_2_5（235333）无变化；Sushi_1_2（233327）仅 ±1~4 帧（Chop(SushiPrawn) 少 1）。
-- **Balloon_1_5（112633）需留意**：ThrowBatch(PastaTomato) 3→64、FillCooker(BoiledPasta) 14→0。灶空时 FillCooker（eta −1.5 + cooker_idle 3.73 = 2.23）以 0.02 输给番茄远投（eta −1.0 + async 2.0 + combo 0.25 + batch 1.0 = 2.25），14 帧是这个差距。根因是 FillCooker 与 ThrowBatch 两套加分口径（cooker_idle vs async+batch）本就不可比，此前靠 FetchToBoard 没有 async 掩盖；要不要让「灶空着」压过番茄备料，属于改权重，未动。
+- **Balloon_1_5（112633）需留意**（下面数值是 eta 删除前测的）：ThrowBatch(PastaTomato) 3→64、FillCooker(BoiledPasta) 14→0。灶空时 FillCooker（eta −1.5 + cooker_idle 3.73 = 2.23）以 0.02 输给番茄远投（eta −1.0 + async 2.0 + combo 0.25 + batch 1.0 = 2.25），14 帧是这个差距。根因是 FillCooker 与 ThrowBatch 两套加分口径（cooker_idle vs async+batch）本就不可比，此前靠 FetchToBoard 没有 async 掩盖；要不要让「灶空着」压过番茄备料，属于改权重，未动。
 - **batch_bonus 改为几何递减**（`planner._batch_bonus`）：第 k 份加 `W_BATCH × BATCH_DECAY^(k−2)`，N=2/3/4/6 → 0.5/0.75/0.875/0.97，上限 1.0（原线性 0.5×(N−1)，220619 里出现过 1.5）。理由：N 随订单数涨，后几份服务的单更从容、锅位不够要等、批次常被打断。回放后 Balloon_1_5 的 FillCooker(BoiledPasta) 回到 14 帧（ThrowBatch(PastaTomato) 64→50）；Balloon_2_3 两局基本不变。
 - ThrowBatch(BurritoMeat) 变多会放大 split 模式「拿起→放下」循环（见 220619 t=685~942）→ 已修，见下条。
 - **split 模式拿着料的保护**（`relay.ThrowBatch`）：`_carrying_this_batch` 原只认 far。split 下篮子漂移让「P1 能到砧板」逐帧翻转，t=706/905 刚拿起肉就判不可行、树按「本批结束」SUCCESS、下一拍 StashHeld 放下，再拿起（ThrowBatch+StashHeld 约 8% 拍）。现在：拿着本批料且承诺是它时按探测口径（far/split）继续；这一帧暂无出手位也算可行，由单轮里新增的 `WaitUntil(有出手位, LAUNCH_WAIT_TICKS=60)` 兜底，等满失败 → 承诺清空 → 保护解除 → StashHeld。t=706/905 两帧当场就能出手（`throw_ok_here` 为真），落点按 P1 可达格判。fixture `balloon23-20261029-220619.ndjson.gz`。需实机验证。
@@ -176,7 +176,7 @@ Windows 最新运行见 `../notes/windows-live-validation-2026-10-19.md`：已�
 - **P1 名称硬编码**：`"Player 1"` / `"Player 2"`（`predicates.P1_NAME/P2_NAME`）。真实帧 `chefs[].slot` 全为 null，只能按 name 区分（已核实 2204 条 chef 条目）。
 - **熟料 token 不透明（仅旧帧）**：`RecipeBook.want_tokens` 对需烹饪的料同时给 rich token（`cooked:{raw}:{cookware}`）和旧帧 opaque `COOKED_PLATE_TOKEN`。新帧 `detail` 已通过 `plate_tokens` 输出 rich token，`plate_has`/`plate_lacks`/`missing` 据此能区分同一盘多份不同熟料；旧帧（无 detail）仍退化为不透明 token，多熟料关卡在旧帧下无法区分。
 - **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / slack 曲线）已按真实 trace 定标，其余 `W_*` 与穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）仍是经验初值。改之前读 §4「改权重前必读」。
-- **打分项已精简（2026-11-08）**：删掉从不改变排序的 `deliver_bonus`、`freshness`，以及 `hands` / `move_penalty` 两个成本项；`eta` 保留——全量测试证明它是承重项，删掉会让 `test_loaded_carrier` 的「取带料卷饼」重新输给 FillCooker。现共 14 个 term 键。
+- **打分项已精简（2026-11-08）**：删掉 `deliver_bonus`、`freshness`、`hands`、`move_penalty`，并进一步删掉 `eta` 与 `ingredient_reuse`；现共 12 个 term 键。后两项是有意实验：已知 `test_loaded_carrier` 的「取带料卷饼」会重新输给 FillCooker（测试已标 xfail），待实机验证后再决定是否重标定。
 - 对话协作层（`Intents.assignments`、split mode 的显式分单 `order_assignment`）原为空壳预留，已连同 P1 短程意图推断一起作为死代码删除（`2026-10-18` 清理，见 `ai/state/p1model.py` 顶部说明）。
 - 「16 个 task」的说法已过时（现为 19），以代码的 `TASK_TYPES` 为准。
 
@@ -308,7 +308,7 @@ L3 兑现 / L4 解卡（无盘）/ **L5 空层** / L6 备菜（含填灶）/ L7 
   （⑨.5 接管，`infeasible_streak` 被反复清零）。现在并列记 `chosen` 与 `exec.task`。
 
 - **填灶无条件压过备菜**（`828a99f`）：见上面 L5 那段。修法是把 FillCooker 放回
-  L6、`cooker_idle` 随之进 L6 白名单（少了它填灶层内净分只剩 `eta` 的 -1.5，
+  L6、`cooker_idle` 随之进 L6 白名单（少了它填灶层内只剩 0 分，
   会从「永远赢」翻到「永远输」）。离线重放 1015 拍：缺 2 份保留填灶 100%、
   缺 1 份保留 33%、缺 0 份全让位 —— 连续单调无硬门。`W_COOKER_IDLE=5.6` 那套
   标定（按「压过备菜合计 4.97」定、饱和点缺 3 份）自动重新生效，没加新常数。
@@ -376,9 +376,9 @@ L3 兑现 / L4 解卡（无盘）/ **L5 空层** / L6 备菜（含填灶）/ L7 
 动 `W_*` 之后：① 跑 `tests/test_fill_cooker_priority.py` 与 `tests/test_plate_supply_guard.py`（两处量级卡口）；② 用 `tools/replay_urgency.py <trace>` 查 urgency 是否仍单调（倒挂须为 0%）；③ 重放一局真实 trace 比对选择分布。
 
 **打分口径**：urgency 必须读 `ETA.solo_slack_by_order`（独立 slack），**不要**读 `slack_by_order`（队列累计，判死口径）。两者对 remaining 的方向是反的，混用会让「排得越后越优先」，而单组测试查不出来——`tests/test_eta.py::test_queue_slack_is_the_one_that_inverts` 把这个差别钉住了。当前量级关系：**填灶与备菜在 L6 层内直接比**（`828a99f` 把 FillCooker 从 L5 挪回来），
-`W_COOKER_IDLE=5.6` 按缺口线性给到饱和（缺 3 份满额），实测缺 3 份时合计压过备菜的
-~4.97、缺 1 份时只有 1.9 分让位 —— 这一对是**今天唯一还靠数值定胜负的跨类关系**，
-动它必须重放（见上面第 ③ 步）。端刚熟的锅（L2）与 0 盘洗盘（L4）已由层序隔离，
-不再需要数值余量。
+`W_COOKER_IDLE=5.6` 按缺口线性给到饱和（缺 3 份满额）。原实测备菜合计 ~4.97
+（含已删除的 `ingredient_reuse` 1.0），删掉后 ~3.97；5.6 仍然压过，缺 1 份时
+只有 1.87 分让位 —— 这一对是**今天唯一还靠数值定胜负的层内关系**，动它必须重放
+（见上面第 ③ 步）。端刚熟的锅（L2）与 0 盘洗盘（L4）已由层序隔离，不再需要数值余量。
 
 **警惕"自欺的修复"**：combo 第一版按 `task.order_id == head` 加分，离线复验看着像修好了（改选了 order#3），但盘里装的菜没变、游戏照样记给同 dish 里 `remaining` 最小的单 —— 实机行为与旧版一字不差，只是 trace 上的 order_id 变好看了。验证改动时要问「实机会不会不一样」，不是「trace 看起来有没有变」。

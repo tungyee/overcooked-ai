@@ -188,8 +188,8 @@ TERM_WHITELIST = {
     # 本层），别的备菜 task _time_pressure 恒 0，加了不影响它们。
     L_PREP: frozenset([
         "pressure",
-        "urgency", "completion_ratio", "async_resource", "ingredient_reuse",
-        "combo_head", "combo_break", "deadline_lookahead", "eta",
+        "urgency", "completion_ratio", "async_resource",
+        "combo_head", "combo_break", "deadline_lookahead",
         # 对话偏好（spec §4.5）在备菜层与既有项直接相加：direct 的 +4
         # 改同层先后，claim 的 -8 在层内被截止闸兜底（spec §4.6）。
         "pref",
@@ -202,8 +202,8 @@ TERM_WHITELIST = {
         # ThrowBatch 的批量加分：W_BATCH × (N−1)，见 planner._score_throw_batch。
         "batch_bonus",
     ]),
-    # L7 清理：只剩类型成本与对话偏好；同分时按候选顺序（稳定排序）。
-    L_CLEANUP: frozenset(["eta", "pref"]),
+    # L7 清理：只剩对话偏好；同分时按候选顺序（稳定排序）。
+    L_CLEANUP: frozenset(["pref"]),
 }
 
 

@@ -51,34 +51,6 @@ def _make_bb():
 
 # ---------- 测试用例 ----------
 
-def test_score_prefers_lower_estimated_steps():
-    """打分函数偏好估计步数更少的候选（类型成本项生效）。"""
-    order = _make_order("Test", ["Tomato"], remaining=3)
-    w = _make_world(orders=[order])
-    bb = _make_bb()
-
-    # 创建两个候选：一个 10 步，一个 20 步
-    cand_short = Candidate(
-        task=T.Chop("order1", ("board_01",), "Tomato"),
-        preconditions=[],
-        estimated_steps=10
-    )
-    cand_long = Candidate(
-        task=T.Chop("order1", ("board_02",), "Tomato"),
-        preconditions=[],
-        estimated_steps=20
-    )
-
-    score_short, terms_short = _score_candidate(w, bb, cand_short)
-    score_long, _terms_long = _score_candidate(w, bb, cand_long)
-
-    # 步数少的分数更高（成本用负号）
-    assert score_short > score_long
-    assert "urgency" in terms_short
-    assert "pressure" in terms_short
-    assert terms_short["eta"] < 0
-
-
 def test_score_urgency_boosts_with_lower_remaining():
     """订单 remaining 越小，紧迫度分数越高。
 
@@ -155,12 +127,11 @@ def test_score_candidate_handles_missing_order():
         estimated_steps=10
     )
 
-    # 应该不崩溃；订单不存在，只扣类型成本
+    # 应该不崩溃；订单不存在，所有订单相关信号都为 0
     score, terms = _score_candidate(w, bb, cand)
 
-    assert score < 0
+    assert score == 0.0
     assert terms["urgency"] == 0.0
-    assert terms["eta"] < 0
 
 
 def test_score_identical_candidates_equal():

@@ -94,10 +94,10 @@ def test_fill_cooker_is_prep_layer():
 
 
 def test_cooker_idle_is_scored_in_prep_layer():
-    """cooker_idle 必须进 L6 白名单，否则填灶在层内净分只剩 eta 的负数,
-    从「永远赢」直接翻到「永远输」—— 灶又全空，正是 FillCooker 这个 task
-    当初被造出来要解决的问题（AGENTS.md §4 产能：59% 的拍三口灶一个都没
-    在煮、三单全过期）。"""
+    """cooker_idle 必须进 L6 白名单，否则填灶在层内只剩 0 分，
+    会被备菜项压掉、灶又全空 —— 正是 FillCooker 这个 task 当初被造出来
+    要解决的问题（AGENTS.md §4 产能：59% 的拍三口灶一个都没在煮、
+    三单全过期）。"""
     assert "cooker_idle" in TERM_WHITELIST[L_PREP]
 
 

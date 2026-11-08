@@ -19,7 +19,7 @@ def test_score_candidate_without_layer_is_unchanged():
     layer，必须按原语义工作。若这条失败，后面的测试会一起红，但从
     那片红里定位不到原因——所以单独钉在最前面。
     """
-    terms = {"urgency": 3.0, "pressure": 0.0, "eta": -1.5,
+    terms = {"urgency": 3.0, "pressure": 0.0, "combo_break": -1.5,
              "completion_ratio": 3.0}
     score_all, kept_all = PL.filter_terms(terms, None)
     assert score_all == 0.0 and kept_all == {}   # None 层 = 不打分（见 Task 4）

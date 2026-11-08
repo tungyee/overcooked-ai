@@ -134,8 +134,9 @@ def test_wash_pressure_weight_covers_prep_ceiling():
         FetchToBoard/Chop，见 planner._feeds_cooker），与 completion_ratio
         适用的 task 也不重合。
 
-    实测备菜合计是 4.97（urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，
-    灶全空 3 单要米，见 ai/planner.py 的 W_COOKER_IDLE 注释）。这与 A 组
+    实测备菜合计当时是 4.97（urgency 3.72 + ingredient_reuse 1.0 +
+    combo_head 0.25，灶全空 3 单要米）；ingredient_reuse 已删除，现在是 ~3.97。
+    这与 A 组
     Ruling 13 修掉的是同一类错误——拿理论上限冒充实测值。
 
     测法：用 _score_candidate 实算，不用权重常量相加。

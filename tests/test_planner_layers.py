@@ -450,17 +450,17 @@ def test_duplicate_key_takes_the_higher_layer():
 def test_filter_terms_keeps_only_whitelisted():
     """层内只算该层相关的项。这是「W_* 之间不再需要跨类可比」的实现——
     备菜层只和白名单内的项比较，结构上碰不到别的层的项。"""
-    terms = {"cooker_idle": 4.8, "eta": -1.5, "urgency": 3.0,
+    terms = {"cooker_idle": 4.8, "pressure": 2.0, "urgency": 3.0,
              "plate_pressure": 7.0}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
-    assert set(kept) == {"cooker_idle", "eta", "urgency"}
-    assert score == pytest.approx(4.8 - 1.5 + 3.0)
+    assert set(kept) == {"cooker_idle", "pressure", "urgency"}
+    assert score == pytest.approx(4.8 + 2.0 + 3.0)
 
 
 # planner 当前产出的全部 term 键（与 ai/planner.py 的 terms[...] 对齐）。
 _ALL_TERMS = (
-    "urgency", "pressure", "eta", "async_resource",
-    "completion_ratio", "ingredient_reuse", "combo_head",
+    "urgency", "pressure", "async_resource",
+    "completion_ratio", "combo_head",
     "combo_break", "deadline_lookahead", "plate_pressure", "cooker_idle",
     "no_plate_placed", "pref", "batch_bonus",
 )
@@ -500,7 +500,7 @@ def test_rescue_layers_ignore_completion_ratio():
 
 def test_fire_layer_scores_zero():
     """L0 不打分（plan_firefighting 只发一个全局候选）。"""
-    score, kept = PL.filter_terms({"pressure": 2.0, "eta": -1.0}, PL.L_FIRE)
+    score, kept = PL.filter_terms({"pressure": 2.0, "urgency": 3.0}, PL.L_FIRE)
     assert score == 0.0
     assert kept == {}
 
@@ -523,7 +523,7 @@ def test_prep_layer_scores_take_cooked_pressure():
 
 
 def test_filter_terms_with_none_layer():
-    assert PL.filter_terms({"eta": -1.0}, None) == (0.0, {})
+    assert PL.filter_terms({"pressure": 1.0}, None) == (0.0, {})
 
 
 def test_identical_scores_keep_input_order_after_sort():
@@ -538,7 +538,7 @@ def test_identical_scores_keep_input_order_after_sort():
         == ["a", "b", "c"]
 
     # 且 filter_terms 对相同输入给出相同输出（无随机性、无字典序依赖）
-    terms = {"cooker_idle": 4.8, "eta": -1.2}
+    terms = {"cooker_idle": 4.8, "pressure": -1.2}
     first = PL.filter_terms(terms, PL.L_CAPACITY)
     for _ in range(5):
         assert PL.filter_terms(terms, PL.L_CAPACITY) == first
@@ -550,17 +550,17 @@ def test_unregistered_layer_raises():
     静默不隔离比静默丢分危险：隔离是本模块存在的全部理由。
     """
     with pytest.raises(KeyError):
-        PL.filter_terms({"urgency": 5.0, "eta": -1.0}, 999)
+        PL.filter_terms({"urgency": 5.0, "pressure": 1.0}, 999)
 
 
 def test_unblock_layer_scores_plate_terms_only():
     """L4 解卡只看盘：plate_pressure（洗盘）与 no_plate_placed（摆盘）。
 
-    评审把这层白名单换成语义错误但名字合法的 {combo_break, ingredient_reuse}，
+    评审把这层白名单换成语义错误但名字合法的 {combo_break, async_resource}，
     39 个测试全绿——L4 此前只有 spec 的文字定义，没有行为断言。
     """
     terms = {"plate_pressure": 7.0, "no_plate_placed": 3.0,
-             "urgency": 4.0, "eta": -1.5, "combo_break": -0.5}
+             "urgency": 4.0, "pressure": -1.5, "combo_break": -0.5}
     score, kept = PL.filter_terms(terms, PL.L_UNBLOCK)
     assert set(kept) == {"plate_pressure", "no_plate_placed"}
     assert score == pytest.approx(10.0)

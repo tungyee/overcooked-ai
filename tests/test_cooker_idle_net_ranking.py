@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """填灶权重的净值边界（Ruling 12）。
 
-`W_COOKER_IDLE = 5.6` 字面上大于 `W_PRESSURE * 1.0 = 5.0`，看起来违反了
-「填灶不能压过端刚熟的锅」。但 cooker_idle 要扣 eta（净 4.1），而端熟锅的
-pressure 分不扣同量 eta —— 所以必须比**算出来的净分**，不是比常量。
+`W_COOKER_IDLE = 5.6` 与 `W_PRESSURE * 1.0 = 5.0` 只差 0.6，而候选还会吃到
+urgency / completion / combo 等项。所以必须比**算出来的实际分**，不是比常量。
 
 比常量查不出这类问题，正是 cf2fc64（手写加法）与 W_DEADLINE_LOOKAHEAD
 （从未被引用）那两个 bug 的形状。
@@ -28,9 +27,10 @@ def _score(w, tasks):
 
 
 def test_hot_pot_still_beats_fill_on_net_score():
-    """端刚熟的锅 > 填空灶，按净分比较。
+    """端刚熟的锅 > 填空灶，按实际分比较。
 
-    W_COOKER_IDLE(5.6) > W_PRESSURE*1.0(5.0) 是故意的：前者扣 eta、后者不扣。
+    W_COOKER_IDLE(5.6) 略高于 W_PRESSURE*1.0(5.0)，但刚熟的锅还会吃到
+    urgency / combo 等项，不能只看 pressure 常量。
     """
     hot = _cooker("c1", cooked=True, cooking=True, contents=["sushirice"])
     hot["cooking_time"] = 12.0

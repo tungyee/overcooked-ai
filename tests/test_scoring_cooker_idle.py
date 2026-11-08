@@ -15,8 +15,9 @@ def test_weight_beats_prep_but_loses_to_delivery_and_hot_pot():
 
     **备菜上限的口径已修正（Ruling 13）**：原先写「备菜上限 =
     async_resource(2.0) + completion_ratio(1.0) = 3.0」，漏掉了 urgency。
-    实测备菜合计是 **4.97**（urgency 3.72 + ingredient_reuse 1.0 +
-    combo_head 0.25，灶全空 3 单要米）。那个 3.0 的模型在 53d6a2b 把 urgency
+    实测备菜合计当时是 **4.97**（urgency 3.72 + ingredient_reuse 1.0 +
+    combo_head 0.25，灶全空 3 单要米）；ingredient_reuse 已删除，现在是 ~3.97。
+    那个 3.0 的模型在 53d6a2b 把 urgency
     从「中段恒 ~0.1」改成「中段 3~4 分」时就失效了，只是当时 urgency 又被
     deadline_lookahead 以同形曲线反向抵消（见 _deadline_forecast 已移除的 ②），
     净效果接近 0，所以这条断言一直没翻红。

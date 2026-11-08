@@ -449,20 +449,19 @@ def test_duplicate_key_takes_the_higher_layer():
 
 def test_filter_terms_keeps_only_whitelisted():
     """层内只算该层相关的项。这是「W_* 之间不再需要跨类可比」的实现——
-    W_COOKER_IDLE 只跟 W_ETA 比（同在 L5），结构上碰不到备菜的项。"""
+    备菜层只和白名单内的项比较，结构上碰不到别的层的项。"""
     terms = {"cooker_idle": 4.8, "eta": -1.5, "urgency": 3.0,
-             "completion_ratio": 1.33}
-    score, kept = PL.filter_terms(terms, PL.L_CAPACITY)
-    assert set(kept) == {"cooker_idle", "eta"}
-    assert score == pytest.approx(4.8 - 1.5)
+             "plate_pressure": 7.0}
+    score, kept = PL.filter_terms(terms, PL.L_PREP)
+    assert set(kept) == {"cooker_idle", "eta", "urgency"}
+    assert score == pytest.approx(4.8 - 1.5 + 3.0)
 
 
 # planner 当前产出的全部 term 键（与 ai/planner.py 的 terms[...] 对齐）。
 _ALL_TERMS = (
     "urgency", "pressure", "eta", "async_resource",
     "completion_ratio", "ingredient_reuse", "combo_head",
-    "combo_break", "freshness", "deadline_lookahead", "hands", "move_penalty",
-    "deliver_bonus", "plate_pressure", "cooker_idle",
+    "combo_break", "deadline_lookahead", "plate_pressure", "cooker_idle",
     "no_plate_placed", "pref", "batch_bonus",
 )
 
@@ -490,19 +489,6 @@ def test_whitelists_only_reference_real_terms():
         assert not unknown, "层 %s 的白名单含未知 term: %s" % (layer, unknown)
 
 
-def test_deliver_bonus_is_in_no_whitelist():
-    """W_DELIVER_BONUS 是恒等加常数的类别标记：L3 全部候选都是
-    DeliverPlate，给每个人加同一个 3.0 不改变任何排序。它原本在调两件事
-    （类别优先级 + 改选频率，见 4.0→3.0 那段注释），现在类别优先级归层序、
-    改选频率归 COMMITMENT_MARGIN。
-
-    常量本身保留（三个测试文件引用它，删会连带改测试，而「零测试改动」
-    是分层正确性的核心证据）；这里只钉住它不再参与打分。
-    """
-    for allowed in PL.TERM_WHITELIST.values():
-        assert "deliver_bonus" not in allowed
-
-
 def test_rescue_layers_ignore_completion_ratio():
     """L1/L2 只看锅。盘满不满不影响该不该去盛这锅饭。"""
     terms = {"pressure": 1.8, "completion_ratio": 2.5, "urgency": 4.0}
@@ -521,19 +507,19 @@ def test_fire_layer_scores_zero():
 
 def test_filter_terms_sums_negative_contributions():
     """惩罚项存负数，求和即可。"""
-    terms = {"eta": -1.5, "hands": -1.0, "move_penalty": -5.0,
+    terms = {"deadline_lookahead": -5.0, "combo_break": -0.5,
              "urgency": 3.0, "completion_ratio": 1.33}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
-    assert score == pytest.approx(-1.5 - 1.0 - 5.0 + 3.0 + 1.33)
+    assert score == pytest.approx(-5.0 - 0.5 + 3.0 + 1.33)
 
 
 def test_prep_layer_scores_take_cooked_pressure():
     """快熟阶段的 TakeCookedToPlate 在 L6 要能吃到 pressure 项，否则
     「提前端盘等熟」的压力梯度又会被白名单架空（实机烧糊的根因之一）。"""
-    terms = {"pressure": 2.5, "eta": -1.5, "hands": -1.0, "urgency": 3.0}
+    terms = {"pressure": 2.5, "urgency": 3.0}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
     assert "pressure" in kept
-    assert score == pytest.approx(2.5 - 1.5 - 1.0 + 3.0)
+    assert score == pytest.approx(2.5 + 3.0)
 
 
 def test_filter_terms_with_none_layer():
@@ -570,11 +556,11 @@ def test_unregistered_layer_raises():
 def test_unblock_layer_scores_plate_terms_only():
     """L4 解卡只看盘：plate_pressure（洗盘）与 no_plate_placed（摆盘）。
 
-    评审把这层白名单换成语义错误但名字合法的 {hands, move_penalty}，39 个测试
-    全绿——L4 此前只有 spec 的文字定义，没有行为断言。
+    评审把这层白名单换成语义错误但名字合法的 {combo_break, ingredient_reuse}，
+    39 个测试全绿——L4 此前只有 spec 的文字定义，没有行为断言。
     """
     terms = {"plate_pressure": 7.0, "no_plate_placed": 3.0,
-             "urgency": 4.0, "eta": -1.5, "hands": -1.0}
+             "urgency": 4.0, "eta": -1.5, "combo_break": -0.5}
     score, kept = PL.filter_terms(terms, PL.L_UNBLOCK)
     assert set(kept) == {"plate_pressure", "no_plate_placed"}
     assert score == pytest.approx(10.0)

@@ -297,41 +297,6 @@ def test_prep_combo_not_applied_to_order_independent_tasks():
     assert terms["combo_break"] == 0.0
 
 
-def test_combo_term_dominates_freshness_term():
-    """量级关系：combo 必须显著高于新鲜度，不能在同一量级上互相抵消。
-
-    依据（ai/economy.py 实测）：新鲜度最多差 5 分（3→8，相对 base 60 仅 8%），
-    而 combo 到 3 就系数翻倍。队首不新鲜、后面某单很新鲜时，**combo 赢**。
-    """
-    assert planner.W_COMBO_HEAD > planner.W_FRESHNESS * 2
-
-
-# ---------- 打分：新鲜度 ----------
-
-def test_freshness_bonus_tracks_tier():
-    w = FakeWorld(_orders(("3", 120.0)))      # 高档（>2/3 lifetime）
-    bb = Blackboard()
-    _, fresh = _score_deliver(w, bb, "3")
-    w2 = FakeWorld(_orders(("3", 20.0)))      # 低档（<1/3）
-    _, late = _score_deliver(w2, bb, "3")
-    assert fresh["freshness"] > late["freshness"]
-
-
-def test_freshness_only_applies_to_delivery():
-    """只有送餐才谈新鲜度：备菜快慢不直接决定小费档位。"""
-    from ai import tasks as T
-    w = FakeWorld(_orders(("3", 120.0)))
-    bb = Blackboard()
-    cand = planner.Candidate(T.FetchToPlate("3", ("p1",), "Seaweed"), [], 10)
-    _, terms = planner._score_candidate(w, bb, cand)
-    assert terms["freshness"] == 0.0
-
-
-def test_freshness_is_small_relative_to_delivery_bonus():
-    """新鲜度是顺带收，不是目标：不能让它盖过"把盘送出去"本身。"""
-    assert planner.W_FRESHNESS < planner.W_DELIVER_BONUS / 2
-
-
 def test_old_same_dish_combo_heuristic_is_gone():
     """旧的「连续送同类菜」判据必须删除，否则两套语义并存互相干扰。"""
     assert not hasattr(planner, "_is_combo_continuation")

@@ -20,7 +20,7 @@ def test_score_candidate_without_layer_is_unchanged():
     那片红里定位不到原因——所以单独钉在最前面。
     """
     terms = {"urgency": 3.0, "pressure": 0.0, "eta": -1.5,
-             "deliver_bonus": 3.0}
+             "completion_ratio": 3.0}
     score_all, kept_all = PL.filter_terms(terms, None)
     assert score_all == 0.0 and kept_all == {}   # None 层 = 不打分（见 Task 4）
 

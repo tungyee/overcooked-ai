@@ -102,8 +102,8 @@ def test_deliver_outranks_prep():
 def test_hot_pot_outranks_deliver():
     """锅快糊 vs 料齐的盘 → 先救锅。
 
-    依据：锅会烧糊（料没了 + 要灭火），盘不会。注释里写的是
-    「W_DELIVER_BONUS 要低于快糊锅的 pressure（W_PRESSURE*2.0=10.0）」。
+    依据：锅会烧糊（料没了 + 要灭火），盘不会。分层后由 L1 > L3
+    结构性保证，不再依赖数值大小。
     """
     plate_full = {"n": "p1", "name": "plate", "x": 3.0, "z": 3.0,
                   "contents": ["Seaweed", "BoiledSushiRice", "Cucumber"],

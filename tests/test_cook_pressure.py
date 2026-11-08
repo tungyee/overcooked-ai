@@ -433,23 +433,6 @@ def test_chop_declares_empty_hands_and_clears_first():
     assert isinstance(seq.children[0], EnsureHandsFree)
 
 
-def test_take_cooked_score_penalized_when_holding_cookware():
-    w = _take_world([])
-    task = _take_task()
-    cand = planner.Candidate(task, [], 15)
-    bb = Blackboard()
-
-    w.chefs[0]["held"] = None
-    free_score, free_terms = planner._score_candidate(w, bb, cand)
-
-    w.chefs[0]["held"] = "utensil_pot_01"
-    busy_score, busy_terms = planner._score_candidate(w, bb, cand)
-
-    assert free_terms["hands"] == 0.0
-    assert busy_terms["hands"] < 0
-    assert busy_score < free_score
-
-
 # ---------- B3：loose_cookware 只认地上的锅 ----------
 
 def test_loose_cookware_excludes_only_cooker_pots():

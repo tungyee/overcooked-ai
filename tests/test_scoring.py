@@ -477,32 +477,6 @@ def test_no_deadline_penalty_when_safe():
     assert "deadline_lookahead" not in terms or terms["deadline_lookahead"] == 0
 
 
-def test_deliver_plate_hand_penalty_uses_pickup_not_clear():
-    """holding_plated_dish 的"手不对"是去捡盘，不是腾手，代价应更小。
-
-    实机：DeliverPlate 被 HAND_CLEAR_STEPS(10) 惩罚压着，做好的盘送不出去，
-    反而去 FetchToBoard 取生料。
-    """
-    world = _make_test_world(
-        orders=[{"id": "order1", "name": "Sushi", "remaining": 30,
-                 "composition": ["Seaweed"]}]
-    )
-    world.chefs[1]["held"] = None   # P2 空手
-
-    bb = Blackboard()
-    bb.tick = 0
-    bb.commitment = Commitment()
-
-    cand = planner.Candidate(
-        task=T.DeliverPlate("order1", ("p1",)),
-        preconditions=["holding_plated_dish"],
-        estimated_steps=5,
-    )
-
-    score, terms = planner._score_candidate(world, bb, cand)
-    assert terms["hands"] == -(planner.W_ETA * planner.HAND_PICKUP_STEPS)
-
-
 def test_all_weights_integrated():
     """综合测试：所有权重都参与打分。"""
     world = _make_test_world(
@@ -532,8 +506,14 @@ def test_all_weights_integrated():
     assert abs(score - expected_total) < 0.01, f"总分({score})应等于各项之和({expected_total})"
 
 
-def test_deliver_plate_gets_delivery_bonus_and_outranks_prep():
-    """送餐优先：料齐盘的 DeliverPlate 应有 deliver_bonus，压过备菜候选。"""
+def test_deliver_plate_outranks_prep_by_layer_not_bonus():
+    """送餐优先由层序保证：DeliverPlate 在 L3，备菜在 L6。
+
+    分层后不再给 DeliverPlate 加常数额外加分——L3 全是送餐，
+    给每个候选加同一个常数不改变任何排序。
+    """
+    from ai.core import planner_layers as PL
+
     world = _make_test_world(
         orders=[{"id": "order1", "name": "Sushi", "remaining": 30,
                  "composition": ["BoiledSushiRice", "SushiFish"]}],
@@ -556,12 +536,11 @@ def test_deliver_plate_gets_delivery_bonus_and_outranks_prep():
         estimated_steps=15,
     )
 
-    s_deliver, terms = planner._score_candidate(world, bb, deliver)
-    s_prep, _ = planner._score_candidate(world, bb, prep)
+    _, terms = planner._score_candidate(world, bb, deliver)
 
-    assert "deliver_bonus" in terms
-    assert terms["deliver_bonus"] > 0
-    assert s_deliver > s_prep, f"DeliverPlate({s_deliver}) 应高于备菜({s_prep})"
+    assert "deliver_bonus" not in terms
+    assert PL.layer_of_task(deliver.task, world) == PL.L_REDEEM
+    assert PL.layer_of_task(prep.task, world) == PL.L_PREP
 
 
 def test_wash_plate_gets_pressure_scaled_by_clean_plate_count():

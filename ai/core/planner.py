@@ -18,7 +18,7 @@ from ai.query import stations as S
 from ai import tasks as T
 from ai.state.blackboard import Blackboard, Commitment
 from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
-from ai.query.recipes import RecipeBook, find_ingredient
+from ai.query.recipes import RecipeBook
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
 from ai.state.world import World
 from ai.space import reachability, shuttle
@@ -742,6 +742,11 @@ W_PRESSURE = 5.0
 # 问题。「不能压过快糊的锅」同理（L1 > L4）。若 W_NO_PLATE_PLACED 变动，
 # 上面那个区间要重算。
 W_PLATE_PRESSURE = 2.5
+# 任务成本（拍 → 分）。estimated_steps 来自 _CAND_META，是**类型常量**，
+# 所以 eta 表达的是「这类动作通常要几步」的先验，不是实时距离。
+# 它不能删：删掉后「填灶（15 步）」和「取料（10 步）」在同一层里变成纯收益
+# 比较，实测会让 test_loaded_carrier 的「取带料卷饼」（5.536）输给
+# 「FillCooker」（5.6），把那个实机 bug 放回来。
 W_ETA = 0.1
 
 # Plan 4 Task 4 权重（spec §6.8）
@@ -750,20 +755,16 @@ W_COMPLETION_RATIO = 1.0     # 完成度（盘里食材越接近完成优先级�
 W_INGREDIENT_REUSE = 0.5     # 食材复用（一次取料满足多个订单）
 # Combo 队首加分 / 跳单惩罚（第 3 组 3.3/3.4）。
 #
-# 量级依据（ai/economy.py 的实测收益函数）：新鲜度最多差 5 分（3→8，相对
+# 量级依据（ai/economy.py 的实测收益函数）：小费档位最多差 5 分（3→8，相对
 # base 60 只有 8%），而 combo 到 3 就系数翻倍、到 5 是 4 倍。所以优先级是
-# **不丢单 >> 按序送 >> 送得新鲜**，combo 项必须显著高于新鲜度项，否则两者
-# 在同一量级上互相抵消（队首不新鲜、后面某单很新鲜时该听谁的）。
+# **不丢单 >> 按序送 >> 送得新鲜**，combo 项必须高于小费档位差。
 #
-# 上限控制在 2.0：它叠加在 W_DELIVER_BONUS(3.0) 之上，合计 5.0 已与端刚熟的
-# 锅（W_PRESSURE*1.0）持平——再高就会为了保连击而让锅烧糊。
+# 上限控制在 2.0：与 W_COMBO_BREAK 一起形成 4.0 的队首/跳单分差——再高就会
+# 为了保连击而让锅烧糊（L2 救料层仍结构性优先）。
 W_COMBO_HEAD = 2.0
 # 跳单惩罚：队首仍可救时，送后面的单会把连击打断。取与加分同量级，形成
 # 「送队首 +2.0 / 送别人 -2.0」的 4.0 分差，足以压过备菜但不盖过救锅。
 W_COMBO_BREAK = 2.0
-# 新鲜度加分（满档与最低档之差）。实测只值 5 分小费，故权重取小。
-W_FRESHNESS = 0.6
-
 # 备菜吃 combo 偏好时的折扣。备菜离"兑现连击"还隔着好几步，不该和送餐等价，
 # 更不该盖过救锅（W_PRESSURE）/ 填灶（W_COOKER_IDLE）。
 #
@@ -800,32 +801,12 @@ W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩
 # 4.0/4.8 不战而胜。删掉重复计分后，备菜的真实合计是 **4.97**
 # （urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，实测灶全空 3 单要米）。
 #
-# 5.6 的推导依赖 **eta ≈ -1.5**：5.6 - 1.5 = 4.1 > 3.47，留 0.6 余量。
-# spec §10 列着「两套耗时常数统一」（EST_* 10/20/15/5 vs eta.COST_* 125/30/120/50），
-# 那件事会改 eta 的量级 —— 届时这个 5.6 必须重算。
-#
-# 注意 5.6 > W_PRESSURE*1.0 = 5.0，**字面上**违反了「不能压过端刚熟的锅」这条
-# 约束。但 cooker_idle 要扣 eta（净 4.1），而端熟锅的 pressure 分不扣同量 eta，
-# 所以净值仍是端熟锅优先。下面那条测试钉的是**净值**关系，不是常量大小。
+# 5.6 只用于 L6 层内排序：刚熟/快糊的锅在 L1/L2，层序已经保证它们先于填灶，
+# 不再需要靠扣 eta 来做净值比较。
 W_COOKER_IDLE = 5.6
 # 缺口饱和点：缺 3 份以上就算"满额紧急"，再多不额外加分——否则开局 5 单
 # 全要米时填灶会盖过送餐和灭火。
 COOKER_SHORTFALL_SATURATION = 3
-
-# 送餐优先（先上得分更高）：料齐的盘应尽快送出去，压过继续备菜的候选。
-# 取值要压过 W_ASYNC_RESOURCE(2.0)+completion_ratio(1.0)，但低于快糊锅
-# 的 pressure 分（W_PRESSURE*2.0=10.0），否则会耽误端快糊的锅（实机烧糊）。
-# 注：刚熟的锅 pressure 分 = W_PRESSURE*1.0=5.0，略高于送餐——熟料优先
-# 于送餐（锅会烧糊，盘不会）。若实机发现送餐被压过头，可下调 W_PRESSURE。
-# 由 4.0 降到 3.0：4.0 会把 DeliverPlate 抬到比当前 task 高 2.0 以上、频繁
-# 打破承诺惯性（实机：备菜/传盘做到一半被送餐抢走）。3.0 仍高于备菜（2.0
-# async + 1.0 completion），但分差落在 COMMITMENT_MARGIN(2.0) 内，不轻易改选。
-#
-# **分层后本权重已不参与打分**（Ruling 3 / spec §7.1）：deliver_bonus 不在任何
-# 层的白名单里——L3 兑现层的全部候选都是 DeliverPlate，给每个加同一个常数不改变
-# 任何排序。常量保留是因为三个测试文件引用它算量级天花板，删它会连带改测试，
-# 而「既有测试零改动」是分层正确性的核心证据。
-W_DELIVER_BONUS = 3.0
 
 # 摆盘压力权重：一块盘都没就位时 = 拼装链没有落点，和「0 干净盘」等价
 # 地卡死整条装配。
@@ -849,22 +830,6 @@ W_DELIVER_BONUS = 3.0
 # （pressure 4.17/6.00）让位摆盘，快糊的锅（8.08）仍优先救。
 W_NO_PLATE_PLACED = 3.0
 
-
-# 手部前置的腾手代价（spec §6.1(b)）：task 需要空手但手里有东西时，按
-# "约 EnsureHandsFree 的步数"折算成 ETA 代价。它不是"判不可行"，而是让
-# 打分能比较"先放下手里的活去干它"与"先把手里的活收尾"。
-HAND_CLEAR_STEPS = 10
-
-# 拾取代价（spec §6.1(b)）：holding_cooked / holding_plated_dish 这类前置
-# 的"手不对"不是要腾手，而是过去把目标物捡起来（锅/盘就在那儿），成本远
-# 低于 EnsureHandsFree 的清手。用同 HAND_CLEAR_STEPS 会让 DeliverPlate /
-# TakeCookedToPlate 被 10 步清手惩罚压着，做好的盘送不出去（实机复现）。
-HAND_PICKUP_STEPS = 3
-
-# 搬料惩罚：FetchToBoard 的来源若是"另一块板"，它其实是"搬"而非"取"，
-# 零产出。按 ETA 步数折算成代价，让 Chop（有产出）优先。数值取远大于
-# EST_CHOP，保证"搬"永远打不过"切"。
-MOVE_PENALTY_STEPS = 50
 
 # ==================== 承诺惯性（Plan 3 Task 6）====================
 
@@ -1971,8 +1936,8 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
     """对单个候选打分（spec §6.4）。
 
-    Plan 3 最小权重集：订单紧迫、时间压力、ETA
-    Plan 4 新增：P1 冲突惩罚 + 6 项新权重（Task 4）
+    只保留能在层内区分候选的信号：订单紧迫、锅压力、加工链进度、
+    连击、截止前瞻、盘供应、填灶与对话偏好。
     """
     task = candidate.task
     if task.TYPE == "ThrowBatch":
@@ -1981,9 +1946,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms = {}
 
     # 送餐的「有效订单」是游戏会记账的那一单，不是 task 绑的那个（实测 55/0：
-    # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 新鲜度 / 完成度都该
-    # 按它求值——否则同一盘菜绑给不同 order_id 会算出不同分数，而实机行为完全
-    # 一样，纯属自欺。见 _credited_order_id / _effective_order_id。
+    # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 完成度都该按它求值。
     effective_order_id = _effective_order_id(world, task)
 
     # ① 订单紧迫：读 slack（remaining - ETA）而非裸 remaining（第 3 组 3.1）。
@@ -2010,16 +1973,12 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms["urgency"] = urgency_score
 
     # ② 时间压力
-    pressure = _time_pressure(task, world)
-    pressure_score = W_PRESSURE * pressure
-    terms["pressure"] = pressure_score
+    terms["pressure"] = W_PRESSURE * _time_pressure(task, world)
 
-    # ③ ETA（暂用 estimated_steps 的负数）
-    eta = candidate.estimated_steps
-    eta_score = -W_ETA * eta
-    terms["eta"] = eta_score
+    # ②b 任务成本（类型先验，见 W_ETA 注释）
+    terms["eta"] = -W_ETA * candidate.estimated_steps
 
-    # ④ 异步资源优先（Plan 4 Task 4）：加工链最终进灶才给（_feeds_cooker），
+    # ③ 异步资源优先（Plan 4 Task 4）：加工链最终进灶才给（_feeds_cooker），
     # 取料上砧板与下锅同分，不进灶的切配不给。
     # 仅当订单已有盘就位时才给：没盘时它们的输出无处可去，
     # 提前备料会抢走放盘（实机：洗好碗后 P2 一直煮饭/切菜、不去端盘）。
@@ -2034,21 +1993,21 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["async_resource"] = 0.0
 
-    # ⑤ 完成度（Plan 4 Task 4）。曲线是凸的，见 _completion_bonus。
+    # ④ 完成度（Plan 4 Task 4）。曲线是凸的，见 _completion_bonus。
     # 按 effective_order_id 求值：送餐时它是 credited order，与 task 绑的
     # order_id 可能不同（见本函数开头的注释）。
     completion_ratio = _order_completion_ratio(task, world, bb, book,
                                                plate_match, effective_order_id)
     terms["completion_ratio"] = _completion_bonus(completion_ratio)
 
-    # ⑥ 食材复用（Plan 4 Task 4）
+    # ⑤ 食材复用（Plan 4 Task 4）
     reuse_count = _ingredient_reuse_count(task, world, bb, plate_match, book)
     if reuse_count >= 2:
         terms["ingredient_reuse"] = W_INGREDIENT_REUSE * (reuse_count - 1)
     else:
         terms["ingredient_reuse"] = 0.0
 
-    # ⑨ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
+    # ⑥ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
     # 旧实现判的是「连续送同类菜」（比较 order["name"]），与游戏机制无关。
     # 关键：combo 由「送的是哪种**菜**」决定，不由 task 绑的 order_id 决定。
     # 游戏把这一盘记给「同 dish 存活单里 remaining 最小」的那个（实测 55/0），
@@ -2076,17 +2035,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms["combo_head"] = combo_head
     terms["combo_break"] = combo_break
 
-    # ⑨.5 新鲜度：送得越早小费档位越高（8/5/3）。权重刻意取小——实测只值
-    # 5 分（相对 base 60 仅 8%），单独追新鲜度不值得牺牲任何东西。读「距掉档
-    # 还有几秒」而非线性 remaining：档位是台阶，离边界远时早送晚送没区别。
-    freshness = 0.0
-    if task.TYPE == "DeliverPlate" and order is not None:
-        tier = ECON.tip_tier(order.get("remaining"), order.get("lifetime"))
-        span = float(ECON.TIP_FRESH - ECON.TIP_LATE) or 1.0
-        freshness = W_FRESHNESS * (tier - ECON.TIP_LATE) / span
-    terms["freshness"] = freshness
-
-    # ⑩ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
+    # ⑦ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
     # **必须乘 W_DEADLINE_LOOKAHEAD**：_deadline_forecast 返回 0~1 的系数，
     # 不乘权重的话这一项的实际量级是 1.0 而非 10.0，比 W_COOKER_IDLE=5.6
     # （Ruling 12 重标后的值，原文的 4.8 已过期）小一个数量级——等于这条
@@ -2095,53 +2044,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                                           cooker_match)
     terms["deadline_lookahead"] = -W_DEADLINE_LOOKAHEAD * deadline_penalty
 
-    # ⑪ 手部前置的腾手代价 + 收尾加分（spec §6.1(b)）：按候选 preconditions
-    # 精确判，而非笼统的 HANDS。手持目标物（holding_cooked / holding_plated_dish）
-    # 时任务已在「收尾」，给正向加分，别让异步任务（FetchToCooker / Chop）抢走。
-    hand_penalty = 0.0
-    hand_bonus = 0.0
-    chef = P.chef_by_name(world.chefs, P.P2_NAME)
-    pre = candidate.preconditions or []
-    if chef is not None:
-        need_clear = False
-        need_pickup = False
-        holding_ok = False
-        if "hands_empty" in pre:
-            need_clear = not P.hands_free(chef)
-        elif "holding_cooked" in pre:
-            holding_ok = (P.held_cookware_state(
-                chef, P.held_items(world), world.recipes) == P.COOKWARE_COOKED)
-            need_pickup = not holding_ok
-        elif "holding_plated_dish" in pre:
-            holding_ok = P.held_is_plate(chef)
-            need_pickup = not holding_ok
-        elif getattr(task, "HANDS", "any") == "empty":
-            need_clear = not P.hands_free(chef)
-        if need_clear:
-            hand_penalty = W_ETA * HAND_CLEAR_STEPS
-        elif need_pickup:
-            hand_penalty = W_ETA * HAND_PICKUP_STEPS
-        elif holding_ok:
-            hand_bonus = W_ASYNC_RESOURCE
-    terms["hands"] = hand_bonus - hand_penalty
-
-    # ⑫ 搬料惩罚：FetchToBoard 的来源若是"另一块板"，它是"搬"而非"取"，
-    # 零产出——让 Chop 这类有产出的动作优先。
-    move_penalty = 0.0
-    if task.TYPE == "FetchToBoard":
-        loc = find_ingredient(world, task.item)
-        if loc is not None and loc.get("kind") == "board":
-            move_penalty = W_ETA * MOVE_PENALTY_STEPS
-    terms["move_penalty"] = -move_penalty
-
-    # ⑬ 送餐优先（先上得分更高）：料齐的盘尽快送出去，别被继续备菜压住。
-    # DeliverPlate.feasible 已经保证"盘料齐"，所以这里是硬加分。
-    if task.TYPE == "DeliverPlate":
-        terms["deliver_bonus"] = W_DELIVER_BONUS
-    else:
-        terms["deliver_bonus"] = 0.0
-
-    # ⑭ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
+    # ⑧ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
     if task.TYPE == "WashPlate":
         terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
     elif task.TYPE == "SendAcross" and task.item == "carrier":
@@ -2156,7 +2059,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["plate_pressure"] = 0.0
 
-    # ⑯ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
+    # ⑨ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
     # FetchToCooker 已有 async_resource 加分，不重复给。
     if task.TYPE == "FillCooker":
         shortfall = CS.cooked_shortfall(world, book, task.item) \
@@ -2165,7 +2068,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["cooker_idle"] = 0.0
 
-    # ⑰ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
+    # ⑩ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
     # 判据用 plate_match 而不是「盘的数量」：盘在晾干架/盘堆里一样倒不进料，
     # 只有进了匹配表（落在 counter 拼装格或 P2 手上）的盘才算就位。
     # plate_match 为 None 是「没有匹配信息」而不是「没盘」（同
@@ -2177,10 +2080,10 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["no_plate_placed"] = 0.0
 
-    # ⑱ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
+    # ⑪ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
     # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；
     # layer=None（扁平老路）时照常全量求和。
-    # ⑲ 批量投掷：只有 ThrowBatch 非零（_score_throw_batch 覆写）。
+    # ⑫ 批量投掷：只有 ThrowBatch 非零（_score_throw_batch 覆写）。
     terms["batch_bonus"] = 0.0
     terms["pref"] = _preference_score(candidate, bb, layer)
     # 截止闸既要放行候选，也要撤销同一条 claim 的负分。只放行而保留
@@ -2284,12 +2187,8 @@ def _score_throw_batch(world, bb, candidate, book=None, plate_match=None,
     ctx = _make_context(world, bb, book) if book is not None else None
     gap = task.full_gap(ctx) if ctx is not None else None
     proxy = _throw_proxy(world, bb, task, book, gap)
-    pre, est = _CAND_META.get(proxy.TYPE, (["hands_empty"], EST_FETCH))
-    # 手上已是要投的料时不罚腾手（proxy 的 hands_empty 前置对投掷不成立）
-    chef = P.chef_by_name(world.chefs, P.P2_NAME)
-    if chef is not None and P.held_matches(chef, task.item):
-        pre = []
-    pc = Candidate(proxy, list(pre), est, branch=candidate.branch)
+    _pre, est = _CAND_META.get(proxy.TYPE, ([], EST_FETCH))
+    pc = Candidate(proxy, [], est, branch=candidate.branch)
     _score, terms = _score_candidate(world, bb, pc, book, plate_match,
                                      slack_map, cooker_match, layer)
     terms = dict(terms)
@@ -2776,8 +2675,8 @@ def _completion_bonus(ratio):
 
     取平方（ratio^2 * W * 3）：0 / 1/3 / 2/3 → 0 / 0.33 / 1.33，最后一步的
     增益（1.0）是第一步（0.33）的 3 倍，且 2/3 与 1/3 的差距 1.0 显著超过
-    urgency 的典型组间差。系数 3 让满档仍落在 W_COMPLETION_RATIO*3 = 3.0，
-    与 W_DELIVER_BONUS 同量级 —— 盘齐了就该去送，而不是继续加料。
+    urgency 的典型组间差。系数 3 让满档落在 W_COMPLETION_RATIO*3 = 3.0，
+    足以压过同层其它备菜项。
     """
     if ratio <= 0:
         return 0.0

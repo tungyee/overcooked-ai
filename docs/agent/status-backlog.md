@@ -175,7 +175,8 @@ Windows 最新运行见 `../notes/windows-live-validation-2026-10-19.md`：已�
   这个动态性没有进入 planner（见 §2 本轮「仍未解决」）。
 - **P1 名称硬编码**：`"Player 1"` / `"Player 2"`（`predicates.P1_NAME/P2_NAME`）。真实帧 `chefs[].slot` 全为 null，只能按 name 区分（已核实 2204 条 chef 条目）。
 - **熟料 token 不透明（仅旧帧）**：`RecipeBook.want_tokens` 对需烹饪的料同时给 rich token（`cooked:{raw}:{cookware}`）和旧帧 opaque `COOKED_PLATE_TOKEN`。新帧 `detail` 已通过 `plate_tokens` 输出 rich token，`plate_has`/`plate_lacks`/`missing` 据此能区分同一盘多份不同熟料；旧帧（无 detail）仍退化为不透明 token，多熟料关卡在旧帧下无法区分。
-- **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / `W_FRESHNESS` / slack 曲线）已按真实 trace 定标，其余 `W_*` 与穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）仍是经验初值。改之前读 §4「改权重前必读」。
+- **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / slack 曲线）已按真实 trace 定标，其余 `W_*` 与穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）仍是经验初值。改之前读 §4「改权重前必读」。
+- **打分项已精简（2026-11-08）**：删掉从不改变排序的 `deliver_bonus`、`freshness`，以及 `hands` / `move_penalty` 两个成本项；`eta` 保留——全量测试证明它是承重项，删掉会让 `test_loaded_carrier` 的「取带料卷饼」重新输给 FillCooker。现共 14 个 term 键。
 - 对话协作层（`Intents.assignments`、split mode 的显式分单 `order_assignment`）原为空壳预留，已连同 P1 短程意图推断一起作为死代码删除（`2026-10-18` 清理，见 `ai/state/p1model.py` 顶部说明）。
 - 「16 个 task」的说法已过时（现为 19），以代码的 `TASK_TYPES` 为准。
 

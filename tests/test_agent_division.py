@@ -274,3 +274,15 @@ def test_review_slow_path_for_temporary_block(agent, worker, monkeypatch):
     agent.bb.tick += 20
     agent._service_dialog(world)
     assert [e[0] for e in worker.events] == ["division_review"]
+
+
+def test_command_result_does_not_wake_llm(agent, worker):
+    """命令完成/失败只更新上下文，不再作为 command_result 事件叫 LLM。"""
+    world = make_world()
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent.commands.add(
+        "chop", "NoSuchMaterial", frozenset({("Chop", "x")}), 100,
+        done_item="x")
+    agent._service_commands(world)
+    assert worker.events == []
+    assert agent._last_command_result["status"] == "failed"

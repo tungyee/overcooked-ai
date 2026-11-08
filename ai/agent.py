@@ -1271,12 +1271,6 @@ class Agent:
                     "label": command.label, "target": command.display_target,
                     "status": "failed", "reason": reason,
                 }
-                self._put_event(("command_result", {
-                    "command_id": command.id, "action": command.action,
-                    "label": command.label,
-                    "target": command.display_target, "status": "failed",
-                    "reason": reason,
-                }))
                 if was_queued:
                     # 还没开始就不可行：丢掉这一条，不拖累正在跑的。
                     self.commands.paused = False
@@ -1298,11 +1292,6 @@ class Agent:
                     "label": command.label, "target": command.display_target,
                     "status": "succeeded",
                 }
-                self._put_event(("command_result", {
-                    "command_id": command.id, "action": command.action,
-                    "label": command.label,
-                    "target": command.display_target, "status": "succeeded",
-                }))
 
         # 3) waiting 超时
         for command in self.commands.expire(tick):
@@ -1310,12 +1299,6 @@ class Agent:
                 "label": command.label, "target": command.display_target,
                 "status": "failed", "reason": command.reason,
             }
-            self._put_event(("command_result", {
-                "command_id": command.id, "action": command.action,
-                "label": command.label,
-                "target": command.display_target, "status": "failed",
-                "reason": command.reason,
-            }))
 
         if self.commands.paused:
             self.bb.command_scope = None
@@ -1812,12 +1795,6 @@ class Agent:
                         "target": failed.display_target,
                         "status": "failed", "reason": failed.reason,
                     }
-                    self._put_event(("command_result", {
-                        "command_id": failed.id, "action": failed.action,
-                        "label": failed.label,
-                        "target": failed.display_target,
-                        "status": "failed", "reason": failed.reason,
-                    }))
                     self.bb.command_scope = None
                     self.bb.command_id = None
             if self.bb.commitment:

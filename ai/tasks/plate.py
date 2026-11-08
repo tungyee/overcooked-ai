@@ -317,6 +317,9 @@ class WashPlate(Task):
             return "dirtyplate" in P.held_name(c.get("chef"))
 
         return PR.Timeout(Sequence([
+            # 树首清手：手里拿的是脏盘就保留（直接去池子放），否则先放回合法
+            # 落点。WashPlate 候选不再要求空手生成，端干净盘时也会接到洗碗任务。
+            PR.EnsureHandsFree(keep=holding_dirty),
             Selector([
                 # 起点 C：手里已经端着脏盘（上一步刚捡起 / 被救锅打断后重建树）
                 # → 直接去池子放下，不再找脏盘摞。

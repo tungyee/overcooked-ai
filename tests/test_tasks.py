@@ -578,7 +578,9 @@ def test_wash_plate_tree_supports_plates_already_in_sink():
     tree = t.build()
     seq = tree.child
     assert isinstance(seq, Sequence)
-    sel = seq.children[0]
+    # 树首清手（手持脏盘时保留），之后才是三分支起点
+    assert isinstance(seq.children[0], PR.EnsureHandsFree)
+    sel = seq.children[1]
     assert isinstance(sel, Selector)
     assert len(sel.children) == 3
     # 第一分支：手里已端着脏盘 → 直接放池子

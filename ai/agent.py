@@ -731,6 +731,17 @@ class Agent:
             return "现在没有可送的订单"
         return "还没有装好的盘可送"
 
+    def _wash_reason(self, world):
+        # type: (World) -> str
+        """wash 没有可行候选时的如实说明。
+
+        候选生成只看「有没有脏盘」（不看手空不空），所以走到这里的唯一
+        情形是够不着：洗碗池不在可达范围 / 被别的认领占着。
+        """
+        if dirty_count(world) == 0:
+            return "现在没有脏盘"
+        return "有脏盘，但现在过不去洗碗池（够不着或被占用）"
+
     def _plates_detail(self, world, book):
         # type: (World, Any) -> List[Dict]
         """盘子明细（按需查询用）：数量少、只在 get_world_state 里给。"""
@@ -836,11 +847,10 @@ class Agent:
         if not feasible:
             if action == "deliver":
                 reason = self._deliver_reason(world, self.book)
+            elif action == "wash":
+                reason = self._wash_reason(world)
             else:
-                labels = {
-                    "wash": "现在没有脏盘",
-                    "fetch": "现在没有可取的料",
-                }
+                labels = {"fetch": "现在没有可取的料"}
                 reason = labels.get(action, "现在没有可做的这一步")
             return {"ok": False, "action": action,
                     "target": display or resolved or target_raw,
@@ -928,9 +938,10 @@ class Agent:
             if not feasible:
                 if action == "deliver":
                     reason = self._deliver_reason(world, self.book)
+                elif action == "wash":
+                    reason = self._wash_reason(world)
                 else:
-                    labels = {"wash": "现在没有脏盘",
-                              "fetch": "现在没有可取的料"}
+                    labels = {"fetch": "现在没有可取的料"}
                     reason = labels.get(action, "现在没有可做的这一步")
                 return {"ok": False, "action": action, "reason": reason}
             resolved = str(getattr(feasible[0].task, "item", "") or "") or None

@@ -289,3 +289,47 @@ def test_complex_order_with_cooked_meat():
     assert len(types) >= 4
     # 检查有烹饪相关任务
     assert any("Cooker" in t or "Cook" in t for t in types)
+
+
+def test_wash_plate_candidate_generated_with_hands_full():
+    """有脏盘就发 WashPlate 候选，与手里拿没拿东西无关。
+
+    树首 EnsureHandsFree 负责把非脏盘手持物放回合法落点，所以端干净盘时
+    也该能接「去洗碗」（实机 trace-20261108-181823：池里有脏盘、手里拿着
+    干净盘 → 候选被手部门挡掉，LLM 只能说「现在没有脏盘」）。
+    """
+    from ai import tasks as T
+
+    w = _make_world(
+        stations=[{"t": "washing", "n": "WashingPart", "gx": 0, "gz": 0,
+                   "x": 0.5, "z": 0.5}],
+        chefs=[{"name": "Player 2", "held": "equipment_plate_01",
+                "x": 1.0, "z": 1.0}],
+    )
+    w.items = [{"n": "DirtyPlateStack", "x": 3.0, "z": -12.0}]
+    w.held_items = []
+    bb = _make_bb()
+    book = RecipeBook(w.recipes, w.stations)
+
+    candidates = generate_candidates(w, bb, None, book)
+
+    assert any(isinstance(c.task, T.WashPlate) for c in candidates)
+
+
+def test_no_wash_plate_candidate_without_dirty_plate():
+    """没有脏盘时不发 WashPlate（ack 才能如实回 pending）。"""
+    from ai import tasks as T
+
+    w = _make_world(
+        stations=[{"t": "washing", "n": "WashingPart", "gx": 0, "gz": 0,
+                   "x": 0.5, "z": 0.5}],
+        chefs=[{"name": "Player 2", "held": "", "x": 1.0, "z": 1.0}],
+    )
+    w.items = []
+    w.held_items = []
+    bb = _make_bb()
+    book = RecipeBook(w.recipes, w.stations)
+
+    candidates = generate_candidates(w, bb, None, book)
+
+    assert not any(isinstance(c.task, T.WashPlate) for c in candidates)

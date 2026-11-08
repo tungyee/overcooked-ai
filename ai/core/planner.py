@@ -291,20 +291,22 @@ def _gen_misc(world, bb, book, chef, hands_empty):
     """与订单无关的 task：锅具回收 / 清理 / 待命（spec §6.1 第 2/5/6/11/12/13/14/15 号）。
 
     这些 task 的 feasible 谓词会再过滤一遍；这里只做资源枚举与手部门——
-    需要先拿起东西的（Discard / RescueCooked / RecoverLoosePot / ResetPlate /
-    WashPlate）只在手空时生成，否则其树首的 pickup 会把手里的东西换掉。
+    需要先拿起东西的（Discard / RescueCooked / RecoverLoosePot / ResetPlate）
+    只在手空时生成，否则其树首的 pickup 会把手里的东西换掉。WashPlate 例外：
+    它只看有没有脏盘，树首自带 EnsureHandsFree 处理手持物。
     """
     cands = []  # type: List[Candidate]
 
-    # 第 2 号 WashPlate：有洗碗池且有脏盘才生成；feasible 再判物理可行性。
+    # 第 2 号 WashPlate：只看「有没有脏盘」，不看手里拿没拿东西；feasible 再判
+    # 物理可行性。手里有干净盘也得能接洗碗任务——树首 EnsureHandsFree 负责把
+    # 非脏盘手持物放回合法落点，然后再去洗（拿着干净盘去回盘台洗是常态）。
     # 只按洗碗池生成会把「没有脏盘」也当成一个当前候选，玩家说「去洗碗」
     # 时 ack 会误报 accepted（spec §4.7：目标不存在时应 pending，等盘出现）。
-    if hands_empty:
-        for st in world.stations:
-            if (st.get("t") == "washing" and st.get("n")
-                    and _has_dirty_plate(world, st)):
-                cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
-                                       ["hands_empty"], EST_FETCH))
+    for st in world.stations:
+        if (st.get("t") == "washing" and st.get("n")
+                and _has_dirty_plate(world, st)):
+            cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
+                                   ["hands_empty"], EST_FETCH))
 
     for c in _cookers(world):
         if not c.get("n"):

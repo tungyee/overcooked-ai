@@ -604,6 +604,8 @@ ACCEPT_LEGACY_TOOL_CALLS = True
 
 # 新工具的动作枚举（英文标识，内部翻译成中文 key）。
 TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch"]
+# check_action 暂时不暴露给模型：execute_action 内部已经原子校验。
+ENABLE_CHECK_ACTION = False
 
 
 def tool_schemas(targets=None, duty_ids=None):
@@ -683,6 +685,9 @@ def tool_schemas(targets=None, duty_ids=None):
             },
         },
     ]
+    if not ENABLE_CHECK_ACTION:
+        schemas = [s for s in schemas
+                   if s["function"]["name"] != "check_action"]
     return schemas
 
 

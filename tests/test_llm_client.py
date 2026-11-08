@@ -239,8 +239,9 @@ def test_system_message_carries_rules_and_dag():
     assert msg["role"] == "system"
     text = msg["content"]
     assert "AI 队友" in text
-    assert "check_action" in text and "execute_action" in text
+    assert "execute_action" in text
     assert "cancel_action" in text and "speak" in text
+    assert "check_action" not in text
     assert "chop" in text and "cook" in text and "fetch" in text
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名

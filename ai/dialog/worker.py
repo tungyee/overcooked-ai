@@ -1536,7 +1536,14 @@ class DialogWorker(object):
                 break
             if any(c.name in ("execute_action", "cancel_action")
                    for c in action_calls):
-                # 动作已落地；这一轮没有 speak 就安静结束。
+                if not speak_calls:
+                    # 动作已派发但模型没确认；强制补一句短确认。
+                    force_speak = True
+                    messages.append({
+                        "role": "system",
+                        "content": "动作已派发；必须调用 speak 给玩家一句短确认。",
+                    })
+                    continue
                 break
             # 只有 check_action：继续下一轮，让模型决定 execute/speak。
         turn = turn_messages

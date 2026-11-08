@@ -1043,27 +1043,23 @@ def test_round_summary_does_not_schedule_next_checkin():
 # ------------------------------------------------------- 新工具协议
 
 
-def test_new_protocol_check_then_execute_and_speak():
+def test_new_protocol_execute_and_speak_in_one_turn():
     llm = FakeLLM(
-        reply("", ("check_action", {"action": "chop", "target": "Cucumber"})),
         reply("", ("execute_action", {"action": "chop", "target": "Cucumber"}),
               ("speak", {"text": "好，这就去切黄瓜"})))
     worker, bundle = make_worker(llm=llm)
 
     thread = run_async(worker._handle_transcript, "把黄瓜切了",
                        {"tick": 100, "tools": TOOLS_NEW})
-    batch1 = bundle.cmd_q.get(timeout=2)
-    assert [c[0] for c in batch1.calls] == ["check_action"]
-    bundle.ack_q.put({"batch_id": batch1.batch_id,
-                      "results": [{"ok": True}]})
-    batch2 = bundle.cmd_q.get(timeout=2)
-    assert [c[0] for c in batch2.calls] == ["execute_action"]
-    bundle.ack_q.put({"batch_id": batch2.batch_id,
+    batch = bundle.cmd_q.get(timeout=2)
+    assert [c[0] for c in batch.calls] == ["execute_action"]
+    bundle.ack_q.put({"batch_id": batch.batch_id,
                       "results": [{"ok": True, "status": "running"}]})
     thread.join(2)
 
     assert not thread.is_alive()
     assert bundle.tts.spoken == ["好，这就去切黄瓜"]
+    assert llm.choices == ["auto"]
 
 
 def test_new_protocol_rejection_suppresses_optimistic_speak():
@@ -1171,10 +1167,10 @@ def test_tts_wait_total_timeout_resumes_vad():
     assert bundle.vad.paused is False
 
 
-def test_failed_check_forces_a_speak_turn():
-    """check 失败后模型若只回 content，下一轮必须强制走 speak。"""
+def test_failed_execute_forces_a_speak_turn():
+    """execute 失败后模型若只回 content，下一轮必须强制走 speak。"""
     llm = FakeLLM(
-        reply("", ("check_action", {"action": "chop", "target": "BurritoMeat"})),
+        reply("", ("execute_action", {"action": "chop", "target": "BurritoMeat"})),
         reply("", ("speak", {"text": "我现在够不着砧板，切不了肉。"})))
     worker, bundle = make_worker(llm=llm)
 
@@ -1204,5 +1200,25 @@ def test_content_only_speech_turn_forces_speak():
 
     assert not thread.is_alive()
     assert bundle.tts.spoken == ["现在没有装好的盘能送。"]
+    assert llm.choices[1] == {"type": "function",
+                              "function": {"name": "speak"}}
+
+
+def test_execute_without_speak_forces_ack():
+    """直接 execute 后模型没 speak，必须强制补一句短确认。"""
+    llm = FakeLLM(
+        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"})),
+        reply("", ("speak", {"text": "好，这就去切黄瓜"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": True, "status": "running"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，这就去切黄瓜"]
     assert llm.choices[1] == {"type": "function",
                               "function": {"name": "speak"}}

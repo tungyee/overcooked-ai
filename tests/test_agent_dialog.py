@@ -391,7 +391,7 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["check_action", "execute_action", "cancel_action", "speak"]
+    assert names == ["execute_action", "cancel_action", "speak"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
     assert "chop" in props["action"]["enum"]
 

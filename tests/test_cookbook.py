@@ -20,6 +20,14 @@ def test_resolve_exact_internal_name():
     assert "Wizard_5_5" in guide.internal_names
 
 
+def test_wizard32_asset_maps_to_ui_3_3():
+    """实机 2026-11-08：UI 3-3 的关卡资产名是 Wizard_3_2（编号差 1）。"""
+    book = default_cookbook()
+    assert book.resolve("Wizard_3_2_2P").key == "story/3-3"
+    assert book.resolve("Wizard_3_2").key == "story/3-3"
+    assert book.resolve("Wizard_3_1_2P").key == "story/3-1"
+
+
 def test_resolve_story_pattern_fallback():
     book = default_cookbook()
     assert book.resolve("Wizard_6_1_2P").key == "story/6-1"

@@ -335,7 +335,7 @@ def test_layout_review_states_sides_even_when_both_in_place(agent, worker):
     assert names == ["layout_review"]
     payload = worker.events[0][1]
     assert payload["you_wrong"] is False and payload["player_wrong"] is False
-    assert "你在上半边" in payload["facts"] and "玩家在下半边" in payload["facts"]
+    assert "你守上半边" in payload["facts"] and "玩家守下半边" in payload["facts"]
 
 
 def test_layout_review_only_on_change(agent, worker):

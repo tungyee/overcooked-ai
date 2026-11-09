@@ -275,5 +275,5 @@ def test_facts_always_state_both_sides():
         district="LR", labels=("左", "右"),
         p2_label="右", p2_current="左", p1_label="左", p1_current="左")
     facts = report.facts()
-    assert "你在右半边" in facts
-    assert "玩家在左半边" in facts
+    assert "你守右半边" in facts
+    assert "玩家守左半边" in facts

@@ -144,7 +144,7 @@ class ZoneReport(object):
             return "%s半边" % label if label else "别处"
 
         if self.district and self.p2_label:
-            parts.append("厨房分成%s两半：你在%s，玩家在%s。" % (
+            parts.append("厨房分成%s两半：你守%s，玩家守%s。" % (
                 "左右" if self.district == "LR" else "上下",
                 half(self.p2_label), half(self.p1_label)))
         elif self.open:

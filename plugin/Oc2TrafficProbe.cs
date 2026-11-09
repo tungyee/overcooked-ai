@@ -30,6 +30,8 @@ static class Oc2TrafficProbe
 
     static readonly Dictionary<int, Vector3> _lastPos = new Dictionary<int, Vector3>();
     static readonly Dictionary<int, float> _lastTime = new Dictionary<int, float>();
+    static readonly Dictionary<int, Vector3> _rootPos = new Dictionary<int, Vector3>();
+    static readonly Dictionary<int, float> _rootTime = new Dictionary<int, float>();
     static readonly Dictionary<int, float> _lastMoveLog = new Dictionary<int, float>();
     static readonly HashSet<int> _collLogged = new HashSet<int>();
     static readonly HashSet<int> _keyLogged = new HashSet<int>();
@@ -99,7 +101,7 @@ static class Oc2TrafficProbe
             || l.IndexOf("pedestrian") >= 0 || l.IndexOf("taxi") >= 0
             || l.IndexOf("truck") >= 0 || l.IndexOf("bus") >= 0
             || l.IndexOf(" car") >= 0 || l.IndexOf("_car") >= 0
-            || l.IndexOf("car_") >= 0 || l.IndexOf("light") >= 0;
+            || l.IndexOf("car_") >= 0;
     }
 
     static string Short(object v)
@@ -162,6 +164,107 @@ static class Oc2TrafficProbe
         _lastTime[id] = now;
     }
 
+    static string AnimParams(Animator a)
+    {
+        if (a == null || a.parameters == null) return "";
+        StringBuilder sb = new StringBuilder();
+        foreach (AnimatorControllerParameter p in a.parameters)
+        {
+            if (sb.Length > 0) sb.Append(',');
+            switch (p.type)
+            {
+                case AnimatorControllerParameterType.Bool:
+                    sb.Append(p.name).Append('=').Append(a.GetBool(p.name));
+                    break;
+                case AnimatorControllerParameterType.Float:
+                    sb.Append(p.name).Append('=').Append(a.GetFloat(p.name).ToString("0.00"));
+                    break;
+                case AnimatorControllerParameterType.Int:
+                    sb.Append(p.name).Append('=').Append(a.GetInteger(p.name));
+                    break;
+                default:
+                    sb.Append(p.name).Append("=trigger");
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    static void LogRoots(MonoBehaviour[] all, float now, Action<string> log)
+    {
+        // 4-1 的两辆车和两盏灯：名字固定，按根对象每秒打一条干净时间线，
+        // 不用在几千个组件里靠速度筛。
+        foreach (MonoBehaviour mb in all)
+        {
+            if (mb == null) continue;
+            string nm = mb.name;
+            string path = Path(mb.transform);
+            bool isCar = (nm == "Blue_Car" || nm == "Green_Car")
+                && path.IndexOf("AnimatedObjects") >= 0;
+            bool isLight = nm.StartsWith("traffic_light_animated");
+            if (!isCar && !isLight) continue;
+
+            Vector3 p = mb.transform.position;
+            int id = mb.GetInstanceID();
+            float vx = 0f, vz = 0f, speed = 0f;
+            Vector3 q;
+            float pt;
+            if (_rootPos.TryGetValue(id, out q) && _rootTime.TryGetValue(id, out pt))
+            {
+                float dt = now - pt;
+                if (dt > 0.05f)
+                {
+                    vx = (p.x - q.x) / dt;
+                    vz = (p.z - q.z) / dt;
+                    speed = Mathf.Sqrt(vx * vx + vz * vz);
+                }
+            }
+            _rootPos[id] = p;
+            _rootTime[id] = now;
+
+            Animator anim = mb.GetComponent<Animator>();
+            string clip = "";
+            float norm = 0f;
+            if (anim != null)
+            {
+                AnimatorClipInfo[] infos = anim.GetCurrentAnimatorClipInfo(0);
+                if (infos != null && infos.Length > 0 && infos[0].clip != null)
+                    clip = infos[0].clip.name;
+                norm = anim.GetCurrentAnimatorStateInfo(0).normalizedTime;
+            }
+
+            string extra = "";
+            if (isLight)
+            {
+                // 灯可能是「换材质」而不是换灯光：把根和子物体的材质都打出来。
+                foreach (MeshRenderer mr in mb.GetComponentsInChildren<MeshRenderer>())
+                {
+                    if (mr == null || mr.sharedMaterial == null) continue;
+                    extra += " mat=" + mr.name + ":" + mr.sharedMaterial.name;
+                    if (mr.sharedMaterial.HasProperty("_Color"))
+                        extra += ":color=" + Short(mr.sharedMaterial.color);
+                    if (mr.sharedMaterial.HasProperty("_EmissionColor"))
+                        extra += ":emis=" + Short(mr.sharedMaterial.GetColor("_EmissionColor"));
+                }
+                extra += " params=[" + AnimParams(anim) + "]";
+            }
+            if (isCar)
+            {
+                foreach (Collider c in mb.GetComponentsInChildren<Collider>())
+                {
+                    if (c == null) continue;
+                    if (c.gameObject.name.IndexOf("KillPlane") < 0) continue;
+                    extra += " kill=" + V2(c.bounds.center.x, c.bounds.center.z)
+                        + " size=" + V3(c.bounds.size);
+                    break;
+                }
+            }
+            log("[TRAFFIC-ROOT] name=" + nm + " pos=" + V2(p.x, p.z)
+                + " vel=" + V2(vx, vz) + " speed=" + speed.ToString("0.00")
+                + " clip=" + clip + " norm=" + norm.ToString("0.00") + extra);
+        }
+    }
+
     public static void Tick(MonoBehaviour[] all, string level, Action<string> log)
     {
         if (string.IsNullOrEmpty(level)
@@ -185,6 +288,8 @@ static class Oc2TrafficProbe
             _objLoggedCount = 0;
             _lastPos.Clear();
             _lastTime.Clear();
+            _rootPos.Clear();
+            _rootTime.Clear();
             _lastMoveLog.Clear();
             log("[TRAFFIC] probe start level=" + level
                 + " road=x[" + MinX + "," + MaxX + "] z[" + MinZ + "," + MaxZ + "]");
@@ -224,6 +329,9 @@ static class Oc2TrafficProbe
                 + " types=" + Types(mb.gameObject));
             DumpFields(mb, tn + "[" + mb.name + "]", log);
         }
+
+        // 车/灯根对象每秒一条干净时间线（含动画 clip、信号灯颜色/参数）。
+        LogRoots(all, now, log);
 
         // 马路条带里所有 MonoBehaviour 的移动轨迹（车一定会在这里露出来）。
         foreach (MonoBehaviour mb in all)

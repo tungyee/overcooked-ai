@@ -1304,8 +1304,13 @@ def plan(world, bb, order, book):
     # 替活单占掉 1:1 盘/灶匹配或队列容量。
     live_orders = _dialog_live_orders(world, bb)
 
-    # ⓪.6 断供看门狗：玩家负责的 cook 长时间没人做时，本拍允许 P2 补位。
-    _update_supply_watch(world, bb, book)
+    # ⓪.6 断供看门狗：**暂时停用**。override 撤销 cook 的 -6 认领负分后，
+    # 分差会瞬间越过承诺穿插阈值（COMMITMENT_MARGIN + INTERLEAVE_PENALTY =
+    # 5），而穿插/恢复是逐拍交替的 → P2 在两个任务间来回切，卡住不动
+    # （trace-20261110-000444 t=343 起 FillCooker ↔ FetchToPlate 1:1 交替，
+    # 角色在 (-5,-1)/(-4,-1) 间来回蹭）。等穿插逻辑修好再恢复这一行。
+    # 函数与相关测试保留，恢复时取消注释即可。
+    # _update_supply_watch(world, bb, book)
     # ⓪.7 4-1 过街灯态：记录双灯都灭的起始拍（Approach 在路沿等它）。
     traffic.observe(world, bb)
 

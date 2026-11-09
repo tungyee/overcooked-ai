@@ -457,3 +457,40 @@ def test_initial_division_facts_say_single_block_when_open(agent, worker):
     facts = worker.events[0][1]["facts"]
     assert "一整块" in facts
     assert "两半" not in facts
+
+
+def test_reposition_armed_within_one_tick(agent, worker):
+    """开窗要当拍就布置：窗口只有 2~3 秒，等 1 秒的复核周期就废了。
+
+    实测 trace-20261109-123544 t=118.0 开窗，120.18 才 armed，只剩 1 秒。
+    """
+    lr = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(lr.recipes, lr.stations)
+    agent._service_dialog(lr)
+    _settle(agent, lr)
+    ud = make_split_world("ud", p2=(7, 1), p1=(1, 1))
+    _settle(agent, ud)
+    assert agent.bb.reposition is None
+
+    opened = make_split_world("open", p2=(7, 1), p1=(1, 1))
+    agent.bb.tick += 1                 # 只过一拍
+    agent._service_dialog(opened)
+    assert agent.bb.reposition is not None
+
+
+def test_reposition_armed_even_when_already_in_safe(agent, worker):
+    """已经在安全区也要占住窗口：不然两秒后就被普通任务拽出去了。"""
+    lr = make_split_world("lr", p2=(7, 5), p1=(1, 1))
+    agent.book = RecipeBook(lr.recipes, lr.stations)
+    agent._service_dialog(lr)
+    _settle(agent, lr)
+    ud = make_split_world("ud", p2=(7, 5), p1=(1, 1))
+    _settle(agent, ud)
+    assert agent.bb.reposition is None
+
+    opened = make_split_world("open", p2=(7, 5), p1=(1, 1))
+    agent.bb.tick += 1
+    agent._service_dialog(opened)
+    intent = agent.bb.reposition
+    assert intent is not None
+    assert intent.goal in intent.safe

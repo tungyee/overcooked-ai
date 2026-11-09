@@ -75,13 +75,21 @@ def test_feasible_when_outside_safe_and_goal_reachable():
     assert task.done(ctx) is False
 
 
-def test_not_feasible_when_already_inside_safe():
+def test_inside_safe_still_holds_until_window_closes():
+    """已经站在安全区也要占住窗口：实测它会在开窗后两秒被普通任务拽出去，
+    关窗时正好落在分界线上（trace-20261109-123544 t=220→224）。"""
     bb = Blackboard()
     bb.reposition = _intent()
     task = T.Reposition()
-    ctx, _ = _ctx((9, 5), bb)
+    ctx, ex = _ctx((9, 5), bb)
+    assert task.done(ctx) is False
+    assert task.feasible(ctx) is True
+    tree = task.build()
+    assert tree.tick(ctx) == Status.RUNNING
+    assert not ex.issued, "已经在安全区就不该再发 move"
+    bb.reposition = None          # 窗口关掉
+    assert tree.tick(ctx) == Status.SUCCESS
     assert task.done(ctx) is True
-    assert task.feasible(ctx) is False
 
 
 def test_not_feasible_when_goal_unreachable():
@@ -111,13 +119,14 @@ def test_build_issues_move_towards_goal():
     assert ex.issued[0]["cmd"] == "move"
 
 
-def test_build_ends_immediately_when_inside_safe():
+def test_done_only_when_window_closes():
     bb = Blackboard()
     bb.reposition = _intent()
-    ctx, ex = _ctx((9, 5), bb)
-    tree = T.Reposition().build()
-    assert tree.tick(ctx) == Status.SUCCESS
-    assert not ex.issued
+    task = T.Reposition()
+    ctx, _ = _ctx((0, 0), bb)
+    assert task.done(ctx) is False
+    bb.reposition = None
+    assert task.done(ctx) is True
 
 
 def test_claims_no_resource():
@@ -153,22 +162,69 @@ def test_reposition_gate_beats_delivery():
     assert chosen.task.TYPE == "Reposition"
 
 
-def test_reposition_gate_yields_to_rescue():
-    """有火 / 快糊 / 刚熟救锅时让位（那口锅的倒计时不可压缩）。"""
-    from ai.core import planner
-    take = T.TakeCookedToPlate("order1", ("c1", "plate1"), "BoiledSushiRice")
-    world = type("W", (), {
+def _cooker_world(cooking_progress):
+    return type("W", (), {
         "cookers": [{"n": "c1", "cooking_time": 12.0,
-                     "cooking_progress": 10.0, "cooked": True}],
+                     "cooking_progress": cooking_progress, "cooked": True}],
         "plates": [], "orders": [], "stations": [], "items": [], "chefs": [],
         "level": "Sushi_1_4_2P",
     })()
+
+
+def test_reposition_gate_still_runs_when_just_cooked():
+    """刚熟（L2）不让位：那口锅还有十几秒，窗口只有 2~3 秒。
+
+    实测 trace-20261109-123544 t=118~121：整段窗口都在 TakeCookedToPlate
+    （pressure 刚过 1.0），换边一次都没被选中。
+    """
+    from ai.core import planner
+    take = T.TakeCookedToPlate("order1", ("c1", "plate1"), "BoiledSushiRice")
+    world = _cooker_world(10.0)
+    assert planner._time_pressure(take, world) >= 1.0
+    bb = Blackboard()
+    bb.tick = 10
+    bb.reposition = _intent()
+
+    chosen = planner._select_imperative(
+        [_cand(take), _cand(T.Reposition())], world, bb)
+
+    assert chosen is not None and chosen.task.TYPE == "Reposition"
+
+
+def test_reposition_gate_yields_to_fire():
+    """火（L0）永远优先。"""
+    from ai.core import planner
+    bb = Blackboard()
+    bb.tick = 10
+    bb.reposition = _intent()
+    assert planner._select_imperative(
+        [_cand(T.Extinguish()), _cand(T.Reposition())], _planner_world(), bb) is None
+
+
+def test_reposition_gate_yields_to_almost_burnt():
+    """快糊（L1，pressure >= 1.5）让位：再晚就真烧了。"""
+    from ai.core import planner
+    take = T.TakeCookedToPlate("order1", ("c1", "plate1"), "BoiledSushiRice")
+    world = _cooker_world(17.0)
+    assert planner._time_pressure(take, world) >= 1.5
     bb = Blackboard()
     bb.tick = 10
     bb.reposition = _intent()
 
     assert planner._select_imperative(
         [_cand(take), _cand(T.Reposition())], world, bb) is None
+
+
+def test_reposition_preempts_command_scope():
+    """命令 scope 不能把换边整个屏蔽：窗口 2~3 秒，错过就被关 31 秒。
+
+    实测 t=152/187/220 三个窗口都因为一条迟迟完不成的 plate 命令而没换边。
+    """
+    from ai.core import planner
+    scope = frozenset({("Chop", None)})
+    repo = _cand(T.Reposition())
+    kept = planner._scope_with_preemption([repo], scope)
+    assert repo in kept
 
 
 def test_candidate_generated_when_window_open():

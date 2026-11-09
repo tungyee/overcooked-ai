@@ -1206,11 +1206,13 @@ class Agent:
             self._zone_sig = _zone_key(report)
             events.append(("division", {"facts": self._division_facts(world)}))
             return
+        # 区域复核每拍跑（实测 1.1ms）：开窗只有 2~3 秒，按 1 秒周期去查，
+        # 等发现时窗口已经过了一半（trace-20261109-123544 t=118→120.18）。
+        self._zone_review(world, events, tick)
         if tick - self._division_last_check_tick < DIVISION_CHECK_TICKS:
             return
         self._division_last_check_tick = tick
         self._station_review(world, events, tick)
-        self._zone_review(world, events, tick)
 
     def _station_review(self, world, events, tick):
         # type: (World, list, int) -> None
@@ -1289,7 +1291,11 @@ class Agent:
         if cell is None:
             return                      # 还没看到自己的位置：不猜
         if cell in safe:
-            return                      # 已经在安全区，把窗口留给正常任务
+            # 已经在安全区：原地占住窗口。实测放它去干活，两秒后就被普通
+            # 任务拽出去，关窗时正压在分界线上（t=118、t=220）。
+            self.bb.reposition = zoning.RepositionGoal(
+                goal=cell, safe=safe, until_tick=tick + REPOSITION_TICKS)
+            return
         field = navigation.distance_field(cell, world.walkable, world.belt_dir)
         best = None  # type: Optional[Tuple[int, Tuple[int, int]]]
         for candidate in safe:

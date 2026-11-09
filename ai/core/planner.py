@@ -1235,8 +1235,11 @@ def feasible_candidates(world, bb, book, command_scope=None):
 
 # 命令 scope 之外仍允许抢占命令的动作：它们会随时间恶化，晚一步就糊/着火。
 # 其它任务（取料/切/装盘等）仍然严格受命令 scope 约束，避免把用户指令饿死。
+# Reposition 也在内：换布局的连通窗口只有 2~3 秒，错过就被关在另一侧 31 秒；
+# 命令本身不会丢，窗口一关立刻回来接着做（trace-20261109-123544 t=152/187/220
+# 三个窗口都是被一条迟迟完不成的 plate 命令挡住的）。
 PREEMPT_COMMAND_TYPES = ("RescueCooked", "TakeCookedToPlate", "FillCarrier",
-                         "Extinguish")
+                         "Extinguish", "Reposition")
 
 
 def _preempts_command(task):
@@ -1348,7 +1351,11 @@ def plan(world, bb, order, book):
     # ③.5「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中，跳过
     # 层选择 / 打分 / 承诺惯性。L0-L2 救援在闸内让位，这里只在无火情时抢选。
     # 命令模式下命令 scope 本身就是硬指令，不再走旧 now 闸。
-    imperative = None if command_scope else _select_imperative(feasible, world, bb)
+    # 换边闸先于命令 scope：窗口是硬截止，命令不丢（队列不动），关窗即回。
+    # now 闸仍受命令 scope 约束。
+    imperative = _select_reposition(feasible, world, bb)
+    if imperative is None and not command_scope:
+        imperative = _select_imperative(feasible, world, bb)
     if imperative is not None:
         chosen_task = imperative.task
         # 仍用 layer_filter 算 layer_map 供 trace（闸跳过了层选择，但层号是
@@ -1612,8 +1619,11 @@ def _select_reposition(feasible, world, bb):
     if getattr(bb, "reposition", None) is None:
         return None
     from ai.core.planner_layers import layer_of_task
+    # 只让位给火（L0）和快糊（L1）。**让给 L2「刚熟」是错的**：那口锅还有
+    # 十几秒才糊，而窗口只有 2~3 秒（实测 t=118~121 整段窗口都在端刚熟的
+    # 披萨，换边一次没选中，之后被隔 31 秒）。
     for cand in feasible:
-        if layer_of_task(cand.task, world) in (0, 1, 2):
+        if layer_of_task(cand.task, world) in (0, 1):
             return None
     for cand in feasible:
         if cand.task.TYPE == "Reposition":

@@ -380,6 +380,10 @@ namespace Oc2AI
         private const int GROUND_LAYER_MASK = 1 << 9;
         private const float ANCHOR_RAY_UP = 5f;
         private const float ANCHOR_RAY_LEN = 20f;
+        // 跨地板缝隙：前方探针距离、Dash 按住时长、冷却。
+        private const float DASH_PROBE = 0.55f;
+        private const float DASH_HOLD = 0.08f;
+        private const float DASH_COOLDOWN = 1.0f;
 
         // waypoint 锚点：Python 发的是发令时刻的世界坐标，但站在移动平台（气球篮/
         // 木筏）上时，平台上的点会被平台带走。冻结的世界坐标会落进平台台面里、
@@ -409,6 +413,11 @@ namespace Oc2AI
         private float _lastRelX;
         private float _lastRelZ;
         private bool _hasRel;
+        // Python 只在路径跨地板缝时发 dash=true；没授权时遇到踩空就停下。
+        private readonly bool _allowDash;
+        private bool _dashDown;
+        private float _dashUntil = -1f;
+        private float _lastDashAt = -10f;
 
         // 平台接缝门洞（Oc2Gate.cs）：gates 字段可选，旧 Python 不发则行为不变。
         // 门洞没开时在缝口外停下等，最多 gate.MaxWait 秒（Python 按预测开门时间给，
@@ -438,6 +447,7 @@ namespace Oc2AI
             _goal = ToVec(Req.List(cmd, "goal"));
             _target = Req.Obj(cmd, "target");
             _kind = Req.Str(cmd, "kind");
+            _allowDash = Req.Bool(cmd, "dash");
             var path = Req.List(cmd, "path");
             if (path != null)
                 foreach (var p in path)
@@ -496,6 +506,7 @@ namespace Oc2AI
                     UnityEngine.Debug.Log("[EXEC] move teleporting pos=(" + f.PosX + "," + f.PosZ + ") idx=" + _idx);
                 }
                 PadEngagement.Pad.Stop();
+                ReleaseDash();
                 _lastProgress = now;          // 传送动画不算 stuck
                 _hasRel = false;
                 return true;
@@ -606,9 +617,31 @@ namespace Oc2AI
             return PadButtons.HandleMatches(f, _target, _kind);
         }
 
+        // 前方 DASH_PROBE 处往下打 Ground：没有地板 = 前面是缝/悬崖。
+        private bool GroundGapAhead(ChefFrame f, Vector2 dir)
+        {
+            if (dir.sqrMagnitude < 1e-6f) return false;
+            Vector3 p = new Vector3(
+                f.PosX + dir.x * DASH_PROBE,
+                f.Chef.transform.position.y + ANCHOR_RAY_UP,
+                f.PosZ + dir.y * DASH_PROBE);
+            return !Physics.Raycast(p, Vector3.down, ANCHOR_RAY_LEN,
+                                    GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
+        }
+
+        private void ReleaseDash()
+        {
+            if (!_dashDown) return;
+            _dashDown = false;
+            _dashUntil = -1f;
+            try { PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.Dash, false); }
+            catch (System.Exception) { }
+        }
+
         public void Tick(ChefFrame f, float now)
         {
             if (Done) return;
+            if (_dashDown && now >= _dashUntil) ReleaseDash();
             if (!_started)
             {
                 _started = true; _startTime = now; _lastProgress = now;
@@ -808,7 +841,37 @@ namespace Oc2AI
             float mag = goalDist < BRAKE_DIST
                 ? Mathf.Clamp(goalDist / BRAKE_DIST, MIN_STICK, 1f)
                 : 1f;
+
+            bool gapAhead = GroundGapAhead(f, dir);
+            if (gapAhead && !_allowDash)
+            {
+                // 没有 dash 授权却要踩空：宁可不走，交回 Python 重算，也不掉水。
+                PadEngagement.Pad.Stop();
+                UnityEngine.Debug.Log("[EXEC] move ledge pos=(" + f.PosX + "," + f.PosZ
+                    + ") idx=" + _idx + "/" + _path.Count);
+                Finish(false, "ledge", new double[] { pos.x, pos.y });
+                return;
+            }
+
             PadEngagement.Pad.Move(f.Chef, dir.x * mag, dir.y * mag);
+
+            if (gapAhead && _allowDash && PadEngagement.Pad != null
+                && now - _lastDashAt > DASH_COOLDOWN)
+            {
+                try
+                {
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.Dash, true);
+                    _dashDown = true;
+                    _dashUntil = now + DASH_HOLD;
+                    _lastDashAt = now;
+                    UnityEngine.Debug.Log("[EXEC] move dash pos=(" + f.PosX + "," + f.PosZ
+                        + ") idx=" + _idx + "/" + _path.Count);
+                }
+                catch (System.Exception e)
+                {
+                    UnityEngine.Debug.Log("[EXEC] move dash failed: " + e.Message);
+                }
+            }
         }
 
         // 中途路点够不到时提前转向下一个点。手里的东西挂在厨师刚体下面，碰撞体还开着
@@ -843,6 +906,7 @@ namespace Oc2AI
 
         private void Finish(bool ok, string why, double[] blockedCell = null)
         {
+            ReleaseDash();
             Done = true;
             Ok = ok;
             Why = why;

@@ -437,3 +437,23 @@ def test_layout_review_not_repeated_by_region_jitter(agent, worker):
     jittered.walkable = lambda gx, gz: inner(gx, gz) and (gx, gz) != (0, 0)
     _settle(agent, jittered)
     assert worker.events == []
+
+
+def test_initial_division_facts_describe_layout(agent, worker):
+    """开局就要说清「分成哪两半、谁该在哪」，不然模型只能按出生点猜。"""
+    world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)
+    facts = worker.events[0][1]["facts"]
+    assert "分成左右两半" in facts
+    assert "你该在右半边" in facts
+    assert "玩家该在左半边" in facts
+
+
+def test_initial_division_facts_say_single_block_when_open(agent, worker):
+    world = make_split_world("open", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)
+    facts = worker.events[0][1]["facts"]
+    assert "一整块" in facts
+    assert "两半" not in facts

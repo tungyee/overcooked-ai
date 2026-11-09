@@ -1149,14 +1149,25 @@ class Agent:
 
         不再列「你能做/玩家能做」：单网格寻路对 3-3 左半场/旋转桌不准，
         会把「能装盘」误报成「够不着」。可达性以 execute_actions 返回为准。
+        但**布局一定要说**：3-3 这类关卡开局就分成两半，不说清楚模型只能按
+        出生点猜，容易定出「两人挤同一半」的分工。
         """
+        parts = []  # type: List[str]
+        report = self.bb.zones
+        if report is not None:
+            if report.district and report.p2_label and report.p1_label:
+                parts.append("厨房分成%s两半：你该在%s半边，玩家该在%s半边。" % (
+                    "左右" if report.district == "LR" else "上下",
+                    report.p2_label, report.p1_label))
+            else:
+                parts.append("厨房现在还是一整块，中间的路还没转开。")
         p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
         p2_chef = P.chef_by_name(world.chefs, P.P2_NAME)
         if p1_chef and p2_chef:
-            return "你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
+            parts.append("你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
                 float(p2_chef.get("x") or 0), float(p2_chef.get("z") or 0),
-                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0))
-        return ""
+                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0)))
+        return "".join(parts)
 
     def _station_change_text(self, old_sig, new_sig):
         # type: (Any, Any) -> str

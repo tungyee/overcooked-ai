@@ -43,8 +43,11 @@ from ai.dialog.schema import DialogState
 
 log = logging.getLogger(__name__)
 
-# 一批工具调用等 ack 的上限；主循环每拍开头 drain，正常远小于这个值。
-ACK_TIMEOUT_S = 2.0
+# 一批工具调用等 ack 的上限；主循环每拍开头 drain，正常只要几十毫秒。
+# 不能压到 2 秒：关卡加载时主循环会连吃几秒 `phase=None` 的帧，生命周期守卫
+# 直接跳过对话服务，ack 就迟迟不来（voice-20261109-122611 实测 4.1 秒），
+# 模型只能回一句「刚才没说上话，重来一遍」。
+ACK_TIMEOUT_S = 5.0
 # 一次玩家/事件回合内最多几轮工具调用（check → execute → speak → 修正）。
 MAX_AGENT_TURNS = 4
 # 轮询播放状态的间隔与最长等待（兜底防止设备卡死拖住 worker 线程）。

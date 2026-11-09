@@ -1293,3 +1293,15 @@ def test_speech_content_without_tools_is_spoken():
 
     assert bundle.tts.spoken == ["抱歉，递东西我做不了，得你自己去拿。"]
     assert bundle.cmd_q.empty()
+
+
+def test_tool_ack_timeout_covers_level_load_gap():
+    """等 ack 的上限必须盖住关卡加载时的空档。
+
+    voice-20261109-122611：开局 division 事件刚发出去，主循环连吃 4.1 秒
+    `phase=None` 的帧（`_tick_once` 的生命周期守卫直接跳过对话服务），
+    `set_division` 的 ack 超时，模型只好说「刚才没说上话，重来一遍」。
+    2 秒不够，抬到 5 秒。正常一拍内 ack 仍是几十毫秒。
+    """
+    from ai.dialog import worker as W
+    assert W.ACK_TIMEOUT_S >= 5.0

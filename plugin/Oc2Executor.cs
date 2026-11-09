@@ -385,8 +385,8 @@ namespace Oc2AI
         private const float DASH_HOLD = 0.08f;
         private const float DASH_COOLDOWN = 1.0f;
         // 对岸路点超过这个距离就不 dash：木筏可能已漂远，dash 也够不到，
-        // 交回 Python 重算比冲进水里好。
-        private const float DASH_REACH = 2.3f;
+        // 交回 Python 重算比冲进水里好。2 格跳边的格心距是 2.4m，留 0.2m 余量。
+        private const float DASH_REACH = 2.6f;
 
         // waypoint 锚点：Python 发的是发令时刻的世界坐标，但站在移动平台（气球篮/
         // 木筏）上时，平台上的点会被平台带走。冻结的世界坐标会落进平台台面里、

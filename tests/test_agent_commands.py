@@ -389,14 +389,13 @@ def test_command_without_done_signal_finishes_after_one_task(agent, world):
     assert cmd.status == "succeeded"
 
 
-def test_targetless_chop_on_pizza_level_narrows_to_item():
-    """披萨关卡的 materials 以**菜名**为键，不带 target 的 chop 不能落成整道菜。
+def test_targetless_chop_is_rejected_with_division_hint():
+    """不带 target 的 chop / cook 直接拒，并提示改分工用 set_division。
 
-    实机 trace-20261109-124818 04:49:12：玩家说「你也帮我切点东西吧」，模型
-    发 `execute_actions([{action:"chop"}])`。resolve_target 把物料 Dough 折回
-    整道 PeperoniPizza，scope 变成「给这道菜切/取所有料」，target 是菜名 →
-    command_done 拿菜名求 chop_target 得 None → 命令永远完不成，占着执行槽
-    212/240 秒。
+    披萨关卡的 materials 以菜名为键，targetless chop 会被 resolve_target 折回
+    整道菜，scope 变成「给这道菜备齐料」、target 是菜名 → command_done 永远
+    False（实机 trace-20261109-124818 04:49:12 那条命令占了 212/240 秒）。
+    玩家说「你也帮我切点东西吧」本来也是改分工，不是马上派活。
     """
     import gzip
 
@@ -410,8 +409,34 @@ def test_targetless_chop_on_pizza_level_narrows_to_item():
     a.bb.tick = 100
     a.book = RecipeBook(world.recipes, world.stations)
 
-    out = a._execute_action(world, {"action": "chop"})
-    assert out["ok"] is True
-    cmd = a.commands.active()
-    assert all(item is not None for _task_type, item in cmd.scope), cmd.scope
-    assert command_done_undecidable(cmd, a.book) is False
+    for action in ("chop", "cook"):
+        out = a._execute_action(world, {"action": action})
+        assert out["ok"] is False, out
+        assert "set_division" in out["reason"]
+    assert a.commands.active() is None
+
+
+def test_running_command_expires_after_ttl(agent, world):
+    """命令在跑也有一条寿命上限：卡住必须把执行槽还回来。
+
+    实机 trace-20261109-124818：一条判不出完成条件的 `chop` 占了 212/240 秒，
+    planner 被锁在备料 scope 里、两个灶全程空转。
+    """
+    from ai.dialog import commands as CM
+
+    scope = frozenset({("Chop", None)})
+    agent.commands.add("chop", None, scope, 100)
+    cmd = agent.commands.active()
+    assert cmd.status == "running"
+
+    # 还没到上限：不动
+    agent.bb.tick = 100 + CM.COMMAND_TTL_TICKS
+    agent._service_commands(world)
+    assert cmd.status in ("running", "waiting")
+
+    # 超过上限：判失败，队列暂停，执行槽释放
+    agent.bb.tick = 100 + CM.COMMAND_TTL_TICKS + 1
+    agent._service_commands(world)
+    assert cmd.status == "failed"
+    assert "太久" in cmd.reason
+    assert agent.bb.command_scope is None

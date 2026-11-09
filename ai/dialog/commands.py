@@ -34,6 +34,12 @@ ACTION_LABELS = {
 TICKS_PER_SECOND = 20
 MAX_PENDING = 3
 RESOURCE_WAIT_TIMEOUT_TICKS = 20 * TICKS_PER_SECOND
+# 一条命令从「开始执行」起最多占执行槽多久。单个动作（切/煮/装盘/送餐/洗盘）
+# 再远也远不过一趟跨图往返，60 秒还没完就是卡住了。实机
+# trace-20261109-124818：一条 `chop` 因为判不出完成条件占了 212/240 秒，
+# planner 被锁在备料 scope 里、两个灶全程空转。判不出完成条件的命令现在
+# 靠 `served` 收尾，这个 TTL 是兜底：任何原因卡住都要把执行槽还回来。
+COMMAND_TTL_TICKS = 60 * TICKS_PER_SECOND
 TASK_FAIL_LIMIT = 3
 
 # 命令目标站只在对面时，允许先走中转台的送件 kind。字符串与
@@ -522,14 +528,25 @@ class CommandQueue:
 
     def expire(self, tick):
         # type: (int) -> List[Command]
-        """waiting 超时的命令判失败；返回本次失败的命令。"""
+        """超时的命令判失败；返回本次失败的命令。
+
+        两种超时：waiting 等资源（20 秒）与 running 的整条寿命（60 秒）。
+        running 的 TTL 是兜底——不管为什么卡住（认不出完成条件、来回失败、
+        站点被搬走），都必须把执行槽和 command_scope 还回来，否则 planner
+        会被一直限制在这条命令的 scope 里。
+        """
         failed = []
         for command in self.commands:
-            if command.status != "waiting":
-                continue
-            if command.wait_since and tick - command.wait_since > RESOURCE_WAIT_TIMEOUT_TICKS:
-                self.mark_failed(command, command.wait_reason or "等太久了")
-                failed.append(command)
+            if command.status == "waiting":
+                if (command.wait_since
+                        and tick - command.wait_since > RESOURCE_WAIT_TIMEOUT_TICKS):
+                    self.mark_failed(command, command.wait_reason or "等太久了")
+                    failed.append(command)
+            elif command.status == "running":
+                if (command.started_tick
+                        and tick - command.started_tick > COMMAND_TTL_TICKS):
+                    self.mark_failed(command, "这条命令做太久了，先停一下")
+                    failed.append(command)
         return failed
 
     def snapshot(self):

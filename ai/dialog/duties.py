@@ -363,7 +363,7 @@ def tool_schemas(division_actions=None, with_cookbook=False):
     }
     target_prop = {
         "type": "string",
-        "description": "物料名或菜名，使用本关目录里的英文名（Cucumber、Seaweed、BoiledSushiRice、Sushi_Cucumber）。省略时由系统选最合适的一个。",
+        "description": "物料名或菜名，使用本关目录里的英文名（Cucumber、Seaweed、BoiledSushiRice、Sushi_Cucumber）。chop / cook 必填；deliver / wash 可省略。",
     }
     schemas = [
         {
@@ -382,7 +382,7 @@ def tool_schemas(division_actions=None, with_cookbook=False):
             "type": "function",
             "function": {
                 "name": "execute_actions",
-                "description": "只在玩家明确要求做某件事时调用：把动作数组按顺序排成持久命令并执行。自主干活不要用这个工具派活，planner 会按分工自动选活。单动作也传长度为 1 的数组。没有命令在跑时第一条立即开始；已有命令时按顺序排队（最多 3 条待执行）。每条返回 ok/status/reason；不可行的那条不影响后面的条目。命令会一直做到该动作的完成条件，途中不需要再叫模型。要替换当前工作请先 cancel_action。",
+                "description": "只在玩家明确要求「现在去做某件事」时调用：把动作数组按顺序排成持久命令并执行。玩家说「你也来切 / 你也负责煮」这类是在**调整分工**，用 set_division，不要用这个工具。自主干活也不要用它派活，planner 会按分工自动选活。chop / cook 必须带 target（说清切哪种料、煮哪道菜）；deliver / wash 可以不带。单动作也传长度为 1 的数组。没有命令在跑时第一条立即开始；已有命令时按顺序排队（最多 3 条待执行）。每条返回 ok/status/reason；不可行的那条不影响后面的条目。命令最多执行 60 秒，超时会失败并把执行权交回自动分工。要替换当前工作请先 cancel_action。",
                 "parameters": {
                     "type": "object",
                     "properties": {

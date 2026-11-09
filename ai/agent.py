@@ -921,6 +921,16 @@ class Agent:
         if action not in TOOL_ACTIONS:
             return {"ok": False, "reason": "未知动作：%s" % (action,)}
         target_raw = args.get("target")
+        if action in ("chop", "cook", "mix") and not str(target_raw or "").strip():
+            # 玩家说「你也帮我切点东西吧」是**改分工**，不是马上派活；真要派活
+            # 就得说清切/煮哪种料。不带 target 会让系统替模型挑一个，最后落成
+            # 「给这道菜备齐料」这种判不出完成的巨型命令（实机
+            # trace-20261109-124818 04:49:12 的 `chop` 占了 212/240 秒）。
+            return {"ok": False, "action": action,
+                    "reason": "要说明%s哪种料（本关目录里的英文名）。"
+                              "只是想调整分工就用 set_division。" % (
+                                  "切" if action == "chop" else "煮"),
+                    "hint": "set_division"}
         mode, resolved, display, reason, valid = resolve_target(
             kitchen, action, target_raw)
         if reason and not resolved:
@@ -1022,6 +1032,16 @@ class Agent:
         if action not in TOOL_ACTIONS:
             return {"ok": False, "reason": "未知动作：%s" % (action,)}
         target_raw = args.get("target")
+        if action in ("chop", "cook", "mix") and not str(target_raw or "").strip():
+            # 玩家说「你也帮我切点东西吧」是**改分工**，不是马上派活；真要派活
+            # 就得说清切/煮哪种料。不带 target 会让系统替模型挑一个，最后落成
+            # 「给这道菜备齐料」这种判不出完成的巨型命令（实机
+            # trace-20261109-124818 04:49:12 的 `chop` 占了 212/240 秒）。
+            return {"ok": False, "action": action,
+                    "reason": "要说明%s哪种料（本关目录里的英文名）。"
+                              "只是想调整分工就用 set_division。" % (
+                                  "切" if action == "chop" else "煮"),
+                    "hint": "set_division"}
         mode, resolved, display, reason, valid = resolve_target(
             kitchen, action, target_raw)
         if reason and not resolved:

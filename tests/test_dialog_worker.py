@@ -1334,18 +1334,20 @@ def test_speech_turn_keeps_action_tools():
     assert "execute_actions" in names
 
 
-def test_division_turn_ends_after_division_and_speech():
-    """开局分工落地并说了一句就收尾，不再多要一轮。
+def test_division_turn_ends_naturally_when_model_stops_calling_tools():
+    """分工回合按「模型不再调工具」自然收尾，不做事件特判。
 
-    voice-20261109-124818：turn0 定分工 + speak，turn1 又被叫了一次去调
-    execute_actions，turn2 补一句「好，我这就去送烤箱」——玩家听到两句。
+    回合是一段连续对话：每次把 assistant(tool_calls) 和 tool(result) 追加进
+    messages 再问一次；模型这一轮不调任何工具，回合就结束。分工定完它多要
+    一轮本来也是合理的（可能想读世界状态或补一句），只有多出来的派活被工具
+    表裁掉了。
     """
     llm = FakeLLM(
         reply("",
               ("set_division", {"assignments": [
                   {"action": "cook", "owner": "you"}]}),
               ("speak", {"text": "好，我负责烤箱和洗碗，你切菜装盘。"})),
-        reply("", ("speak", {"text": "好，我这就去送烤箱。"})),  # 不该被请求
+        reply(""),                      # 第二轮不调工具 → 自然结束
     )
     worker, bundle = make_worker(llm=llm)
 
@@ -1355,5 +1357,5 @@ def test_division_turn_ends_after_division_and_speech():
     thread.join(2)
 
     assert not thread.is_alive()
-    assert len(llm.calls) == 1, "分工那一轮之后不该再问一次"
+    assert len(llm.calls) == 2, "模型没调工具才该收尾"
     assert bundle.tts.spoken == ["好，我负责烤箱和洗碗，你切菜装盘。"]

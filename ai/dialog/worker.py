@@ -1643,11 +1643,6 @@ class DialogWorker(object):
                 # 不播“好，这就去”这类乐观台词；下一轮强制 speak 说真实原因。
                 force_speak = True
                 continue
-            if event == "division" and division_changed and texts:
-                # 开局分工：分工已经落地、这一轮也已经说了一句，就到此为止。
-                # 否则循环会多给模型一轮，它拿这一轮再调工具/再说一句
-                # （实机 turn2「好，我这就去送烤箱」，玩家听到两句）。
-                break
             if forced and not speak_calls:
                 # 已经强制过一次 speak，模型仍不调；避免死循环，安静结束。
                 break

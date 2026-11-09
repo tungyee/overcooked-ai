@@ -44,6 +44,14 @@ def _wb(frame):
     return w, RecipeBook(w.recipes, w.stations)
 
 
+def _without_dirty(frame):
+    """载体规划测试不测 wash 策略：去掉脏盘摞，避免 2 盘关 L4 洗盘抢走用例。"""
+    f = copy.deepcopy(frame)
+    f["items"] = [it for it in f.get("items", ())
+                  if "dirtyplate" not in str(it.get("n") or "").lower()]
+    return f
+
+
 def _order(w, oid):
     return next(o for o in w.orders if str(o["id"]) == oid)
 
@@ -176,11 +184,20 @@ def test_carrier_task_done_needs_contents_in_plate(frames):
 
 @pytest.mark.parametrize("idx", [0, 1])
 def test_planner_picks_carrier_to_plate(frames, idx):
-    w, book = _wb(frames[idx])
+    w, book = _wb(_without_dirty(frames[idx]))
     task, rec = planner.plan(w, make_bb(100), None, book)
     scores = {str(c[0]): c[1] for c in rec["candidates"] if c[3]}
     assert str(task) == CARRIER_TASK, sorted(scores.items(), key=lambda kv: -kv[1])[:6]
     assert scores[CARRIER_TASK] > scores.get(PLAIN_TASK, -99)
+
+
+def test_two_plate_fixture_with_dirty_is_wash_unblock(frames):
+    """真实 2 盘帧：一块装料盘 + 一块脏盘 → WashPlate 进 L4（用户确认规则）。"""
+    from ai.core import planner_layers as PL
+    w, _ = _wb(frames[1])
+    assert planner._plate_total(w) == 2
+    wash = T.WashPlate(resources=("WashingPart",))
+    assert PL.layer_of_task(wash, w) == PL.L_UNBLOCK
 
 
 def test_plate_match_prefers_order_with_complete_carrier():
@@ -222,7 +239,7 @@ MEAT_T = "cooked:burritomeat:fryingpan"
 
 
 def _plan_with(frame, tortilla_detail, plate_detail):
-    f = copy.deepcopy(frame)
+    f = _without_dirty(frame)
     for it in f["items"]:
         if it["n"] == "Tortilla":
             it["detail"] = tortilla_detail

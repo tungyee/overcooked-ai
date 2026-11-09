@@ -91,6 +91,34 @@ def test_station_signature_changes_only_when_stations_move():
     assert D.station_signature(a) != D.station_signature(c)
 
 
+def test_station_signature_ignores_world_coords_on_moving_grid():
+    """木筏巡航会让 cooking 站点的 x/z 每帧变化；局部 gx/gz 没变就不该复核。"""
+    raw = {"grids": [{"id": "MovingRaft", "moving": True}]}
+    a = SimpleNamespace(raw=raw, stations=[
+        {"t": "cooking", "grid": "MovingRaft", "gx": 1, "gz": 2,
+         "x": -8.0, "z": 2.4},
+    ])
+    b = SimpleNamespace(raw=raw, stations=[
+        {"t": "cooking", "grid": "MovingRaft", "gx": 1, "gz": 2,
+         "x": -6.0, "z": 2.4},
+    ])
+    assert D.station_signature(a) == D.station_signature(b)
+
+
+def test_station_signature_detects_local_move_on_moving_grid():
+    """木筏上的站点真的换了局部格，仍要触发复核。"""
+    raw = {"grids": [{"id": "MovingRaft", "moving": True}]}
+    a = SimpleNamespace(raw=raw, stations=[
+        {"t": "cooking", "grid": "MovingRaft", "gx": 1, "gz": 2,
+         "x": -8.0, "z": 2.4},
+    ])
+    b = SimpleNamespace(raw=raw, stations=[
+        {"t": "cooking", "grid": "MovingRaft", "gx": 2, "gz": 2,
+         "x": -6.8, "z": 2.4},
+    ])
+    assert D.station_signature(a) != D.station_signature(b)
+
+
 def test_validate_entry_rejects_unknown_action_and_owner():
     world = SimpleNamespace(stations=[{"t": "chopping"}])
     ok, reason, _ = D.validate_entry(world, None, None, None,

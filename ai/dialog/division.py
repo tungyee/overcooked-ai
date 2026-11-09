@@ -185,27 +185,38 @@ def _q(value, scale=1.0):
         return None
 
 
+def _moving_grids(world):
+    # type: (Any) -> set
+    """插件帧里 moving=true 的网格 id；旧帧没有 grids 时返回空集。"""
+    raw = getattr(world, "raw", None) or {}
+    return {str(g.get("id")) for g in raw.get("grids") or ()
+            if isinstance(g, dict) and g.get("moving") is True}
+
+
 def station_signature(world):
     # type: (Any) -> Tuple
     """站点拓扑签名：站点所属网格 + 量化位置。
 
     梯子/转盘这类移动障碍不改变站点，签名不变；热气球篮/木筏把站点
-    带走时签名变化。
+    带走时签名变化。**移动网格上的站点只看局部 gx/gz**——木筏巡航会
+    让世界坐标每帧变，按 x/z 比会每 160 拍误发一次 division_review
+    （trace-20261109-221602：225 秒里 24 次）。
     """
+    moving = _moving_grids(world)
     parts = []  # type: List[Tuple]
     for action in DIVISION_ACTIONS:
         station_type = ACTION_STATION_TYPES[action]
         for station in getattr(world, "stations", None) or ():
             if not isinstance(station, dict) or station.get("t") != station_type:
                 continue
-            parts.append((
-                action,
-                str(station.get("grid") or ""),
-                _q(station.get("gx"), 1.2),
-                _q(station.get("gz"), 1.2),
-                _q(station.get("x"), 1.2),
-                _q(station.get("z"), 1.2),
-            ))
+            grid = str(station.get("grid") or "")
+            row = (action, grid,
+                   _q(station.get("gx"), 1.2),
+                   _q(station.get("gz"), 1.2))
+            if grid not in moving:
+                row += (_q(station.get("x"), 1.2),
+                        _q(station.get("z"), 1.2))
+            parts.append(row)
     return tuple(sorted(parts, key=repr))
 
 

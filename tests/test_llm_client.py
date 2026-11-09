@@ -393,6 +393,13 @@ def test_system_prompt_lists_division_tools_when_available():
     assert "送餐和洗盘不在分工里" in text
 
 
+def test_system_prompt_respects_no_fixed_division_guide():
+    """攻略明确说不设固定分工时，模型不应再调用 set_division。"""
+    text = system_message("", guide="本关不设固定分工", division=True,
+                          cookbook=True)["content"]
+    assert "不要调用 set_division" in text
+
+
 def test_system_prompt_omits_division_tools_when_absent():
     text = system_message("")["content"]
     assert "set_division" not in text

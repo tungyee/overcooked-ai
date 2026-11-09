@@ -82,3 +82,12 @@ def test_custom_root_parses_internal_names(tmp_path):
     assert guide is not None and guide.key == "story/9-9"
     assert "玩家" in guide.section("division")
     assert "你" in guide.summary()
+
+
+def test_rapids35_guide_has_no_fixed_division():
+    """3-5 木筏在巡航，固定分工会让 P2 等玩家切菜；攻略要明确不设固定分工。"""
+    guide = default_cookbook().resolve("Rapids_3_5_2P")
+    assert guide is not None
+    text = guide.section("division")
+    assert "不设固定分工" in text
+    assert "一人切菜" not in text

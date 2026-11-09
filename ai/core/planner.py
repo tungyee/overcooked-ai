@@ -1304,6 +1304,9 @@ def plan(world, bb, order, book):
     # 替活单占掉 1:1 盘/灶匹配或队列容量。
     live_orders = _dialog_live_orders(world, bb)
 
+    # ⓪.6 断供看门狗：玩家负责的 cook 长时间没人做时，本拍允许 P2 补位。
+    _update_supply_watch(world, bb, book)
+
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
     # 已装料载体（包了熟肉的卷饼等）↔订单：覆盖的料不再配锅、不再备料
@@ -1593,6 +1596,12 @@ def _matching_preferences(candidate, bb, layer):
         weight = float(getattr(pref, "weight", 0.0) or 0.0)
         if weight < 0 and immune:
             continue
+        # 断供补位：玩家负责 cook 但长时间不煮时，撤销 cook 类任务的认领负分，
+        # 否则 FetchToCooker/FillCooker 永远选不上（4-1 55 秒无米）。
+        if (weight < 0 and getattr(bb, "supply_override", False)
+                and getattr(pref, "kind", None) == "claim"
+                and task.TYPE in SUPPLY_TAKEOVER_TASK_TYPES):
+            continue
         out.append((pref, weight))
     return out
 
@@ -1614,6 +1623,68 @@ def _claim_penalty(candidate, bb, layer):
     return sum(weight for pref, weight
                in _matching_preferences(candidate, bb, layer)
                if getattr(pref, "kind", None) == "claim" and weight < 0)
+
+
+# 断供补位：灶连续空闲且订单还缺熟料超过这么久，允许 P2 无视「cook 归玩家」
+# 的认领负分去补位下锅。4-1 实机（trace-20261109-223643）：分工 player=cook，
+# FetchToCooker 固定 -6 分，玩家 55 秒没下锅，米断供、寿司一起过期。
+# 截止闸救不了这种局面：它只在「这单还有救」时开（cushion >= 0），
+# 已经进入必死区间的订单不会替 P2 抢下锅。
+SUPPLY_OVERRIDE_TICKS = 160        # 8 秒
+SUPPLY_TAKEOVER_TASK_TYPES = ("FetchToCooker", "FillCooker",
+                              "PlaceCarrierInCooker")
+
+
+def _update_supply_watch(world, bb, book):
+    # type: (World, Blackboard, Any) -> None
+    """维护断供看门狗：持续短缺超过宽限期后打开 cook 补位开关。"""
+    if _supply_starving(world, bb, book):
+        if getattr(bb, "supply_idle_since", None) is None:
+            bb.supply_idle_since = getattr(bb, "tick", 0) or 0
+        done = (getattr(bb, "tick", 0) or 0) - bb.supply_idle_since
+        bb.supply_override = done >= SUPPLY_OVERRIDE_TICKS
+    else:
+        bb.supply_idle_since = None
+        bb.supply_override = False
+
+
+def _supply_starving(world, bb, book):
+    # type: (World, Blackboard, Any) -> bool
+    """当前是否「有灶可煮、订单缺熟料、但没人在煮」。
+
+    只看熟料缺口，不看有没有已装盘的成品：成品盘会在台面/手里来回移动，
+    按盘数判会抖动。缺口口径见 cook_supply.cooked_shortfall（已修成把手持
+    盘也算供给）。
+    """
+    wanted = CS.cooked_items_wanted(world, book)
+    if not wanted:
+        return False
+    if not (CS.idle_cookers(world) or CS.recoverable_cookers(world, book)):
+        return False
+    if not any(CS.cooked_shortfall(world, book, item) > 0 for item in wanted):
+        return False
+
+    # 玩家手里正拿着能煮成所需熟料的生料：他在路上，别抢。
+    holding = getattr(getattr(bb, "p1_model", None), "holding", None)
+    wanted_l = {str(i).lower() for i in wanted}
+    if holding:
+        for cooked in (book.cooked_of_raw(holding) or ()):
+            if str(cooked).lower() in wanted_l:
+                return False
+
+    # 只救还有时间兑现的单：煮一锅 12 秒 + 装盘送餐的余量。
+    need = ETA.task_cost_ticks("FetchToCooker") + ENDGAME_DELIVER_RESERVE
+    time_left = _time_left_ticks(world)
+    if time_left is not None and time_left < need:
+        return False
+    for order in (world.orders or ()):
+        rem = order.get("remaining")
+        if rem is None or float(rem) * ETA.TICKS_PER_SECOND < need:
+            continue
+        for ing in book.requirements(order):
+            if str(ing).lower() in wanted_l:
+                return True
+    return False
 
 
 def _select_reposition(feasible, world, bb):
@@ -2347,6 +2418,28 @@ def _plate_pressure(world):
     if clean == 1:
         return 1.0
     return 0.0
+
+
+def _plate_total(world):
+    # type: (Any) -> int
+    """场上盘子总数：干净/装料/手持 + 洗碗池里的 + 脏盘摞。
+
+    3-5 只有 2 块盘；这个数用来把「2 盘关有 1 个脏盘」直接抬进 L4。
+    脏盘摞在 items 里、池里的盘只体现在 washing.plate_count，两者都要算。
+    """
+    total = len(world.all_plates)
+    for it in (list(getattr(world, "items", ()) or ())
+               + list(getattr(world, "held_items", ()) or ())):
+        if "dirtyplate" in str(it.get("n") or "").lower():
+            total += 1
+    for st in getattr(world, "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != "washing":
+            continue
+        try:
+            total += int(st.get("plate_count") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
 
 
 def _placed_plates(world):

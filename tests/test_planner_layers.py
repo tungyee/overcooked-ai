@@ -17,11 +17,12 @@ class _T(object):
         self.TYPE = type_name
 
 
-def _rules(pressure=0.0, plate_pressure=0.0, placed=False):
-    # type: (float, float, bool) -> tuple
+def _rules(pressure=0.0, plate_pressure=0.0, placed=False, plate_total=99):
+    # type: (float, float, bool, int) -> tuple
     """固定返回值的规则表，让层判定与三条曲线的实现解耦。"""
     return PL.build_rules(lambda t, w: pressure, lambda w: plate_pressure,
-                          lambda w: placed)
+                          lambda w: placed,
+                          plate_total_fn=lambda w: plate_total)
 
 
 def test_layer_constants_are_ordered_high_to_low():
@@ -232,8 +233,12 @@ def test_task_without_cooker_id_never_enters_cook_layers():
 
 
 def test_plate_pressure_three_tiers():
-    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。L4 层谓词收紧为
-    clean==0 且无装配盘，所以只有 0 盘档进 L4，1 盘与 >=2 盘都掉 L7。"""
+    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。
+
+    这里的 `_W` 只有 1~2 块盘且没有脏盘，`_plate_total` 不等于 2（或压力为 0），
+    所以仍按旧的「clean==0 且无装配盘」规则落层：
+    1 块干净盘、2 块干净盘都掉 L7。
+    """
     clean = {"n": "plate1", "contents": []}
     t = _T("WashPlate")
     assert PL.layer_of_task(t, _W(plates=[])) == PL.L_UNBLOCK
@@ -581,3 +586,17 @@ def test_unblock_layer_scores_plate_terms_only():
     score, kept = PL.filter_terms(terms, PL.L_UNBLOCK)
     assert set(kept) == {"plate_pressure", "no_plate_placed"}
     assert score == pytest.approx(10.0)
+
+
+def test_wash_two_plate_level_with_one_dirty_is_unblock():
+    """2 盘关：只要不是两块都干净，wash 就进 L4。"""
+    t = _T("WashPlate")
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=1.0, plate_total=2)) == PL.L_UNBLOCK
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=2.0, plate_total=2,
+                              placed=True)) == PL.L_UNBLOCK
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=1.0, plate_total=3)) == PL.L_CLEANUP
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=0.0, plate_total=2)) == PL.L_CLEANUP

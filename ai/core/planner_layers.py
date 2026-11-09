@@ -60,8 +60,8 @@ LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
 
 
 def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
-                usable_plate_fn=None):
-    # type: (Callable, Callable, Callable, Optional[Callable]) -> Tuple
+                usable_plate_fn=None, plate_total_fn=None):
+    # type: (Callable, Callable, Callable, Optional[Callable], Optional[Callable]) -> Tuple
     """构造层序规则表。
 
     表可替换（重排 / 删条），谓词不可替换——谓词里的曲线是实测定标过的，
@@ -70,17 +70,23 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
 
     `usable_plate_fn`：是否已有可直接接料的盘（台面盘或干净盘堆顶层）。
     缺省退回 `placed_plates_fn`，保持旧调用点语义。
+    `plate_total_fn`：场上盘子总数（含池里/脏盘摞）。缺省 99 = 不启用
+    「2 盘关」特殊规则，旧调用/旧测试行为不变。
     """
     usable_plate_fn = usable_plate_fn or placed_plates_fn
+    plate_total_fn = plate_total_fn or (lambda w: 99)
     return (
         (L_FIRE,         lambda t, w: t.TYPE == "Extinguish"),
         (L_IRREVERSIBLE, lambda t, w: pressure_fn(t, w) >= PRESSURE_IRREVERSIBLE),
         (L_RESCUE,       lambda t, w: pressure_fn(t, w) >= PRESSURE_RESCUE),
         (L_REDEEM,       lambda t, w: t.TYPE == "DeliverPlate"),
         (L_UNBLOCK,      lambda t, w: (
+            # 2 盘关（3-5）：只要不是两块都干净就进 L4——另一块已经脏了，
+            # 等装配盘送完就断供。3 块盘以上仍用旧的「0 盘 + 无装配盘」守卫。
             (t.TYPE == "WashPlate"
-             and plate_pressure_fn(w) >= 2.0
-             and not placed_plates_fn(w))
+             and ((plate_total_fn(w) == 2 and plate_pressure_fn(w) > 0)
+                  or (plate_pressure_fn(w) >= 2.0
+                      and not placed_plates_fn(w))))
             # 已有可直接接料的盘（台面盘 / 干净盘堆顶层）时，摆盘不再是
             # 「解卡」：FetchToPlate 可以直接把料放上去，不该被 L4 结构性
             # 抢走（trace-20261108-225713 t=612：盘堆顶已匹配仍被逼着搬盘）。
@@ -99,8 +105,9 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
 
 
 def layer_of(task, world, pressure_fn=None, plate_pressure_fn=None,
-             placed_plates_fn=None, usable_plate_fn=None, rules=None):
-    # type: (Any, Any, Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable], Optional[Tuple]) -> int
+             placed_plates_fn=None, usable_plate_fn=None, plate_total_fn=None,
+             rules=None):
+    # type: (Any, Any, Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable], Optional[Callable], Optional[Tuple]) -> int
     """这个候选属于哪一层。遍历规则表取第一个命中，无命中则 L_CLEANUP。
 
     纯函数，**不读 bb**：策略覆盖由调用方决定传哪张 rules，层判定本身只认
@@ -108,9 +115,12 @@ def layer_of(task, world, pressure_fn=None, plate_pressure_fn=None,
     看起来是纯查询的函数（spec §5.1）。
     """
     if rules is None:
+        if plate_total_fn is None:
+            from ai.core.planner import _plate_total
+            plate_total_fn = _plate_total
         rules = build_rules(pressure_fn, plate_pressure_fn,
                             placed_plates_fn or (lambda w: False),
-                            usable_plate_fn)
+                            usable_plate_fn, plate_total_fn)
     for layer, pred in rules:
         if pred(task, world):
             return layer
@@ -127,10 +137,10 @@ def layer_of_task(task, world):
     开销可忽略，保持局部 import 最省心。
     """
     from ai.core.planner import (_placed_plates, _plate_pressure,
-                                 _time_pressure, _usable_plate)
+                                 _plate_total, _time_pressure, _usable_plate)
     return layer_of(task, world, rules=build_rules(
         _time_pressure, lambda w: _plate_pressure(w), _placed_plates,
-        _usable_plate))
+        _usable_plate, _plate_total))
 
 
 def layer_filter(candidates, world, layer_fn=None):

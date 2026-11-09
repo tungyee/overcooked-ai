@@ -21,7 +21,7 @@ from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.query.recipes import RecipeBook
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
 from ai.state.world import World
-from ai.space import reachability, shuttle
+from ai.space import reachability, shuttle, traffic
 
 # Plan 3 固定估计步数（spec §7.3.4）
 EST_FETCH, EST_CHOP, EST_COOK_OPS, EST_SERVE = 10, 20, 15, 5
@@ -1306,6 +1306,8 @@ def plan(world, bb, order, book):
 
     # ⓪.6 断供看门狗：玩家负责的 cook 长时间没人做时，本拍允许 P2 补位。
     _update_supply_watch(world, bb, book)
+    # ⓪.7 4-1 过街灯态：记录双灯都灭的起始拍（Approach 在路沿等它）。
+    traffic.observe(world, bb)
 
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
@@ -1395,6 +1397,7 @@ def plan(world, bb, order, book):
     in_layer = []       # type: List[Candidate]
     gate_waits = {}     # type: Dict[Any, float]
     rescue_order = None  # type: Optional[Any]
+    held_crossing = False  # 本拍是否因过街承诺保留旧 task
     if feasible:
         # ③.5 分层（spec §6）。分工偏好只参与同层打分，不改变业务层级：
         # 高层收尾动作即使由 P1 优先负责，仍留在最高层供 P2 必要时补位。
@@ -1439,6 +1442,11 @@ def plan(world, bb, order, book):
             # 惯性负责（spec §8）。当前承诺若落在低层，它不在 scored 里 →
             # 走 infeasible_streak 的 3 拍宽限再改选，白捡一个防抖。
             chosen_task = _apply_commitment_inertia(scored, world, bb)
+            # ⑤.5 过街承诺：已经走到马路上时不因“刚熟”换任务；火/快糊仍可抢。
+            crossing_task = _crossing_hold(world, bb, feasible, chosen_task)
+            if crossing_task is not None:
+                chosen_task = crossing_task
+                held_crossing = True
             score_map = {task.key: (score, terms)
                          for task, score, terms in scored}
             rescue_order = gate_orders.get(getattr(chosen_task, "key", None))
@@ -1475,6 +1483,8 @@ def plan(world, bb, order, book):
         record["gate_waits"] = {str(k): round(v, 1) for k, v in gate_waits.items()}
     if rescue_order is not None:
         record["rescue_override"] = rescue_order
+    if held_crossing:
+        record["crossing_hold"] = True
     # 本拍没再选抢回的那个 task（做完 / 不可行 / 被更高层抢走）→ 保护期结束。
     _finalize_rescue_hold(bb, chosen_task)
     return chosen_task, record
@@ -1685,6 +1695,33 @@ def _supply_starving(world, bb, book):
             if str(ing).lower() in wanted_l:
                 return True
     return False
+
+
+# 过街承诺：已经走到马路上时，除非有火/快糊（pressure >= 1.5），否则不换
+# 任务，先把这一趟走完。4-1 实机里跨街取鱼/海苔要 5~10 秒，期间“刚熟”
+# 的锅（pressure≈1.0）会把任务抢走，AI 走到对面又折返。
+CROSS_HOLD_PRESSURE = 1.5
+
+
+def _crossing_hold(world, bb, feasible, chosen_task):
+    # type: (World, Blackboard, List[Candidate], Optional[Any]) -> Optional[Any]
+    """正在过街时保持当前任务；有火/快糊才允许切走。"""
+    current = getattr(getattr(bb, "commitment", None), "active_task", None)
+    if current is None or chosen_task is None or _tasks_equal(chosen_task, current):
+        return None
+    chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME)
+    cur = P.chef_cell(chef, world.to_grid) if chef is not None else None
+    if cur is None or not traffic.in_road(world, cur):
+        return None
+    # 当前任务已不可行（目标消失/被拿）→ 不能硬保。
+    if not any(_tasks_equal(c.task, current) for c in feasible):
+        return None
+    # 灭火无条件放行；快糊（>=1.5）也放行；刚熟（1.0）不打断过街。
+    if getattr(chosen_task, "TYPE", None) == "Extinguish":
+        return None
+    if _time_pressure(chosen_task, world) >= CROSS_HOLD_PRESSURE:
+        return None
+    return current
 
 
 def _select_reposition(feasible, world, bb):

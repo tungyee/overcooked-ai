@@ -190,6 +190,8 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         "top_layer": record.get("top_layer"),
         # 断供补位看门狗：override=True 表示本拍 cook 负分被撤销。
         "supply": record.get("supply") or {},
+        # 4-1 过街：wait=路沿等灯/车，hold=过街承诺保住旧 task。
+        "traffic": record.get("traffic") or {},
         # planner 这一拍**原始**选的 task（字符串）。与 exec.task 可能不同：
         # agent ⑨.5 会把「后置条件已成立的旧树」接回去让它报完 SUCCESS。
         # 实机 trace-20261015-165358 t=2582~2718 的 WashPlate/FillCooker 2:1

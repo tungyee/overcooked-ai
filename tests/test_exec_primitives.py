@@ -281,3 +281,41 @@ def test_station_interact_cells_uses_reachable_hatch_side():
     # 规划层必须与执行层同口径，否则 can_interact 为真、Approach 必失败。
     ctx = {"w": w, "chef": {"name": "Player 2"}, "field": field}
     assert set(reachability._interact_goals(ctx, st)) == {(9, 2), (9, 3)}
+
+
+def test_approach_waits_at_curb_until_traffic_safe():
+    """4-1 过街：不安全时先走到路沿，不整段过街；灯灭满 3 秒才走。"""
+    class TrafficWorld(FakeWorld):
+        traffic_road = {"minx": -3.6, "maxx": 7.2, "minz": -5.0, "maxz": 5.0}
+        traffic_lights = [{"n": "l1", "on": False, "on_car_b": False}]
+        vehicles = []
+
+    target = {"t": "counter", "n": "target", "gx": 8, "gz": 1,
+              "x": 9.6, "z": 1.2}
+    w = TrafficWorld(walkable=lambda gx, gz: gz == 1 and -8 <= gx <= 8)
+    chef = {"name": "Player 2", "x": -9.6, "z": 1.2, "held": None}
+
+    ex = FakeExec()
+    ctx = make_ctx(w, chef, ex, start=(-8, 1))
+    bb = Blackboard()
+    bb.tick = 0
+    bb.traffic_off_since = None
+    ctx["bb"] = bb
+
+    ap = PR.Approach(lambda c: target, kind="pickup")
+    assert ap.tick(ctx) == Status.RUNNING
+    assert ex.issued[0]["cmd"] == "move"
+    # 路沿是第一个马路格 (-3,1) 的前一格 (-4,1) → 世界 (-4.8,1.2)。
+    assert ex.issued[0]["goal"] == [-4.8, 1.2]
+    # 到路沿只是这一段走完，不能报 SUCCESS（否则 InteractWith 会原地开按）。
+    ex.results.append(ex.ok_result(ex.issued[0]["cmd_id"]))
+    assert ap.tick(ctx) == Status.RUNNING
+
+    ex2 = FakeExec()
+    ctx2 = make_ctx(w, chef, ex2, start=(-8, 1))
+    ctx2["bb"] = bb
+    bb.tick = 60
+    bb.traffic_off_since = 0
+    ap2 = PR.Approach(lambda c: target, kind="pickup")
+    assert ap2.tick(ctx2) == Status.RUNNING
+    assert ex2.issued[0]["goal"] != [-4.8, 1.2]

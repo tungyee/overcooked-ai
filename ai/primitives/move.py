@@ -7,7 +7,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai.space import gaps, navigation, portals, seams, shuttle
+from ai.space import gaps, navigation, portals, seams, shuttle, traffic
 from ai.space import occupancy as O
 from ai.query import predicates as P
 from ai.query import placement
@@ -22,6 +22,8 @@ FACE_MAX_TICKS = 40
 
 # move 命令超时（毫秒）：委托后端下一趟走位最多 8 秒。
 MOVE_TIMEOUT_MS = 8000
+# 路沿等灯/车的上限（拍）：4-1 一个车灯周期约 20~25 秒，留 40 秒余量。
+TRAFFIC_WAIT_TICKS = 800
 
 
 def _nav_debug(msg):
@@ -137,12 +139,16 @@ class Approach(Primitive):
         self.allow_target = allow_target
         self._staging = False          # 渡运：在途的是去候车格的 move
         self._shuttle_wait_ticks = 0
+        self._traffic_wait_ticks = 0   # 4-1 路沿等灯/车
+        self._curb_cmd = False         # 在途的是「先走到路沿」的小段 move
 
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
         self._staging = False
         self._shuttle_wait_ticks = 0
+        self._traffic_wait_ticks = 0
+        self._curb_cmd = False
 
     def needs_reapproach(self, ctx):
         # type: (Dict) -> bool
@@ -198,6 +204,7 @@ class Approach(Primitive):
     def _tick_delegated(self, ctx, ex):
         # type: (Dict, Any) -> str
         """复用本地 goal/path 计算，把走位交给插件 move 命令。"""
+        ctx["traffic_wait"] = False
         w, chef = ctx["w"], ctx["chef"]
         st = resolve(self.target, ctx)
         if st is None:
@@ -257,7 +264,40 @@ class Approach(Primitive):
                        % (_nav_time(ctx), _nav_target(st), self.kind, cur, goal, goals))
             return Status.FAILURE
 
+        # 4-1 过街：只在**起步**前门控；已经在马路上时 safe_to_cross 恒 True，
+        # 不会半途停下。不安全就先走到路沿等，等双灯都灭满 3 秒再整段通过。
+        if self._pending_cmd is None and traffic.path_crosses_road(w, path) \
+                and not traffic.safe_to_cross(w, ctx.get("bb"), path, cur):
+            curb = traffic.curb_index(w, path)
+            info = traffic.state_text(w, ctx.get("bb"))
+            if curb is not None and cur != path[curb]:
+                wait_goal = path[curb]
+                _nav_debug("traffic curb t=%s target=%s kind=%s cur=%s curb=%s %s"
+                           % (_nav_time(ctx), _nav_target(st), self.kind,
+                              cur, wait_goal, info))
+                self._traffic_wait_ticks = 0
+                self._curb_cmd = True
+                cmd = _move_cmd(w, path[:curb + 1], field, ctx.get("bb"),
+                                list(w.to_world(*wait_goal)),
+                                handle_desc(st, target_grid_callbacks(w, st)[0]),
+                                self.kind, MOVE_TIMEOUT_MS)
+                return self._begin_exec(ctx, ex, cmd)
+            self._traffic_wait_ticks += 1
+            if self._traffic_wait_ticks > TRAFFIC_WAIT_TICKS:
+                self._traffic_wait_ticks = 0
+                _nav_debug("traffic wait timeout t=%s target=%s %s"
+                           % (_nav_time(ctx), _nav_target(st), info))
+                return Status.FAILURE
+            # 等外部（灯/车）不计入 task 的 200 拍超时预算。
+            ctx["external_wait"] = ctx.get("external_wait", 0) + 1
+            ctx["traffic_wait"] = True
+            _nav_debug("traffic wait t=%s target=%s kind=%s cur=%s %s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, info))
+            return Status.RUNNING
+
         if self._pending_cmd is None:
+            self._traffic_wait_ticks = 0
+            self._curb_cmd = False
             _nav_debug("move t=%s target=%s kind=%s cur=%s goal=%s goals=%s%s path=%s"
                        % (_nav_time(ctx), _nav_target(st), self.kind, cur, goal,
                           goals, _nav_crossing(w, path), _nav_path(path)))
@@ -265,7 +305,13 @@ class Approach(Primitive):
                             handle_desc(st, target_grid_callbacks(w, st)[0]), self.kind,
                             MOVE_TIMEOUT_MS)
             return self._begin_exec(ctx, ex, cmd)
-        return self._poll_exec(ctx, ex)
+        status = self._poll_exec(ctx, ex)
+        if self._curb_cmd:
+            if status != Status.RUNNING:
+                self._curb_cmd = False
+                # 到路沿不等于到目标：回去重新判灯，不能报 SUCCESS。
+                return Status.RUNNING if status == Status.SUCCESS else status
+        return status
 
     def _tick_shuttle(self, ctx, ex, st, shuttle_st):
         # type: (Dict, Any, Dict, Dict) -> str

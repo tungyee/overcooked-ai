@@ -1926,6 +1926,15 @@ class Agent:
                     if getattr(self.bb, "supply_idle_since", None) is not None
                     else None),
             },
+            # 4-1 过街：本拍是否在路沿等灯/车、是否因过街承诺保住了旧 task。
+            "traffic": {
+                "wait": bool(ctx.get("traffic_wait")),
+                "hold": bool(plan_record.get("crossing_hold")),
+                "off_ticks": (
+                    self.tick - self.bb.traffic_off_since
+                    if getattr(self.bb, "traffic_off_since", None) is not None
+                    else None),
+            },
             # 对话分支与截止闸抢单（spec §6.4）：分支是认领复盘的第一步，
             # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
             "branches": plan_record.get("branches") or {},

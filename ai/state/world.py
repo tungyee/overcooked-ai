@@ -180,6 +180,15 @@ class World(object):
         self.held_plates += _dicts(state.get("held_plates"))
         self.workstations = _dicts(state.get("workstations"))
 
+        # 4-1 过街状态：{road, lights[], cars[]}；旧插件/其它关卡为 None。
+        # road 是马路条带的格心范围；lights 的 on/on_car_b 对应两辆车是否发车。
+        traffic = state.get("traffic")
+        self.traffic = traffic if isinstance(traffic, dict) else {}
+        self.traffic_lights = _dicts(self.traffic.get("lights"))
+        self.vehicles = _dicts(self.traffic.get("cars"))
+        road = self.traffic.get("road")
+        self.traffic_road = road if isinstance(road, dict) else None
+
         # 这三类插件会报重复，构造时就去重（各自规则不同，见 occupancy）
         self.cookers = occupancy.dedupe_cookers(state.get("cookers"))
         deduped_items = occupancy.dedupe_items(state.get("items"))

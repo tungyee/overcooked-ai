@@ -59,6 +59,9 @@ def snapshot(world):
         "stations": [_copy(s) for s in (getattr(world, "stations", None) or [])],
         "recipes": [_recipe(r) for r in (getattr(world, "recipes", None) or [])],
         "map": _map(world),
+        # 4-1 过街状态（road/lights/cars）；其它关卡为 {}。离线复盘看灯/车
+        # 与 trace.traffic.wait/hold 必须能对上，所以原样落盘。
+        "traffic": getattr(world, "traffic", None) or {},
     }
 
 

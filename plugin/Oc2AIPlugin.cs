@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.5")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.6")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -75,7 +75,7 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.24.5 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.24.6 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             _trafficProbeEnabled = Config.Bind<bool>("Diagnostics", "TrafficProbe", true, "Log cars/traffic lights in Sushi_4_1 (diagnostic only).");
             BindWalkProbe();
@@ -1163,7 +1163,7 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.24.5\",\"protocol_version\":8,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.24.6\",\"protocol_version\":9,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))
@@ -1250,6 +1250,11 @@ namespace Oc2AI
             sb.Append(",\"hazards\":");
             AppendHazards(sb);
             seg.Append("hazards=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
+
+            // 4-1 过街：信号灯 + 车 + 马路条带（其它关卡 null）。
+            sb.Append(",\"traffic\":");
+            AppendTraffic(sb);
+            seg.Append("traffic=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"wind_zones\":");
             AppendWindZones(sb);

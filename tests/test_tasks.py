@@ -230,6 +230,7 @@ def test_package_facade_exports_base_names():
 RECIPES = [
     {"name": "Sushi_Cucumber", "comp":
         ["Seaweed", "BoiledSushiRice", "Cucumber"], "cook": "null"},
+    {"name": "Sushi_PlainFish", "comp": ["SushiFish"], "cook": "null"},
     {"name": "BoiledSushiRice", "comp": ["SushiRice"], "cook": "Pot"},
     {"name": "Seaweed", "comp": [], "cook": "null"},
     {"name": "Cucumber", "comp": [], "cook": "null"},
@@ -237,6 +238,8 @@ RECIPES = [
 ]
 ORDER = {"id": "1", "dish": "Sushi_Cucumber",
          "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"]}
+ORDER_PLAIN_FISH = {"id": "2", "dish": "Sushi_PlainFish",
+                    "composition": ["SushiFish"]}
 
 COUNTER = {"t": "counter", "n": "assembly", "gx": 7, "gz": 0,
            "x": 7 * 1.2, "z": 0.0}
@@ -1889,6 +1892,24 @@ def test_deliver_plate_infeasible_when_plate_incomplete():
                   plates=[plate("p1", 7, 0, ["Seaweed"])])
     ctx, _ = make_ctx(w)
     assert T.DeliverPlate("1", ("p1",)).feasible(ctx) is False
+
+
+def test_deliver_plate_infeasible_with_extra_ingredient():
+    """多一份料游戏不结算：missing 为空也要看盘里有没有多余内容。"""
+    w = FakeWorld(stations=[PLATE_STATION], recipes=RECIPES,
+                  orders=[ORDER_PLAIN_FISH],
+                  plates=[plate("p1", 7, 0,
+                                ["SushiFish", "CookedCompositeAssembledNode"])])
+    ctx, _ = make_ctx(w)
+    assert T.DeliverPlate("2", ("p1",)).feasible(ctx) is False
+
+
+def test_deliver_plate_feasible_for_exact_plain_fish():
+    w = FakeWorld(stations=[PLATE_STATION], recipes=RECIPES,
+                  orders=[ORDER_PLAIN_FISH],
+                  plates=[plate("p1", 7, 0, ["SushiFish"])])
+    ctx, _ = make_ctx(w)
+    assert T.DeliverPlate("2", ("p1",)).feasible(ctx) is True
 
 
 def test_deliver_plate_infeasible_when_order_gone():

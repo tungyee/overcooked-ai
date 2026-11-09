@@ -720,7 +720,7 @@ def _inst_deliver(node, ctx):
         pid = p.get("n")
         if not pid:
             continue
-        if ctx["book"].missing(ctx["order"], p) != ():
+        if not ctx["book"].matches(ctx["order"], p):
             continue
         if _claimed(pid, "deliver", ctx["bb"]):
             continue

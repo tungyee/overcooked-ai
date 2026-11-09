@@ -346,7 +346,7 @@ def _ready_plates(world, book, live_orders):
     for order in live_orders or ():
         for plate in getattr(world, "plates", None) or ():
             try:
-                if book is not None and book.missing(order, plate) == ():
+                if book is not None and book.matches(order, plate):
                     out.append("#%s %s" % (order.get("id"),
                                            order.get("dish")))
                     break

@@ -259,7 +259,7 @@ def plated_dish_sources(world, book, bb=None):
         if _side_of(world, near, far, p, bb) != "near":
             continue
         for order in world.orders:
-            if book.missing(order, p) == ():
+            if book.matches(order, p):
                 out.append((p, order))
                 break
     return out

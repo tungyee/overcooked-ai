@@ -274,7 +274,7 @@ class DeliverPlate(Task):
         order = self._order(ctx)
         if order is None:
             return False       # 订单没了 → 该走 ResetPlate
-        if ctx["book"].missing(order, p) != ():
+        if not ctx["book"].matches(order, p):
             return False
         # 出餐口全在对面时，本 task 走不过去；让 SendAcross(plated_dish)
         # 先送到共享台面。拓扑未知（无 field）保持旧行为。

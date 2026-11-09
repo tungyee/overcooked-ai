@@ -590,7 +590,7 @@ def _head_plate_ready(world, head_order):
     from ai.query.recipes import RecipeBook
     book = RecipeBook(world.recipes, world.stations)
     for p in world.plates:
-        if not book.missing(head_order, p):
+        if book.matches(head_order, p):
             return True
     return False
 

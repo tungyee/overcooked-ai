@@ -137,6 +137,26 @@ class RecipeBook(object):
         return tuple(ing for ing in self.requirements(order)
                      if not (self.want_tokens(ing) & have))
 
+    def matches(self, order, plate):
+        # type: (Optional[Dict], Optional[Dict]) -> bool
+        """盘是否**正好**是这一单的菜：不缺料，且没有多余盘内容。
+
+        `missing` 只回答"还缺什么"，多放的料不影响它；但游戏只在盘内容与
+        菜谱一致时结算。多放一份料（例如给 Sushi_PlainFish 加米饭）会被
+        出餐口吞掉、不涨分——4-1 实机 trace-20261109-231509 t≈61.5：
+        鱼+米饭被当成 Sushi_PlainFish 送出，deliveries/base 都没变。
+
+        `optional` 里的成分算允许项：游戏允许订单的可选配料。
+        """
+        if not order or not plate:
+            return False
+        if self.missing(order, plate) != ():
+            return False
+        allowed = self.order_want_tokens(order)
+        for ing in order.get("optional") or ():
+            allowed |= self.want_tokens(ing)
+        return self.plate_tokens(plate) <= allowed
+
     def missing_union(self, order, plates):
         # type: (Optional[Dict], List[Dict]) -> Tuple[str, ...]
         """多盘并集口径的 `missing`：还缺哪些顶层成分（盘合并用）。

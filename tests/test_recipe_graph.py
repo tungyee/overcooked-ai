@@ -306,3 +306,40 @@ def test_emit_plate_uses_non_held_empty_plate():
     )
     tasks = recipe_graph._emit_plate(w, Blackboard(), "order1")
     assert [t.TYPE for t in tasks] == ["PlaceCleanPlate"]
+
+
+# ---------- 出餐候选：盘内容必须与菜谱完全一致 ----------
+
+_PLAIN_FISH_RECIPES = [
+    {"name": "Sushi_PlainFish", "t": "CompositeOrderNode",
+     "comp": ["SushiFish"], "plate": "CompositeSushi"},
+    {"name": "SushiFish", "t": "IngredientOrderNode", "comp": [],
+     "plate": "CompositeSushi", "chop": "ChoppedSushiFish",
+     "chop_stages": 8, "chop_node": "SushiFish"},
+]
+
+
+def _plain_fish_world(plate_contents):
+    return _world(
+        orders=[{"id": "1", "dish": "Sushi_PlainFish",
+                 "composition": ["SushiFish"], "remaining": 60}],
+        recipes=_PLAIN_FISH_RECIPES,
+        stations=[],
+        plates=[{"n": "p1", "contents": plate_contents}],
+    )
+
+
+def test_deliver_plate_not_emitted_for_plate_with_extra_ingredient():
+    """鱼+米饭不是 Sushi_PlainFish：missing 为空也不能发 DeliverPlate。
+
+    4-1 实机 trace-20261109-231509 t≈61.5 就是这样把盘送进餐口，游戏不结算。
+    """
+    w = _plain_fish_world(["SushiFish", "CookedCompositeAssembledNode"])
+    book = RecipeBook(w.recipes, w.stations)
+    assert "DeliverPlate" not in _emit_types(w, book)
+
+
+def test_deliver_plate_emitted_for_exact_plate():
+    w = _plain_fish_world(["SushiFish"])
+    book = RecipeBook(w.recipes, w.stations)
+    assert "DeliverPlate" in _emit_types(w, book)

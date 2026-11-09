@@ -41,7 +41,7 @@ World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
 - **Planner**（`planner.py`）：纯函数步进器。`select_task(world, bb, order, book)` 走：
   生成候选（枚举所有订单，Plan 4 多订单模式）→ 可行性过滤（`claims_available` 前置 +
   `_is_abandoned` 拉黑检查 + 各 task 的 `feasible()`）→ **分层过滤（取最高层，见
-  `planner_layers.py`）** → 打分（该层白名单内的项）→ 承诺惯性（防抖 + 穿插）。
+  `planner_layers.py`）** → 打分（该层白名单内的项）→ 承诺惯性（防抖）。
   **无状态每拍重算**，执行顺序从可行性涌现，不建 DAG、不拓扑排序。层是派生值：
   高层动作不可达时该候选自然从 feasible 消失、层自己掉下来。
 - **Executor**（`executor.py`）：把 task 换成一棵小的 `bt` 行为树，每拍 tick 产出按键。task 身份（四元组，见 `tasks-primitives.md`）不变就复用同一棵树（进度自然保留），变了就 halt 旧树重建；每棵树包一层 `Timeout` 做最后兜底，默认 `MAX_TASK_TICKS=300` 拍，task 可用类属性 `TIMEOUT_TICKS` 声明自己的上限（灭火是两趟差事，用 `FIREFIGHT_TIMEOUT_TICKS=800`）。

@@ -108,7 +108,6 @@ class Blackboard:
     # 读它：篮子动时「目标在篮子上的 task」判不可行，避免选到必失败的候选。
     balloon_moving: bool = False
     blacklisted_resources: Dict[Any, int] = field(default_factory=dict)  # 拉黑资源 → 失效拍号
-    paused_task: Optional[Dict] = None  # 暂停的任务 {"task_id": str, "steps_done": int}
     # 投锅冷却：灶资源 id → 失效拍号。ThrowOntoStation 投偏/没对准后写，期间
     # 这口灶只走过去放、不再投。不进 scratch：scratch 随模式整体替换会丢。
     pot_throw_cooldown: Dict[Any, int] = field(default_factory=dict)

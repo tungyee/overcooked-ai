@@ -229,7 +229,6 @@ def test_soak_multi_order_600ticks(clean_trace):
         metrics = {
             "completed_orders": [],
             "burnt_dishes": 0,
-            "interleave_count": 0,
             "max_waiters": 0,
             "order_turnaround": {}
         }
@@ -265,7 +264,7 @@ def test_soak_with_fire_interrupt(clean_trace):
 
     验证：
       - 灭火时切换到 Firefighting 模式
-      - 承诺被中断（paused_task 或重新规划）
+      - 承诺被中断（灭火模式抢占）
       - 火灭后恢复 Normal 模式
 
     注意：此测试依赖灭火器和灶台的正确配置，可能因模拟状态不完整而失败。
@@ -359,10 +358,6 @@ def test_soak_p1_conflict_handling(clean_trace):
 
 def _collect_metrics(agent, world, metrics):
     """收集浸泡测试指标。"""
-    # 检测承诺穿插（paused_task 存在）
-    if hasattr(agent.bb, "paused_task") and agent.bb.paused_task:
-        metrics["interleave_count"] += 1
-
     # 记录 waiters 队列峰值
     for waiters_list in agent.bb.waiters.values():
         metrics["max_waiters"] = max(metrics["max_waiters"], len(waiters_list))
@@ -380,12 +375,9 @@ def _verify_soak_metrics(metrics):
     print(f"\n=== 浸泡测试指标 ===")
     print(f"完成订单数: {completed_count}")
     print(f"糊菜数量: {metrics['burnt_dishes']}")
-    print(f"承诺中断次数: {metrics['interleave_count']}")
     print(f"waiters 队列峰值: {metrics['max_waiters']}")
 
     # 验证
     assert completed_count >= 3, f"完成订单数 {completed_count} < 3"
     assert metrics["burnt_dishes"] == 0, f"糊菜数量 {metrics['burnt_dishes']} > 0"
     assert metrics["max_waiters"] <= 5, f"waiters 峰值 {metrics['max_waiters']} > 5"
-    # 注意：承诺中断需要实际实现了 paused_task 才能验证
-    # assert metrics["interleave_count"] >= 2, f"承诺中断次数 {metrics['interleave_count']} < 2"

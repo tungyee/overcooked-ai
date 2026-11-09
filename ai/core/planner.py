@@ -16,7 +16,7 @@ from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.query import stations as S
 from ai import tasks as T
-from ai.state.blackboard import Blackboard, Commitment
+from ai.state.blackboard import Blackboard
 from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
 from ai.query.recipes import RecipeBook
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
@@ -831,10 +831,6 @@ COMMITMENT_MARGIN = 2.0         # 改选门槛（分数差）
 PROGRESS_BONUS_PER_STEP = 1.0   # 每完成一步的进度加成
 INFEASIBLE_THRESHOLD = 3        # 连续多少拍不可行才放弃
 
-# Task 5: 承诺穿插常量
-INTERLEAVE_THRESHOLD = 5        # 剩余步数阈值（低于此值不允许穿插）
-INTERLEAVE_PENALTY = 3.0        # 穿插的额外分数门槛
-
 
 # ==================== 每拍 1:1 匹配（盘↔订单 / 灶↔订单）====================
 
@@ -1305,11 +1301,10 @@ def plan(world, bb, order, book):
     live_orders = _dialog_live_orders(world, bb)
 
     # ⓪.6 断供看门狗：**暂时停用**。override 撤销 cook 的 -6 认领负分后，
-    # 分差会瞬间越过承诺穿插阈值（COMMITMENT_MARGIN + INTERLEAVE_PENALTY =
-    # 5），而穿插/恢复是逐拍交替的 → P2 在两个任务间来回切，卡住不动
-    # （trace-20261110-000444 t=343 起 FillCooker ↔ FetchToPlate 1:1 交替，
-    # 角色在 (-5,-1)/(-4,-1) 间来回蹭）。等穿插逻辑修好再恢复这一行。
-    # 函数与相关测试保留，恢复时取消注释即可。
+    # P2 会从正在做的事（尤其手里拿着料、正要装盘）切走去补锅；先关掉观察。
+    # 此前它还会把分差推到穿插阈值以上，暴露逐拍交替；穿插逻辑已删除（切换
+    # 后重新打分），不再有那个问题。要恢复这条行为时取消注释即可。
+    # 函数与相关测试保留。
     # _update_supply_watch(world, bb, book)
     # ⓪.7 4-1 过街灯态：记录双灯都灭的起始拍（Approach 在路沿等它）。
     traffic.observe(world, bb)
@@ -2678,9 +2673,8 @@ def _apply_commitment_inertia(scored, world, bb):
     1. 进度加成：已完成的步数越多，改选门槛越高
     2. 不可行迟滞：连续 N 拍不可行才允许切换
 
-    Task 5 新增：承诺穿插（Commitment Interleaving）
-    3. 穿插条件：当前 task RUNNING、剩余步数 > INTERLEAVE_THRESHOLD、新 task 分数显著更高
-    4. 穿插时暂停当前 task 到 bb.paused_task，完成后恢复
+    改选后旧 task 不保留「暂停」状态；它仍参与正常打分，分数还高就会再次
+    被选中，分数被压低就自然不再回去。
 
     返回: 选中的 task（可能是当前承诺或新选择）
     """
@@ -2691,39 +2685,7 @@ def _apply_commitment_inertia(scored, world, bb):
     scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
     top_task, top_score, top_terms = scored_sorted[0]
 
-    # ① 优先恢复 paused_task（Task 5）。**穿插任务还在可行候选里时不能恢复**：
-    # 否则「穿插 → 下一拍恢复 → 再穿插」逐拍交替，Executor 每拍重建任务树、
-    # 角色原地来回晃（trace-20261110-001603 t=195 起 FillCarrier ↔
-    # FetchToPlate 1:1 交替，P2 在两格之间蹭）。穿插的本意是把高分任务做完，
-    # 所以只在穿插任务完成/失败（agent ⑬ 把 commitment 清空）或已不可行时恢复。
-    if bb.paused_task:
-        paused_task_id = bb.paused_task.get("task_id")
-        interleaving = (getattr(bb.commitment, "active_task", None)
-                        if bb.commitment is not None else None)
-        interleaving_live = (
-            interleaving is not None
-            and any(_tasks_equal(task, interleaving)
-                    for task, _score, _terms in scored))
-        if not interleaving_live:
-            # 查找 paused_task 是否在可行候选中
-            for task, score, terms in scored:
-                if task.key == paused_task_id:
-                    # 恢复暂停的任务，并保留暂停前的进度。bb.commitment 可能是 None：
-                    # 穿插的那个 task 刚在 agent.py ⑬ 成功/失败，commitment 被清成了
-                    # None（而非测试里模拟的 active_task=None），直接 .steps_done 会
-                    # AttributeError。这里先把 commitment 恢复成指向被暂停 task 的有效
-                    # 对象，再写回进度。
-                    if bb.commitment is None:
-                        bb.commitment = Commitment()
-                    bb.commitment.active_task = task
-                    bb.commitment.steps_done = bb.paused_task.get("steps_done", 0)
-                    bb.paused_task = None  # 清空 paused_task
-                    return task
-
-            # 如果 paused_task 不可行了，清空并继续正常流程
-            bb.paused_task = None
-
-    # ② 检查是否有当前承诺
+    # ① 检查是否有当前承诺
     if not bb.commitment or not bb.commitment.active_task:
         # 无承诺，选最高分
         return top_task
@@ -2766,32 +2728,15 @@ def _apply_commitment_inertia(scored, world, bb):
     bb.commitment.infeasible_streak = 0
     current_task_obj, current_score, current_terms = current_entry
 
-    # ⑤ Task 5: 检查是否允许穿插
-    est_steps = _estimate_task_steps(current_task_obj)
-    remaining_steps = est_steps - bb.commitment.steps_done
-
-    # 穿插条件判断
-    if (remaining_steps > INTERLEAVE_THRESHOLD and
-        _task_is_interruptible(current_task_obj) and
-        top_score - current_score > (COMMITMENT_MARGIN + INTERLEAVE_PENALTY)):
-
-        # 穿插：保存当前 task 到 paused_task
-        bb.paused_task = {
-            "task_id": current_task_obj.key,
-            "steps_done": bb.commitment.steps_done
-        }
-        return top_task  # 执行新任务
-
-    # ⑤.5 不可打断的 task 一律保持承诺（Discard = 倒掉还在烧的锅）。
-    # 这一条原先只写在上面的"穿插"分支里，而下面的**常规改选**分支没查——
-    # 于是分差够大时 Discard 照样会被普通备菜抢走，不可打断形同虚设。
-    # 以前分差很少够大（urgency 旧曲线在中段恒 ~0.1），所以没暴露；
-    # urgency 改读 slack 后中段能到 4+，这个洞立刻就会被踩到
-    # （tests/test_planner_multi.py::test_no_interleave_firefighting）。
+    # ⑤ 不可打断的 task 一律保持承诺（Discard = 倒掉还在烧的锅）。
+    # 常规改选分支必须查这一条：分差够大时 Discard 不能被普通备菜抢走
+    # （urgency 改读 slack 后中段能到 4+，不查立刻会被踩到；
+    # tests/test_planner_multi.py::test_non_interruptible_task_not_preempted）。
     if not _task_is_interruptible(current_task_obj):
         return current_task_obj
 
     # ⑥ 计算进度加成（常规承诺惯性）
+    est_steps = _estimate_task_steps(current_task_obj)
     progress_ratio = bb.commitment.steps_done / max(est_steps, 1.0)
     progress_bonus = progress_ratio * PROGRESS_BONUS_PER_STEP
     threshold = COMMITMENT_MARGIN + progress_bonus
@@ -2834,7 +2779,7 @@ def _estimate_task_steps(task):
 
 def _task_is_interruptible(task):
     # type: (Any) -> bool
-    """检查任务是否可被穿插打断（Task 5）。
+    """检查任务是否可被更高分候选抢占。
 
     某些任务不允许被打断：
     - Discard: 灭火/倒垃圾必须立即完成

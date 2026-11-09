@@ -11,9 +11,9 @@
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier）。`T.TASK_TYPES` 登记全部 24 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier / reposition）。`T.TASK_TYPES` 登记全部 25 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
-主线 20 个 task 类型（另两个 `ThrowBatch` / `FillCooker` 见表后）：
+主线 21 个 task 类型（另两个 `ThrowBatch` / `FillCooker` 见表后）：
 
 | 模块 | task |
 |---|---|
@@ -26,6 +26,7 @@
 | `mix.py` | `Mix` |
 | `relay.py` | `SendAcross`、`ThrowBatch` |
 | `carrier.py` | `FetchToCarrier`、`PlaceCarrierInCooker` |
+| `reposition.py` | `Reposition` |
 
 `SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道两种：渡运篮子（key = 渡运网格名）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。渡运通道留 1 格回程，静态通道不留。任务本身只做「拿起来 → 放到通道格」；四种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
 
@@ -37,6 +38,8 @@
 `planner.generate_candidates` 只遍历 `handover.send_requests()`；`wash` / `deliver` 命令的 scope 分别带上 `dirty_plate` / `plated_dish` 的送件。原 1-3 中转台 `PlaceToRelay` / `relay_cells_for` 已删，由它取代。
 
 `FetchToCarrier` / `PlaceCarrierInCooker`（`carrier.py`）：**可烹饪载体**（披萨饼 = 反编译 `CookablePreparationContainer`：可放料 + 自带 CookingHandler）。链 = 底料切成饼 → 配料放到饼上 → 料齐的饼整份放进站型对得上的空灶（烤箱）→ `TakeCookedToPlate` 端盘取 → 出餐。判据只读插件协议 8 的能力字段（`crate.chop_cookable` / `items[].cookable` / `cookers[].station_type`），旧帧没有就不发这条链。载体实例每拍按 `carriers.match_prep_carriers` 配给订单（P2 够得着的优先，其次料多的），task 身份只带载体形态名。
+
+`Reposition`（`reposition.py`）：**订单无关**的换边，只在布局换向的连通窗口里出现。3-3（帧里报 `Wizard_3_2_2P`）的中央料箱每 34 秒在竖列/横排之间切换，把厨房切成左右或上下两半，**全图只连通 2.0~3.4 秒**（实测 trace-20261109-011932）。目标由 `ai/space/zoning.py` 的 `ZoneTracker` 算好放进 `bb.reposition`：`safe` = 见过的所有布局里都属于你的格（两种切法都对），`goal` = 其中离你最近、且当前可达的一格。树只有 `GoToCell(goal, arrived=进 safe)`；`claims()` 为空、不认领、`NO_ABANDON`。它**不是按层竞争**的：planner 的「马上去」闸（`_select_reposition`）在 `bb.reposition` 非空时硬选它，但让位给 L0/L1/L2（火 / 快糊 / 刚熟救锅）。窗口一关主循环就清 `bb.reposition`，任务随之不可行，不反复重试。
 
 `ThrowBatch`（`relay.py`）：**订单无关**的投掷备料，把一种可投掷料投向下一站消费站（砧板/灶）。**当前一次只投一份**（`relay.MAX_BATCH_UNITS = 1`，暂不做批量）。两类触发：分割地图（消费站只有 P1 够得着，Rapids_2_1 木筏↔厨房）与连通但远（料到消费站 > `throw_supply.THROW_MIN_DIST`，开关 `ENABLE_FAR_THROW`，**当前关闭**：单份远投没有摊销、料落在锅旁还要再捡）。缺口 = 可见订单需求 + `THROW_EXTRA_UNITS` − 已越过这一站的 − 已在这一站任一消费站附近（含飞行中）的，再封顶到 `MAX_BATCH_UNITS`；每拍重算。树 = `Timeout(取 → WaitUntil(有出手位) → GoToCell(出手位) → ThrowTo(消费站), 单轮)`，投完 SUCCESS 交还 Planner，要不要投下一份每拍重新决定。拿着本批料、承诺中时不因单帧判据翻转放下（far/split 都适用，`_carrying_this_batch`）。打分 = 等价取料 task（FetchToBoard/FetchToCooker，绑最急的单）的分 + `_batch_bonus(N)`（N=1 时为 0），L6 备菜层。供需与出手位在 `ai/revenue/throw_supply.py`，落点几何在 `ai/space/throw.py`，分区在 `ai/space/regions.py`。
 

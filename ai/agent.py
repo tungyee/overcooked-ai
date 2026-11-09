@@ -29,7 +29,7 @@ from ai.dialog.policy import EventQueue
 from ai.dialog.schema import DialogState
 from ai.revenue import eta as ETA
 from ai.space import (navigation, portals, reachability, regions, seam_clock,
-                      seams, shuttle)
+                      seams, shuttle, zoning)
 from ai.state import p1model, reconcile
 from ai.output import state_dump, trace
 from ai.query import predicates as P
@@ -388,6 +388,11 @@ def _validate_action(kitchen, action, direction, world, bb):
 DIVISION_CHECK_TICKS = 20
 DIVISION_CONFIRM = 2
 DIVISION_REVIEW_COOLDOWN_TICKS = 20 * 8
+# 换布局复核的冷却：布局本身 34 秒才换一次，冷却只需够挡住转场动画里的
+# 抖动（实测窗口 2.0~3.4 秒，确认 2 次已够）。
+ZONE_REVIEW_COOLDOWN_TICKS = 20 * 3
+# 换边目标的兜底寿命（拍）：实测连通窗口最长 3.4 秒，留一倍余量。
+REPOSITION_TICKS = 20 * 7
 
 
 def _min_interact_cost(world, bb, name, stations):
@@ -444,6 +449,45 @@ def _ranked_tasks(plan_record):
         seen.add(text)
         out.append(task)
     return out
+
+
+def _zone_key(report):
+    # type: (Any) -> Any
+    """换布局复核的判据：只看「该谁去哪半边」。
+
+    不用连通块的原始签名（格数/中心）：转场收尾时边界会差一两格（36 格变
+    35 格），签名每变一次就重发一条复核。角色目标没变的布局抖动不算变化。
+    """
+    if report is None:
+        return None
+    # 不含 labels 本身：它的顺序跟着连通块排序走，少一格就会翻（['上','下']
+    # 变 ['下','上']），那不是「换布局」。
+    return (report.district, report.p2_label, report.p1_label)
+
+
+def _zone_record(report):
+    # type: (Any) -> Optional[Dict]
+    """区域判定的 trace 摘要（谁站错半边是可复盘的关键信号）。"""
+    if report is None:
+        return None
+    return {
+        "district": report.district,
+        "open": bool(report.open),
+        "labels": list(report.labels),
+        "you": [report.p2_current, report.p2_label],
+        "player": [report.p1_current, report.p1_label],
+        "wrong": [bool(report.p2_wrong), bool(report.p1_wrong)],
+        "safe": [len(report.safe_p2), len(report.safe_p1)],
+    }
+
+
+def _reposition_record(intent):
+    # type: (Any) -> Optional[Dict]
+    """换边目标的 trace 摘要。"""
+    if intent is None:
+        return None
+    return {"goal": list(intent.goal), "safe": len(intent.safe),
+            "until": intent.until_tick}
 
 
 def _stuck_info(bb, world, motion=None):
@@ -557,6 +601,11 @@ class Agent:
         self._division_last_review_tick = 0
         self._division_last_check_tick = 0
         self._division_initial_fired = False
+        # 区域复核（换布局）：连通块目标区 + 换边目标。
+        self._zones = zoning.ZoneTracker()
+        self._zone_sig = None
+        self._zone_pending = 0
+        self._zone_last_review_tick = 0
         # 临时命令队列（新工具协议）：planner 只跑当前命令的 scope。
         self.commands = CommandQueue()
         self._last_command_result = None
@@ -1083,11 +1132,16 @@ class Agent:
         """换关/首次观察：清空分工与复核状态。"""
         self.bb.division = self.bb.division.__class__()
         self.bb.preferences[:] = []
+        self.bb.reposition = None
         self._division_station_sig = None
         self._division_pending = 0
         self._division_last_review_tick = 0
         self._division_last_check_tick = 0
         self._division_initial_fired = False
+        self._zones.reset()
+        self._zone_sig = None
+        self._zone_pending = 0
+        self._zone_last_review_tick = 0
 
     def _division_facts(self, world):
         # type: (World) -> str
@@ -1119,21 +1173,37 @@ class Agent:
 
     def _update_division(self, world, events, tick):
         # type: (World, list, int) -> None
-        """开局分工 + 动态复核；只在站点拓扑变化时叫 LLM。
+        """开局分工 + 动态复核；只在必要时叫 LLM。
 
-        转盘/梯子这类纯路径变化不算：可达性对 3-3 的旋转桌并不准（
-        左半场在单网格寻路之外），用它去改分工会把「能装盘」误报成
-        「够不着」。站点位置真的变了（平台把站点带走/永久换边）才复核。
+        两级复核：
+
+        - **站点搬家**（平台把站点带走/永久换边）→ `division_review`，模型
+          可以改分工；
+        - **布局换边**（3-3 的料箱竖列/横排切换）→ `layout_review`，站点没动，
+          分工不用改，只提醒站在错半边的人；同时给窗口里的换边布置目标。
+
+        转盘/梯子这类纯路径变化不算：单网格寻路对 3-3 的旋转桌并不准，用它
+        去改分工会把「能装盘」误报成「够不着」。
         """
         if not self._division_initial_fired:
             self._division_initial_fired = True
             self._division_station_sig = station_signature(world)
             self._division_last_check_tick = tick
+            # 开局先把第一套布局记下来（不发复核），换边时才有历史可比。
+            report = self._zones.observe(world, self.bb.division)
+            self.bb.zones = report
+            self._zone_sig = _zone_key(report)
             events.append(("division", {"facts": self._division_facts(world)}))
             return
         if tick - self._division_last_check_tick < DIVISION_CHECK_TICKS:
             return
         self._division_last_check_tick = tick
+        self._station_review(world, events, tick)
+        self._zone_review(world, events, tick)
+
+    def _station_review(self, world, events, tick):
+        # type: (World, list, int) -> None
+        """站点位置真的变了才复核（平台把站点带走 / 关卡永久换边）。"""
         station_sig = station_signature(world)
         if station_sig == self._division_station_sig:
             self._division_pending = 0
@@ -1153,6 +1223,76 @@ class Agent:
             "current": self.bb.division.render() or "（空）",
             "station_moved": True,
         }))
+
+    def _zone_review(self, world, events, tick):
+        # type: (World, list, int) -> None
+        """布局换边复核：谁站错了半边，窗口里给换边布置目标。
+
+        3-3 实测：料箱每 34 秒换一次切法（左右 ↔ 上下），全图只连通
+        2.0~3.4 秒。窗口打开时先把自己挪进「两种布局都算对」的格；布局稳定
+        后再看谁站错了——站错就是被隔开，只剩改分工一条路。
+        """
+        report = self._zones.observe(world, self.bb.division)
+        self.bb.zones = report
+        if report.open:
+            self._arm_reposition(world, report, tick)
+            return
+        # 窗口关掉：换边的截止到了（没走到的这一版就不追了，等下一次）。
+        if self.bb.reposition is not None:
+            self.bb.reposition = None
+            log.info("换边窗口关闭，撤销换边目标")
+        sig = _zone_key(report)
+        if sig == self._zone_sig:
+            self._zone_pending = 0
+            return
+        self._zone_pending += 1
+        if self._zone_pending < DIVISION_CONFIRM:
+            return
+        # 先认下这套布局：冷却只压事件、不压签名。否则冷却期内被拦下的事件
+        # 会在冷却到期后当成「又变了一次」重发（真机上 240 秒发了 14 条）。
+        self._zone_pending = 0
+        self._zone_sig = sig
+        if tick - self._zone_last_review_tick < ZONE_REVIEW_COOLDOWN_TICKS:
+            return
+        self._zone_last_review_tick = tick
+        if not (report.p1_wrong or report.p2_wrong):
+            return
+        events.append(("layout_review", {
+            "facts": report.facts(),
+            "you_wrong": bool(report.p2_wrong),
+            "player_wrong": bool(report.p1_wrong),
+            "district": report.district,
+            "labels": list(report.labels),
+        }))
+
+    def _arm_reposition(self, world, report, tick):
+        # type: (World, Any, int) -> None
+        """窗口打开：算出安全格里最近的一格，交给 `Reposition` task。"""
+        if self.bb.reposition is not None:
+            return                      # 已经在窗口里，保留建树时定下的目标
+        safe = report.safe_p2
+        if not safe:
+            return                      # 还没见过布局，不动比乱走好
+        chef = P.chef_by_name(world.chefs, P.P2_NAME)
+        cell = P.chef_cell(chef, world.to_grid)
+        if cell is None:
+            return                      # 还没看到自己的位置：不猜
+        if cell in safe:
+            return                      # 已经在安全区，把窗口留给正常任务
+        field = navigation.distance_field(cell, world.walkable, world.belt_dir)
+        best = None  # type: Optional[Tuple[int, Tuple[int, int]]]
+        for candidate in safe:
+            dist = field.get(candidate)
+            if dist is None:
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, candidate)
+        if best is None:
+            return                      # 目标此刻够不着：不硬穿走廊
+        self.bb.reposition = zoning.RepositionGoal(
+            goal=best[1], safe=safe, until_tick=tick + REPOSITION_TICKS)
+        log.info("换边：目标 %s（距离 %s 拍），安全格 %s 个",
+                 best[1], best[0], len(safe))
 
     def _dialog_matches(self, world, book):
         # type: (World, RecipeBook) -> Tuple[list, Dict, Dict]
@@ -1368,6 +1508,11 @@ class Agent:
         """
         record = {"batches": [], "event": None, "commands": []}
         if self.dialog_worker is None:
+            # 没有对话层（未开语音 / key 缺失）也要复核区域并换边：3-3 错过
+            # 连通窗口要等 31 秒，这跟有没有人说话无关。事件投进丢弃列表，
+            # 没人可提醒。
+            self._maybe_reset_dialog_level(world)
+            self._update_division(world, [], self.bb.tick or 0)
             return record
 
         self._maybe_reset_dialog_level(world)
@@ -1436,6 +1581,8 @@ class Agent:
             record["event"] = events[-1] if len(events) == 1 else events
         record["commands"] = self.commands.snapshot()
         record["division"] = self.bb.division.snapshot()
+        record["zones"] = _zone_record(self.bb.zones)
+        record["reposition"] = _reposition_record(self.bb.reposition)
         return record
 
     def _put_ack(self, ack):

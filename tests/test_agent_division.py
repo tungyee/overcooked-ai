@@ -260,3 +260,180 @@ def test_command_result_does_not_wake_llm(agent, worker):
     agent._service_commands(world)
     assert worker.events == []
     assert agent._last_command_result["status"] == "failed"
+
+
+# ---------- 换布局：区域复核 / 换边 ----------
+
+def make_split_world(kind="lr", p2=(1, 1), p1=(1, 3)):
+    """切开的两半厨房：`lr` 左右切、`ud` 上下切、`open` 全连通（换布局窗口）。
+
+    站点全程不动（3-3 的真实情况：只有料箱在转），所以三种布局共用同一组
+    站点：砧板在上、灶和水槽在下。左右切时 P1（灶+水槽）待左半、你（砧板）
+    避开左半去右半；上下切时 P1 待下半、你去上半。
+    """
+    world = make_world(level="Wizard_3_2_2P")
+    if kind == "lr":
+        blocked = {(5, gz) for gz in range(6)}
+    elif kind == "ud":
+        blocked = {(gx, 3) for gx in range(11)}
+    else:
+        blocked = set()
+    cells = {(gx, gz) for gx in range(11) for gz in range(6)} - blocked
+    world.walkable = lambda gx, gz: (gx, gz) in cells
+    world.to_grid = lambda x, z: (int(round(x)), int(round(z)))
+    world.stations = [
+        {"t": "chopping", "n": "boardL", "gx": 1, "gz": 6},
+        {"t": "chopping", "n": "boardR", "gx": 7, "gz": 6},
+        {"t": "cooking", "n": "ovenL", "gx": 1, "gz": -1},
+        {"t": "washing", "n": "sink", "gx": -1, "gz": 1},
+    ]
+    for chef in world.chefs:
+        cell = p2 if chef["name"] == "Player 2" else p1
+        chef["x"], chef["z"] = float(cell[0]), float(cell[1])
+    return world
+
+
+def _settle(agent, world, times=3):
+    for _ in range(times):
+        agent.bb.tick += 20
+        agent._service_dialog(world)
+
+
+def test_layout_review_fires_when_player_on_wrong_side(agent, worker):
+    world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)            # 开局：只发 division
+    worker.events.clear()
+    _settle(agent, world)
+    assert worker.events == []              # 布局没变，不复核
+
+    world = make_split_world("ud", p2=(7, 5), p1=(7, 5))
+    agent.bb.tick += 20
+    agent._service_dialog(world)
+    agent.bb.tick += 20
+    agent._service_dialog(world)
+    names = [event[0] for event in worker.events]
+    assert names == ["layout_review"]
+    payload = worker.events[0][1]
+    assert payload["player_wrong"] is True
+    assert payload["you_wrong"] is False
+    assert "下" in payload["facts"]
+
+
+def test_layout_review_silent_when_both_in_place(agent, worker):
+    world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)
+    _settle(agent, world)
+    worker.events.clear()
+
+    world = make_split_world("ud", p2=(7, 5), p1=(1, 1))
+    _settle(agent, world)
+    assert worker.events == []
+
+
+def test_layout_review_only_on_change(agent, worker):
+    """布局没变就不再发（每 34 秒一次，不是每秒一次）。"""
+    world = make_split_world(p2=(7, 1), p1=(7, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)
+    _settle(agent, world)
+    worker.events.clear()
+    _settle(agent, world)
+    assert worker.events == []
+
+
+def test_reposition_armed_when_map_opens(agent, worker):
+    """转场窗口打开 → 布置换边目标，且目标落在两种布局都算对的格里。"""
+    lr = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(lr.recipes, lr.stations)
+    agent._service_dialog(lr)
+    _settle(agent, lr)                      # 记下左右布局
+    ud = make_split_world("ud", p2=(7, 1), p1=(1, 1))
+    _settle(agent, ud)                      # 记下上下布局
+    assert agent.bb.reposition is None
+
+    opened = make_split_world("open", p2=(7, 1), p1=(1, 1))
+    agent.bb.tick += 20
+    agent._service_dialog(opened)
+
+    intent = agent.bb.reposition
+    assert intent is not None
+    assert intent.goal in intent.safe
+    # 两种布局都算对的是右上角（左右切在右、上下切在上）
+    assert (7, 5) in intent.safe
+    assert (1, 5) not in intent.safe
+
+
+def test_reposition_cleared_when_window_closes(agent, worker):
+    lr = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(lr.recipes, lr.stations)
+    agent._service_dialog(lr)
+    _settle(agent, lr)
+    ud = make_split_world("ud", p2=(7, 1), p1=(1, 1))
+    _settle(agent, ud)
+
+    opened = make_split_world("open", p2=(7, 1), p1=(1, 1))
+    agent.bb.tick += 20
+    agent._service_dialog(opened)
+    assert agent.bb.reposition is not None
+
+    closed = make_split_world("ud", p2=(7, 5), p1=(1, 1))
+    agent.bb.tick += 20
+    agent._service_dialog(closed)
+    assert agent.bb.reposition is None
+
+
+def test_service_record_exposes_zones(agent):
+    world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    agent.book = RecipeBook(world.recipes, world.stations)
+    record = agent._service_dialog(world)
+    assert record["zones"]["district"] == "LR"
+    assert record["zones"]["labels"] == ["左", "右"]
+    assert record["reposition"] is None
+
+
+def test_reposition_runs_without_dialog_worker(agent, monkeypatch):
+    """没开语音（对话层缺席）也要换边：窗口不等人。"""
+    quiet = Agent(dialog_worker=None, exec_client=MagicMock())
+
+    def feed(world):
+        quiet._service_dialog(world)
+
+    lr = make_split_world("lr", p2=(7, 1), p1=(1, 1))
+    feed(lr)
+    quiet.bb.tick += 20
+    feed(lr)
+    quiet.bb.tick += 20
+    feed(lr)
+    ud = make_split_world("ud", p2=(7, 1), p1=(1, 1))
+    quiet.bb.tick += 20
+    feed(ud)
+    quiet.bb.tick += 20
+    feed(ud)
+    assert quiet.bb.reposition is None
+
+    opened = make_split_world("open", p2=(7, 1), p1=(1, 1))
+    quiet.bb.tick += 20
+    feed(opened)
+    assert quiet.bb.reposition is not None
+
+
+def test_layout_review_not_repeated_by_region_jitter(agent, worker):
+    """同一种切法边界差一两格不算换布局（真机 240 秒曾发过 14 条）。"""
+    lr = make_split_world("lr", p2=(7, 1), p1=(7, 1))
+    agent.book = RecipeBook(lr.recipes, lr.stations)
+    agent._service_dialog(lr)
+    worker.events.clear()
+
+    ud = make_split_world("ud", p2=(7, 5), p1=(7, 5))
+    _settle(agent, ud)
+    assert [e[0] for e in worker.events] == ["layout_review"]
+    worker.events.clear()
+
+    # 少一格可走格：连通块大小变了，但两个角色该待的半边没变
+    jittered = make_split_world("ud", p2=(7, 5), p1=(7, 5))
+    inner = jittered.walkable
+    jittered.walkable = lambda gx, gz: inner(gx, gz) and (gx, gz) != (0, 0)
+    _settle(agent, jittered)
+    assert worker.events == []

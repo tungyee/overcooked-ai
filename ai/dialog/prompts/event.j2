@@ -11,6 +11,8 @@
 事件：本关开始。按攻略和站位，用 set_division 定下分工，再调用 speak 工具说一句；不念内部名词。
 {% elif event == "division_review" %}
 事件：地图变了。需要改分工就调用 set_division 再调用 speak 工具；不需要改就什么都不要调用，保持安静。
+{% elif event == "layout_review" %}
+事件：中间的路换方向了，厨房被切成另外两半。分工不用改就不要调用 set_division；只有你被隔在另一边、够不着自己的站点时才改分工。要提醒玩家换到哪半边就调用 speak 工具，一两句大白话，不念坐标和内部代号。
 {% elif event == "checkin" %}
 按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊；调用 speak 工具说出来。
 {% elif event == "batch" %}

@@ -228,7 +228,8 @@ def state_message(event, context, new_dishes_dag="", event_detail="",
     if event == "new_order" and new_dishes_dag:
         parts.append("【新菜】\n" + new_dishes_dag)
     if event in ("speech", "command_result", "last_seconds", "round_summary",
-                 "checkin", "batch", "division", "division_review"):
+                 "checkin", "batch", "division", "division_review",
+                 "layout_review"):
         event_text = prompts.render_event(event, event_detail, failed=failed)
         if event_text.strip():
             parts.append(event_text)

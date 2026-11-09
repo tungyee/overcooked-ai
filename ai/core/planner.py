@@ -116,6 +116,12 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     # 与订单无关的清理 / 回收 / 待命 task（第 2/5/6/11/12/13/14/15 号）
     candidates.extend(_gen_misc(world, bb, book, chef, hands_empty))
 
+    # 换布局：窗口打开时把自己挪进「两种布局都算对」的格。不接订单、不认领，
+    # 由「马上去」闸硬选（见 _select_reposition），普通打分排在 L_PREP 里。
+    if getattr(bb, "reposition", None) is not None:
+        candidates.append(Candidate(T.Reposition(), [], EST_FETCH,
+                                    branch=branch_of_task(T.Reposition(), book)))
+
     # 当前承诺的 task 必须留在候选里：手持状态是 ETA 惩罚而非硬否决
     # （spec §6.1 选 (b)），所以"拿着料去装盘"这类 task 会被上面的
     # hands_empty 门挡掉。不重新加入，正在执行的任务就会被 Planner 自己
@@ -1595,11 +1601,31 @@ def _claim_penalty(candidate, bb, layer):
                if getattr(pref, "kind", None) == "claim" and weight < 0)
 
 
+def _select_reposition(feasible, world, bb):
+    # type: (List[Candidate], World, Blackboard) -> Optional[Candidate]
+    """换边闸：布局窗口里先把腿走进安全区。
+
+    `bb.reposition` 由主循环在「全图刚连通」那一帧布置（`ai/space/zoning.py`）。
+    和 now 闸同样的让位规则：有 L0/L1/L2（火 / 快糊 / 刚熟救锅）就交给正常
+    分层路径——那口锅的倒计时不可压缩，而换边还有 2~3 秒窗口。
+    """
+    if getattr(bb, "reposition", None) is None:
+        return None
+    from ai.core.planner_layers import layer_of_task
+    for cand in feasible:
+        if layer_of_task(cand.task, world) in (0, 1, 2):
+            return None
+    for cand in feasible:
+        if cand.task.TYPE == "Reposition":
+            return cand
+    return None
+
+
 def _select_imperative(feasible, world, bb):
     # type: (List[Candidate], World, Blackboard) -> Optional[Candidate]
     """「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中候选。
 
-    找未过期的 now 偏好；没有则返回 None。任一 feasible 候选落在
+    找未过期的 now 偏好；没有则交给换边闸。任一 feasible 候选落在
     L0/L1/L2（火 / 快糊 / 刚熟救锅）→ 让位返回 None，交给正常分层路径；
     否则返回第一个命中 now scope 的 feasible 候选（feasible 顺序即链的
     下一步）。
@@ -1613,7 +1639,7 @@ def _select_imperative(feasible, world, bb):
                  and (not getattr(p, "expires_tick", 0)
                       or tick < getattr(p, "expires_tick", 0))]
     if not now_prefs:
-        return None
+        return _select_reposition(feasible, world, bb)
     # 「马上去」已经认下：把它**钉住**，别让普通打分（送餐等更高分任务）抢走。
     # 否则 now 任务每拍被更高分候选顶掉、永远做不成——trace-20261021-145504 的
     # 1-6 段正是 FetchToBoard(Cucumber)↔DeliverPlate 逐拍交替、角色在 (0,-3)↔(1,-3)
@@ -1634,7 +1660,8 @@ def _select_imperative(feasible, world, bb):
         for pref in now_prefs:
             if preference_matches_task(pref, cand.task):
                 return cand
-    return None
+    # now 没命中（偏好已过期 / 作用域对不上）时，换边仍然该走。
+    return _select_reposition(feasible, world, bb)
 
 
 # ---------- 截止闸与分工补位（spec §4.6）----------

@@ -2393,6 +2393,7 @@ def test_all_spec_tasks_are_registered():
         "FetchToCarrier", "PlaceCarrierInCooker",             # 22, 23（可烹饪载体：披萨）
         "FillCarrier",                                        # wrap 载体（卷饼直接装熟料）
         "MergePlates",                                        # 盘合并（spec 2026-11-01-plate-merge-design）
+        "Reposition",                                         # 换布局时走进安全区
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

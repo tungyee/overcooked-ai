@@ -128,7 +128,7 @@ def event_priority(event):
         return 0 if isinstance(payload, dict) and payload.get("status") == "failed" else 2
     if name in ("last_seconds", "round_summary"):
         return 2
-    if name in ("checkin", "division", "division_review"):
+    if name in ("checkin", "division", "division_review", "layout_review"):
         return 3
     if name == "batch":
         return 3

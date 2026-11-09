@@ -411,11 +411,14 @@ _SPEAK_TAG_RE = re.compile(r"<speak>\s*(.*?)\s*</speak>", re.S)
 _SPEAK_TAG_EVENTS = frozenset((
     "last_seconds", "round_summary", "checkin", "batch",
     "command_result", "new_order", "division", "division_review",
+    "layout_review",
 ))
 # 纯闲聊/播报回合：模型忘了调 speak 时，content 直接兜底念出来。
 # 分工/复核不在此列：没调 set_division 就不能先念一个没落地的分工。
 _CONTENT_FALLBACK_EVENTS = frozenset((
     "speech", "checkin", "last_seconds", "round_summary", "batch",
+    # 换布局只在有人站错半边时才发，本来就是「必须说一句」的事件。
+    "layout_review",
 ))
 
 
@@ -454,6 +457,8 @@ def _event_detail(name, payload):
         facts = payload.get("facts") or ""
         current = payload.get("current") or ""
         return "变化：%s 当前分工：%s" % (facts, current or "（空）")
+    if name == "layout_review":
+        return payload.get("facts") or ""
     return ""
 
 
@@ -1255,7 +1260,11 @@ class DialogWorker(object):
             detail = "\n".join(_event_detail(n, p) for n, p in (payload or []))
             failed = any(isinstance(p, dict) and p.get("status") == "failed"
                          for _n, p in (payload or []))
-            silent = any(n == "division_review" for n, _p in (payload or []))
+            # 只有「改分工」类的事件才需要压着声音等落地；和换布局复核
+            # 合在一批时不压——换布局本来就是让人开口的。
+            names = {n for n, _p in (payload or [])}
+            silent = ("division_review" in names
+                      and "layout_review" not in names)
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
@@ -1263,7 +1272,7 @@ class DialogWorker(object):
                           event_detail=detail, failed=failed,
                           silent_review=silent)
             return
-        if name in ("division", "division_review"):
+        if name in ("division", "division_review", "layout_review"):
             detail = _event_detail(name, payload)
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,

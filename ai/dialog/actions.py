@@ -38,6 +38,9 @@ FETCH_TASK_TYPES = ("FetchToBoard", "FetchToCarrier", "FillCarrier",
 OTHER_TASK_TYPES = (
     "ReturnPot", "RescueCooked", "MergePlates", "SendAcross", "ThrowBatch",
     "Discard", "RecoverLoosePot", "StashHeld", "ResetPlate", "Extinguish",
+    # 换边：布局窗口里把自己挪到两种布局都对的格，不产生菜品、不认领，
+    # 不该出现在分工枚举里。
+    "Reposition",
 )  # type: Tuple[str, ...]
 
 # 每个可分工动作绑定的站点类型（frame stations[].t），供「判」做粗粒度校验

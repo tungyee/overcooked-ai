@@ -132,6 +132,10 @@ class Blackboard:
     rescue_cooldown_until: int = 0
     # 对话层临时命令：hold_until 之前 planner 不选任务（cancel_action 后停手）。
     hold_until: int = 0
+    # 换布局时的换边目标（ai/space/zoning.RepositionGoal）；None = 不在窗口里。
+    reposition: Any = None
+    # 最近一帧的区域判定（ai/space/zoning.ZoneReport），给复核事件/trace 用。
+    zones: Any = None
     # 当前命令的 task scope / id；planner 只在这个 scope 内选任务。
     command_scope: Any = None
     command_id: Optional[str] = None

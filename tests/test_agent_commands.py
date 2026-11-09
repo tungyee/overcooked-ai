@@ -361,3 +361,28 @@ def test_execute_actions_allowed_on_player_speech(agent, world):
     out = agent._apply_duty_batch(world, batch)[0]
     assert out["ok"] is True
     assert len(agent.commands.commands) == 1
+
+
+def test_command_without_done_signal_finishes_after_one_task(agent, world):
+    """判不出完成条件的命令（target 是菜名）做过一次就收工。
+
+    实机 trace-20261109-124818：`execute_actions([{action:"chop"}])` 不带
+    target，最后落在「给这道菜切所有料」的 dish scope，target=菜名 →
+    `chop_target(菜名)` 是 None → command_done 永远 False，命令占着执行槽
+    212/240 秒，planner 被锁在备料里，披萨组装不起来。
+    """
+    from ai.dialog.commands import command_done_undecidable
+
+    scope = frozenset({("Chop", None)})
+    agent.commands.add("chop", None, scope, 100)
+    cmd = agent.commands.active()
+    assert command_done_undecidable(cmd, agent.book) is True
+
+    # 还没做过任何事：不能凭空成功
+    agent._service_commands(world)
+    assert cmd.status == "running"
+
+    # 成功做过一次本 scope 的任务之后，这一拍收尾
+    cmd.served = True
+    agent._service_commands(world)
+    assert cmd.status == "succeeded"

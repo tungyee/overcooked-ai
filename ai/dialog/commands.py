@@ -340,6 +340,8 @@ class Command:
     start_dirty: int = 0
     attempts: int = 0
     reason: str = ""
+    # 是否有过一次命中本命令 scope 的成功任务（给「判不出完成条件」的命令收尾）。
+    served: bool = False
 
     @property
     def label(self):
@@ -793,6 +795,27 @@ def command_failed(world, book, command):
         if not _target_needed(world, book, command):
             return "这单已经不需要了"
     return ""
+
+
+def command_done_undecidable(command, book):
+    # type: (Command, Any) -> bool
+    """这条命令是否**判不出**完成条件。
+
+    典型是 `execute_actions([{action:"chop"}])` 不带 target：最终会把 scope 落成
+    「这道菜要切的所有料」、target 却是菜名（实机 trace-20261109-124818
+    04:49:12 → `chop`，target=PeperoniPizza）。`command_done` 对 chop 拿
+    `book.chop_target(菜名)` → None → 永远 False，命令一直占着执行槽，
+    planner 被限制在备料 scope 里 212/240 秒，披萨组装不起来、两个灶全程空转。
+
+    这类命令按「做过一次就收工」处理（见 `Agent._service_commands`）。
+    """
+    action = str(command.action or "")
+    target = command.done_item or command.target
+    if action == "chop":
+        return not target or not (book and book.chop_target(target))
+    if action in ("cook", "mix"):
+        return not target
+    return False
 
 
 def command_done(world, book, command):

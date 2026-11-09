@@ -14,7 +14,8 @@ from ai import tasks as T
 from ai.core import arbiter, executor, planner
 from ai.dialog.actions import ACTION_STATION_TYPES
 from ai.dialog.commands import (Command, CommandQueue, build_scope,
-                                command_done, command_failed, deliveries,
+                                command_done, command_done_undecidable,
+                                command_failed, deliveries,
                                 dirty_count, item_scope, resolve_done_item,
                                 resolve_target, scope_matches_task)
 from ai.dialog.cookbook import default_cookbook
@@ -1434,7 +1435,9 @@ class Agent:
         for command in list(self.commands.commands):
             if command.terminal():
                 continue
-            if command_done(world, self.book, command):
+            if command_done(world, self.book, command) or (
+                    command.served
+                    and command_done_undecidable(command, self.book)):
                 self.commands.mark_succeeded(command)
                 self._last_command_result = {
                     "label": command.label, "target": command.display_target,
@@ -1932,6 +1935,11 @@ class Agent:
         if status == "success":
             success_task = chosen_task  # 保存成功的 task（trace 记录用）
             self._note_success(chosen_task)
+            # 「判不出完成条件」的命令靠这一拍收尾：做过一次就够。
+            active_cmd = self.commands.active()
+            if (active_cmd is not None and chosen_task is not None
+                    and scope_matches_task(active_cmd.scope, chosen_task)):
+                active_cmd.served = True
             if chosen_task and hasattr(chosen_task, "claims"):
                 for res_id, action in chosen_task.claims():
                     self.bb.claims.pop((res_id, action), None)

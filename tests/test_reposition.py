@@ -247,3 +247,31 @@ def test_no_candidate_when_window_closed():
     book = RecipeBook([], [])
     cands = planner.generate_candidates(_planner_world(), bb, None, book)
     assert not any(c.task.TYPE == "Reposition" for c in cands)
+
+
+def test_assembly_gets_a_small_constant_bonus():
+    """组装（放料进饼底 / 送进烤箱）同分时要压过再取一份料。"""
+    from ai.core import planner
+    from ai.query.recipes import RecipeBook
+    from ai.state.world import World
+
+    world = World({
+        "phase": "level", "level": "Wizard_3_2_2P", "paused": False,
+        "orders": [{"id": "1", "dish": "MargheritaPizza", "composition": [],
+                    "remaining": 90, "lifetime": 130}],
+        "recipes": [], "stations": [], "chefs": [], "items": [],
+        "plates": [], "workstations": [], "cookers": [], "extinguishers": [],
+        "grid": {"size": [1.2, 1.0, 1.2], "nodeMap": None},
+    })
+    book = RecipeBook(world.recipes, world.stations)
+    bb = Blackboard()
+    bb.tick = 100
+
+    carrier = T.FetchToCarrier("1", ("Pizza_Base_Raw",), "Tomato")
+    chop = T.Chop("1", ("board",), "Tomato")
+    _score, carrier_terms = planner._score_candidate(
+        world, bb, _cand(carrier), book)
+    _score, chop_terms = planner._score_candidate(world, bb, _cand(chop), book)
+
+    assert carrier_terms["assembly"] == planner.W_ASSEMBLY
+    assert chop_terms["assembly"] == 0.0

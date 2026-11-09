@@ -784,6 +784,14 @@ W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩
 # （urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，实测灶全空 3 单要米）。
 # ingredient_reuse 与 eta 已删除：同场景备菜降到 ~3.97，5.6 仍是 L6 的最高毛收益；
 # 刚熟/快糊的锅在 L1/L2，层序保证它们先于填灶，不需要再做净值比较。
+# 组装推进的固定加分。量级只需压过备菜的 combo_head（W_COMBO_HEAD *
+# COMBO_PREP_DISCOUNT = 0.5，实机常见 0.25），不参与跨类优先级：真正决定
+# 「该不该组装」的还是 urgency / 盘供应 / 灶缺口。
+#
+# 为什么需要它：组装（把料放到饼底、把饼底送进烤箱）是这条链上唯一的「兑现」
+# 一步，但它的分项和取料同源，同分时按候选顺序输给 FetchToBoard。实机
+# trace-20261109-124818 两个灶空了 225 秒，P2 一直在 FetchToBoard/Chop。
+W_ASSEMBLY = 0.3
 W_COOKER_IDLE = 5.6
 # 缺口饱和点：缺 3 份以上就算"满额紧急"，再多不额外加分——否则开局 5 单
 # 全要米时填灶会盖过送餐和灭火。
@@ -2089,6 +2097,12 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
         terms["no_plate_placed"] = W_NO_PLATE_PLACED
     else:
         terms["no_plate_placed"] = 0.0
+
+    # ⑨.5 组装推进：同分时让「把料放进饼底 / 把饼底送进烤箱」先走。
+    if task.TYPE in ("FetchToCarrier", "FillCarrier", "PlaceCarrierInCooker"):
+        terms["assembly"] = W_ASSEMBLY
+    else:
+        terms["assembly"] = 0.0
 
     # ⑩ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
     # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；

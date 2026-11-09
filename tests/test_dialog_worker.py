@@ -1332,3 +1332,28 @@ def test_speech_turn_keeps_action_tools():
     worker._run_llm({"tools": TOOLS_NEW}, "speech", "帮我切个番茄")
     names = {t["function"]["name"] for t in llm.calls[0][1]}
     assert "execute_actions" in names
+
+
+def test_division_turn_ends_after_division_and_speech():
+    """开局分工落地并说了一句就收尾，不再多要一轮。
+
+    voice-20261109-124818：turn0 定分工 + speak，turn1 又被叫了一次去调
+    execute_actions，turn2 补一句「好，我这就去送烤箱」——玩家听到两句。
+    """
+    llm = FakeLLM(
+        reply("",
+              ("set_division", {"assignments": [
+                  {"action": "cook", "owner": "you"}]}),
+              ("speak", {"text": "好，我负责烤箱和洗碗，你切菜装盘。"})),
+        reply("", ("speak", {"text": "好，我这就去送烤箱。"})),  # 不该被请求
+    )
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._run_llm, {"tools": TOOLS_NEW}, "division", "")
+    ack_for(bundle, [{"tool": "set_division", "ok": True,
+                      "division_changed": True}])
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert len(llm.calls) == 1, "分工那一轮之后不该再问一次"
+    assert bundle.tts.spoken == ["好，我负责烤箱和洗碗，你切菜装盘。"]

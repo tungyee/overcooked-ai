@@ -407,6 +407,25 @@ def _tool_nudge(results):
     return " ".join(dict.fromkeys(notes))
 
 
+# 只有玩家语音回合才开放派活工具。分工 / 换布局 / 例行 checkin 这些事件里
+# 模型没有「马上去做」的授权，但工具摆在面前它就会调：实机
+# voice-20261109-124818 的 division 回合 turn0 定完分工说完一句，turn1 又调
+# execute_actions（被拒），turn2 补一句「好，我这就去送烤箱」——玩家听到两句。
+_ACTION_TOOL_NAMES = frozenset(("execute_actions", "execute_action",
+                                "cancel_action"))
+
+
+def _tools_for_event(tools, event):
+    # type: (Any, Any) -> Any
+    """按事件裁剪工具表：非语音回合不摆派活工具。"""
+    if not tools or event == "speech":
+        return tools
+    kept = [tool for tool in tools
+            if (tool.get("function") or {}).get("name")
+            not in _ACTION_TOOL_NAMES]
+    return kept or tools
+
+
 # 模型偶尔把台词写成 <speak>...</speak>，而不是调用 speak 工具。
 _SPEAK_TAG_RE = re.compile(r"<speak>\s*(.*?)\s*</speak>", re.S)
 # 只有纯播报类事件才兜底播放标签内容；speech 回合仍只告警——那里
@@ -1515,7 +1534,7 @@ class DialogWorker(object):
                 "role": "system",
                 "content": "本轮是失败事件：必须调用 speak 说明原因；content 不会播出去。",
             })
-        tools = context.get("tools") or None
+        tools = _tools_for_event(context.get("tools") or None, event)
 
         stream = StreamingTTS(self, timing)
         self._active_stream = stream

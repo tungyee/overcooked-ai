@@ -1305,3 +1305,30 @@ def test_tool_ack_timeout_covers_level_load_gap():
     """
     from ai.dialog import worker as W
     assert W.ACK_TIMEOUT_S >= 5.0
+
+
+def test_division_turn_does_not_offer_action_tools():
+    """分工回合不开放派活工具。
+
+    实机 trace-20261109-124818：division 回合 turn0 定了分工并说了「好，我负责
+    送烤箱…」，turn1 又调 execute_actions（被拒），turn2 补一句「好，我这就去
+    送烤箱」——玩家听到两句。根因是分工回合还摆着 execute_actions。
+    """
+    llm = FakeLLM(reply("好。"))
+    worker, _ = make_worker(llm=llm)
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "plate"])
+    worker._run_llm({"tools": tools_with_division}, "division", "")
+
+    tools = llm.calls[0][1]
+    names = {t["function"]["name"] for t in tools}
+    assert "execute_actions" not in names
+    assert "cancel_action" not in names
+    assert "speak" in names and "set_division" in names
+
+
+def test_speech_turn_keeps_action_tools():
+    llm = FakeLLM(reply("好。"))
+    worker, bundle = make_worker(llm=llm)
+    worker._run_llm({"tools": TOOLS_NEW}, "speech", "帮我切个番茄")
+    names = {t["function"]["name"] for t in llm.calls[0][1]}
+    assert "execute_actions" in names

@@ -320,7 +320,8 @@ def test_layout_review_fires_when_player_on_wrong_side(agent, worker):
     assert "下" in payload["facts"]
 
 
-def test_layout_review_silent_when_both_in_place(agent, worker):
+def test_layout_review_states_sides_even_when_both_in_place(agent, worker):
+    """两人都在对的位置也要报一句站位：玩家不知道自己该守哪边。"""
     world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
     agent.book = RecipeBook(world.recipes, world.stations)
     agent._service_dialog(world)
@@ -329,7 +330,11 @@ def test_layout_review_silent_when_both_in_place(agent, worker):
 
     world = make_split_world("ud", p2=(7, 5), p1=(1, 1))
     _settle(agent, world)
-    assert worker.events == []
+    names = [e[0] for e in worker.events]
+    assert names == ["layout_review"]
+    payload = worker.events[0][1]
+    assert payload["you_wrong"] is False and payload["player_wrong"] is False
+    assert "你在上半边" in payload["facts"] and "玩家在下半边" in payload["facts"]
 
 
 def test_layout_review_only_on_change(agent, worker):

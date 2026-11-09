@@ -228,10 +228,52 @@ def test_facts_player_line_is_imperative_and_self_line_is_statement():
     facts = report.facts()
     assert "请让玩家去下半边" in facts
     assert "只说「去下半边」" in facts
-    assert "你在下半边，被隔开了" in facts
+    assert "你被隔开了" in facts
 
 
 def test_layout_review_event_detail_carries_facts():
     from ai.dialog.worker import _event_detail
     detail = _event_detail("layout_review", {"facts": "你在这边，应该去右上。"})
     assert "右上" in detail
+
+
+def test_tracker_keeps_assignment_when_both_halves_fit():
+    """两边都满足装备时不要跟着格数抖动换边（真机目标每秒翻一次）。"""
+    walk, stations, plates = _room_split_by_column()
+    # 两侧都补上水槽：默认装备（砧板 / 灶+水槽）两边都满足
+    stations = list(stations) + [{"t": "washing", "n": "sinkR", "gx": 10, "gz": 1}]
+    tracker = zoning.ZoneTracker()
+    first = _observe(tracker, _world(walk, stations, plates, p2=(7, 1), p1=(1, 1)))
+    # 只少一格（真机里料箱转场时边界就在抖）
+    jittered = set(walk) - {(0, 5)}
+    second = _observe(tracker, _world(jittered, stations, plates, p2=(7, 1), p1=(1, 1)))
+    assert (second.p2_label, second.p1_label) == (first.p2_label, first.p1_label)
+
+
+def test_no_advice_when_division_cannot_separate_halves():
+    """两边只有半边能干活时不给建议：把两个人都赶去同一半没有意义。
+
+    真机 trace-20261109-124818：分工 `下锅=you`、`装盘=player`（装盘不加功能
+    区）+ `切=both`，两个人的装备都只剩灶，UD 布局下都只能去下半边。
+    """
+    walk, stations, plates = _room_split_by_column()
+    stations = [
+        {"t": "chopping", "n": "boardL", "gx": 1, "gz": -1},
+        {"t": "chopping", "n": "boardR", "gx": 7, "gz": -1},
+        {"t": "cooking", "n": "ovenL", "gx": 0, "gz": -1},
+        {"t": "washing", "n": "sink", "gx": -1, "gz": 1},
+    ]
+    division = _division([("下锅", "P2"), ("装盘", "P1"), ("切", "BOTH")])
+    world = _world(walk, stations, plates, p2=(7, 1), p1=(1, 1))
+    report = _observe(zoning.ZoneTracker(), world, division)
+    assert report.p2_label == "" and report.p1_label == ""
+    assert report.p2_wrong is False and report.p1_wrong is False
+
+
+def test_facts_always_state_both_sides():
+    report = zoning.ZoneReport(
+        district="LR", labels=("左", "右"),
+        p2_label="右", p2_current="左", p1_label="左", p1_current="左")
+    facts = report.facts()
+    assert "你在右半边" in facts
+    assert "玩家在左半边" in facts

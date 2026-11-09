@@ -1268,8 +1268,8 @@ class Agent:
         if tick - self._zone_last_review_tick < ZONE_REVIEW_COOLDOWN_TICKS:
             return
         self._zone_last_review_tick = tick
-        if not (report.p1_wrong or report.p2_wrong):
-            return
+        # 每次换布局都要说一遍「谁守哪半边」：玩家反馈（voice-20261109-124818）
+        # 是只在有人站错时才说一句、而且只说一边，他根本不知道自己该站哪。
         events.append(("layout_review", {
             "facts": report.facts(),
             "you_wrong": bool(report.p2_wrong),

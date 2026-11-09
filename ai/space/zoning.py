@@ -130,10 +130,12 @@ class ZoneReport(object):
         # type: () -> str
         """给 LLM 看的一句话（不念内部代号）。
 
+        开头一定是「谁守哪半边」：真机反馈（voice-20261109-124818）是玩家
+        根本不知道自己该站哪，因为只在有人站错时才提一句、而且只说一边。
+
         玩家那句只给**目的半边**、不给来源：写成「从A换到B」时实测模型会
-        抓住第一个提到的半边反着说（「请让玩家从上半边换到下半边」→
-        「你去上半边」，6 次里 4 次说反）。只留「请让玩家去B」，实测 3/3
-        方向正确。自己那半句是陈述句，不当祈使句用。
+        抓住第一个提到的半边反着说（「从上半边换到下半边」→「你去上半边」，
+        6 次里 4 次说反）。只留「请让玩家去B」，实测 6/6 方向正确。
         """
         parts = []  # type: List[str]
 
@@ -141,25 +143,21 @@ class ZoneReport(object):
             # type: (str) -> str
             return "%s半边" % label if label else "别处"
 
-        if self.open:
-            parts.append("中间的路正在转开")
+        if self.district and self.p2_label:
+            parts.append("厨房分成%s两半：你在%s，玩家在%s。" % (
+                "左右" if self.district == "LR" else "上下",
+                half(self.p2_label), half(self.p1_label)))
+        elif self.open:
+            parts.append("中间的路正在转开。")
         # 已经在正确半边的角色不占句子：说「你在上半边，应该去上半边」
         # 会让模型以为要动。
         if self.p1_label and self.p1_current != self.p1_label:
             parts.append("请让玩家去%s" % half(self.p1_label))
             if self.p1_current:
-                # 只说目的半边：给出「从A到B」时实测模型会抓住 A 反着说。
                 parts.append("提醒玩家时只说「去%s」，不要提%s" % (
                     half(self.p1_label), half(self.p1_current)))
         if self.p2_wrong:
-            if self.p2_current:
-                parts.append("你在%s，被隔开了，够不着自己的站点" % (
-                    half(self.p2_current),))
-            else:
-                parts.append("你被隔开了，够不着自己的站点")
-        elif self.p2_label and self.p2_current != self.p2_label:
-            parts.append("你在%s，该去%s" % (
-                half(self.p2_current), half(self.p2_label)))
+            parts.append("你被隔开了，够不着自己的站点")
         return "；".join(parts) + "。" if parts else ""
 
 
@@ -401,6 +399,7 @@ class ZoneTracker(object):
         self._seen_multi = False
         self._last_signature = None
         self._hits = 0
+        self._assign = {}  # type: Dict[str, FrozenSet[Tuple[int, int]]]
 
     def reset(self):
         # type: () -> None
@@ -408,6 +407,27 @@ class ZoneTracker(object):
         self._seen_multi = False
         self._last_signature = None
         self._hits = 0
+        self._assign = {}
+        self._assign = {}  # type: Dict[str, FrozenSet[Tuple[int, int]]]
+
+    def _pick(self, regions_list, kit, role, avoid=None):
+        # type: (List[Region], FrozenSet[str], str, Optional[int]) -> Optional[int]
+        """优先沿用上一次的分区，装不下再重选。
+
+        两边都满足装备时，`pick` 只能按格数决胜负，而转场收尾时格数每秒抖
+        一两格 → 目标区每秒翻一次（真机 trace-20261109-124818 t=18~21：
+        右/左 与 左/右 交替）。分区一旦定下就钉住，只有旧的那半不再满足
+        装备时才换。
+        """
+        last = self._assign.get(role) or frozenset()
+        if last:
+            for index, region in enumerate(regions_list):
+                if index == avoid or _fits(region, kit):
+                    continue
+                overlap = len(region.cells & last)
+                if overlap >= LAYOUT_SAME_RATIO * min(len(last), len(region.cells)):
+                    return index
+        return pick(regions_list, kit, avoid)
 
     def _record(self, signature, regions_list, p2, p1):
         # type: (Tuple, List[Region], Optional[int], Optional[int]) -> None
@@ -456,10 +476,15 @@ class ZoneTracker(object):
         # 先给玩家选：玩家的装备（灶+水槽）通常更受限，选完再让你避开。
         # 反过来先选你，会在「两边都能切+装盘、只有一边有灶和水槽」时把你
         # 塞进玩家唯一能干活的半边，两人挤在一起。
-        p1_index = pick(regions_list, kits[1])
-        p2_index = pick(regions_list, kits[0], avoid=p1_index)
+        p1_index = self._pick(regions_list, kits[1], "p1")
+        p2_index = self._pick(regions_list, kits[0], "p2", avoid=p1_index)
         if p2_index is None:
-            p2_index = pick(regions_list, kits[0])
+            p2_index = self._pick(regions_list, kits[0], "p2")
+        if p2_index is not None and p2_index == p1_index:
+            # 两个人的活路落在同一半：这份分工分不开两侧，给建议只会把两人
+            # 挤在一起（真机 trace-20261109-124818：chop=both + 装盘不加功能
+            # 区，两个人的装备都只剩灶，UD 布局下都只能去下半边）。
+            p1_index = p2_index = None
         report.district = "LR" if any(
             r.label in ("左", "右") for r in regions_list) else "UD"
         report.labels = tuple(r.label for r in regions_list)
@@ -468,6 +493,10 @@ class ZoneTracker(object):
         report.signature = tuple(sorted(
             (r.size, round(r.center[0], 1), round(r.center[1], 1))
             for r in regions_list))
+        if p2_index is not None:
+            self._assign["p2"] = regions_list[p2_index].cells
+        if p1_index is not None:
+            self._assign["p1"] = regions_list[p1_index].cells
         if p2_index is not None:
             report.p2_cells = regions_list[p2_index].cells
             report.p2_label = regions_list[p2_index].label

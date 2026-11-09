@@ -5,7 +5,7 @@ Face：转向 target（委托后端下为 no-op，转向已并入 move/tap 的�
 """
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai.space import navigation, portals, seams, shuttle
+from ai.space import gaps, navigation, portals, seams, shuttle
 from ai.space import occupancy as O
 from ai.query import predicates as P
 from ai.query import placement
@@ -32,7 +32,7 @@ def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
     if tail is not None:
         points = list(points) + [tail]
     cmd = build_command("move", goal=goal, path=points, target=target, kind=kind,
-                        dash=False,
+                        dash=gaps.path_has_gap(w, path),
                         # 门洞口等门 / 过传送门时放宽超时（插件按 max_wait 等）
                         timeout_ms=timeout_ms + int(1000 * extra_s))
     if gates:
@@ -42,17 +42,20 @@ def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
     return cmd
 
 
-def _station_interact_cells(st, cell, w, kind, include_belts=False):
-    # type: (Dict, Tuple[int, int], object, Optional[str], bool) -> List[Tuple[int, int]]
+def _station_interact_cells(st, cell, w, kind, include_belts=False, field=None):
+    # type: (Dict, Tuple[int, int], object, Optional[str], bool, Optional[Dict]) -> List[Tuple[int, int]]
     """站点交互位：出餐口只取厨房内侧（前侧），其余站点用四邻并集。
 
     出餐口是嵌在外墙里的一段墙，墙后那一面是死路，站过去送不了餐；
     见 navigation.serving_hatch_interact_cells 的判据（沿墙法向的深度）。
+    `field` 传 P2 的距离场：两侧都算，优先选实际可达的一侧（4-1 墙外死区
+    比厨房侧更深但不可达）。
     """
     if st.get("t") == PLATE_STATION:
         fp = O.station_block_cells(st, w.terrain, w.mapping)
         return navigation.serving_hatch_interact_cells(
-            fp, w.walkable, w.belt_cells)
+            fp, w.walkable, w.belt_cells, field=field,
+            include_belts=include_belts)
     if st.get("t") == "washing" and kind == "placement":
         cells = sink_place_cells(st, w.stations, w.to_grid)
     else:

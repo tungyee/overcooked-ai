@@ -84,3 +84,18 @@ def test_path_has_gap():
     w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.0, 5.4, 0.0, 2.4)])
     assert gaps.path_has_gap(w, [(2, 1), (3, 1)]) is True
     assert gaps.path_has_gap(w, [(1, 1), (2, 1)]) is False
+
+
+def test_portals_nav_args_include_gap_jump():
+    from ai.space import portals
+
+    # 2 格缝：中间 (3,1) 不可走，只有 gaps 的跳边能到 (4,1)
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.6, 6.0, 0.0, 2.4)],
+                  walk=lambda gx, gz: gx != 3)
+    w.seam_gates = None
+    w.portal_map = None
+    w.lane_map = None
+    w.belt_dir = {}
+    nav = portals.nav_args(w)
+    field = distance_field((2, 1), belt_dir={}, **nav)
+    assert (4, 1) in field

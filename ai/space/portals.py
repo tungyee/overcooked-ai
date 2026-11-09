@@ -21,7 +21,7 @@
 import math
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ai.space import lanes, seams
+from ai.space import gaps, lanes, seams
 from ai.space.occupancy import CHEF_CLEARANCE
 
 Cell = Tuple[int, int]
@@ -216,7 +216,9 @@ def nav_args(world, bb=None, blocked=None):
                wait_cost=seams.wait_cost_of(world, bb), jumps=jumps,
                jump_cost=jump_cost)
     # 半格走廊（ai/space/lanes.py）：只补普通格子断开的 S 弯，不碰门洞/触发格。
-    return lanes.wrap(nav, getattr(world, "lane_map", None), lanes.excluded_cells(world))
+    nav = lanes.wrap(nav, getattr(world, "lane_map", None), lanes.excluded_cells(world))
+    # 地板缝隙（ai/space/gaps.py）：缝隙普通邻接不可走，够得着的加 dash 跳边。
+    return gaps.wrap(nav, world)
 
 
 def route(world, path, field=None, bb=None):

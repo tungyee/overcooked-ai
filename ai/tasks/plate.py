@@ -102,6 +102,22 @@ def clean_plate_at_source(ctx):
     return False
 
 
+def holding_plated_dish(ctx):
+    # type: (Dict) -> bool
+    """手里端着有料的盘（成品盘 / 待装盘的盘）。
+
+    这类盘该走 DeliverPlate / SendAcross，不该为了清手放下——放下就会被
+    下一个选中的任务再捡起来。实机 trace-20261109-124818 t=140~150 与
+    t=216~220 就是这样循环：WashPlate 要空手 → EnsureHandsFree 把成品盘放
+    到台面 → SendAcross 又把它拾起 → 再放下，10 秒里 wash 和 send 都没做成。
+    """
+    chef = ctx.get("chef") or {}
+    for item in getattr(ctx["w"], "held_plates", ()) or ():
+        if P.holds_plate(chef, item) and P.plate_count(item) > 0:
+            return True
+    return False
+
+
 def dirty_plate_exists(ctx, sink_id=None):
     # type: (Dict, Any) -> bool
     """有要洗的盘：场上的 DirtyPlateStack、手里的脏盘、或洗碗池里待洗的盘。
@@ -253,6 +269,10 @@ class WashPlate(Task):
         # Sequence 直接 SUCCESS，一次洗盘键都不按。实机 trace-20261014-221306：
         # t=6117~6193 与 7228~7370 共 220 拍选 WashPlate、0 拍按键。
         if self.done(ctx):
+            return False
+        # 手里端着有料的盘：先把那盘送出去，别为了清手把它放下（放下就会被
+        # 送餐/送盘任务再捡起来，两个任务互相拆台）。
+        if holding_plated_dish(ctx):
             return False
         # 这个池子在对面时 P2 走不过去；让 SendAcross(dirty_plate) 先送过去。
         # 拓扑未知（无 field）保持旧行为。

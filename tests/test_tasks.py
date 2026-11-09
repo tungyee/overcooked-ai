@@ -2458,3 +2458,22 @@ def test_recover_loose_pot_binds_to_that_pot():
     assert pickup.expect(make_ctx(w, chef=chef("utensil_pot_01 (3)"))[0]) is True
     assert pickup.expect(make_ctx(w, chef=chef("utensil_pot_01"))[0]) is False
     assert pickup.expect(make_ctx(w, chef=chef(None))[0]) is False
+
+
+def test_wash_plate_infeasible_while_holding_plated_dish():
+    """手里端着有料的盘时不许洗：否则会把成品盘放下、被送餐任务再捡起来。
+
+    实机 trace-20261109-124818 t=140~150（以及 216~220）就是这样循环 10 秒：
+    WashPlate 要空手 → EnsureHandsFree 把成品盘放到台面 → SendAcross 又把它
+    拾起 → 再放下。整段 wash 与 send 都没完成。
+    """
+    w = FakeWorld(stations=[SINK, DRYING], recipes=RECIPES, orders=[ORDER],
+                  workstations=[],
+                  items=[{"n": "DirtyPlateStack", "x": 0.0, "z": -12.0}],
+                  plates=[plate("p9", 0, 0, contents=["Pizza"])])
+    w.held_plates = [dict(w.plates[0], held_by="Player 2")]
+    w.plates = []
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0,
+            "held": "equipment_plate_01 (9)", "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is False

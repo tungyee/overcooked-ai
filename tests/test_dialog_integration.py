@@ -152,9 +152,9 @@ def test_action_division_reaches_planner(monkeypatch):
         {"action": "cook", "owner": "player"},
     ])["ok"] is True
 
-    # 偏好编译：切=direct(+1)、下锅=claim(-6)
+    # 偏好编译：分给你的切不加分，玩家的下锅扣分（只靠「别抢活」分工）
     kinds = {p.kind: p.weight for p in agent.bb.preferences}
-    assert kinds.get("direct") == 1.0
+    assert "direct" not in kinds
     assert kinds.get("claim") == -6.0
 
     # planner 在同一黑板上重新选，能出结果（偏好已就位、链路不崩）

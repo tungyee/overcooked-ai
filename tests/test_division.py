@@ -5,14 +5,15 @@ from types import SimpleNamespace
 from ai.dialog import division as D
 
 
-def test_set_and_preferences_action_level():
+def test_you_gets_no_bonus():
+    """分给你的动作不加分：只靠「别抢玩家的活」来分工。
+
+    加分会让自己的活压过更值钱但没分工的事（组装/送餐/救锅）——真机
+    trace-20261109-124818 里 55% 的时间都在切菜，披萨组装不起来。
+    """
     state = D.DivisionState()
     assert state.set("切", D.OWNER_YOU)
-    prefs = state.preferences()
-    assert len(prefs) == 1
-    assert prefs[0].kind == "direct"
-    assert prefs[0].weight == D.WEIGHT_DO
-    assert prefs[0].scope == frozenset({("Chop", None)})
+    assert state.preferences() == []
 
 
 def test_set_item_level_and_claim():
@@ -36,7 +37,7 @@ def test_overwrite_and_clear():
     state.set("切", D.OWNER_PLAYER, "Meat")
     assert state.set("切", D.OWNER_YOU, "Meat") is True
     assert len(state.entries) == 1
-    assert state.preferences()[0].kind == "direct"
+    assert state.preferences() == []
     assert state.clear("切", "Meat") is True
     assert state.entries == []
 

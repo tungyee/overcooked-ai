@@ -148,8 +148,9 @@ def test_set_division_applies_and_weights(agent, worker):
     assert result["division_changed"] is True
     assert agent.bb.division.snapshot() == {
         "you": ["cook"], "player": ["plate"], "both": []}
+    # 只给玩家那边扣分；分给你的动作不加分（避免自己的活压过更值钱的事）
     kinds = {(p.kind, p.owner, p.weight) for p in agent.bb.preferences}
-    assert kinds == {("direct", "P2", 1.0), ("claim", "P1", -6.0)}
+    assert kinds == {("claim", "P1", -6.0)}
 
 
 def test_set_division_is_resident_and_editable_mid_level(agent, worker):

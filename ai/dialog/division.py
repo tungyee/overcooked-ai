@@ -30,7 +30,9 @@ OWNER_TOOL_NAMES = {
 }  # type: Dict[str, str]
 TOOL_OWNER_NAMES = {v: k for k, v in OWNER_TOOL_NAMES.items()}
 
-WEIGHT_DO = 1.0          # you 负责：P2 优先做
+# 分工只做「别抢玩家的活」，**不给自己加分**：自己的活本来就不会被玩家的
+# 负分挡住；加分反而让它压过更值钱但没分给任何人的事（组装/送餐/救锅），
+# 实机 trace-20261109-124818 里 55% 的时间都在切菜、披萨组装不起来。
 WEIGHT_CLAIM = -6.0      # player 负责：P2 避开，订单要崩时仍可补位
 
 
@@ -126,18 +128,19 @@ class DivisionState(object):
 
     def preferences(self):
         # type: () -> List[Preference]
-        """编译成 planner 的偏好；BOTH 不产生偏好。"""
+        """编译成 planner 的偏好：只给玩家负责的动作扣分。
+
+        分给你自己的动作**不加分**（见 WEIGHT_CLAIM 上方注释）；BOTH 两边都
+        不产生偏好。
+        """
         out = []  # type: List[Preference]
         for entry in self.entries:
-            if entry.owner == OWNER_BOTH:
+            if entry.owner != OWNER_PLAYER:
                 continue
-            scope = action_scope(entry.action, entry.item or None)
-            if entry.owner == OWNER_YOU:
-                out.append(Preference(kind="direct", owner=OWNER_YOU,
-                                      weight=WEIGHT_DO, scope=scope))
-            else:
-                out.append(Preference(kind="claim", owner=OWNER_PLAYER,
-                                      weight=WEIGHT_CLAIM, scope=scope))
+            out.append(Preference(kind="claim", owner=OWNER_PLAYER,
+                                  weight=WEIGHT_CLAIM,
+                                  scope=action_scope(entry.action,
+                                                     entry.item or None)))
         return out
 
     def copy(self):

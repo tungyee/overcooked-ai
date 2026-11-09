@@ -1056,11 +1056,23 @@ class Agent:
             resolved = str(getattr(feasible[0].task, "item", "") or "") or None
             display = display or resolved
             if resolved:
-                mode2, resolved2, display2, _r2, _v2 = resolve_target(
-                    kitchen, action, resolved)
-                scope2, _sr2 = build_scope(kitchen, action, resolved2, mode2)
-                if scope2:
-                    scope, resolved, display = scope2, resolved2, display2 or resolved
+                # 先按**具体物料**建 scope：披萨关卡的物料目录是按菜名建的
+                # （materials = {PeperoniPizza, MargheritaPizza}），resolved 一个
+                # 物料（Dough）会被 resolve_target 折回整道菜，scope 变成「给
+                # 这道菜切/取所有料」，`command_done` 拿菜名求 chop_target 得到
+                # None → 命令永远完不成（trace-20261109-124818 04:49:12 那条
+                # `chop` 占了 212/240 秒）。item_scope 能落到 ("Chop","dough")，
+                # 完成条件也就是「切好的饼底出现」。
+                item_res = item_scope(kitchen, action, resolved)
+                if item_res is not None:
+                    scope, resolved, display = item_res[0], resolved, resolved
+                else:
+                    mode2, resolved2, display2, _r2, _v2 = resolve_target(
+                        kitchen, action, resolved)
+                    scope2, _sr2 = build_scope(kitchen, action, resolved2, mode2)
+                    if scope2:
+                        scope, resolved, display = (scope2, resolved2,
+                                                    display2 or resolved)
         if action == "wash" and dirty_count(world) == 0:
             return {"ok": False, "action": action, "reason": "现在没有脏盘"}
         if action == "deliver":

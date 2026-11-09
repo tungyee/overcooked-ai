@@ -8,7 +8,8 @@ import pytest
 
 from ai.agent import Agent
 from ai.dialog import llm
-from ai.dialog.commands import command_done, dirty_count
+from ai.dialog.commands import (command_done, command_done_undecidable,
+                               dirty_count)
 from ai.query.recipes import RecipeBook
 from ai.state.world import World
 
@@ -386,3 +387,31 @@ def test_command_without_done_signal_finishes_after_one_task(agent, world):
     cmd.served = True
     agent._service_commands(world)
     assert cmd.status == "succeeded"
+
+
+def test_targetless_chop_on_pizza_level_narrows_to_item():
+    """披萨关卡的 materials 以**菜名**为键，不带 target 的 chop 不能落成整道菜。
+
+    实机 trace-20261109-124818 04:49:12：玩家说「你也帮我切点东西吧」，模型
+    发 `execute_actions([{action:"chop"}])`。resolve_target 把物料 Dough 折回
+    整道 PeperoniPizza，scope 变成「给这道菜切/取所有料」，target 是菜名 →
+    command_done 拿菜名求 chop_target 得 None → 命令永远完不成，占着执行槽
+    212/240 秒。
+    """
+    import gzip
+
+    path = os.path.join(os.path.dirname(__file__), "fixtures", "wizard",
+                        "wizard32-20261101-173006-board-base.ndjson.gz")
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        raw = json.loads(fh.readline())
+    world = World(raw)
+    with patch("ai.agent.StateClient", lambda *a, **k: MagicMock()):
+        a = Agent(voice=None)
+    a.bb.tick = 100
+    a.book = RecipeBook(world.recipes, world.stations)
+
+    out = a._execute_action(world, {"action": "chop"})
+    assert out["ok"] is True
+    cmd = a.commands.active()
+    assert all(item is not None for _task_type, item in cmd.scope), cmd.scope
+    assert command_done_undecidable(cmd, a.book) is False

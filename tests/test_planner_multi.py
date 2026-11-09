@@ -500,3 +500,58 @@ def test_no_interleave_firefighting():
     # 因为 Discard 不可被打断
     assert chosen == current_task, "Discard 不应被穿插打断"
     assert bb.paused_task is None, "不应保存 paused_task"
+
+
+def test_interleave_waits_for_interleaving_task_to_finish():
+    """穿插任务还可行时，不能下一拍就恢复 paused_task。
+
+    实机 trace-20261110-001603 t=195 起：FillCarrier ↔ FetchToPlate 每拍
+    1:1 交替（分差 6 > INTERLEAVE_PENALTY+MARGIN=5），Executor 每拍重建
+    任务树，P2 拿着卷饼在两格之间来回晃。恢复必须等穿插任务完成/失败。
+    """
+    from ai.core.planner import _apply_commitment_inertia
+    from ai.state.blackboard import Commitment
+
+    world = _make_world()
+    bb = _make_bb()
+
+    paused = T.Chop("order1", ("board_01",), "Cucumber")
+    interleaving = T.FetchToCooker("order1", ("cooker_01",), "Cucumber")
+    bb.commitment = Commitment(interleaving, 0, 0, 0, 0)
+    bb.paused_task = {"task_id": paused.key, "steps_done": 2}
+    scored = [(interleaving, 0.25, {}), (paused, -5.75, {})]
+
+    # 穿插任务仍可行 → 继续它，paused_task 继续挂着
+    for tick in range(6):
+        bb.tick = tick
+        chosen = _apply_commitment_inertia(scored, world, bb)
+        assert chosen == interleaving, "穿插任务还在跑，不应切回旧任务"
+        assert bb.paused_task is not None, "旧任务应等穿插完成后再恢复"
+        bb.commitment = Commitment(chosen, tick, 0, 0, 0)
+
+    # 穿插任务完成：agent.py ⑬ 把 commitment 清空 → 下一拍恢复旧任务
+    bb.commitment = None
+    chosen = _apply_commitment_inertia(scored, world, bb)
+    assert chosen == paused, "穿插完成后应恢复被暂停的任务"
+    assert bb.paused_task is None, "恢复后应清空 paused_task"
+    assert bb.commitment.active_task == paused
+
+
+def test_interleave_restores_paused_task_when_interleaving_becomes_infeasible():
+    """穿插任务从可行候选里消失 → 立即恢复 paused_task。"""
+    from ai.core.planner import _apply_commitment_inertia
+    from ai.state.blackboard import Commitment
+
+    world = _make_world()
+    bb = _make_bb()
+
+    paused = T.Chop("order1", ("board_01",), "Cucumber")
+    interleaving = T.FetchToCooker("order1", ("cooker_01",), "Cucumber")
+    bb.commitment = Commitment(interleaving, 0, 0, 0, 0)
+    bb.paused_task = {"task_id": paused.key, "steps_done": 3}
+
+    chosen = _apply_commitment_inertia([(paused, -5.75, {})], world, bb)
+    assert chosen == paused, "穿插任务不可行时应恢复旧任务"
+    assert bb.paused_task is None
+    assert bb.commitment.active_task == paused
+    assert bb.commitment.steps_done == 3

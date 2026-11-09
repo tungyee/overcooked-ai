@@ -2691,26 +2691,37 @@ def _apply_commitment_inertia(scored, world, bb):
     scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
     top_task, top_score, top_terms = scored_sorted[0]
 
-    # ① 优先恢复 paused_task（Task 5）
+    # ① 优先恢复 paused_task（Task 5）。**穿插任务还在可行候选里时不能恢复**：
+    # 否则「穿插 → 下一拍恢复 → 再穿插」逐拍交替，Executor 每拍重建任务树、
+    # 角色原地来回晃（trace-20261110-001603 t=195 起 FillCarrier ↔
+    # FetchToPlate 1:1 交替，P2 在两格之间蹭）。穿插的本意是把高分任务做完，
+    # 所以只在穿插任务完成/失败（agent ⑬ 把 commitment 清空）或已不可行时恢复。
     if bb.paused_task:
-        # 查找 paused_task 是否在可行候选中
         paused_task_id = bb.paused_task.get("task_id")
-        for task, score, terms in scored:
-            if task.key == paused_task_id:
-                # 恢复暂停的任务，并保留暂停前的进度。bb.commitment 可能是 None：
-                # 穿插的那个 task 刚在 agent.py ⑬ 成功/失败，commitment 被清成了
-                # None（而非测试里模拟的 active_task=None），直接 .steps_done 会
-                # AttributeError。这里先把 commitment 恢复成指向被暂停 task 的有效
-                # 对象，再写回进度。
-                if bb.commitment is None:
-                    bb.commitment = Commitment()
-                bb.commitment.active_task = task
-                bb.commitment.steps_done = bb.paused_task.get("steps_done", 0)
-                bb.paused_task = None  # 清空 paused_task
-                return task
+        interleaving = (getattr(bb.commitment, "active_task", None)
+                        if bb.commitment is not None else None)
+        interleaving_live = (
+            interleaving is not None
+            and any(_tasks_equal(task, interleaving)
+                    for task, _score, _terms in scored))
+        if not interleaving_live:
+            # 查找 paused_task 是否在可行候选中
+            for task, score, terms in scored:
+                if task.key == paused_task_id:
+                    # 恢复暂停的任务，并保留暂停前的进度。bb.commitment 可能是 None：
+                    # 穿插的那个 task 刚在 agent.py ⑬ 成功/失败，commitment 被清成了
+                    # None（而非测试里模拟的 active_task=None），直接 .steps_done 会
+                    # AttributeError。这里先把 commitment 恢复成指向被暂停 task 的有效
+                    # 对象，再写回进度。
+                    if bb.commitment is None:
+                        bb.commitment = Commitment()
+                    bb.commitment.active_task = task
+                    bb.commitment.steps_done = bb.paused_task.get("steps_done", 0)
+                    bb.paused_task = None  # 清空 paused_task
+                    return task
 
-        # 如果 paused_task 不可行了，清空并继续正常流程
-        bb.paused_task = None
+            # 如果 paused_task 不可行了，清空并继续正常流程
+            bb.paused_task = None
 
     # ② 检查是否有当前承诺
     if not bb.commitment or not bb.commitment.active_task:

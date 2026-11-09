@@ -72,6 +72,15 @@ def test_gap_too_wide_is_blocked_without_jump():
     assert (4, 1) not in field
 
 
+def test_one_and_a_half_meter_gap_is_not_dashable():
+    """3-5 实测 1.5m 缝 dash 落不到对岸（trace-20261110-003648 t=286 掉水）。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.9, 6.3, 0.0, 2.4)],
+                  walk=lambda gx, gz: gx != 3)
+    nav = _nav(w)
+    assert nav["edge_blocked"]((2, 1), (4, 1)) is True
+    assert (4, 1) not in nav["jumps"].get((2, 1), ())
+
+
 def test_gap_through_wall_has_no_jump():
     w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.0, 5.4, 0.0, 2.4)],
                   blocking=[(2.7, 3.3, 0.0, 2.4)])
@@ -84,6 +93,29 @@ def test_path_has_gap():
     w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.0, 5.4, 0.0, 2.4)])
     assert gaps.path_has_gap(w, [(2, 1), (3, 1)]) is True
     assert gaps.path_has_gap(w, [(1, 1), (2, 1)]) is False
+
+
+def test_path_gap_edges_returns_landing_index():
+    """dash_edges 要给出「落到哪一格」的下标，插件据此只在跳边段按 Dash。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.6, 6.0, 0.0, 2.4)],
+                  walk=lambda gx, gz: (gx, gz) != (3, 1))
+    assert gaps.path_gap_edges(w, [(1, 1), (2, 1), (4, 1)]) == [2]
+    assert gaps.path_gap_edges(w, [(1, 1), (2, 1)]) == []
+
+
+def test_path_gap_edges_skips_too_wide_gap():
+    """超过 GAP_MAX_M 的缝不是 jump 边，不能授权 dash。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (4.7, 7.1, 0.0, 2.4)],
+                  walk=lambda gx, gz: gx != 3)
+    assert gaps.path_gap_edges(w, [(2, 1), (4, 1)]) == []
+
+
+def test_command_gap_edges_maps_world_points():
+    """move 命令的路点是世界坐标；dash_edges 的下标要落在命令的 points 上。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.6, 6.0, 0.0, 2.4)],
+                  walk=lambda gx, gz: (gx, gz) != (3, 1))
+    pts = [list(w.to_world(2, 1)), list(w.to_world(4, 1))]
+    assert gaps.command_gap_edges(w, pts) == [1]
 
 
 def test_portals_nav_args_include_gap_jump():

@@ -107,6 +107,49 @@ def test_primitive_returns_failure_when_target_vanishes():
     assert len(ex.issued) == 0
 
 
+def test_move_cmd_sets_dash_edges(monkeypatch):
+    """跨缝 move 要带上落点下标，插件才能只在跳边段按 Dash。"""
+    from ai.primitives import move as M
+
+    class GapWorld(FakeWorld):
+        def __init__(self):
+            FakeWorld.__init__(self, walkable=lambda gx, gz: (gx, gz) != (3, 1))
+            self.terrain = {9: [(0.0, 2.4, 0.0, 2.4), (3.6, 6.0, 0.0, 2.4)]}
+            self.raw = {}
+            self.stations = []
+            self.seam_gates = None
+            self.portal_map = None
+            self.lane_map = None
+
+    w = GapWorld()
+    monkeypatch.setattr(
+        M.portals, "route",
+        lambda w, path, field, bb: ([list(w.to_world(*c)) for c in path], [], [], 0.0))
+    cmd = M._move_cmd(w, [(1, 1), (2, 1), (4, 1)], None, Blackboard(),
+                      [4.8, 1.2], None, None, 8000)
+    assert cmd["dash"] is True
+    assert cmd["dash_edges"] == [2]
+
+
+def test_move_cmd_without_gap_has_empty_dash_edges(monkeypatch):
+    from ai.primitives import move as M
+
+    w = FakeWorld(walkable=lambda gx, gz: True)
+    w.terrain = {9: [(0.0, 6.0, 0.0, 2.4)]}
+    w.raw = {}
+    w.stations = []
+    w.seam_gates = None
+    w.portal_map = None
+    w.lane_map = None
+    monkeypatch.setattr(
+        M.portals, "route",
+        lambda w, path, field, bb: ([list(w.to_world(*c)) for c in path], [], [], 0.0))
+    cmd = M._move_cmd(w, [(1, 1), (2, 1)], None, Blackboard(),
+                      [2.4, 1.2], None, None, 8000)
+    assert cmd["dash"] is False
+    assert cmd["dash_edges"] == []
+
+
 def test_hold_issues_hold():
     ex = FakeExec()
     ctx = make_ctx(W, CHEF, ex)

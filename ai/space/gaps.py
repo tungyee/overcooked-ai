@@ -18,8 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ai.space import occupancy
 
-# 可 dash 跨过的最大缝隙（米）。Overcooked 的 dash 约 2.5m，留 0.5m 余量。
-GAP_MAX_M = 2.0
+# 可 dash 跨过的最大缝隙（米）。实测 dash 从头前冲约 2.2~2.4m，但触发点是
+# 缝前 DASH_PROBE(0.55m)，再留一点余量；trace-20261110-003648 里 1.5m 与
+# 1.99m 的缝都掉水，0.57m 的缝稳定通过。取 1.4m：允许 3-5 靠岸缝，拒绝
+# 木筏漂开后的宽缝，让寻路等下一次靠岸而不是硬跳。
+GAP_MAX_M = 1.4
 # dash 跳边的寻路代价：略高于一格，避免为了省一步到处 dash。
 DASH_COST = 2
 # 缝隙宽度采样数；格心间距 1.2m 时步长约 0.06m，足够分辨半格缝。
@@ -186,15 +189,18 @@ class _MergedJumpCost(object):
         return default
 
 
-def wrap(nav, world):
-    # type: (Dict, Any) -> Dict
-    """给 portals.nav_args 的结果叠一层缝隙规则。"""
+def jump_pairs(world):
+    # type: (Any) -> Dict[Pair, int]
+    """可 dash 的缝隙对：宽度 <= GAP_MAX_M 且连线中点不在阻挡层里。
+
+    与 wrap 加跳边的判据同一口径；命令侧的 dash_edges 也用它，避免
+    「寻路说能跳、插件收到 dash 授权」两套阈值不一致。
+    """
     pairs = gap_pairs(world)
     if not pairs:
-        return nav
+        return {}
     blocking = _blocking(world)
-    jumps = {}  # type: Dict[Cell, List[Cell]]
-    costs = {}  # type: Dict[Pair, int]
+    out = {}  # type: Dict[Pair, int]
     for (a, b), width in pairs.items():
         if width > GAP_MAX_M:
             continue
@@ -205,6 +211,20 @@ def wrap(nav, world):
         mx, mz = (pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0
         if occupancy._point_in_any_box(mx, mz, blocking):
             continue
+        out[(a, b)] = DASH_COST
+    return out
+
+
+def wrap(nav, world):
+    # type: (Dict, Any) -> Dict
+    """给 portals.nav_args 的结果叠一层缝隙规则。"""
+    pairs = gap_pairs(world)
+    if not pairs:
+        return nav
+    jumpable = jump_pairs(world)
+    jumps = {}  # type: Dict[Cell, List[Cell]]
+    costs = {}  # type: Dict[Pair, int]
+    for (a, b) in jumpable:
         jumps.setdefault(a, [])
         if b not in jumps[a]:
             jumps[a].append(b)
@@ -219,11 +239,51 @@ def wrap(nav, world):
 
 def path_has_gap(world, path):
     # type: (Any, List[Cell]) -> bool
-    """path 里是否有相邻两格属于缝隙对。"""
-    pairs = gap_pairs(world)
-    if not pairs:
-        return False
-    for i in range(len(path) - 1):
-        if (tuple(path[i]), tuple(path[i + 1])) in pairs:
-            return True
-    return False
+    """path 里是否有相邻两格属于可 dash 的缝隙跳边。"""
+    return bool(path_gap_edges(world, path))
+
+
+def path_gap_edges(world, path):
+    # type: (Any, List[Cell]) -> List[int]
+    """path 里哪些**落点下标**是从缝隙跳边跨过去的。
+
+    返回的是「拐到这一格」的下标（与 move 命令的 path 下标同口径），
+    插件据此只在跳边段按 Dash，而不是整条路径随便遇到平台边缘就跳。
+    宽度超过 GAP_MAX_M 的缝隙不算，和寻路 / 插件落点校验同一口径。
+    """
+    if not path:
+        return []
+    jumpable = jump_pairs(world)
+    if not jumpable:
+        return []
+    out = []  # type: List[int]
+    for i in range(1, len(path)):
+        if (tuple(path[i - 1]), tuple(path[i])) in jumpable:
+            out.append(i)
+    return out
+
+
+def command_gap_edges(world, points):
+    # type: (Any, List[Any]) -> List[int]
+    """move 命令的世界路点里，哪些落点下标是缝隙跳边。
+
+    `portals.route` 可能为了传送门/半格走廊插入额外路点，下标与格子路径
+    不再一一对应；这里把每个世界点投影回格，再按 jump_pairs 判段。
+    """
+    if not points:
+        return []
+    jumpable = jump_pairs(world)
+    if not jumpable:
+        return []
+    out = []  # type: List[int]
+    prev = None
+    for i, p in enumerate(points):
+        try:
+            cell = world.to_grid(float(p[0]), float(p[1]))
+        except (TypeError, ValueError, IndexError):
+            cell = None
+        if cell is not None and prev is not None \
+                and (tuple(prev), tuple(cell)) in jumpable:
+            out.append(i)
+        prev = cell
+    return out

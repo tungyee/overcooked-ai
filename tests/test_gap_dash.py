@@ -18,16 +18,20 @@ class FakeWorld(object):
         return (gx * 1.2, gz * 1.2)
 
 
-def _move_cmd(monkeypatch, has_gap):
+def _move_cmd(monkeypatch, edges):
     from ai.primitives import move as M
-    monkeypatch.setattr(M.gaps, "path_has_gap", lambda w, path: has_gap)
+    monkeypatch.setattr(M.gaps, "command_gap_edges", lambda w, points: edges)
     return M._move_cmd(FakeWorld(), [(0, 0), (1, 0)], None, Blackboard(),
                        [1.2, 0.0], None, None, 8000)
 
 
 def test_move_cmd_sets_dash_when_path_has_gap(monkeypatch):
-    assert _move_cmd(monkeypatch, True)["dash"] is True
+    cmd = _move_cmd(monkeypatch, [1])
+    assert cmd["dash"] is True
+    assert cmd["dash_edges"] == [1]
 
 
 def test_move_cmd_leaves_dash_false_without_gap(monkeypatch):
-    assert _move_cmd(monkeypatch, False)["dash"] is False
+    cmd = _move_cmd(monkeypatch, [])
+    assert cmd["dash"] is False
+    assert cmd["dash_edges"] == []

@@ -384,6 +384,14 @@ namespace Oc2AI
         private const float DASH_PROBE = 0.55f;
         private const float DASH_HOLD = 0.08f;
         private const float DASH_COOLDOWN = 1.0f;
+        // 起跳前先看落点：沿当前方向 DASH_LAND_PROBE 处必须还有地板。
+        // 实测 dash 从头前冲约 2.2~2.4m；探针 2.0m 留 0.2m 余量。
+        // 光看「前方 0.55m 没地板」就跳会把平台边缘巡逻（路径下一步拐弯）
+        // 和木筏漂走后的宽缝都当成可跳的缝。
+        private const float DASH_LAND_PROBE = 2.0f;
+        // 跳边起点前多远就允许起跳：路径在格子中心拐弯时，等走到格心才按
+        // Dash 已经太晚（trace-20261110-003648 t=286：起跳点离缝边 0.11m）。
+        private const float DASH_APPROACH = 0.9f;
         // 对岸路点超过这个距离就不 dash：木筏可能已漂远，dash 也够不到，
         // 交回 Python 重算比冲进水里好。2 格跳边的格心距是 2.4m，留 0.2m 余量。
         private const float DASH_REACH = 2.6f;
@@ -417,7 +425,10 @@ namespace Oc2AI
         private float _lastRelZ;
         private bool _hasRel;
         // Python 只在路径跨地板缝时发 dash=true；没授权时遇到踩空就停下。
+        // 新协议另发 dash_edges（落点下标列表）：只在真正的缝隙跳边段按 Dash，
+        // 不再「整条路径任意边缘都跳」。旧 Python 不发时退回 dash 标记。
         private readonly bool _allowDash;
+        private readonly List<int> _dashEdges;
         private bool _dashDown;
         private float _dashUntil = -1f;
         private float _lastDashAt = -10f;
@@ -451,6 +462,17 @@ namespace Oc2AI
             _target = Req.Obj(cmd, "target");
             _kind = Req.Str(cmd, "kind");
             _allowDash = Req.Bool(cmd, "dash");
+            var edges = Req.List(cmd, "dash_edges");
+            if (edges != null)
+            {
+                _dashEdges = new List<int>();
+                foreach (var e in edges)
+                {
+                    if (e is double d) _dashEdges.Add((int)d);
+                    else if (e is long l) _dashEdges.Add((int)l);
+                    else if (e is int i) _dashEdges.Add(i);
+                }
+            }
             var path = Req.List(cmd, "path");
             if (path != null)
                 foreach (var p in path)
@@ -589,6 +611,15 @@ namespace Oc2AI
             return (g == null ? "" : g.ToString() + ":") + (n == null ? "?" : n.ToString());
         }
 
+        // 诊断：dash_edges 的落点下标；旧 Python 不发时为 legacy。
+        private string DashEdgesText()
+        {
+            if (_dashEdges == null) return "legacy";
+            var parts = new string[_dashEdges.Count];
+            for (int i = 0; i < parts.Length; i++) parts[i] = _dashEdges[i].ToString();
+            return string.Join(",", parts);
+        }
+
         private Vector2 PointAt(int i)
         {
             bool isExit;
@@ -643,6 +674,33 @@ namespace Oc2AI
                                     GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
         }
 
+        // 当前段是否授权 dash。新协议（dash_edges）只看真正的缝隙跳边段；
+        // 下一步就是跳边且已走到起点附近时也放行，避免等走到格心才起跳。
+        private bool DashAllowedHere(Vector2 pos, Vector2 target)
+        {
+            if (_dashEdges == null) return _allowDash;
+            if (_dashEdges.Contains(_idx)) return true;
+            if (_idx + 1 < _path.Count && _dashEdges.Contains(_idx + 1)
+                && Vector2.Distance(pos, target) <= DASH_APPROACH)
+                return true;
+            return false;
+        }
+
+        // 起跳前校验落点：当前方向 DASH_LAND_PROBE 处必须有地板；跳边落点
+        // 的锚点也必须打在真实地板上（木筏漂走后锚点会落空，此时不能跳）。
+        private bool DashLandingReady(ChefFrame f, Vector2 dir)
+        {
+            if (dir.sqrMagnitude < 1e-6f) return false;
+            Vector3 p = new Vector3(
+                f.PosX + dir.x * DASH_LAND_PROBE,
+                f.Chef.transform.position.y + ANCHOR_RAY_UP,
+                f.PosZ + dir.y * DASH_LAND_PROBE);
+            if (!Physics.Raycast(p, Vector3.down, ANCHOR_RAY_LEN,
+                                 GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            return _idx >= _anchors.Count || _anchors[_idx].T != null;
+        }
+
         private void ReleaseDash()
         {
             if (!_dashDown) return;
@@ -676,6 +734,7 @@ namespace Oc2AI
                   .Append(" target=").Append(TargetDesc())
                   .Append(" kind=").Append(_kind ?? "null")
                   .Append(" dash=").Append(_allowDash ? "1" : "0")
+                  .Append(" dashEdges=").Append(DashEdgesText())
                   .Append(" goal=(").Append(_goal.x).Append(',').Append(_goal.y)
                   .Append(") goal_floor=").Append(_goalAnchor.T != null ? _goalAnchor.T.name : "none")
                   .Append(" anchored=").Append(_anchoredCount).Append('/').Append(_path.Count)
@@ -864,9 +923,14 @@ namespace Oc2AI
 
             bool gapAhead = GroundGapAhead(f, dir);
             float farDist = Vector2.Distance(pos, target);
-            if (gapAhead && (!_allowDash || farDist > DASH_REACH))
+            bool dashHere = DashAllowedHere(pos, target);
+            // 旧 Python 不发 dash_edges：保持旧行为，不额外校验落点（协议只增不改）。
+            bool landOk = true;
+            if (gapAhead && dashHere && farDist <= DASH_REACH && _dashEdges != null)
+                landOk = DashLandingReady(f, dir);
+            if (gapAhead && (!dashHere || farDist > DASH_REACH || !landOk))
             {
-                // 没有 dash 授权、或对岸路点已经超出 dash 射程（木筏漂远）：
+                // 不在跳边段、没有 dash 授权、对岸超出射程、或落点没地板：
                 // 宁可不走，交回 Python 重算，也不掉水。
                 PadEngagement.Pad.Stop();
                 UnityEngine.Debug.Log("[EXEC] move ledge t=" + now.ToString("0.00")
@@ -874,7 +938,8 @@ namespace Oc2AI
                     + ") idx=" + _idx + "/" + _path.Count
                     + " target=(" + target.x + "," + target.y + ")"
                     + " target_id=" + TargetDesc()
-                    + " allowDash=" + (_allowDash ? "1" : "0")
+                    + " dashHere=" + (dashHere ? "1" : "0")
+                    + " land=" + (landOk ? "1" : "0")
                     + " far=" + farDist.ToString("0.00"));
                 Finish(false, "ledge", new double[] { target.x, target.y });
                 return;
@@ -882,7 +947,7 @@ namespace Oc2AI
 
             PadEngagement.Pad.Move(f.Chef, dir.x * mag, dir.y * mag);
 
-            if (gapAhead && _allowDash && PadEngagement.Pad != null
+            if (gapAhead && dashHere && landOk && PadEngagement.Pad != null
                 && now - _lastDashAt > DASH_COOLDOWN)
             {
                 try

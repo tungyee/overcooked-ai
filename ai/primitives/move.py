@@ -83,13 +83,18 @@ def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
     # type: (object, List[Tuple[int, int]], Any, Any, List[float], Any, Optional[str], int, Optional[List[float]]) -> Dict
     """格子路径 → 插件 move 命令（门洞 gates + 传送门 portals 段 + 放宽超时）。
 
+    `dash_edges` 是**落点下标**：只有这些段才是缝隙跳边，插件只在这几段
+    按 Dash。整条路径只要有一段缝就给 dash=True 会让插件在任意平台边缘
+    提前起跳（trace-20261110-003648 的 5 次落水有 4 次是这种误跳）。
+
     tail：路点末尾追加的世界点（渡运站位朝台面推一点）。
     """
     points, gates, hops, extra_s = portals.route(w, path, field, bb)
     if tail is not None:
         points = list(points) + [tail]
+    edges = gaps.command_gap_edges(w, points)
     cmd = build_command("move", goal=goal, path=points, target=target, kind=kind,
-                        dash=gaps.path_has_gap(w, path),
+                        dash=bool(edges), dash_edges=edges,
                         # 门洞口等门 / 过传送门时放宽超时（插件按 max_wait 等）
                         timeout_ms=timeout_ms + int(1000 * extra_s))
     if gates:

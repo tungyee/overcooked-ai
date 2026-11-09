@@ -141,6 +141,39 @@ def holding_valuable(ctx):
     return holding_plated_dish(ctx) or holding_raw_carrier(ctx)
 
 
+def dirty_stack_entry(ctx):
+    # type: (Dict) -> Optional[Dict]
+    """脏盘摞的执行目标：优先同位置的 plate_return 站点，否则脏盘 item。
+
+    items[] 的 DirtyPlateStack 只有世界坐标，没有 gx/gz；同位置的
+    stations 条目（实测 {'t':'plate_return','n':'workstation_plate_return',
+    'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
+    都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
+    """
+    stack = None
+    for it in getattr(ctx["w"], "items", ()) or ():
+        if "dirtyplate" in str(it.get("n") or "").lower():
+            stack = it
+            break
+    if stack is None:
+        return None
+    sx, sz = stack.get("x"), stack.get("z")
+    if sx is None or sz is None:
+        return stack
+    for st in getattr(ctx["w"], "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != "plate_return":
+            continue
+        if "drying" in str(st.get("n") or "").lower():
+            continue        # 晾干架是取干净盘的，不是脏盘摞
+        if st.get("gx") is None or st.get("gz") is None:
+            continue
+        # 同位置（回盘台与脏盘摞重合）才认
+        if abs(float(st.get("x", 1e9)) - float(sx)) < 0.7 and \
+                abs(float(st.get("z", 1e9)) - float(sz)) < 0.7:
+            return st
+    return stack
+
+
 def dirty_plate_exists(ctx, sink_id=None):
     # type: (Dict, Any) -> bool
     """有要洗的盘：场上的 DirtyPlateStack、手里的脏盘、或洗碗池里待洗的盘。
@@ -304,6 +337,14 @@ class WashPlate(Task):
             from ai.space import reachability
             if not reachability.can_interact(ctx, sink):
                 return False
+        # 池里已经有盘时，直接洗池子即可，不需要够得着脏盘摞；只有「要去捡
+        # 脏盘」这条路才要求脏盘摞可达，否则会选一个空跑的 WashPlate。
+        dirty = dirty_stack_entry(ctx)
+        if (dirty is not None and sink_plate_count(ctx, self.sink_id) <= 0
+                and ctx.get("field") is not None):
+            from ai.space import reachability
+            if not reachability.can_interact(ctx, dirty):
+                return False
         # 当前承诺就是洗这个池子 → 继续洗完，别中断。这里必须看「承诺」而
         # 不是只看「池子里有盘」：池子里有盘也可能是 P1 刚放进去的脏盘，那时
         # 场上还有干净盘/装配盘的话就不该去洗。只有 P2 自己已承诺在洗（含
@@ -332,35 +373,7 @@ class WashPlate(Task):
             return sink_plate_count(c, sink_id) > 0
 
         def dirty(c):
-            """脏盘摞的取用目标：优先 stations 里的回盘台（有 gx/gz）。
-
-            items[] 的 DirtyPlateStack 只有世界坐标，没有 gx/gz；同位置的
-            stations 条目（实测 {'t':'plate_return','n':'workstation_plate_return',
-            'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
-            都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
-            """
-            stack = None
-            for it in c["w"].items:
-                if "dirtyplate" in str(it.get("n") or "").lower():
-                    stack = it
-                    break
-            if stack is None:
-                return None
-            sx, sz = stack.get("x"), stack.get("z")
-            if sx is None or sz is None:
-                return stack
-            for st in c["w"].stations:
-                if not isinstance(st, dict) or st.get("t") != "plate_return":
-                    continue
-                if "drying" in str(st.get("n") or "").lower():
-                    continue        # 晾干架是取干净盘的，不是脏盘摞
-                if st.get("gx") is None or st.get("gz") is None:
-                    continue
-                # 同位置（回盘台与脏盘摞重合）才认
-                if abs(float(st.get("x", 1e9)) - float(sx)) < 0.7 and \
-                        abs(float(st.get("z", 1e9)) - float(sz)) < 0.7:
-                    return st
-            return stack
+            return dirty_stack_entry(c)
 
         def holding_dirty(c):
             """手里已经端着脏盘（捡起后、还没放进池子）。"""

@@ -184,3 +184,15 @@ def test_now_wash_selects_when_clean_remain():
         [Candidate(wash, [], 15)], w, bb)
     assert chosen is not None
     assert chosen.task == wash
+
+
+def test_wash_infeasible_when_dirty_stack_unreachable(monkeypatch):
+    """脏盘摞在对面木筏、field 够不着时，不要选 WashPlate 空跑。"""
+    from ai.space import reachability
+    w = _wash_world(plates=[], items=[_dirty()])
+    ctx = _ctx(w)
+    ctx["field"] = {}
+    monkeypatch.setattr(
+        reachability, "can_interact",
+        lambda c, entry: entry.get("t") == "washing")
+    assert T.WashPlate(resources=("sink_01",)).feasible(ctx) is False

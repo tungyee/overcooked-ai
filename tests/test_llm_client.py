@@ -258,9 +258,13 @@ def test_system_prompt_allows_retry_after_state_change():
     旧规则“不要重复同一个 target”会让模型在 wash 刚失败两次后，即使
     玩家说“切完洗碗”、场上已经有脏盘，也不敢再调 execute_actions。
     """
-    text = system_message("本关菜：\n  Sushi_Cucumber = Cucumber")["content"]
+    text = system_message("本关菜：\n  Sushi_Cucumber = Cucumber",
+                          actions=True)["content"]
     assert "不要重复同一个 target" not in text
     assert "可以重新放进 execute_actions" in text
+    # 没有派活工具的回合（division / 播报）不该出现执行规则
+    no_actions = system_message("")["content"]
+    assert "可以重新放进 execute_actions" not in no_actions
 
 
 def test_render_state_is_readable_and_in_seconds():

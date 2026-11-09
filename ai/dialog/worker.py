@@ -1400,7 +1400,9 @@ class DialogWorker(object):
             context.get("dag") or "",
             context.get("guide") or "",
             division=_tools_include(tools, "set_division"),
-            cookbook=_tools_include(tools, "read_cookbook"))]
+            cookbook=_tools_include(tools, "read_cookbook"),
+            actions=(event == "speech"
+                     and _tools_include(tools, "execute_actions")))]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)
@@ -1520,7 +1522,9 @@ class DialogWorker(object):
             context.get("dag") or "",
             context.get("guide") or "",
             division=_tools_include(tools, "set_division"),
-            cookbook=_tools_include(tools, "read_cookbook"))]
+            cookbook=_tools_include(tools, "read_cookbook"),
+            actions=(event == "speech"
+                     and _tools_include(tools, "execute_actions")))]
         new_dag = ""
         if event == "new_order":
             new_dag = _new_dishes_dag(context, new_orders)

@@ -206,12 +206,17 @@ def _read_sse(resp, started=None, on_text=None, timeout=None):
 
 # ---------------------------------------------------------------- prompt
 
-def system_message(kitchen_dag, guide="", division=False, cookbook=False):
-    # type: (str, str, bool, bool) -> dict
-    """静态规则 + 本关 DAG + 攻略摘要（每关只变一次，方便上下文缓存）。"""
+def system_message(kitchen_dag, guide="", division=False, cookbook=False,
+                  actions=False):
+    # type: (str, str, bool, bool, bool) -> dict
+    """静态规则 + 本关 DAG + 攻略摘要（每关只变一次，方便上下文缓存）。
+
+    `actions`：这一轮是否开放派活工具（只有玩家语音回合才为真）。
+    """
     return {"role": "system",
             "content": prompts.render_system(
-                kitchen_dag, guide, division=division, cookbook=cookbook)}
+                kitchen_dag, guide, division=division, cookbook=cookbook,
+                actions=actions)}
 
 
 def render_state(context):

@@ -1351,7 +1351,9 @@ def test_division_turn_ends_naturally_when_model_stops_calling_tools():
     )
     worker, bundle = make_worker(llm=llm)
 
-    thread = run_async(worker._run_llm, {"tools": TOOLS_NEW}, "division", "")
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "plate"])
+    thread = run_async(worker._run_llm, {"tools": tools_with_division},
+                       "division", "")
     ack_for(bundle, [{"tool": "set_division", "ok": True,
                       "division_changed": True}])
     thread.join(2)

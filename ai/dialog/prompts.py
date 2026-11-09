@@ -25,11 +25,13 @@ def action_label(action):
     return ACTION_LABELS.get(str(action or ""), str(action or ""))
 
 
-def render_system(dag, guide="", division=False, cookbook=False):
-    # type: (str, str, bool, bool) -> str
+def render_system(dag, guide="", division=False, cookbook=False,
+                  actions=False):
+    # type: (str, str, bool, bool, bool) -> str
     return _ENV.get_template("system.j2").render(
         dag=dag or "", guide=guide or "",
-        division=bool(division), cookbook=bool(cookbook))
+        division=bool(division), cookbook=bool(cookbook),
+        actions=bool(actions))
 
 
 def command_view(command):

@@ -225,3 +225,28 @@ def test_wash_and_deliver_scopes_include_relay_kinds():
     deliver, _ = build_scope(None, "deliver", None, None)
     assert ("SendAcross", XS.KIND_DIRTY_PLATE) in wash
     assert ("SendAcross", XS.KIND_PLATED_DISH) in deliver
+
+
+def test_send_across_dirty_plate_blocked_while_holding_raw_carrier(frames):
+    """手里端着待进炉的披萨底时，别为了送脏盘把它放下。
+
+    实机 trace-20261109-212622 t=94~99：SendAcross(dirty_plate) 为清手把披萨底
+    放到台面，PlaceCarrierInCooker 又捡起来，0.4 秒一次来回。
+    """
+    from ai.tasks.plate import holding_valuable
+
+    f = json.loads(json.dumps(frames[3]))
+    base = next(i for i in f["items"]
+                if isinstance(i.get("cookable"), dict)
+                and i["cookable"].get("prep")
+                and not i.get("held_by"))
+    base["held_by"] = "Player 2"
+    for chef in f["chefs"]:
+        if chef["name"] == "Player 2":
+            chef["held"] = base["n"]
+    w, book, bb, ctx = _ctx(f)
+
+    assert holding_valuable(ctx) is True
+    task = T.SendAcross(item=XS.KIND_DIRTY_PLATE,
+                        resources=("dirty_plate", CH.STATIC))
+    assert task.feasible(ctx) is False

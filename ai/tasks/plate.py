@@ -118,6 +118,29 @@ def holding_plated_dish(ctx):
     return False
 
 
+def holding_raw_carrier(ctx):
+    # type: (Dict) -> bool
+    """手里端着生的载体（待进炉的披萨底）。
+
+    和 holding_plated_dish 同类：别的要空手的任务会把它放到台面、下一个任务
+    再捡起来。实机 trace-20261109-212622 t=94~99：SendAcross(dirty_plate) 为了
+    清手把待进炉的披萨底放下，PlaceCarrierInCooker 又捡起来，0.4 秒一次来回。
+    """
+    from ai.query import carriers as CR
+    held = CR.held_item(ctx["w"], P.P2_NAME)
+    if held is None:
+        return False
+    # 先确认是「可上灶的载体」（披萨底），再看它还是生的：普通料（番茄等）
+    # cooked 也是 None，会被 is_raw_carrier 误判成生载体。
+    return CR.is_prep_carrier(held, ctx.get("book"))         and CR.is_raw_carrier({"item": held})
+
+
+def holding_valuable(ctx):
+    # type: (Dict) -> bool
+    """手里端着不该为清手而放下的东西（成品盘 / 生载体）。"""
+    return holding_plated_dish(ctx) or holding_raw_carrier(ctx)
+
+
 def dirty_plate_exists(ctx, sink_id=None):
     # type: (Dict, Any) -> bool
     """有要洗的盘：场上的 DirtyPlateStack、手里的脏盘、或洗碗池里待洗的盘。
@@ -270,9 +293,9 @@ class WashPlate(Task):
         # t=6117~6193 与 7228~7370 共 220 拍选 WashPlate、0 拍按键。
         if self.done(ctx):
             return False
-        # 手里端着有料的盘：先把那盘送出去，别为了清手把它放下（放下就会被
-        # 送餐/送盘任务再捡起来，两个任务互相拆台）。
-        if holding_plated_dish(ctx):
+        # 手里端着有料的盘 / 生载体：先把东西送出去，别为了清手把它放下
+        # （放下就会被送餐/送盘任务再捡起来，两个任务互相拆台）。
+        if holding_valuable(ctx):
             return False
         # 这个池子在对面时 P2 走不过去；让 SendAcross(dirty_plate) 先送过去。
         # 拓扑未知（无 field）保持旧行为。

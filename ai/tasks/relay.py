@@ -26,6 +26,7 @@ from ai.space import regions as RG
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            _grid_matches, _station_for_item,
                            _unpack_resource_id)
+from ai.tasks.plate import holding_valuable
 
 # 一轮「取 → 走到出手位 → 投」的拍数上限（20Hz）：取料 ~40 拍 + 走位 ~60 拍
 # + 转身投出 ~25 拍，留一倍余量。单轮超时 = 进度看门狗：一轮投不出去就交还
@@ -163,6 +164,11 @@ class SendAcross(Task):
         # type: (Dict) -> bool
         spec = self._spec()
         if spec is None or self.done(ctx):
+            return False
+        # 手里端着成品盘 / 生载体时，别为了送脏盘/干净盘把它放下——放下就被
+        # 下一个任务捡起来，来回循环（trace-20261109-212622 t=94~99：
+        # SendAcross(dirty_plate) 放披萨底 ↔ PlaceCarrierInCooker 捡起）。
+        if self.item in ("clean_plate", "dirty_plate") and holding_valuable(ctx):
             return False
         source = self._source(ctx)
         if source is None:

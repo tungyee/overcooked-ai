@@ -210,6 +210,11 @@ def station_signature(world):
             if not isinstance(station, dict) or station.get("t") != station_type:
                 continue
             grid = str(station.get("grid") or "")
+            # 3-5 的出餐口挂在移动出餐船上，grid=null，gx/gz 和 x/z 都随船漂；
+            # 它不是分工资源，整条从签名里去掉，否则每帧都判「站点搬家」。
+            if station_type == "plate_station" and not grid and moving:
+                parts.append((action, grid))
+                continue
             row = (action, grid,
                    _q(station.get("gx"), 1.2),
                    _q(station.get("gz"), 1.2))

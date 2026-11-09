@@ -196,3 +196,15 @@ def test_wash_infeasible_when_dirty_stack_unreachable(monkeypatch):
         reachability, "can_interact",
         lambda c, entry: entry.get("t") == "washing")
     assert T.WashPlate(resources=("sink_01",)).feasible(ctx) is False
+
+
+def test_two_plate_rule_only_for_known_two_plate_levels():
+    """帧里看到 2 块盘不等于关卡只有 2 块盘：3+ 盘关的脏盘摞可能是一摞。"""
+    w = _wash_world(plates=[("p1", 5, 5, ("Seaweed",))], items=[_dirty()])
+    wash = T.WashPlate(resources=("sink_01",))
+
+    w.level = "Mine_2_4_2P"
+    assert PL.layer_of_task(wash, w) == PL.L_CLEANUP
+
+    w.level = "Rapids_3_5_2P"
+    assert PL.layer_of_task(wash, w) == PL.L_UNBLOCK

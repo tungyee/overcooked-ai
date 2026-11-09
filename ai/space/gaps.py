@@ -24,8 +24,9 @@ GAP_MAX_M = 2.0
 DASH_COST = 2
 # 缝隙宽度采样数；格心间距 1.2m 时步长约 0.06m，足够分辨半格缝。
 _SAMPLES = 21
-# 小于这个宽度不算缝（点判抖动/地板接缝误差）。
-_MIN_GAP_M = 0.05
+# 小于这个宽度不算缝：厨师胶囊半径 0.4m，半格以下的接缝/停靠缝人直接
+# 走得过去（Balloon_1_5 的 0.36m 停靠缝、3-6 的 0.18m 地板接缝）。
+_MIN_GAP_M = 0.5
 
 Cell = Tuple[int, int]
 Pair = Tuple[Cell, Cell]

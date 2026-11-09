@@ -99,3 +99,32 @@ def test_portals_nav_args_include_gap_jump():
     nav = portals.nav_args(w)
     field = distance_field((2, 1), belt_dir={}, **nav)
     assert (4, 1) in field
+
+
+def test_sub_character_crack_is_not_a_gap():
+    """0.36m 的停靠缝（Balloon_1_5）人能直接走过，不能当 dash 跳边。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (2.76, 5.16, 0.0, 2.4)],
+                  walk=lambda gx, gz: 0.0 <= gx * CELL <= 5.16
+                  and 0.0 <= gz * CELL <= 2.4)
+    assert gaps.gap_pairs(w) == {}
+
+
+def test_no_gap_returns_nav_unchanged():
+    """没有缝隙的关卡不能改变寻路参数（门洞/传送门/走廊原样保留）。"""
+    w = FakeWorld([(0.0, 5.0, 0.0, 5.0)],
+                  walk=lambda gx, gz: 0 <= gx <= 4 and 0 <= gz <= 4)
+    base = {"is_walkable": w.walkable, "edge_blocked": None,
+            "jumps": {}, "jump_cost": {}}
+    assert gaps.wrap(base, w) is base
+
+
+def test_wrap_preserves_existing_jumps_and_costs():
+    """gaps.wrap 要能叠在 lanes._Jumps/_JumpCost 之上，不丢已有跳边。"""
+    w = FakeWorld([(0.0, 2.4, 0.0, 2.4), (3.0, 5.4, 0.0, 2.4)])
+    base_jumps = {(0, 0): [(5, 5)]}
+    base_cost = {((0, 0), (5, 5)): 7}
+    nav = gaps.wrap({"is_walkable": w.walkable, "edge_blocked": None,
+                     "jumps": base_jumps, "jump_cost": base_cost}, w)
+    assert (5, 5) in nav["jumps"].get((0, 0), ())
+    assert (3, 1) in nav["jumps"].get((2, 1), ())
+    assert nav["jump_cost"].get(((0, 0), (5, 5))) == 7

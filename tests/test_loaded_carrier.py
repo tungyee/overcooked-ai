@@ -191,15 +191,6 @@ def test_planner_picks_carrier_to_plate(frames, idx):
     assert scores[CARRIER_TASK] > scores.get(PLAIN_TASK, -99)
 
 
-def test_two_plate_fixture_with_dirty_is_wash_unblock(frames):
-    """真实 2 盘帧：一块装料盘 + 一块脏盘 → WashPlate 进 L4（用户确认规则）。"""
-    from ai.core import planner_layers as PL
-    w, _ = _wb(frames[1])
-    assert planner._plate_total(w) == 2
-    wash = T.WashPlate(resources=("WashingPart",))
-    assert PL.layer_of_task(wash, w) == PL.L_UNBLOCK
-
-
 def test_plate_match_prefers_order_with_complete_carrier():
     """卷已包齐（饼+肉+饭）只差一只盘：唯一的空盘给这单，而不是别的单。"""
     from ai.query.recipes import RecipeBook as RB

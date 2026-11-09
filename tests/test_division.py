@@ -167,3 +167,32 @@ def test_reach_signature_uses_cost_to(monkeypatch):
         ("切", False, True),
     )
     assert calls
+
+
+def test_station_signature_ignores_moving_serving_hatch():
+    """3-5 的出餐口挂在移动出餐船上，grid=null；它不该参与分工复核签名。"""
+    raw = {"grids": [{"id": "MovingRaft", "moving": True}]}
+    a = SimpleNamespace(raw=raw, stations=[
+        {"t": "plate_station", "grid": None, "gx": -1, "gz": 8,
+         "x": 8.0, "z": 9.0},
+    ])
+    b = SimpleNamespace(raw=raw, stations=[
+        {"t": "plate_station", "grid": None, "gx": -3, "gz": 7,
+         "x": 5.0, "z": 8.0},
+    ])
+    assert D.station_signature(a) == D.station_signature(b)
+
+
+def test_rapids35_fixture_station_signature_is_stable():
+    """真实 3-5 三帧：木筏和出餐船都在动，分工签名不应变。"""
+    import gzip
+    import json
+    import os
+    from ai.state.world import World
+
+    path = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                        "rapids35-20261101-180609-deliver.ndjson.gz")
+    with gzip.open(path, "rt", encoding="utf8") as fh:
+        frames = [json.loads(line) for line in fh if line.strip()]
+    sigs = {D.station_signature(World(f)) for f in frames[:3]}
+    assert len(sigs) == 1

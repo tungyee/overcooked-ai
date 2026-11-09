@@ -314,7 +314,8 @@ class Primitive(Node):
             # 绕开它一阵子；否则插件判关、Python 判通时会在缝口反复重发同一条 move。
             # 「portal busy」：推门推满 max_wait 都没被传走，回传入口门中心 → 拉黑触发格，
             # portals.nav_args 不再连这扇门的跳边，一阵子后自然恢复（按门洞口径，不拉黑资源）。
-            if not r.get("ok") and r.get("why") in ("stuck", "gate closed", "portal busy") \
+            if not r.get("ok") and r.get("why") in (
+                    "stuck", "ledge", "gate closed", "portal busy") \
                     and isinstance(r.get("blocked_cell"), (list, tuple)) \
                     and len(r["blocked_cell"]) >= 2:
                 w = ctx.get("w")

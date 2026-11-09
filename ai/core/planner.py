@@ -2420,13 +2420,29 @@ def _plate_pressure(world):
     return 0.0
 
 
+def _is_two_plate_level(level):
+    # type: (Any) -> bool
+    """已知的 2 盘关卡。只认 3-5，避免用帧里的盘数猜关卡容量。"""
+    base = str(level or "").strip()
+    if base.endswith("_2P"):
+        base = base[:-3]
+    return base == "Rapids_3_5"
+
+
 def _plate_total(world):
     # type: (Any) -> int
     """场上盘子总数：干净/装料/手持 + 洗碗池里的 + 脏盘摞。
 
     3-5 只有 2 块盘；这个数用来把「2 盘关有 1 个脏盘」直接抬进 L4。
     脏盘摞在 items 里、池里的盘只体现在 washing.plate_count，两者都要算。
+
+    **非 2 盘关卡返回 99（禁用该规则）**：一个 DirtyPlateStack 可能是一摞
+    （Wizard 3-3 三块盘会变成一个 item），按帧数猜会把 3+ 盘关误判成 2 盘。
+    合成测试/旧帧没有 level 时仍按帧数算，便于单测。
     """
+    level = str(getattr(world, "level", "") or "")
+    if level and not _is_two_plate_level(level):
+        return 99
     total = len(world.all_plates)
     for it in (list(getattr(world, "items", ()) or ())
                + list(getattr(world, "held_items", ()) or ())):

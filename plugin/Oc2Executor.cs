@@ -384,6 +384,9 @@ namespace Oc2AI
         private const float DASH_PROBE = 0.55f;
         private const float DASH_HOLD = 0.08f;
         private const float DASH_COOLDOWN = 1.0f;
+        // 对岸路点超过这个距离就不 dash：木筏可能已漂远，dash 也够不到，
+        // 交回 Python 重算比冲进水里好。
+        private const float DASH_REACH = 2.3f;
 
         // waypoint 锚点：Python 发的是发令时刻的世界坐标，但站在移动平台（气球篮/
         // 木筏）上时，平台上的点会被平台带走。冻结的世界坐标会落进平台台面里、
@@ -843,13 +846,16 @@ namespace Oc2AI
                 : 1f;
 
             bool gapAhead = GroundGapAhead(f, dir);
-            if (gapAhead && !_allowDash)
+            float farDist = Vector2.Distance(pos, target);
+            if (gapAhead && (!_allowDash || farDist > DASH_REACH))
             {
-                // 没有 dash 授权却要踩空：宁可不走，交回 Python 重算，也不掉水。
+                // 没有 dash 授权、或对岸路点已经超出 dash 射程（木筏漂远）：
+                // 宁可不走，交回 Python 重算，也不掉水。
                 PadEngagement.Pad.Stop();
                 UnityEngine.Debug.Log("[EXEC] move ledge pos=(" + f.PosX + "," + f.PosZ
-                    + ") idx=" + _idx + "/" + _path.Count);
-                Finish(false, "ledge", new double[] { pos.x, pos.y });
+                    + ") idx=" + _idx + "/" + _path.Count
+                    + " far=" + farDist.ToString("0.00"));
+                Finish(false, "ledge", new double[] { target.x, target.y });
                 return;
             }
 

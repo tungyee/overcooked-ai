@@ -50,12 +50,13 @@ class W(object):
     """只读世界替身：供需计数是纯谓词，不该依赖真 World。"""
 
     def __init__(self, orders=(), cookers=(), plates=(), chefs=(), items=(),
-                 recipes=None):
+                 recipes=None, held_plates=()):
         self.orders = list(orders)
         self.cookers = list(cookers)
         self.plates = list(plates)
         self.chefs = list(chefs)
         self.items = list(items)
+        self.held_plates = list(held_plates)
         self.recipes = recipes if recipes is not None else RECIPES
 
 
@@ -118,6 +119,17 @@ def test_supply_counts_plated_portions():
     """已装盘未送的也算供给：那份米已经不需要再煮一次。"""
     w = W(orders=[order("1", "Sushi_Fish")],
           plates=[plate("p1", ["cooked:sushirice:pot"])])
+    assert CS.cooked_supply(w, book(), "BoiledSushiRice") == 1
+
+
+def test_supply_counts_held_plates():
+    """手里端着、正在送的那盘也是供给。
+
+    World.plates 不含手持盘，只看它会在端盘/送餐途中把供给判成 0，planner
+    重复下锅；4-1 断供看门狗也会被这种瞬时 0 抖动误触发。
+    """
+    w = W(orders=[order("1", "Sushi_Fish")],
+          held_plates=[plate("p1", ["cooked:sushirice:pot"])])
     assert CS.cooked_supply(w, book(), "BoiledSushiRice") == 1
 
 

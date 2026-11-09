@@ -41,6 +41,7 @@ mkdir -p "$OUT"
   -r:"$M/mscorlib.dll" -r:"$M/System.dll" -r:"$M/System.Core.dll" \
   -r:"$M/UnityEngine.dll" -r:"$M/UnityEngine.CoreModule.dll" \
   -r:"$M/UnityEngine.PhysicsModule.dll" \
+  -r:"$M/UnityEngine.AnimationModule.dll" \
   -r:"$M/Assembly-CSharp.dll" -r:"$M/Assembly-CSharp-firstpass.dll" \
   -r:"$BE/BepInEx.dll" \
   -out:"$OUT/Oc2AIPlugin.dll" \

@@ -188,6 +188,8 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         "bindings": record.get("bindings", {}),
         # 这一拍选在哪层。复盘先看它，再看候选明细（spec §6）。
         "top_layer": record.get("top_layer"),
+        # 断供补位看门狗：override=True 表示本拍 cook 负分被撤销。
+        "supply": record.get("supply") or {},
         # planner 这一拍**原始**选的 task（字符串）。与 exec.task 可能不同：
         # agent ⑨.5 会把「后置条件已成立的旧树」接回去让它报完 SUCCESS。
         # 实机 trace-20261015-165358 t=2582~2718 的 WashPlate/FillCooker 2:1

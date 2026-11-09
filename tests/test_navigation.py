@@ -185,6 +185,36 @@ def test_serving_hatch_interact_cells_both_sides_open_falls_back():
     assert set(cells) == {(0, 2), (1, 2), (0, 0), (1, 0), (-1, 1), (2, 1)}
 
 
+def test_serving_hatch_interact_cells_prefers_reachable_side_over_deeper_dead_end():
+    """墙外死区比厨房侧更深时，按距离场选真正可达的一侧（4-1 实机）。
+
+    4-1 出餐口占地 (10,2)/(10,3)：西侧厨房只有 2 格深，东侧墙外是 3 格死路，
+    深度判据会选中东侧；但东侧被墙隔开、距离场到不了。P1 实际站 (9,2) 送餐。
+    """
+    blocked = {(10, 2), (10, 3), (7, 2), (7, 3)}
+    walkable = lambda gx, gz: -5 <= gx <= 20 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+    field = {(9, 2): 22, (9, 3): 23, (8, 2): 21, (8, 3): 22}
+
+    cells = serving_hatch_interact_cells(
+        {(10, 2), (10, 3)}, walkable, field=field)
+
+    assert set(cells) == {(9, 2), (9, 3)}
+
+
+def test_serving_hatch_interact_cells_keeps_deeper_side_when_both_reachable():
+    """两侧都可达时保持原判据：更深的一侧是厨房。"""
+    blocked = {(1, 0), (1, 1), (-1, 0), (-1, 1)}
+    walkable = lambda gx, gz: -5 <= gx <= 5 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+    field = {(0, 0): 1, (0, 1): 2, (2, 0): 1, (2, 1): 2, (3, 0): 3}
+
+    cells = serving_hatch_interact_cells(
+        {(1, 0), (1, 1)}, walkable, field=field)
+
+    assert set(cells) == {(2, 0), (2, 1)}
+
+
 def test_serving_hatch_interact_cells_single_cell_falls_back():
     """1×1 占地（方向不明确）→ 退回全部四邻。"""
     blocked = {(0, 0)}

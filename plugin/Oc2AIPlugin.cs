@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.4")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.5")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -75,8 +75,9 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.24.4 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.24.5 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
+            _trafficProbeEnabled = Config.Bind<bool>("Diagnostics", "TrafficProbe", true, "Log cars/traffic lights in Sushi_4_1 (diagnostic only).");
             BindWalkProbe();
             StartSocket();
             _execServer = new ExecServer();
@@ -113,6 +114,8 @@ namespace Oc2AI
                 if (IsInLevel())
                 {
                     RefreshLevel();
+                    if (_trafficProbeEnabled.Value)
+                        Oc2TrafficProbe.Tick(_all, _level, Logger.LogInfo);
                     if (_discoverEnabled.Value && !_discoveryDone) { _discoveryDone = true; Discover(); }
                     string state = BuildState();
                     // 不再把整帧状态写进游戏日志：这是卡顿大户，决策复盘走 Python 侧
@@ -1160,7 +1163,7 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.24.4\",\"protocol_version\":8,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.24.5\",\"protocol_version\":8,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))

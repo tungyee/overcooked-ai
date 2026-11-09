@@ -109,17 +109,9 @@ class Approach(Primitive):
                         or cur in {s["cell"] for s in hatch})
         if cur == cell and (w.walkable(*cell) or P.interact_ready(chef, st, self.kind, w.to_grid)):
             return False
-        footprint = {cell}
-        if st.get('t') == PLATE_STATION:
-            footprint = O.station_block_cells(st, getattr(w, 'terrain', {}),
-                                               getattr(w, 'mapping', None)) or footprint
-        elif st.get('t') == 'washing' and self.kind == 'placement':
-            footprint = sink_place_cells(st, w.stations, w.to_grid)
-        else:
-            footprint = O.interaction_footprint(st, cell, getattr(w, 'stations', ()),
-                                                w.to_grid, w.to_world, w.walkable)
-        goals = navigation.interact_cells_multi(footprint, w.walkable,
-                                                w.belt_cells, include_belts=True)
+        goals = _station_interact_cells(st, cell, w, self.kind,
+                                        include_belts=True,
+                                        field=ctx.get('field'))
         return cur not in goals
 
     def tick(self, ctx):
@@ -169,7 +161,8 @@ class Approach(Primitive):
             return self._tick_hatch(ctx, ex, st, hatch)
 
         blocked = _blocked_cells(ctx, P.resource_id(st))
-        goals = _station_interact_cells(st, cell, w, self.kind)
+        goals = _station_interact_cells(st, cell, w, self.kind,
+                                        field=ctx.get("field"))
         if self.allow_target:
             goals = [cell] + goals
         if not goals:
@@ -183,7 +176,8 @@ class Approach(Primitive):
         got = navigation.nearest_cost(field, [g for g in goals if g not in blocked])
         if got is None:
             goals = _station_interact_cells(st, cell, w, self.kind,
-                                            include_belts=True)
+                                            include_belts=True,
+                                            field=ctx.get("field"))
             got = navigation.nearest_cost(field, [g for g in goals if g not in blocked])
         if got is None:
             return Status.FAILURE

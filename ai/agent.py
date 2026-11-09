@@ -1916,6 +1916,16 @@ class Agent:
             # trace.emit 读到的恒为 None —— 实机 trace-20261015-165358 的
             # 3637 行里 top_layer 全是 null，只能靠逐候选 layer 反推 min()。
             "top_layer": plan_record.get("top_layer"),
+            # 断供补位看门狗（planner._update_supply_watch）：override=True
+            # 表示本拍 cook 类任务的玩家认领负分已被撤销，复盘可直接看出
+            # 「为什么 P2 去煮饭了」。
+            "supply": {
+                "override": bool(getattr(self.bb, "supply_override", False)),
+                "idle_ticks": (
+                    self.tick - self.bb.supply_idle_since
+                    if getattr(self.bb, "supply_idle_since", None) is not None
+                    else None),
+            },
             # 对话分支与截止闸抢单（spec §6.4）：分支是认领复盘的第一步，
             # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
             "branches": plan_record.get("branches") or {},

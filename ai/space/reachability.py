@@ -167,23 +167,30 @@ def _interact_goals(ctx, entry):
     cell = cell_of(world, entry)
     if cell is None:
         return set()
-    cells = {cell}
     extra = set()
     if entry.get('t') == 'plate_station' and hasattr(world, 'mapping'):
-        cells = occupancy.station_block_cells(entry, world.terrain, world.mapping)
+        fp = occupancy.station_block_cells(entry, world.terrain, world.mapping)
+        # 与执行层 move._station_interact_cells 同一判据：距离场可达侧优先，
+        # 否则墙外死区比厨房侧更深时规划层会认为能送、执行层永远走不到。
+        goals = set(navigation.serving_hatch_interact_cells(
+            fp, world.walkable, world.belt_cells,
+            field=ctx.get('field'), include_belts=True))
         # 漂移出餐口量化到「紧邻是水面」的那一行时，格内交互位为空；
         # 补格外站位（与 move.Approach 同一判据，见 shuttle.hatch_fallback）。
         extra = {s['cell'] for s in shuttle.hatch_fallback(world, entry)}
     elif entry.get('t') == 'washing':
         from ai.query.stations import sink_place_cells
         cells = sink_place_cells(entry, world.stations, world.to_grid)
+        goals = set(navigation.interact_cells_multi(
+            cells, world.walkable, world.belt_cells, include_belts=True))
     else:
         # 与执行层 move._station_interact_cells 同一口径：按占地（含承载台面）
         # 取交互位，移动篮亚格偏移时盘不会因量化到台面后一格而判不可达。
         cells = occupancy.interaction_footprint(entry, cell, world.stations,
                                                 world.to_grid, world.to_world,
                                                 world.walkable)
-    goals = set(navigation.interact_cells_multi(cells, world.walkable, world.belt_cells, include_belts=True))
+        goals = set(navigation.interact_cells_multi(
+            cells, world.walkable, world.belt_cells, include_belts=True))
     goals |= extra
     if world.walkable(*cell):
         goals.add(cell)

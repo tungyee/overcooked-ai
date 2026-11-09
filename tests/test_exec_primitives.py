@@ -240,3 +240,44 @@ def test_tap_command_carries_stack_for_stack_plate():
     assert ex.issued[0]["kind"] == "placement"
     assert ex.issued[0]["target"]["stack"] == "CleanPlateStack"
     assert ex.issued[0]["target"]["gx"] is not None
+
+
+def test_station_interact_cells_uses_reachable_hatch_side():
+    """4-1：墙外死区更深但不可达，执行层必须选厨房侧 (9,2)/(9,3)。"""
+    st = {"t": "plate_station", "n": "hatch",
+          "x": 36.8, "z": 7.8, "gx": 10, "gz": 2}
+
+    class Mapping(object):
+        origin_x, origin_z = 24.8, 4.8
+        cell = cell_z = 1.2
+
+        def to_world(self, gx, gz):
+            return (24.8 + gx * 1.2, 4.8 + gz * 1.2)
+
+    class HatchWorld(FakeWorld):
+        def __init__(self):
+            FakeWorld.__init__(self)
+            self.terrain = {20: [(36.2, 37.4, 6.6, 9.0)]}
+            self.mapping = Mapping()
+            self.stations = [st]
+            self._walk = lambda gx, gz: (gx, gz) in {
+                (8, 2), (8, 3), (9, 2), (9, 3),
+                (11, 2), (11, 3), (12, 2), (12, 3), (13, 2), (13, 3)}
+
+        def to_grid(self, x, z):
+            return (int(round((x - 24.8) / 1.2)), int(round((z - 4.8) / 1.2)))
+
+        def to_world(self, gx, gz):
+            return Mapping().to_world(gx, gz)
+
+    from ai.primitives.move import _station_interact_cells
+    from ai.space import reachability
+
+    w = HatchWorld()
+    field = {(8, 2): 21, (8, 3): 22, (9, 2): 22, (9, 3): 23}
+    goals = _station_interact_cells(st, (10, 2), w, "placement", field=field)
+    assert set(goals) == {(9, 2), (9, 3)}
+
+    # 规划层必须与执行层同口径，否则 can_interact 为真、Approach 必失败。
+    ctx = {"w": w, "chef": {"name": "Player 2"}, "field": field}
+    assert set(reachability._interact_goals(ctx, st)) == {(9, 2), (9, 3)}

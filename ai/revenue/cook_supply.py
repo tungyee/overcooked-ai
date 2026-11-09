@@ -104,10 +104,19 @@ def cooked_supply(world, book, item):
         elif cooked_flag and _pot_matches(book, item, parse_pot_contents(detail)):
             n += 1
 
-    # ④ 已装盘未送
-    for p in (getattr(world, "plates", None) or ()):
-        if book.plate_has(p, item):
-            n += 1
+    # ④ 已装盘未送：台面上的 + 手里端着的。World.plates 已排除手持盘，
+    # 只看它会在端盘/送餐途中把供给判成 0（重复下锅；断供看门狗抖动）。
+    seen_plates = set()
+    for pool in (getattr(world, "plates", None) or (),
+                 getattr(world, "held_plates", None) or ()):
+        for p in pool:
+            pid = p.get("n")
+            if pid is not None:
+                if pid in seen_plates:
+                    continue
+                seen_plates.add(pid)
+            if book.plate_has(p, item):
+                n += 1
 
     # ⑤ 已装料载体里的（包了熟肉的卷饼等，散落或任一方手持）：放进盘就是
     # 一份装盘熟料。不算的话 P1 包好肉卷，填灶还按缺一份再煎一锅。

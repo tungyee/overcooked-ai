@@ -218,14 +218,42 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
     return list(preferred) if preferred else list(fallback)
 
 
-def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None):
-    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set]) -> List[Tuple[int, int]]
+def _pick_hatch_side(primary_cells, secondary_cells, primary_depth,
+                     secondary_depth, field):
+    # type: (List[Tuple[int, int]], List[Tuple[int, int]], int, int, Optional[Dict]) -> Optional[List[Tuple[int, int]]]
+    """两侧交互位里选厨房侧：距离场可达优先，其次比可走深度。
+
+    4-1 红绿灯寿司街：出餐口东侧（墙外）地面延伸到关卡边界外，按可走深度
+    比厨房侧更深，但被墙隔开、距离场到不了；P1 实际站西侧 (9,2) 送餐。
+    只看深度会把交互位定到墙外死区，Approach 永远 `nearest_cost=None`。
+    """
+    if field is not None:
+        primary_reach = [c for c in primary_cells if c in field]
+        secondary_reach = [c for c in secondary_cells if c in field]
+        if primary_reach and not secondary_reach:
+            return primary_reach
+        if secondary_reach and not primary_reach:
+            return secondary_reach
+    if primary_depth > secondary_depth:
+        return primary_cells
+    if secondary_depth > primary_depth:
+        return secondary_cells
+    return None
+
+
+def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None,
+                                 field=None, include_belts=False):
+    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], Optional[Dict], bool) -> List[Tuple[int, int]]
     """出餐口（嵌墙）交互位：只取厨房内侧（前侧），排除墙后死路一侧。
 
     出餐口是嵌在外墙里的一段墙，只有朝厨房的一面能送餐；墙后那一面是
     贴墙的死路（0~1 格），站过去既送不了餐、也常被柜台/墙卡住。前/后按
     「沿墙法向连续可走多少格」的深度区分：深度大的一面是厨房（前侧）。
     两面深度相等（出餐口不在墙边，罕见）时退回全部四邻，不做过滤。
+
+    传了 `field`（P2 的距离场）时先看两侧是否可达：只有一侧可达就用那一侧。
+    4-1 的墙外死区比厨房侧更深但不可达，纯深度判据会送不出去（见
+    `_pick_hatch_side`）。
 
     水平墙（占地 gz 相同、gx >= 2）比南北，垂直墙（占地 gx 相同、gz >= 2）
     比东西；1×1 或方向不明确的占地退化为 interact_cells_multi。
@@ -238,20 +266,23 @@ def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None):
         mid_gx = xs[len(xs) // 2]
         north = _walkable_depth(mid_gx, gz, 0, 1, is_walkable)
         south = _walkable_depth(mid_gx, gz, 0, -1, is_walkable)
-        if north > south:
-            return [(gx, gz + 1) for gx in xs if is_walkable(gx, gz + 1)]
-        if south > north:
-            return [(gx, gz - 1) for gx in xs if is_walkable(gx, gz - 1)]
+        north_cells = [(gx, gz + 1) for gx in xs if is_walkable(gx, gz + 1)]
+        south_cells = [(gx, gz - 1) for gx in xs if is_walkable(gx, gz - 1)]
+        side = _pick_hatch_side(north_cells, south_cells, north, south, field)
+        if side is not None:
+            return side
     elif len(xs) == 1 and len(zs) >= 2:
         gx = xs[0]
         mid_gz = zs[len(zs) // 2]
         east = _walkable_depth(gx, mid_gz, 1, 0, is_walkable)
         west = _walkable_depth(gx, mid_gz, -1, 0, is_walkable)
-        if east > west:
-            return [(gx + 1, gz) for gz in zs if is_walkable(gx + 1, gz)]
-        if west > east:
-            return [(gx - 1, gz) for gz in zs if is_walkable(gx - 1, gz)]
-    return interact_cells_multi(footprint, is_walkable, belt_cells)
+        east_cells = [(gx + 1, gz) for gz in zs if is_walkable(gx + 1, gz)]
+        west_cells = [(gx - 1, gz) for gz in zs if is_walkable(gx - 1, gz)]
+        side = _pick_hatch_side(east_cells, west_cells, east, west, field)
+        if side is not None:
+            return side
+    return interact_cells_multi(footprint, is_walkable, belt_cells,
+                                include_belts=include_belts)
 
 
 def _walkable_depth(gx, gz, dx, dz, is_walkable, limit=8):

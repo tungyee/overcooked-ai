@@ -3,6 +3,8 @@
 Approach：走到能跟 target 交互的位置。
 Face：转向 target（委托后端下为 no-op，转向已并入 move/tap 的重瞄）。
 """
+import os
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from ai.space import gaps, navigation, portals, seams, shuttle
@@ -20,6 +22,59 @@ FACE_MAX_TICKS = 40
 
 # move 命令超时（毫秒）：委托后端下一趟走位最多 8 秒。
 MOVE_TIMEOUT_MS = 8000
+
+
+def _nav_debug(msg):
+    # type: (str) -> None
+    """走位诊断日志（OC2_NAV_DEBUG=1 时打印到 stderr）。
+
+    过街/取盘这类问题需要同时看：目标身份、目标格、交互位、路径、以及
+    有没有拿到路径。默认关，避免刷屏。
+    """
+    flag = os.environ.get("OC2_NAV_DEBUG", "").strip().lower()
+    if flag not in ("", "0", "false", "no", "off"):
+        print("[NAV] " + msg, file=sys.stderr, flush=True)
+
+
+def _nav_time(ctx):
+    # type: (Dict) -> Any
+    """用插件关卡时钟给日志打时基，和 trace 的 level_time 对得上。"""
+    w = ctx.get("w")
+    raw = getattr(w, "raw", None) or {}
+    return raw.get("level_time")
+
+
+def _nav_target(target):
+    # type: (Any) -> str
+    if not isinstance(target, dict):
+        return str(target)
+    return "%s:%s@(%s,%s)" % (
+        target.get("grid") or "", target.get("n") or "?",
+        target.get("x"), target.get("z"))
+
+
+def _nav_crossing(w, path):
+    # type: (Any, Optional[List[Tuple[int, int]]]) -> str
+    """4-1 过街标记：路径是否穿过马路条带（gx -3..6）。"""
+    if not path:
+        return ""
+    level = str(getattr(w, "level", "") or "")
+    if "4_1" not in level:
+        return ""
+    road = [tuple(c) for c in path if -3 <= c[0] <= 6]
+    if not road:
+        return ""
+    return " cross_road=%s..%s n=%d" % (road[0], road[-1], len(road))
+
+
+def _nav_path(path):
+    # type: (Optional[List[Tuple[int, int]]]) -> str
+    if not path:
+        return "[]"
+    if len(path) <= 24:
+        return str([tuple(c) for c in path])
+    return str([tuple(c) for c in path[:12]])[:-1] + ", ... , " + str(
+        [tuple(c) for c in path[-8:]])[1:]
 
 
 def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
@@ -112,7 +167,12 @@ class Approach(Primitive):
         goals = _station_interact_cells(st, cell, w, self.kind,
                                         include_belts=True,
                                         field=ctx.get('field'))
-        return cur not in goals
+        if cur not in goals:
+            _nav_debug("reapproach t=%s target=%s kind=%s cur=%s cell=%s goals=%s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind,
+                          cur, cell, goals))
+            return True
+        return False
 
     def tick(self, ctx):
         # type: (Dict) -> str
@@ -148,7 +208,11 @@ class Approach(Primitive):
 
         cur = P.chef_cell(chef, w.to_grid)
         if cur is None:
+            _nav_debug("no-chef-cell t=%s target=%s" % (_nav_time(ctx), _nav_target(st)))
             return Status.FAILURE
+        if self._pending_cmd is None:
+            _nav_debug("plan t=%s target=%s kind=%s cur=%s cell=%s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, cell))
         shuttle_st = shuttle.station_of(w, st)
         if shuttle_st is not None:
             return self._tick_shuttle(ctx, ex, st, shuttle_st)
@@ -180,14 +244,23 @@ class Approach(Primitive):
                                             field=ctx.get("field"))
             got = navigation.nearest_cost(field, [g for g in goals if g not in blocked])
         if got is None:
+            _nav_debug("no-goal t=%s target=%s kind=%s cur=%s cell=%s goals=%s "
+                       "blocked=%s field_has=%s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, cell,
+                          goals, sorted(blocked), len(field or {})))
             return Status.FAILURE
         goal = got[0]
         path = navigation.trace_back(field, goal, w.belt_dir, ctx.get("soft_cost"),
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
+            _nav_debug("no-path t=%s target=%s kind=%s cur=%s goal=%s goals=%s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, goal, goals))
             return Status.FAILURE
 
         if self._pending_cmd is None:
+            _nav_debug("move t=%s target=%s kind=%s cur=%s goal=%s goals=%s%s path=%s"
+                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, goal,
+                          goals, _nav_crossing(w, path), _nav_path(path)))
             cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*goal)),
                             handle_desc(st, target_grid_callbacks(w, st)[0]), self.kind,
                             MOVE_TIMEOUT_MS)

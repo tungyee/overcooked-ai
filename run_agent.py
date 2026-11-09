@@ -78,6 +78,8 @@ def _parse_args(argv):
                     help="显式启用语音；缺必需环境变量时报错退出（退出码 2）")
     ap.add_argument("--no-voice", action="store_true",
                     help="强制关闭语音，忽略环境变量")
+    ap.add_argument("--nav-debug", action="store_true",
+                    help="打印 [NAV] 走位诊断（目标/交互位/路径/过街标记）")
     ap.add_argument("--voice-debug", action="store_true",
                     help="把 ai.dialog 日志开到 DEBUG（ASR/LLM/命令/ack/播报；"
                          "不含分段计时）")
@@ -302,6 +304,9 @@ def _check_exec_channel(exec_client, timeout=EXEC_PING_TIMEOUT):
 
 def main(argv=None):
     args = _parse_args(argv)
+    if args.nav_debug:
+        os.environ["OC2_NAV_DEBUG"] = "1"
+        print("[run] [NAV] 走位诊断已开启（输出到 stderr）", file=sys.stderr)
 
     try:
         _load_env(args)

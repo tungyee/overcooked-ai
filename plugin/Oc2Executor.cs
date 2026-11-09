@@ -578,6 +578,17 @@ namespace Oc2AI
             return new Vector2(w.x, w.z);
         }
 
+        // 诊断：move 日志里带上目标身份（盘 id / 站点名），复盘时能和 trace
+        // 的 exec.task / interaction.target 对上。
+        private string TargetDesc()
+        {
+            if (_target == null) return "null";
+            object n, g;
+            _target.TryGetValue("n", out n);
+            _target.TryGetValue("grid", out g);
+            return (g == null ? "" : g.ToString() + ":") + (n == null ? "?" : n.ToString());
+        }
+
         private Vector2 PointAt(int i)
         {
             bool isExit;
@@ -661,7 +672,11 @@ namespace Oc2AI
                 _goalAnchor = MakeAnchor(_goal, y);
                 if (_gates.Count > 0 && f.Valid) _body = Oc2AIPlugin.ChefBody(f.Chef);
                 var sb = new System.Text.StringBuilder();
-                sb.Append("[EXEC] move start goal=(").Append(_goal.x).Append(',').Append(_goal.y)
+                sb.Append("[EXEC] move start t=").Append(now.ToString("0.00"))
+                  .Append(" target=").Append(TargetDesc())
+                  .Append(" kind=").Append(_kind ?? "null")
+                  .Append(" dash=").Append(_allowDash ? "1" : "0")
+                  .Append(" goal=(").Append(_goal.x).Append(',').Append(_goal.y)
                   .Append(") goal_floor=").Append(_goalAnchor.T != null ? _goalAnchor.T.name : "none")
                   .Append(" anchored=").Append(_anchoredCount).Append('/').Append(_path.Count)
                   .Append(" pos=(").Append(f.PosX).Append(',').Append(f.PosZ).Append(") path=[");
@@ -830,10 +845,12 @@ namespace Oc2AI
             }
             else if (now - _lastProgress > STUCK_TIME)
             {
-                UnityEngine.Debug.Log("[EXEC] move stuck pos=(" + f.PosX + "," + f.PosZ + ")"
+                UnityEngine.Debug.Log("[EXEC] move stuck t=" + now.ToString("0.00")
+                    + " pos=(" + f.PosX + "," + f.PosZ + ")"
                     + " goal=(" + goal.x + "," + goal.y + ")"
                     + " idx=" + _idx + "/" + _path.Count
-                    + " target=(" + target.x + "," + target.y + ")");
+                    + " target=(" + target.x + "," + target.y + ")"
+                    + " target_id=" + TargetDesc());
                 PadEngagement.Pad.Stop();
                 Finish(false, "stuck", new double[] { target.x, target.y });
                 return;
@@ -852,8 +869,12 @@ namespace Oc2AI
                 // 没有 dash 授权、或对岸路点已经超出 dash 射程（木筏漂远）：
                 // 宁可不走，交回 Python 重算，也不掉水。
                 PadEngagement.Pad.Stop();
-                UnityEngine.Debug.Log("[EXEC] move ledge pos=(" + f.PosX + "," + f.PosZ
+                UnityEngine.Debug.Log("[EXEC] move ledge t=" + now.ToString("0.00")
+                    + " pos=(" + f.PosX + "," + f.PosZ
                     + ") idx=" + _idx + "/" + _path.Count
+                    + " target=(" + target.x + "," + target.y + ")"
+                    + " target_id=" + TargetDesc()
+                    + " allowDash=" + (_allowDash ? "1" : "0")
                     + " far=" + farDist.ToString("0.00"));
                 Finish(false, "ledge", new double[] { target.x, target.y });
                 return;
@@ -870,8 +891,10 @@ namespace Oc2AI
                     _dashDown = true;
                     _dashUntil = now + DASH_HOLD;
                     _lastDashAt = now;
-                    UnityEngine.Debug.Log("[EXEC] move dash pos=(" + f.PosX + "," + f.PosZ
-                        + ") idx=" + _idx + "/" + _path.Count);
+                    UnityEngine.Debug.Log("[EXEC] move dash t=" + now.ToString("0.00")
+                        + " pos=(" + f.PosX + "," + f.PosZ
+                        + ") idx=" + _idx + "/" + _path.Count
+                        + " target_id=" + TargetDesc());
                 }
                 catch (System.Exception e)
                 {
@@ -901,9 +924,11 @@ namespace Oc2AI
             Vector3 dir = new Vector3(d.x, 0f, d.y).normalized;
             RaycastHit hit;
             if (rb.SweepTest(dir, out hit, SKIP_PROBE, QueryTriggerInteraction.Ignore)) return false;
-            UnityEngine.Debug.Log("[EXEC] move skip waypoint pos=(" + f.PosX + "," + f.PosZ + ")"
+            UnityEngine.Debug.Log("[EXEC] move skip waypoint t=" + now.ToString("0.00")
+                + " pos=(" + f.PosX + "," + f.PosZ + ")"
                 + " idx=" + _idx + " target=(" + PointAt(_idx).x + "," + PointAt(_idx).y + ")"
-                + " next=(" + next.x + "," + next.y + ")");
+                + " next=(" + next.x + "," + next.y + ")"
+                + " target_id=" + TargetDesc());
             _idx++;
             _lastProgress = now;
             _hasRel = false;
@@ -917,6 +942,11 @@ namespace Oc2AI
             Ok = ok;
             Why = why;
             BlockedCell = blockedCell;
+            UnityEngine.Debug.Log("[EXEC] move finish t=" + Time.unscaledTime.ToString("0.00")
+                + " ok=" + (ok ? "1" : "0") + " why=" + (why ?? "null")
+                + " goal=(" + _goal.x.ToString("0.00") + "," + _goal.y.ToString("0.00") + ")"
+                + " idx=" + _idx + "/" + _path.Count
+                + " target_id=" + TargetDesc());
         }
     }
 }

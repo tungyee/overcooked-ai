@@ -259,7 +259,8 @@ static class Oc2TrafficProbe
                     break;
                 }
             }
-            log("[TRAFFIC-ROOT] name=" + nm + " pos=" + V2(p.x, p.z)
+            log("[TRAFFIC-ROOT] t=" + now.ToString("0.00")
+                + " name=" + nm + " pos=" + V2(p.x, p.z)
                 + " vel=" + V2(vx, vz) + " speed=" + speed.ToString("0.00")
                 + " clip=" + clip + " norm=" + norm.ToString("0.00") + extra);
         }

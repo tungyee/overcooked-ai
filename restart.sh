@@ -7,6 +7,7 @@
 #   ./restart.sh --voice      # 显式开语音（缺 key 直接报错退出）
 #   ./restart.sh --no-voice   # 强制关语音
 #   ./restart.sh --skip-build # 跳过编译（仅重启；只改了 Python 侧时用）
+#   ./restart.sh --nav-debug              # 打印 [NAV] 走位诊断（过街/取盘）
 #   ./restart.sh --voice-debug            # 语音调试日志开到 DEBUG（有语音时默认开）
 #   ./restart.sh --voice-log PATH         # 指定对话日志；默认 voice-<trace 时间戳>.jsonl
 # 各 flag 可组合，如 ./restart.sh --skip-build --voice --voice-debug --voice-log voice.jsonl
@@ -27,11 +28,13 @@ PRE_GAME_PIDS=""        # 启动新游戏前就存在的进程（通常是没退
 VOICE_FLAG=""          # 空=自动（有 key 就开）；--voice 显式开；--no-voice 显式关
 VOICE_DEBUG_FLAG=""
 VOICE_LOG_PATH=""
+NAV_DEBUG_FLAG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --skip-build) SKIP_BUILD=1 ;;
         --voice)      VOICE_FLAG="--voice" ;;
         --no-voice)   VOICE_FLAG="--no-voice" ;;
+        --nav-debug) NAV_DEBUG_FLAG="--nav-debug" ;;
         --voice-debug) VOICE_DEBUG_FLAG="--voice-debug" ;;
         --voice-log)
             if [ $# -lt 2 ]; then
@@ -190,5 +193,6 @@ echo "[restart] 提示：虚拟手柄只在主菜单能 engage 成 P2——标�
 AGENT_ARGS=("$PYTHON" run_agent.py)
 [ -n "$VOICE_FLAG" ] && AGENT_ARGS+=("$VOICE_FLAG")
 [ -n "$VOICE_DEBUG_FLAG" ] && AGENT_ARGS+=("$VOICE_DEBUG_FLAG")
+[ -n "$NAV_DEBUG_FLAG" ] && AGENT_ARGS+=("$NAV_DEBUG_FLAG")
 [ -n "$VOICE_LOG_PATH" ] && AGENT_ARGS+=("--voice-log" "$VOICE_LOG_PATH")
 exec "${AGENT_ARGS[@]}"

@@ -2398,6 +2398,7 @@ def test_all_spec_tasks_are_registered():
     """
     expected = {
         "PlaceCleanPlate", "WashPlate",                       # 1, 2
+        "FetchConveyorPlate",                                 # 传送带抢救
         "FetchToCooker", "TakeCookedToPlate", "ReturnPot",    # 3, 4, 5
         "RescueCooked",                                       # 6
         "Extinguish",                                         # 6.5（灭火）

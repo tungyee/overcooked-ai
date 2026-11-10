@@ -435,6 +435,64 @@ class WashPlate(Task):
 
 
 @_register
+class FetchConveyorPlate(Task):
+    """传送带上的盘快到末端垃圾桶时，先去把它拿起来。
+
+    4-2 的台面传送带末端就是 Bin 1：玩家送过来的盘/成品如果不接，会一路
+    进桶销毁。旧逻辑只给脏盘 `WashPlate` 提优先级，干净盘/成品盘没有任
+    务，`DeliverPlate` 又可能被 combo_break 挡住，盘就没了
+    （trace-20261110-234204 t=340~421：装生菜的 -19528 在传送带上，P2
+    在忙别的，t=421 进 Bin 1）。
+
+    这是**抢救**，不是「就地使用」：拿起来就完成，后面由 planner 按当前
+    局面重新决定送餐/装盘/放台面。HANDS="any"：手里有别的盘也先清手去接，
+    因为传送带上的盘马上会被销毁。
+    """
+
+    TYPE = "FetchConveyorPlate"
+    DESC = "把传送带上快进垃圾桶的盘拿起来"
+    LABEL = "抢救传送带上的盘"
+    HANDS = "any"
+
+    @property
+    def plate_id(self):
+        return self._resources[0]
+
+    def claims(self):
+        return ((self.plate_id, "rescue"),)
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        p = plate_by_id(ctx, self.plate_id)
+        if p is None:
+            return True
+        return P.holds_plate(ctx["chef"], p)
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        p = plate_by_id(ctx, self.plate_id)
+        if p is None or self.done(ctx):
+            return False
+        if p.get("held_by") == P.P1_NAME:
+            return False
+        from ai.space import channels as CH
+        return CH.plate_on_conveyor(ctx["w"], p)
+
+    def build(self):
+        # type: () -> Node
+        pid = self.plate_id
+
+        def held(c):
+            return P.holds_plate(c["chef"], plate_by_id(c, pid))
+
+        return PR.Timeout(Sequence([
+            # 手里有别的盘也先放下（就近台面）：不接的话传送带上的盘直接进桶。
+            PR.EnsureHandsFree(keep=held),
+            PR.InteractWith(lambda c: plate_by_id(c, pid), "pickup", held),
+        ]), TASK_TIMEOUT_TICKS)
+
+
+@_register
 class ResetPlate(Task):
     """第 14 号：清掉内容与任何现存订单都不匹配的盘。
 

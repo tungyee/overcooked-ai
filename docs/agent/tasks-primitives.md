@@ -11,7 +11,7 @@
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier / reposition）。`T.TASK_TYPES` 登记全部 25 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier / reposition）。`T.TASK_TYPES` 登记全部 26 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
 主线 21 个 task 类型（另两个 `ThrowBatch` / `FillCooker` 见表后）：
 
@@ -20,7 +20,7 @@
 | `chop.py` | `FetchToBoard`、`Chop` |
 | `cook.py` | `FetchToCooker`、`TakeCookedToPlate`、`ReturnPot`、`RescueCooked` |
 | `fire.py` | `Extinguish` |
-| `plate.py` | `PlaceCleanPlate`、`WashPlate`、`ResetPlate` |
+| `plate.py` | `PlaceCleanPlate`、`WashPlate`、`FetchConveyorPlate`、`ResetPlate` |
 | `assembly.py` | `FetchToPlate`、`DeliverPlate` |
 | `cleanup.py` | `Discard`、`RecoverLoosePot`、`StashHeld`、`Prefetch` |
 | `mix.py` | `Mix` |
@@ -38,6 +38,8 @@
 **传送带只给「不能扔」的东西**（成品盘、盘、载体）；生料和切好的料仍走 `ThrowBatch`。4-2 实测：`ChoppedLettuce`/`ChoppedTomato` 的 `throwable=true`，盘子 `throwable=false`。
 
 `planner.generate_candidates` 只遍历 `handover.send_requests()`；`wash` / `deliver` 命令的 scope 分别带上 `dirty_plate` / `plated_dish` 的送件。原 1-3 中转台 `PlaceToRelay` / `relay_cells_for` 已删，由它取代。
+
+`FetchConveyorPlate`（`plate.py`）：4-2 的台面传送带末端是垃圾桶。非脏盘（干净盘 / 成品盘）在传送带上时，`channels.plate_on_conveyor` 判它真的在带上（按同名 item 的 `on_station`，不是段心距离——旁边柜台上的盘不能误抢），生成 L4 抢救候选：`HANDS="any"`，树首 `EnsureHandsFree` 后 `pickup`，拿起即完成，后续送餐/装盘由 Planner 按当前局面重选。脏盘仍由 `WashPlate` 处理，避免两个任务抢同一摞。
 
 `FetchToCarrier` / `PlaceCarrierInCooker`（`carrier.py`）：**可烹饪载体**（披萨饼 = 反编译 `CookablePreparationContainer`：可放料 + 自带 CookingHandler）。链 = 底料切成饼 → 配料放到饼上 → 料齐的饼整份放进站型对得上的空灶（烤箱）→ `TakeCookedToPlate` 端盘取 → 出餐。判据只读插件协议 8 的能力字段（`crate.chop_cookable` / `items[].cookable` / `cookers[].station_type`），旧帧没有就不发这条链。载体实例每拍按 `carriers.match_prep_carriers` 配给订单（P2 够得着的优先，其次料多的），task 身份只带载体形态名。
 

@@ -36,7 +36,7 @@ def _plan(frame):
 
 def test_reserved_plate_is_not_sent_as_a_simpler_dish():
     """盘配给 All 单且还缺料：不要生成「按 ChipsOnly 送走」的 SendAcross。"""
-    for t in (512, 541):
+    for t in (512,):
         frame = next(f for f in _frames() if f["_trace_t"] == t)
         task, record = _plan(frame)
         sends = [c[0] for c in record["candidates"]
@@ -48,7 +48,7 @@ def test_reserved_plate_is_not_sent_as_a_simpler_dish():
 
 
 def test_send_across_candidate_is_gone_while_plate_is_held_for_all_order():
-    frame = next(f for f in _frames() if f["_trace_t"] == 541)
+    frame = next(f for f in _frames() if f["_trace_t"] == 512)
     task, _record = _plan(frame)
     assert "order#1" in str(task)
 

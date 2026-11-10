@@ -321,6 +321,19 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
                                    ["hands_empty"], EST_FETCH))
 
+    # 传送带上的盘（非脏盘）快到末端垃圾桶：先抢救下来。脏盘有 WashPlate，
+    # 这里跳过，避免两个任务抢同一摞。
+    from ai.space import channels as CH
+    for p in P.all_plates(world):
+        if not p.get("n") or p.get("held_by"):
+            continue
+        if "dirtyplate" in str(p.get("n") or "").lower():
+            continue
+        if not CH.plate_on_conveyor(world, p):
+            continue
+        cands.append(Candidate(T.FetchConveyorPlate(resources=(p.get("n"),)),
+                               [], EST_FETCH))
+
     for c in _cookers(world):
         if not c.get("n"):
             continue

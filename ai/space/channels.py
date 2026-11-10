@@ -85,6 +85,36 @@ def _on_conveyor(entry, st):
             + (float(sz) - float(z)) ** 2) <= CONVEYOR_SLOT_DIST ** 2
 
 
+def plate_on_conveyor(world, plate):
+    # type: (object, Optional[Dict]) -> bool
+    """盘是否真的在传送带上。
+
+    盘对象本身常没有 on_station（插件把段名报在同位置的 items[] 上）；
+    只看盘心到段心的距离会把旁边柜台上的盘也误判成传送带，抢盘任务就会
+    去拿一块根本没危险的盘（trace-20261110-231906 t=541）。优先按同名
+    item 的 on_station 认，退路才看盘自身字段。
+    """
+    if not isinstance(plate, dict):
+        return False
+    if "conveyor" in str(plate.get("on_station") or "").lower():
+        return True
+    name = str(plate.get("name") or "")
+    x, z = plate.get("x"), plate.get("z")
+    if not name or x is None or z is None:
+        return False
+    for it in getattr(world, "items", ()) or ():
+        if not isinstance(it, dict) or str(it.get("n") or "") != name:
+            continue
+        if "conveyor" not in str(it.get("on_station") or "").lower():
+            continue
+        ix, iz = it.get("x"), it.get("z")
+        if ix is None or iz is None:
+            continue
+        if abs(float(ix) - float(x)) < 0.6 and abs(float(iz) - float(z)) < 0.6:
+            return True
+    return False
+
+
 def conveyor_slots(world, bb=None):
     # type: (object, object) -> List[Dict]
     """P2 这侧够得着的传送带段（地图不分割时为空）。"""

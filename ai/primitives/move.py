@@ -173,8 +173,11 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
     2. 路径要过街但人还没到路沿：先只走到路沿。
     3. 按**车道腿**放行：4-1 每个信号周期只有一辆车跑（蓝/绿交替），另一条
        车道停着。近侧腿的安全就先去中线、远侧腿的安全再走完；整段都安全
-       （红灯，两车都停）就一次走完。正在过的那一腿来车、又还没过中线时，
+       （红灯，两车都停）就一次走完。正在过的这一腿来车、又还没过中线时，
        改道到两条车道中间等。
+    4. 中线位置用两车缝隙中点算，**不依赖路径里有没有中线格**——人过了中线
+       之后路径里就没有那一格了，若退回「已在路上就继续」会在远侧车道有车时
+       放行（trace-20261110-211743 L166 被 Blue 车压）。
     """
     if not traffic.path_crosses_road(w, path):
         return None
@@ -182,14 +185,18 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
     chef = ctx.get("chef")
     info = traffic.state_text(w, bb)
     spot = traffic.median_spot(w, path)
+    road = traffic.path_road_cells(w, path)
     near, far = traffic.split_at_median(w, path, spot)
+    rest = near + far if spot is not None else road
+    gap = traffic.median_gap(w)
+    in_road = traffic.chef_in_road(w, chef)
+    past = traffic.past_median(w, chef, gap, path)
     if prim._pending_cmd is not None:
         if prim._curb_cmd or prim._median_cmd:
             return None
-        # 近侧车道来车、人还没过中线 → 改道到中线等这一轮过去。
-        if spot is not None and traffic.chef_in_road(w, chef) \
-                and traffic.before_median(w, chef, spot, path) \
-                and not traffic.leg_safe(w, near):
+        # 正在过街：剩余这一整段还不安全、人又没过中线 → 去中线等。
+        if spot is not None and in_road and not past \
+                and not traffic.leg_safe(w, rest):
             got = _issue_median(prim, ctx, ex, w, cur, field, spot, target,
                                 kind, timeout_ms, label, info)
             if got is not None:
@@ -205,19 +212,24 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
         cmd = _move_cmd(w, path[:curb + 1], field, ctx.get("bb"),
                         list(w.to_world(*wait_goal)), target, kind, timeout_ms)
         return prim._begin_exec(ctx, ex, cmd)
-    if spot is None:
-        # 没有可站的车道缝隙（单车/读不到车）：退回红灯门控。
-        if not traffic.safe_to_cross(w, bb, path, cur, chef):
-            return _wait_for_light(prim, ctx, label, kind, cur, info)
-        return None
+    # 中线等待：锁存状态管「改道过去」这一趟（5Hz 位置在移动中会差 1 格，
+    # 不能用来反复判到没到）；at_median 管「站定在中线」的其它情况（换任务后
+    # 新树从车道中间出发）。两者都看剩余这段路（rest）的车。
     if prim._median_wait or traffic.at_median(w, chef, spot):
-        # 在中线等：远侧腿的车停了才继续（近侧有车不影响，它已经在身后）。
-        if not traffic.leg_safe(w, far):
+        if not traffic.leg_safe(w, rest):
             return _wait_for_light(prim, ctx, label, kind, cur, info)
         prim._median_wait = False
         return None
-    # 在路沿、还没过中线：远侧腿安全就整段走完；只有近侧腿安全就先到中线。
-    if traffic.leg_safe(w, near + far):
+    if spot is None:
+        # 路径里没有中线格：已经过了中线，或本来就没有可站的缝。
+        if in_road:
+            # 过了中线再回头更危险：把剩下这一小段走完（车起步到路口 ≥1s）。
+            return None
+        if not traffic.safe_to_cross(w, bb, path, cur, chef):
+            return _wait_for_light(prim, ctx, label, kind, cur, info)
+        return None
+    # 在路沿、还没到中线：整段安全就一次走完；只有近侧腿安全就先到中线。
+    if traffic.leg_safe(w, rest):
         return None
     if traffic.leg_safe(w, near):
         got = _issue_median(prim, ctx, ex, w, cur, field, spot, target, kind,

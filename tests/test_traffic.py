@@ -93,15 +93,18 @@ def test_observe_tracks_red_onset():
     assert bb.traffic_red_since is None
 
 
-def test_curb_cell_uses_chef_position_not_cell_center():
-    """路沿格心压在 road 边界上，不能因此当成「已在过街」绕开红绿灯。"""
+def test_curb_cell_is_not_road():
+    """路沿格心压在 road 边界上，但那是人行道边：路径/厨师都不该当成过街。"""
     w = _World(lights=LIGHT_GREEN)
-    curb = (-3, 1)          # 格心 (21.2, 6.0) == road.minx
-    path = [(0, 1), (8, 1)]
-    chef = {"name": "Player 2", "x": 21.0, "z": 6.0}   # 实际站在路沿外
-    # 旧口径（只看格心）会短路成 True，这正是实机被撞的原因。
-    assert traffic.safe_to_cross(w, _bb(), path, cur=curb) is True
-    assert traffic.safe_to_cross(w, _bb(), path, cur=curb, chef=chef) is False
+    assert traffic.in_road(w, (-3, 1)) is False      # 格心 == road.minx
+    assert traffic.in_road(w, (6, 1)) is False       # 格心 == road.maxx
+    assert traffic.in_road(w, (0, 1)) is True
+    assert traffic.path_crosses_road(w, [(-3, 1)]) is False
+    # 真正在车道里的人：绿灯也不拦（半途不停），由“按车道腿”的逻辑管。
+    chef = {"name": "Player 2", "x": 24.8, "z": 6.0}
+    assert traffic.chef_in_road(w, chef) is True
+    assert traffic.safe_to_cross(w, _bb(), [(0, 1), (8, 1)], cur=(0, 1),
+                                 chef=chef) is True
 
 
 def test_chef_actually_on_road_keeps_going():
@@ -162,8 +165,9 @@ def test_pedestrian_red_reads_lamps():
 def test_curb_index_is_cell_before_first_road_cell():
     w = _World()
     path = [(-8, 1), (-4, 1), (-3, 1), (0, 1), (6, 1), (8, 1)]
-    assert traffic.curb_index(w, path) == 1
-    assert traffic.curb_index(w, [(-3, 1), (0, 1)]) is None
+    # 严格口径：路沿格 (-3) 不算马路，第一个马路格是 (0) → 路沿是 (-3)。
+    assert traffic.curb_index(w, path) == 2
+    assert traffic.curb_index(w, [(-3, 1), (0, 1)]) == 0
 
 
 def test_road_between_detects_opposite_sides():

@@ -46,6 +46,12 @@ def road_box(world):
         return None
 
 
+# 路沿格（gx=-3 / gx=6）的格心正好等于 road 的 minx/maxx，但那是人行道边，
+# 不是车道。路径判据必须把它们排除，否则「走到人行道边的盘子」也会被当成
+# 过街，在路沿干等红灯（trace-20261110-211743 L92.9 等了 4.2 秒）。
+ROAD_EDGE_EPS = 0.6   # 半格；格心离边界不足半格就不算进入马路
+
+
 def _point_in_road(world, cell):
     # type: (Any, Tuple[int, int]) -> bool
     box = road_box(world)
@@ -55,7 +61,8 @@ def _point_in_road(world, cell):
         x, z = world.to_world(*cell)
     except (AttributeError, TypeError, ValueError):
         return False
-    return box[0] <= x <= box[1] and box[2] <= z <= box[3]
+    return (box[0] + ROAD_EDGE_EPS < x < box[1] - ROAD_EDGE_EPS
+            and box[2] <= z <= box[3])
 
 
 def _point_in_road_xy(world, x, z):
@@ -85,7 +92,12 @@ def chef_in_road(world, chef):
     x, z = chef.get("x"), chef.get("z")
     if x is None or z is None:
         return False
-    return _point_in_road_xy(world, x, z)
+    box = road_box(world)
+    if box is None:
+        return False
+    # 与路径判据同一口径：贴着边界（路沿格心）不算「已经在马路上」。
+    return (box[0] + 0.05 < x < box[1] - 0.05
+            and box[2] <= z <= box[3])
 
 
 def road_side(world, chef):
@@ -139,6 +151,49 @@ def curb_index(world, path):
     return None
 
 
+def median_gap(world):
+    # type: (Any) -> Optional[Tuple[float, float]]
+    """两辆车 KillPlane 在 x 方向之间的缝隙 (lo, hi)；没有 → None。
+
+    车沿 z 跑，这条缝撞不到。路径里不一定有中线格（人已经过中线时），所以
+    中线位置要能从车辆直接算，不能只依赖 `median_spot`。
+    """
+    spans = []
+    for car in getattr(world, "vehicles", ()) or ():
+        try:
+            spans.append((float(car["minx"]), float(car["maxx"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(spans) < 2:
+        return None
+    spans.sort()
+    gaps = [(hi, lo) for (_lo, hi), (lo, _hi) in zip(spans, spans[1:])
+            if lo > hi]
+    if not gaps:
+        return None
+    # 多条缝取最宽的那条（4-1 只有两条车道，就是唯一一条）。
+    return max(gaps, key=lambda g: g[1] - g[0])
+
+
+def past_median(world, chef, gap, path):
+    # type: (Any, Any, Optional[Tuple[float, float]], Optional[List[Tuple[int, int]]]) -> bool
+    """厨师是否已经越过两车缝隙的中点（沿 path 的前进方向）。"""
+    if gap is None or not isinstance(chef, dict) or not path:
+        return False
+    x = chef.get("x")
+    if x is None:
+        return False
+    try:
+        mx = (gap[0] + gap[1]) / 2.0
+        sx = world.to_world(*path[0])[0]
+        ex = world.to_world(*path[-1])[0]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if abs(ex - sx) < 0.1:
+        return False
+    return x > mx + 0.3 if ex > sx else x < mx - 0.3
+
+
 def median_spot(world, path):
     # type: (Any, Optional[List[Tuple[int, int]]]) -> Optional[Tuple[Tuple[int, int], Tuple[float, float]]]
     """过街路径上的「两条车道中间」等待点：返回 (路径格, 等待点世界坐标)。
@@ -186,19 +241,27 @@ def median_cell(world, path):
     return spot[0] if spot is not None else None
 
 
-def at_median(world, chef, spot):
+def at_median(world, chef, spot=None):
     # type: (Any, Any, Any) -> bool
     """厨师此刻是否站在中线等待点上（按实际坐标，插件有 0.5m 到达容差）。
 
     只在**站定**时可靠：5Hz 快照最多滞后 0.2 秒（6 m/s ≈ 1 格），移动中
     不要用它做「继续/等待」判据（改道后的等待用原语的锁存状态）。
+    `spot` 缺省/为 None 时（人已经过中线、路径里没有中线格）用两车缝隙
+    中点兜底，z 取厨师当前 z。
     """
-    if spot is None or not isinstance(chef, dict):
+    if not isinstance(chef, dict):
         return False
     x, z = chef.get("x"), chef.get("z")
     if x is None or z is None:
         return False
-    (mx, mz) = spot[1]
+    if spot is not None:
+        (mx, mz) = spot[1]
+    else:
+        gap = median_gap(world)
+        if gap is None:
+            return False
+        mx, mz = (gap[0] + gap[1]) / 2.0, z
     return abs(x - mx) <= 0.6 and abs(z - mz) <= 0.9
 
 

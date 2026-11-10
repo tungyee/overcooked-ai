@@ -351,8 +351,8 @@ def test_approach_waits_at_curb_until_red_light():
     ap = PR.Approach(lambda c: target, kind="pickup")
     assert ap.tick(ctx) == Status.RUNNING
     assert ex.issued[0]["cmd"] == "move"
-    # 路沿是第一个马路格 (-3,1) 的前一格 (-4,1) → 世界 (-4.8,1.2)。
-    assert ex.issued[0]["goal"] == [-4.8, 1.2]
+    # 路沿格 (-3,1) —— 它的格心压在 road.minx 上，但本身不算马路 → (-3.6,1.2)。
+    assert ex.issued[0]["goal"] == [-3 * 1.2, 1.2]
     # 到路沿只是这一段走完，不能报 SUCCESS（否则 InteractWith 会原地开按）。
     ex.results.append(ex.ok_result(ex.issued[0]["cmd_id"]))
     assert ap.tick(ctx) == Status.RUNNING
@@ -371,27 +371,27 @@ def test_approach_waits_at_curb_until_red_light():
                          "has_lamps": True}]
     ap2 = PR.Approach(lambda c: target, kind="pickup")
     assert ap2.tick(ctx2) == Status.RUNNING
-    assert ex2.issued[0]["goal"] == [-4.8, 1.2]
+    assert ex2.issued[0]["goal"] == [-3 * 1.2, 1.2]
 
     # 红灯刚亮 + 人已经在路沿：当拍整段走。
-    chef_at_curb = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    chef_at_curb = {"name": "Player 2", "x": -3.6, "z": 1.2, "held": None}
     ex3 = FakeExec()
-    ctx3 = make_ctx(w, chef_at_curb, ex3, start=(-4, 1))
+    ctx3 = make_ctx(w, chef_at_curb, ex3, start=(-3, 1))
     ctx3["bb"] = bb2
     ap3 = PR.Approach(lambda c: target, kind="pickup")
     assert ap3.tick(ctx3) == Status.RUNNING
-    assert ex3.issued[0]["goal"] != [-4.8, 1.2]
+    assert ex3.issued[0]["goal"] != [-3 * 1.2, 1.2]
 
     # 红灯亮了很久（开局长红灯 20~27s）：照样当拍走，不能干等下一轮。
     ex4 = FakeExec()
-    ctx4 = make_ctx(w, chef_at_curb, ex4, start=(-4, 1))
+    ctx4 = make_ctx(w, chef_at_curb, ex4, start=(-3, 1))
     bb4 = Blackboard()
     bb4.tick = 100
     bb4.traffic_red_since = 0        # 已经亮了 100 拍：长红灯窗口
     ctx4["bb"] = bb4
     ap4 = PR.Approach(lambda c: target, kind="pickup")
     assert ap4.tick(ctx4) == Status.RUNNING
-    assert ex4.issued and ex4.issued[0]["goal"] != [-4.8, 1.2]
+    assert ex4.issued and ex4.issued[0]["goal"] != [-3 * 1.2, 1.2]
 
 
 
@@ -415,13 +415,13 @@ def test_go_to_cell_waits_at_curb_for_light():
 
     prim = PR.GoToCell(lambda c: (6, 1))
     assert prim.tick(ctx) == Status.RUNNING
-    # 先只走到路沿 (-4,1)，绿灯不发整段。
-    assert ex.issued[0]["goal"] == [-4.8, 1.2]
+    # 先只走到路沿 (-3,1)，绿灯不发整段。
+    assert ex.issued[0]["goal"] == [-3 * 1.2, 1.2]
     ex.results.append(ex.ok_result(ex.issued[0]["cmd_id"]))
     assert prim.tick(ctx) == Status.RUNNING          # 到路沿不报成功
 
     # 人在路沿 + 绿灯 → 原地等。
-    ctx["chef"] = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    ctx["chef"] = {"name": "Player 2", "x": -3.6, "z": 1.2, "held": None}
     assert prim.tick(ctx) == Status.RUNNING
     assert len(ex.issued) == 1
     assert ctx["traffic_wait"] is True
@@ -431,7 +431,7 @@ def test_go_to_cell_waits_at_curb_for_light():
                          "red": True, "yellow": False, "green": False,
                          "has_lamps": True}]
     ex2 = FakeExec()
-    ctx2 = make_ctx(w, ctx["chef"], ex2, start=(-4, 1))
+    ctx2 = make_ctx(w, ctx["chef"], ex2, start=(-3, 1))
     bb2 = Blackboard()
     bb2.tick = 10
     bb2.traffic_red_since = 10
@@ -468,9 +468,9 @@ def test_approach_diverts_to_median_when_near_car_starts():
             "yellow": False, "green": False, "has_lamps": True}]
     yellow = [{"n": "l1", "on": True, "on_car_b": False, "red": False,
                "yellow": True, "green": False, "has_lamps": True}]
-    chef = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    chef = {"name": "Player 2", "x": -3.6, "z": 1.2, "held": None}
     ex = FakeExec()
-    ctx = make_ctx(w, chef, ex, start=(-4, 1))
+    ctx = make_ctx(w, chef, ex, start=(-3, 1))
     bb = Blackboard()
     bb.tick = 0
     bb.traffic_red_since = 0
@@ -480,7 +480,7 @@ def test_approach_diverts_to_median_when_near_car_starts():
     ap = PR.Approach(lambda c: target, kind="pickup")
     assert ap.tick(ctx) == Status.RUNNING
     # 红灯刚亮、人在路沿：整段过街。
-    assert ex.issued[0]["goal"] != [-4.8, 1.2]
+    assert ex.issued[0]["goal"] != [-3 * 1.2, 1.2]
 
     # 还走在近侧（Blue）车道里，Blue 开始跑（on=True）。
     ctx["chef"] = {"name": "Player 2", "x": -1.0, "z": 1.2, "held": None}
@@ -521,9 +521,9 @@ def test_go_to_cell_diverts_to_median_when_near_car_starts():
             "yellow": False, "green": False, "has_lamps": True}]
     green_car = [{"n": "l1", "on": False, "on_car_b": True, "red": False,
                   "yellow": True, "green": False, "has_lamps": True}]
-    chef = {"name": "Player 2", "x": 8.4, "z": 1.2, "held": None}
+    chef = {"name": "Player 2", "x": 7.2, "z": 1.2, "held": None}
     ex = FakeExec()
-    ctx = make_ctx(w, chef, ex, start=(7, 1))
+    ctx = make_ctx(w, chef, ex, start=(6, 1))
     bb = Blackboard()
     bb.tick = 0
     bb.traffic_red_since = 0

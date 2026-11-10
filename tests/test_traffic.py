@@ -174,3 +174,51 @@ def test_road_between_detects_opposite_sides():
     assert traffic.road_between(w, (18.0, 6.0), (19.0, 6.0)) is False
     assert traffic.road_between(w, (33.0, 6.0), (34.0, 6.0)) is False
     assert traffic.road_between(_World(road=False), (18.0, 6.0), (33.0, 6.0)) is False
+
+
+def test_median_cell_is_between_car_lanes():
+    """中线等待格：两辆车 x 区间之间的缝隙里的路径格。"""
+    w = _World(cars=[
+        {"n": "A", "minx": 21.4, "maxx": 22.6, "minz": -10, "maxz": 40},
+        {"n": "B", "minx": 27.0, "maxx": 28.6, "minz": -10, "maxz": 40},
+    ])
+    # 路径横穿：格心 21.2 .. 32.0（1.2 一格）。缝隙 (22.6, 27.0)，中点 24.8 → 格 (0,1)。
+    path = [(gx, 1) for gx in range(-3, 7)]
+    assert traffic.median_cell(w, path) == (0, 1)
+
+
+def test_no_median_with_single_car_or_no_path():
+    w = _World(cars=[{"n": "A", "minx": 21.4, "maxx": 22.6,
+                      "minz": -10, "maxz": 40}])
+    assert traffic.median_cell(w, [(0, 1)]) is None
+    assert traffic.median_cell(_World(), [(-8, 1), (-7, 1)]) is None
+
+
+def test_before_median_uses_travel_direction():
+    w = _World(cars=[
+        {"n": "A", "minx": 21.4, "maxx": 22.6, "minz": -10, "maxz": 40},
+        {"n": "B", "minx": 27.0, "maxx": 28.6, "minz": -10, "maxz": 40},
+    ])
+    path = [(gx, 1) for gx in range(-3, 7)]
+    spot = traffic.median_spot(w, path)
+    assert spot[0] == (0, 1)
+    assert abs(spot[1][0] - 24.8) < 1e-6      # 缝隙 (22.6, 27.0) 的中点
+    assert traffic.before_median(w, {"x": 21.8, "z": 6.0}, spot, path) is True
+    assert traffic.before_median(w, {"x": 25.2, "z": 6.0}, spot, path) is False
+    # 反向走：从东往西，还没过中线的人 x 更大。
+    west = list(reversed(path))
+    assert traffic.before_median(w, {"x": 29.0, "z": 6.0}, spot, west) is True
+    assert traffic.before_median(w, {"x": 24.0, "z": 6.0}, spot, west) is False
+    assert traffic.at_median(w, {"x": 24.8, "z": 6.0}, spot) is True
+    assert traffic.at_median(w, {"x": 27.2, "z": 6.0}, spot) is False
+
+
+def test_red_fresh_requires_observed_onset():
+    w = _World(lights=LIGHT_RED)
+    assert traffic.red_fresh(w, _bb(tick=10, red_since=8)) is True
+    assert traffic.red_fresh(w, _bb(tick=10, red_since=0)) is False
+    assert traffic.red_fresh(w, _bb(tick=10, red_since=10)) is True
+    bb = _bb()
+    bb.traffic_red_since = None
+    assert traffic.red_fresh(w, bb) is False
+    assert traffic.red_fresh(_World(lights=LIGHT_GREEN), _bb()) is False

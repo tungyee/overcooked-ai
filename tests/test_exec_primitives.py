@@ -438,3 +438,119 @@ def test_go_to_cell_waits_at_curb_for_light():
     ctx2["bb"] = bb2
     assert PR.GoToCell(lambda c: (6, 1)).tick(ctx2) == Status.RUNNING
     assert ex2.issued[0]["goal"] == [6 * 1.2, 1.2]
+
+
+def _traffic_world_with_median():
+    from ai.primitives.move import Approach  # noqa: F401  (保持导入同源)
+
+    class TrafficWorld(FakeWorld):
+        traffic_road = {"minx": -3.6, "maxx": 7.2, "minz": -5.0, "maxz": 5.0}
+        # 两条车道：A 在格 -1，B 在格 2；中间缝隙 (-0.4, 2.0) 落在格 1。
+        vehicles = [
+            # z 停在交叉口外，红灯时车体不压路径（压路径的兜底另有用例）。
+            {"n": "A", "minx": -1.6, "maxx": -0.4, "minz": -10, "maxz": -2},
+            {"n": "B", "minx": 2.0, "maxx": 3.2, "minz": 8, "maxz": 20},
+        ]
+
+    w = TrafficWorld(walkable=lambda gx, gz: gz == 1 and -8 <= gx <= 8)
+    return w
+
+
+def test_approach_diverts_to_median_when_light_changes_mid_crossing():
+    """过街途中灯变黄/绿、还没过中线 → 改道到两车道中间等，不硬穿。"""
+    from ai.space.navigation import distance_field
+
+    w = _traffic_world_with_median()
+    target = {"t": "counter", "n": "target", "gx": 8, "gz": 1,
+              "x": 9.6, "z": 1.2}
+    red = [{"n": "l1", "on": False, "on_car_b": False, "red": True,
+            "yellow": False, "green": False, "has_lamps": True}]
+    yellow = [{"n": "l1", "on": True, "on_car_b": False, "red": False,
+               "yellow": True, "green": False, "has_lamps": True}]
+    chef = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    ex = FakeExec()
+    ctx = make_ctx(w, chef, ex, start=(-4, 1))
+    bb = Blackboard()
+    bb.tick = 0
+    bb.traffic_red_since = 0
+    ctx["bb"] = bb
+    w.traffic_lights = red
+
+    ap = PR.Approach(lambda c: target, kind="pickup")
+    assert ap.tick(ctx) == Status.RUNNING
+    # 红灯刚亮、人在路沿：整段过街。
+    assert ex.issued[0]["goal"] != [-4.8, 1.2]
+
+    # 走到车道中间偏西（还没过中线），灯变黄。
+    ctx["chef"] = {"name": "Player 2", "x": 0.0, "z": 1.2, "held": None}
+    ctx["field"] = distance_field((0, 1), w.walkable, w.belt_dir)
+    w.traffic_lights = yellow
+    assert ap.tick(ctx) == Status.RUNNING
+    # 改道命令只走到中线：缝隙 (-0.4, 2.0) 的中点 x=0.8，最后一段的路径格是 (1,1)。
+    assert ex.issued[-1]["goal"] == [0.8, 1.2]
+    assert ap._median_cmd is True
+
+    ex.results.append(ex.ok_result(ex.issued[-1]["cmd_id"]))
+    assert ap.tick(ctx) == Status.RUNNING          # 到中线，不报成功
+
+    # 在中线等黄灯：不发新命令，记 traffic_wait。
+    ctx["chef"] = {"name": "Player 2", "x": 0.8, "z": 1.2, "held": None}
+    ctx["field"] = distance_field((1, 1), w.walkable, w.belt_dir)
+    issued = len(ex.issued)
+    assert ap.tick(ctx) == Status.RUNNING
+    assert len(ex.issued) == issued
+    assert ctx["traffic_wait"] is True
+
+    # 下一轮红灯刚亮：继续走完剩下的半条街。
+    w.traffic_lights = red
+    bb.tick = 100
+    bb.traffic_red_since = 100
+    assert ap.tick(ctx) == Status.RUNNING
+    assert len(ex.issued) == issued + 1
+    assert ex.issued[-1]["goal"] != [0.8, 1.2]
+
+
+def test_go_to_cell_diverts_to_median_when_light_changes():
+    from ai.space.navigation import distance_field
+
+    w = _traffic_world_with_median()
+    red = [{"n": "l1", "on": False, "on_car_b": False, "red": True,
+            "yellow": False, "green": False, "has_lamps": True}]
+    yellow = [{"n": "l1", "on": True, "on_car_b": False, "red": False,
+               "yellow": True, "green": False, "has_lamps": True}]
+    chef = {"name": "Player 2", "x": 8.4, "z": 1.2, "held": None}
+    ex = FakeExec()
+    ctx = make_ctx(w, chef, ex, start=(7, 1))
+    bb = Blackboard()
+    bb.tick = 0
+    bb.traffic_red_since = 0
+    ctx["bb"] = bb
+    w.traffic_lights = red
+
+    prim = PR.GoToCell(lambda c: (-5, 1))
+    assert prim.tick(ctx) == Status.RUNNING
+    issued = len(ex.issued)
+    assert issued == 1 and ex.issued[0]["goal"] != [0.8, 1.2]
+
+    # 往西走到东侧车道（还没过中线 x=1.2），灯变黄 → 改道去中线。
+    ctx["chef"] = {"name": "Player 2", "x": 2.4, "z": 1.2, "held": None}
+    ctx["field"] = distance_field((2, 1), w.walkable, w.belt_dir)
+    w.traffic_lights = yellow
+    assert prim.tick(ctx) == Status.RUNNING
+    assert ex.issued[-1]["goal"] == [0.8, 1.2]
+
+    ex.results.append(ex.ok_result(ex.issued[-1]["cmd_id"]))
+    assert prim.tick(ctx) == Status.RUNNING       # 到中线，不报成功
+
+    ctx["chef"] = {"name": "Player 2", "x": 0.8, "z": 1.2, "held": None}
+    ctx["field"] = distance_field((1, 1), w.walkable, w.belt_dir)
+    issued = len(ex.issued)
+    assert prim.tick(ctx) == Status.RUNNING       # 黄灯，在中线等
+    assert len(ex.issued) == issued
+    assert ctx["traffic_wait"] is True
+
+    w.traffic_lights = red
+    bb.tick = 50
+    bb.traffic_red_since = 50
+    assert prim.tick(ctx) == Status.RUNNING
+    assert len(ex.issued) == issued + 1

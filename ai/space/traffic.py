@@ -137,6 +137,85 @@ def curb_index(world, path):
     return None
 
 
+def median_spot(world, path):
+    # type: (Any, Optional[List[Tuple[int, int]]]) -> Optional[Tuple[Tuple[int, int], Tuple[float, float]]]
+    """过街路径上的「两条车道中间」等待点：返回 (路径格, 等待点世界坐标)。
+
+    车沿 z 跑，车的 KillPlane AABB 在 x 方向就是它压住的宽度，两辆车 x 区间
+    之间的缝隙是撞不到的（4-1 实机：Green [27.68,29.38]、Blue [23.55,25.63]，
+    缝隙 2.05m）。等待点取缝隙中点的 x，而不是格心——格心离某条车道只剩
+    ~0.4m，站在正中间两边各留 ~1m。过街途中灯变了又还没过中线时先去这里等。
+    """
+    road_cells = path_road_cells(world, path)
+    if not road_cells:
+        return None
+    spans = []
+    for car in getattr(world, "vehicles", ()) or ():
+        try:
+            spans.append((float(car["minx"]), float(car["maxx"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(spans) < 2:
+        return None
+    spans.sort()
+    gaps = [(hi, lo) for (_lo, hi), (lo, _hi) in zip(spans, spans[1:])
+            if lo > hi]
+    if not gaps:
+        return None
+    best = None  # type: Optional[Tuple[Tuple[int, int], Tuple[float, float], float]]
+    for cell in road_cells:
+        try:
+            x, z = world.to_world(*cell)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for lo, hi in gaps:
+            if lo <= x <= hi:
+                mid = (lo + hi) / 2.0
+                dist = abs(x - mid)
+                if best is None or dist < best[2]:
+                    best = (cell, (mid, z), dist)
+    return (best[0], best[1]) if best is not None else None
+
+
+def median_cell(world, path):
+    # type: (Any, Optional[List[Tuple[int, int]]]) -> Optional[Tuple[int, int]]
+    """等待点所在的路径格（见 median_spot）；没有能站的缝隙返回 None。"""
+    spot = median_spot(world, path)
+    return spot[0] if spot is not None else None
+
+
+def at_median(world, chef, spot):
+    # type: (Any, Any, Optional[Tuple[Tuple[int, int], Tuple[float, float]]]) -> bool
+    """厨师此刻是否站在中线等待点上（按实际坐标，插件有 0.5m 到达容差）。"""
+    if spot is None or not isinstance(chef, dict):
+        return False
+    x, z = chef.get("x"), chef.get("z")
+    if x is None or z is None:
+        return False
+    (mx, mz) = spot[1]
+    return abs(x - mx) <= 0.6 and abs(z - mz) <= 0.9
+
+
+def before_median(world, chef, spot, path):
+    # type: (Any, Any, Any, Optional[List[Tuple[int, int]]]) -> bool
+    """厨师还没越过中线等待点（沿 path 的前进方向）。"""
+    if spot is None or not isinstance(chef, dict) or not path:
+        return False
+    x = chef.get("x")
+    if x is None:
+        return False
+    try:
+        mx = spot[1][0]
+        sx = world.to_world(*path[0])[0]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if sx < mx:
+        return x < mx - 0.1
+    if sx > mx:
+        return x > mx + 0.1
+    return False
+
+
 def _lamp_state(light):
     # type: (Any) -> Optional[str]
     """返回 'red' / 'yellow' / 'green' / 'off'；None = 旧帧没有灯色字段。"""
@@ -205,6 +284,23 @@ def observe(world, bb):
         bb.traffic_red_since = getattr(bb, "tick", 0) or 0
 
 
+def red_fresh(world, bb):
+    # type: (Any, Any) -> bool
+    """行人红灯是否刚亮起（这一轮还来得及横穿）。
+
+    `bb` 为 None（离线调用）时只看灯色；否则要求观察到红灯起点且在
+    `RED_FRESH_TICKS` 内——红灯只有 ~1.8 秒，尾巴起步会卡在车道上。
+    """
+    if pedestrian_red(world) is not True:
+        return False
+    if bb is None:
+        return True
+    since = getattr(bb, "traffic_red_since", None)
+    if since is None:
+        return False
+    return (getattr(bb, "tick", 0) or 0) - since <= RED_FRESH_TICKS
+
+
 def safe_to_cross(world, bb, path, cur=None, chef=None):
     # type: (Any, Any, Optional[List[Tuple[int, int]]], Optional[Tuple[int, int]], Any) -> bool
     """路径要过街时是否可以从当前格起步。
@@ -226,15 +322,9 @@ def safe_to_cross(world, bb, path, cur=None, chef=None):
         return True
     if road_box(world) is None or not getattr(world, "traffic_lights", None):
         return True
-    red = pedestrian_red(world)
-    if not red:
-        # 红之外（黄/绿）以及读不到灯色（旧 DLL/子灯没找到）都不走。
+    if not red_fresh(world, bb):
+        # 红之外（黄/绿）、读不到灯色、或红灯已经亮了一阵，都不走。
         return False
-    since = getattr(bb, "traffic_red_since", None) if bb is not None else None
-    if bb is not None:
-        # 红灯已经亮了一阵才到路沿：这一轮来不及，等下一轮。
-        if since is None or (getattr(bb, "tick", 0) or 0) - since > RED_FRESH_TICKS:
-            return False
     return not _vehicle_blocks(world, road_cells)
 
 

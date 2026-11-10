@@ -326,11 +326,10 @@ def test_station_interact_cells_uses_reachable_hatch_side():
     assert set(reachability._interact_goals(ctx, st)) == {(9, 2), (9, 3)}
 
 
-def test_approach_waits_at_curb_until_traffic_safe():
-    """4-1 过街：不安全时先走到路沿，不整段过街；灯灭满 3 秒才走。"""
+def test_approach_waits_at_curb_until_red_light():
+    """4-1 过街：绿灯/黄灯先走到路沿等，红灯当拍整段走。"""
     class TrafficWorld(FakeWorld):
         traffic_road = {"minx": -3.6, "maxx": 7.2, "minz": -5.0, "maxz": 5.0}
-        traffic_lights = [{"n": "l1", "on": False, "on_car_b": False}]
         vehicles = []
 
     target = {"t": "counter", "n": "target", "gx": 8, "gz": 1,
@@ -342,8 +341,11 @@ def test_approach_waits_at_curb_until_traffic_safe():
     ctx = make_ctx(w, chef, ex, start=(-8, 1))
     bb = Blackboard()
     bb.tick = 0
-    bb.traffic_off_since = None
     ctx["bb"] = bb
+    # 绿灯：不安全，先走到路沿。
+    w.traffic_lights = [{"n": "l1", "on": True, "on_car_b": False,
+                         "red": False, "yellow": False, "green": True,
+                         "has_lamps": True}]
 
     ap = PR.Approach(lambda c: target, kind="pickup")
     assert ap.tick(ctx) == Status.RUNNING
@@ -354,11 +356,85 @@ def test_approach_waits_at_curb_until_traffic_safe():
     ex.results.append(ex.ok_result(ex.issued[0]["cmd_id"]))
     assert ap.tick(ctx) == Status.RUNNING
 
+    # 红灯但从远处规划：仍然先到路沿——灯必须在**离开路沿那一拍**再判，
+    # 否则从厨房另一头看到红灯就把整段路发下去，走到路沿时灯已经变了
+    # （trace-20261110-115339 t=480→508）。
     ex2 = FakeExec()
     ctx2 = make_ctx(w, chef, ex2, start=(-8, 1))
-    ctx2["bb"] = bb
-    bb.tick = 60
-    bb.traffic_off_since = 0
+    bb2 = Blackboard()
+    bb2.tick = 0
+    bb2.traffic_red_since = 0
+    ctx2["bb"] = bb2
+    w.traffic_lights = [{"n": "l1", "on": False, "on_car_b": False,
+                         "red": True, "yellow": False, "green": False,
+                         "has_lamps": True}]
     ap2 = PR.Approach(lambda c: target, kind="pickup")
     assert ap2.tick(ctx2) == Status.RUNNING
-    assert ex2.issued[0]["goal"] != [-4.8, 1.2]
+    assert ex2.issued[0]["goal"] == [-4.8, 1.2]
+
+    # 红灯刚亮 + 人已经在路沿：当拍整段走。
+    chef_at_curb = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    ex3 = FakeExec()
+    ctx3 = make_ctx(w, chef_at_curb, ex3, start=(-4, 1))
+    ctx3["bb"] = bb2
+    ap3 = PR.Approach(lambda c: target, kind="pickup")
+    assert ap3.tick(ctx3) == Status.RUNNING
+    assert ex3.issued[0]["goal"] != [-4.8, 1.2]
+
+    # 红灯已经亮了一阵：在路沿等下一轮，不发 move。
+    ex4 = FakeExec()
+    ctx4 = make_ctx(w, chef_at_curb, ex4, start=(-4, 1))
+    bb4 = Blackboard()
+    bb4.tick = 100
+    bb4.traffic_red_since = 0
+    ctx4["bb"] = bb4
+    ap4 = PR.Approach(lambda c: target, kind="pickup")
+    assert ap4.tick(ctx4) == Status.RUNNING
+    assert not ex4.issued
+    assert ctx4["traffic_wait"] is True
+
+
+
+def test_go_to_cell_waits_at_curb_for_light():
+    """GoToCell 也要过街门控：出手位/换边目标在马路对面时不能直接冲过去。"""
+    class TrafficWorld(FakeWorld):
+        traffic_road = {"minx": -3.6, "maxx": 7.2, "minz": -5.0, "maxz": 5.0}
+        vehicles = []
+
+    w = TrafficWorld(walkable=lambda gx, gz: gz == 1 and -8 <= gx <= 8)
+    w.traffic_lights = [{"n": "l1", "on": True, "on_car_b": False,
+                         "red": False, "yellow": False, "green": True,
+                         "has_lamps": True}]
+    chef = {"name": "Player 2", "x": -9.6, "z": 1.2, "held": None}
+    ex = FakeExec()
+    ctx = make_ctx(w, chef, ex, start=(-8, 1))
+    bb = Blackboard()
+    bb.tick = 0
+    bb.traffic_red_since = 0
+    ctx["bb"] = bb
+
+    prim = PR.GoToCell(lambda c: (6, 1))
+    assert prim.tick(ctx) == Status.RUNNING
+    # 先只走到路沿 (-4,1)，绿灯不发整段。
+    assert ex.issued[0]["goal"] == [-4.8, 1.2]
+    ex.results.append(ex.ok_result(ex.issued[0]["cmd_id"]))
+    assert prim.tick(ctx) == Status.RUNNING          # 到路沿不报成功
+
+    # 人在路沿 + 绿灯 → 原地等。
+    ctx["chef"] = {"name": "Player 2", "x": -4.8, "z": 1.2, "held": None}
+    assert prim.tick(ctx) == Status.RUNNING
+    assert len(ex.issued) == 1
+    assert ctx["traffic_wait"] is True
+
+    # 红灯刚亮 → 整段走。
+    w.traffic_lights = [{"n": "l1", "on": False, "on_car_b": False,
+                         "red": True, "yellow": False, "green": False,
+                         "has_lamps": True}]
+    ex2 = FakeExec()
+    ctx2 = make_ctx(w, ctx["chef"], ex2, start=(-4, 1))
+    bb2 = Blackboard()
+    bb2.tick = 10
+    bb2.traffic_red_since = 10
+    ctx2["bb"] = bb2
+    assert PR.GoToCell(lambda c: (6, 1)).tick(ctx2) == Status.RUNNING
+    assert ex2.issued[0]["goal"] == [6 * 1.2, 1.2]

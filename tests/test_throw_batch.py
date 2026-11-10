@@ -886,3 +886,23 @@ def test_no_throw_upstairs_from_ground_floor(frames_upstairs, idx):
         if plan is not None:
             top = TH.ground_top(w.terrain_y, *plan["world"])
             assert top is not None and top > 1.4
+
+
+# ---------------------------------------------------------------- 4-1 马路
+
+def test_launch_cells_never_in_road_or_across_it():
+    """4-1：出手位不能落在车道上，也不能选在对岸（等于横穿车道去投）。"""
+    class _RoadWorld(object):
+        traffic_road = {"minx": 21.2, "maxx": 32.0,
+                        "minz": -4.0, "maxz": 15.0}
+
+        def to_world(self, gx, gz):
+            return (24.8 + gx * 1.2, 4.8 + gz * 1.2)
+
+    w = _RoadWorld()
+    assert TS._launch_ok(w, "east", (7, 0)) is True     # 对岸人行道
+    assert TS._launch_ok(w, "east", (6, 0)) is False    # 路沿格（x == maxx）
+    assert TS._launch_ok(w, "east", (3, 0)) is False    # 车道
+    assert TS._launch_ok(w, "east", (-4, 0)) is False   # 对岸
+    assert TS._launch_ok(w, "west", (-4, 0)) is True
+    assert TS._launch_ok(w, None, (7, 0)) is True       # 已站在路上：不额外限制

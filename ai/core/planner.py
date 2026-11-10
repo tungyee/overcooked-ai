@@ -1306,9 +1306,8 @@ def plan(world, bb, order, book):
     # 后重新打分），不再有那个问题。要恢复这条行为时取消注释即可。
     # 函数与相关测试保留。
     # _update_supply_watch(world, bb, book)
-    # ⓪.7 4-1 过街灯态：记录双灯都灭的起始拍（Approach 在路沿等它）。
+    # ⓪.7 4-1 过街灯态：记录行人红灯的起始拍（Approach 只在刚亮时起步）。
     traffic.observe(world, bb)
-
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
     # 已装料载体（包了熟肉的卷饼等）↔订单：覆盖的料不再配锅、不再备料
@@ -1711,7 +1710,11 @@ def _crossing_hold(world, bb, feasible, chosen_task):
         return None
     chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME)
     cur = P.chef_cell(chef, world.to_grid) if chef is not None else None
-    if cur is None or not traffic.in_road(world, cur):
+    if cur is None:
+        return None
+    # 用实际位置而不是格心：路沿那一列的格心正好压在 road 边界上，按格心判
+    # 会把「在路沿等灯」当成「已经在过街」，白白锁住任务不让换。
+    if not traffic.chef_in_road(world, chef):
         return None
     # 当前任务已不可行（目标消失/被拿）→ 不能硬保。
     if not any(_tasks_equal(c.task, current) for c in feasible):

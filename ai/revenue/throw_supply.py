@@ -23,6 +23,7 @@ from ai.query import stations as S
 from ai.revenue import cook_supply as CS
 from ai.space import regions as RG
 from ai.space import throw as TH
+from ai.space import traffic
 
 # 订单之外多投的预备份数（每条加工链）。0 = 只投可见订单要的份数：远投打开后
 # 多投的那份常落在锅旁地上没人用，先不留余量（2026-10-30）。
@@ -228,7 +229,14 @@ def mode_for(world, dest, srcs, bb=None):
         if s["kind"] == "held":
             continue
         a = _point(world, s["entry"] or {})
-        if a is not None and math.hypot(a[0] - b[0], a[1] - b[1]) >= THROW_MIN_DIST:
+        if a is None:
+            continue
+        # 隔着马路（4-1）：料在对岸、消费站在近岸。走过去顶多绕几步，投的话
+        # 出手位必须落在车道上（射程 7.5m 够不到对岸），实机被车撞
+        # （trace-20261110-115339 t=591）。这种距离不算「远投」。
+        if traffic.road_between(world, a, b):
+            continue
+        if math.hypot(a[0] - b[0], a[1] - b[1]) >= THROW_MIN_DIST:
             return MODE_FAR
     return None
 
@@ -318,6 +326,27 @@ def _max_lands(mode):
     return (TH.MAX_LAND_DIST,)
 
 
+def _launch_ok(world, side, cell):
+    # type: (Any, Optional[str], Tuple[int, int]) -> bool
+    """出手格能不能站：不能在车道上，也不能和厨师分处马路两侧。
+
+    4-1 的马路把两个半场隔开：鱼/虾在对岸，砧板在近岸，出手位落进车道
+    （马路条带 gx -3..6）会被车撞；站在对岸又等于要横穿车道去投，不如
+    直接走过去。没有 road 数据的关卡不受影响。
+    """
+    box = traffic.road_box(world)
+    if box is None:
+        return True
+    x, z = world.to_world(*cell)
+    if not (box[2] <= z <= box[3]):
+        return True
+    if box[0] <= x <= box[1]:
+        return False
+    if side is None:
+        return True
+    return (x < box[0]) == (side == "west")
+
+
 def launch_plan(world, dest, mode, bb=None):
     # type: (Any, Dict, str, Any) -> Optional[Dict]
     """当前帧的出手方案（TH.plan_launch 的结果），每帧按 (dest, mode) 缓存。
@@ -327,10 +356,14 @@ def launch_plan(world, dest, mode, bb=None):
         f2 = RG.field_of(world, bb, P.P2_NAME)
         if target is None or not f2:
             return None
+        chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME)
+        side = traffic.road_side(world, chef)
         # 出手格按脚下高度分组：障碍与落点能否够着都相对出手点算（一楼格与
         # 楼上格看到的「高出脚下的地面」不同）
         by_floor = {}  # type: Dict[float, List[Tuple[int, int]]]
         for c in f2:
+            if not _launch_ok(world, side, c):
+                continue
             by_floor.setdefault(round(_cell_floor_y(world, c), 2), []).append(c)
         tests = {}
         for max_land in _max_lands(mode):

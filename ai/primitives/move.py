@@ -22,7 +22,7 @@ FACE_MAX_TICKS = 40
 
 # move 命令超时（毫秒）：委托后端下一趟走位最多 8 秒。
 MOVE_TIMEOUT_MS = 8000
-# 路沿等灯/车的上限（拍）：4-1 一个车灯周期约 20~25 秒，留 40 秒余量。
+# 路沿等灯/车的上限（拍）：实机红绿周期约 5 秒，留 40 秒余量。
 TRAFFIC_WAIT_TICKS = 800
 
 
@@ -269,13 +269,18 @@ class Approach(Primitive):
                        % (_nav_time(ctx), _nav_target(st), self.kind, cur, goal, goals))
             return Status.FAILURE
 
-        # 4-1 过街：只在**起步**前门控；已经在马路上时 safe_to_cross 恒 True，
-        # 不会半途停下。不安全就先走到路沿等，等双灯都灭满 3 秒再整段通过。
-        if self._pending_cmd is None and traffic.path_crosses_road(w, path) \
-                and not traffic.safe_to_cross(w, ctx.get("bb"), path, cur):
+        # 4-1 过街：门控必须在**离开路沿那一拍**判灯，而不是在规划整段路时
+        # 判一次。之前从远处（比如厨房另一头）规划过街时灯是红的就直接把
+        # 整段路径发下去，走到路沿时灯早变黄了，插件照旧把人送进车道
+        # （trace-20261110-115339 t=480→508）。所以只要路径要过街且人还
+        # 没到路沿，就先只走到路沿；到了路沿再按当前灯态决定跨不跨。
+        # 已经在马路上（实际位置在 road 里）时 safe_to_cross 恒 True，不会
+        # 半途停下。
+        if self._pending_cmd is None and traffic.path_crosses_road(w, path):
             curb = traffic.curb_index(w, path)
+            at_curb = curb is None or cur == path[curb]
             info = traffic.state_text(w, ctx.get("bb"))
-            if curb is not None and cur != path[curb]:
+            if not at_curb:
                 wait_goal = path[curb]
                 _nav_debug("traffic curb t=%s target=%s kind=%s cur=%s curb=%s %s"
                            % (_nav_time(ctx), _nav_target(st), self.kind,
@@ -287,18 +292,20 @@ class Approach(Primitive):
                                 handle_desc(st, target_grid_callbacks(w, st)[0]),
                                 self.kind, MOVE_TIMEOUT_MS)
                 return self._begin_exec(ctx, ex, cmd)
-            self._traffic_wait_ticks += 1
-            if self._traffic_wait_ticks > TRAFFIC_WAIT_TICKS:
-                self._traffic_wait_ticks = 0
-                _nav_debug("traffic wait timeout t=%s target=%s %s"
-                           % (_nav_time(ctx), _nav_target(st), info))
-                return Status.FAILURE
-            # 等外部（灯/车）不计入 task 的 200 拍超时预算。
-            ctx["external_wait"] = ctx.get("external_wait", 0) + 1
-            ctx["traffic_wait"] = True
-            _nav_debug("traffic wait t=%s target=%s kind=%s cur=%s %s"
-                       % (_nav_time(ctx), _nav_target(st), self.kind, cur, info))
-            return Status.RUNNING
+            if not traffic.safe_to_cross(w, ctx.get("bb"), path, cur,
+                                         ctx.get("chef")):
+                self._traffic_wait_ticks += 1
+                if self._traffic_wait_ticks > TRAFFIC_WAIT_TICKS:
+                    self._traffic_wait_ticks = 0
+                    _nav_debug("traffic wait timeout t=%s target=%s %s"
+                               % (_nav_time(ctx), _nav_target(st), info))
+                    return Status.FAILURE
+                # 等外部（灯/车）不计入 task 的 200 拍超时预算。
+                ctx["external_wait"] = ctx.get("external_wait", 0) + 1
+                ctx["traffic_wait"] = True
+                _nav_debug("traffic wait t=%s target=%s kind=%s cur=%s %s"
+                           % (_nav_time(ctx), _nav_target(st), self.kind, cur, info))
+                return Status.RUNNING
 
         if self._pending_cmd is None:
             self._traffic_wait_ticks = 0
@@ -454,6 +461,7 @@ class GoToCell(Primitive):
         self.cell_fn = cell_fn
         self.arrived = arrived
         self.precise = precise
+        self._curb_cmd = False   # 在途的是「先走到路沿」的小段 move
         self._goal = None   # type: Optional[Tuple[int, int]]
         self._fails = 0
         self._nudged = False
@@ -461,6 +469,7 @@ class GoToCell(Primitive):
     def reset(self):
         # type: () -> None
         Primitive.reset(self)
+        self._curb_cmd = False
         self._goal = None
         self._fails = 0
         self._nudged = False
@@ -523,6 +532,16 @@ class GoToCell(Primitive):
             s = self._poll_exec(ctx, ctx["exec"])
             if s == Status.RUNNING:
                 return s
+            if self._curb_cmd:
+                # 到路沿不等于到目标：回去按当前灯态重新判，别报 SUCCESS。
+                self._curb_cmd = False
+                if s == Status.FAILURE:
+                    self._goal = None
+                    self._fails += 1
+                    if self._fails > GOTO_RETRIES:
+                        self.reset()
+                        return Status.FAILURE
+                return Status.RUNNING
             if self._nudged:
                 return self._done()       # 纠偏只挪一次：成败都交给后续节点
             if s == Status.SUCCESS:
@@ -543,6 +562,24 @@ class GoToCell(Primitive):
                                      ctx.get("soft_cost"), seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             return Status.FAILURE
+        # 4-1 过街：和 Approach 一样，先在路沿停下、按当时的灯态再决定跨不跨。
+        # 出手位在马路对面时（ThrowBatch / Reposition）如果直接发整段路径，
+        # 插件会无视灯把车道上当作普通格走（trace-20261110-115339 t=591）。
+        if traffic.path_crosses_road(w, path):
+            curb = traffic.curb_index(w, path)
+            if curb is not None and cur != path[curb]:
+                self._goal = tuple(goal)
+                self._curb_cmd = True
+                wait_goal = path[curb]
+                cmd = _move_cmd(w, path[:curb + 1], field, ctx.get("bb"),
+                                list(w.to_world(*wait_goal)), None, None,
+                                GOTO_MOVE_TIMEOUT_MS)
+                return self._begin_exec(ctx, ctx["exec"], cmd)
+            if not traffic.safe_to_cross(w, ctx.get("bb"), path, cur,
+                                         ctx.get("chef")):
+                ctx["external_wait"] = ctx.get("external_wait", 0) + 1
+                ctx["traffic_wait"] = True
+                return Status.RUNNING
         self._goal = tuple(goal)
         cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*self._goal)),
                         None, None, GOTO_MOVE_TIMEOUT_MS)

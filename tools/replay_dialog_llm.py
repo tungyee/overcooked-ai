@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""用历史 trace 的真实状态回放 LLM 对话回合（旧 scenario + function calling）。
+"""用历史 trace 的真实状态回放 LLM 对话回合（scenario + 当前工具协议）。
 
 历史 trace 每拍落一条 JSONL；较新的 trace 带 `state` 快照。本脚本把快照
 还原成 `World`，按局面选帧，然后走**线上同一条路径**：
@@ -403,8 +403,6 @@ def _run_turn(agent, worker, world, step):
     # type: (Any, DialogWorker, World, Step) -> Dict
     """一轮：worker 线程里跑 LLM；主线程 20 Hz 驱动 _service_dialog 落地批次。"""
     context = agent._build_dialog_context(world)
-    # 旧 scenario 仍走两段式（无工具）；新工具协议由 worker 在线上使用。
-    context["tools"] = None
     done = threading.Event()
     started = time.monotonic()
 

@@ -129,6 +129,7 @@ def test_move_cmd_sets_dash_edges(monkeypatch):
                       [4.8, 1.2], None, None, 8000)
     assert cmd["dash"] is True
     assert cmd["dash_edges"] == [2]
+    assert cmd["run"] is False        # 跨缝段不跑
 
 
 def test_move_cmd_without_gap_has_empty_dash_edges(monkeypatch):
@@ -148,6 +149,7 @@ def test_move_cmd_without_gap_has_empty_dash_edges(monkeypatch):
                       [2.4, 1.2], None, None, 8000)
     assert cmd["dash"] is False
     assert cmd["dash_edges"] == []
+    assert cmd["run"] is False        # 短路径不跑
 
 
 def test_hold_issues_hold():
@@ -560,3 +562,68 @@ def test_go_to_cell_diverts_to_median_when_near_car_starts():
     bb.tick = 50
     assert prim.tick(ctx) == Status.RUNNING
     assert len(ex.issued) == issued + 1
+
+
+def test_move_cmd_long_plain_path_authorizes_run_dash(monkeypatch):
+    """长距离普通地面路径要授权插件 dash 提速；门洞/传送门段不授权。"""
+    from ai.primitives import move as M
+
+    def world():
+        w = FakeWorld(walkable=lambda gx, gz: True)
+        w.terrain = {9: [(0.0, 20.0, 0.0, 2.4)]}
+        w.raw = {}
+        w.stations = []
+        w.seam_gates = None
+        w.portal_map = None
+        w.lane_map = None
+        return w
+
+    path = [(gx, 1) for gx in range(1, 8)]       # 7 格
+    monkeypatch.setattr(
+        M.portals, "route",
+        lambda w, p, field, bb: ([list(w.to_world(*c)) for c in p], [], [], 0.0))
+    cmd = M._move_cmd(world(), path, None, Blackboard(),
+                      [8.4, 1.2], None, None, 8000)
+    assert cmd["run"] is True
+    assert cmd["dash"] is False
+
+    # 有门洞段（要停下来等门）时不跑。
+    monkeypatch.setattr(
+        M.portals, "route",
+        lambda w, p, field, bb: ([list(w.to_world(*c)) for c in p], [object()], [], 0.0))
+    cmd = M._move_cmd(world(), path, None, Blackboard(),
+                      [8.4, 1.2], None, None, 8000)
+    assert cmd["run"] is False
+
+
+def test_new_task_at_median_waits_for_red():
+    """换任务后新树从车道中间出发：远侧车道有车时站定在中线等，不硬穿。"""
+    from ai.space.navigation import distance_field
+
+    w = _traffic_world_with_median()
+    green = [{"n": "l1", "on": True, "on_car_b": False, "red": False,
+              "yellow": False, "green": True, "has_lamps": True}]
+    red = [{"n": "l1", "on": False, "on_car_b": False, "red": True,
+            "yellow": False, "green": False, "has_lamps": True}]
+    # 中线等待点 (0.8, 1.2)；人站在附近（5Hz 快照有 0.5m 容差）。
+    chef = {"name": "Player 2", "x": 1.2, "z": 1.2, "held": None}
+    ex = FakeExec()
+    ctx = make_ctx(w, chef, ex, start=(1, 1))
+    bb = Blackboard()
+    bb.tick = 0
+    bb.traffic_red_since = 0
+    ctx["bb"] = bb
+    w.traffic_lights = green
+
+    target = {"t": "counter", "n": "target", "gx": -6, "gz": 1,
+              "x": -7.2, "z": 1.2}
+    ap = PR.Approach(lambda c: target, kind="pickup")
+    assert ap.tick(ctx) == Status.RUNNING
+    assert not ex.issued                      # 绿灯：在中线等
+    assert ctx["traffic_wait"] is True
+
+    w.traffic_lights = red
+    bb.tick = 40
+    bb.traffic_red_since = 40                 # 红灯刚亮
+    assert ap.tick(ctx) == Status.RUNNING
+    assert ex.issued                          # 红灯：继续向西

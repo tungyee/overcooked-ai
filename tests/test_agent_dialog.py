@@ -113,10 +113,6 @@ def _batch(*calls, source=""):
     return DutyBatch(batch_id="b1", calls=list(calls), source=source)
 
 
-def _duty(**args):
-    return ("assign_action", args)
-
-
 # ---------------------------------------------------------- 账本落地
 
 
@@ -188,7 +184,7 @@ def test_service_dialog_survives_crashing_batch(dagent, world, fake_worker,
     def boom(*_a, **_k):
         raise RuntimeError("bad")
     monkeypatch.setattr(dagent, "_apply_duty_batch", boom)
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="assign", action="洗盘", direction="P2")))
+    fake_worker.cmd_q.put(_batch(("speak", {"text": "好"})))
 
     dagent._service_dialog(world)
 

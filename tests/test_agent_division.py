@@ -190,6 +190,29 @@ def test_load_guide_falls_back_to_asset_name(agent, monkeypatch):
     assert agent._guide is not None
 
 
+def test_division_event_context_published_first(agent, worker):
+    """事件必须先看到当前上下文（含 tools），否则开局分工退化到无工具路径。"""
+    world = make_world()
+    agent.book = RecipeBook(world.recipes, world.stations)
+    order = []
+    publish = worker.publish_context
+    put_event = worker.put_event
+
+    def _publish(context):
+        order.append("context")
+        publish(context)
+
+    def _put_event(event):
+        order.append("event")
+        put_event(event)
+
+    worker.publish_context = _publish
+    worker.put_event = _put_event
+    agent._service_dialog(world)
+    assert "division" in [event[0] for event in worker.events]
+    assert order.index("context") < order.index("event")
+
+
 def test_set_division_applies_and_weights(agent, worker):
     world = make_world()
     agent.book = RecipeBook(world.recipes, world.stations)

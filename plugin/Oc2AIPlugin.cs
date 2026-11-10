@@ -117,6 +117,7 @@ namespace Oc2AI
                 if (IsInLevel())
                 {
                     RefreshLevel();
+                    Oc2PilotProbe.Tick(_all, Logger.LogInfo);
                     if (_trafficProbeEnabled.Value)
                         Oc2TrafficProbe.Tick(_all, _level, Logger.LogInfo);
                     if (_discoverEnabled.Value && !_discoveryDone) { _discoveryDone = true; Discover(); }

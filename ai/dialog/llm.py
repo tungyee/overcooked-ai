@@ -3,7 +3,6 @@
 主路径由 `worker._run_llm` 驱动多轮工具调用：`execute_actions` /
 `cancel_action` / `speak` / `get_world_state` / `set_division` /
 `read_cookbook`。工具结果由主循环权威校验后回填，模型据此继续下一轮或收尾。
-`_run_llm_legacy` 保留给旧 trace/回放的两段式调用。
 
 消息分工：
 - 开头 system：人设、本关配方 DAG、攻略摘要（每关只变一次）；
@@ -93,8 +92,7 @@ class LLMClient(object):
 
     def chat(self, messages, tools=None, tool_choice="auto", on_text=None):
         # type: (List[dict], Optional[List[dict]], str, Any) -> LLMReply
-        """一次流式请求。`tool_choice="none"` 用于两段式的第二段：工具结果已
-        回填，只要最终那句话（tools 仍要带上，否则历史里的 tool_calls 无定义）。
+        """一次流式请求。`tool_choice="none"` 可强制模型只说话、不调工具。
 
         `on_text` 是可选回调：每收到一个 content delta 就调用一次，用于
         边生成边把文本交给 TTS；工具调用的 arguments 不经过它。"""

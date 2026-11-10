@@ -47,6 +47,15 @@ namespace Oc2AI
                 bool on = false, onB = false;
                 try { on = a.GetBool("LightsOn"); onB = a.GetBool("LightsOn_CarB"); }
                 catch (Exception) { }
+                // 灯 prefab 的子物体 red_glow/yellow_glow/green_glow 由 Animator
+                // 直接切 m_IsActive；这是玩家看到的灯色，不是车灯 bool。只读诊断：
+                // 原样暴露三个灯的 active 状态，Python 侧暂不消费。
+                bool red = LampActive(mb.transform, "red_glow");
+                bool yellow = LampActive(mb.transform, "yellow_glow");
+                bool green = LampActive(mb.transform, "green_glow");
+                bool hasLamps = LampExists(mb.transform, "red_glow")
+                    || LampExists(mb.transform, "yellow_glow")
+                    || LampExists(mb.transform, "green_glow");
                 Vector3 p = mb.transform.position;
                 if (i++ > 0) sb.Append(',');
                 sb.Append("{\"n\":").Append(Jstr(nm))
@@ -54,6 +63,10 @@ namespace Oc2AI
                   .Append(",\"z\":").Append(F(p.z))
                   .Append(",\"on\":").Append(on ? "true" : "false")
                   .Append(",\"on_car_b\":").Append(onB ? "true" : "false")
+                  .Append(",\"red\":").Append(red ? "true" : "false")
+                  .Append(",\"yellow\":").Append(yellow ? "true" : "false")
+                  .Append(",\"green\":").Append(green ? "true" : "false")
+                  .Append(",\"has_lamps\":").Append(hasLamps ? "true" : "false")
                   .Append('}');
             }
             sb.Append("],\"cars\":[");
@@ -89,6 +102,26 @@ namespace Oc2AI
                   .Append('}');
             }
             sb.Append("]}");
+        }
+
+        // 灯 prefab 的三个灯泡是子 GameObject（red_glow / yellow_glow / green_glow），
+        // Animator 用 m_IsActive 切换亮灭；灭掉的灯是 inactive，必须带 true 才能找到。
+        static bool LampExists(Transform root, string name)
+        {
+            foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (t != null && t.name == name) return true;
+            }
+            return false;
+        }
+
+        static bool LampActive(Transform root, string name)
+        {
+            foreach (Transform t in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (t != null && t.name == name) return t.gameObject.activeSelf;
+            }
+            return false;
         }
 
         static string F(float v)

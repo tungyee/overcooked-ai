@@ -1201,7 +1201,7 @@ class Agent:
                     "左右" if report.district == "LR" else "上下",
                     report.p2_label, report.p1_label))
             else:
-                parts.append("厨房现在还是一整块，中间的路还没转开。")
+                parts.append("厨房现在还是一整块，没有分开。")
         p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
         p2_chef = P.chef_by_name(world.chefs, P.P2_NAME)
         if p1_chef and p2_chef:
@@ -1628,15 +1628,10 @@ class Agent:
         # ④.6 开局分工 / 动态复核：只在需要时叫 LLM。
         self._update_division(world, events, tick)
 
-        # 同一拍的事件合成一段对话：单个直接发，多个合并成 batch，worker 一次说完。
-        if events:
-            if len(events) == 1:
-                self._put_event(events[0])
-            else:
-                self._put_event(("batch", events))
-
-        # ⑥ 2 Hz 上下文（20 Hz 主循环 / 10 拍）；有事件时立刻发一份，
-        # 让 worker 处理事件时看到的是本拍状态。
+        # ⑥ 2 Hz 上下文（20 Hz 主循环 / 10 拍）；有事件时**先**发一份，
+        # 再投事件。否则 worker 可能先处理事件、看到上一关/空白的上下文
+        # （没有 tools），开局分工就会退化成不带工具的两段式，模型把
+        # <tool_call> 写进 content 被 TTS 念出来。
         if self.tick % 10 == 0 or events or record["batches"]:
             publish = getattr(self.dialog_worker, "publish_context", None)
             if callable(publish):
@@ -1645,6 +1640,13 @@ class Agent:
                 except Exception:               # noqa: BLE001
                     # 上下文是增强信息；构造失败不该打断主循环，但必须留痕。
                     log.exception("构造对话上下文失败")
+
+        # 同一拍的事件合成一段对话：单个直接发，多个合并成 batch，worker 一次说完。
+        if events:
+            if len(events) == 1:
+                self._put_event(events[0])
+            else:
+                self._put_event(("batch", events))
 
         if events:
             record["event"] = events[-1] if len(events) == 1 else events
@@ -1944,13 +1946,10 @@ class Agent:
                     else None),
             },
             # 4-1 过街：本拍是否在路沿等灯/车、是否因过街承诺保住了旧 task。
+            # wait 在 ⑫ 执行后回填（Approach 在 exec 里才写 ctx["traffic_wait"]）。
             "traffic": {
-                "wait": bool(ctx.get("traffic_wait")),
+                "wait": False,
                 "hold": bool(plan_record.get("crossing_hold")),
-                "off_ticks": (
-                    self.tick - self.bb.traffic_off_since
-                    if getattr(self.bb, "traffic_off_since", None) is not None
-                    else None),
             },
             # 对话分支与截止闸抢单（spec §6.4）：分支是认领复盘的第一步，
             # `rescue_override` 记录闸抢的是哪一单。火情路径没有这两项。
@@ -1997,6 +1996,9 @@ class Agent:
             status = "idle"
             record['waiting'] = waiting_reason(plan_record.get('candidates', []), world.orders)
             record['mode_reason'] = record['waiting']['reason']
+
+        # Approach 在 exec 里才写 ctx["traffic_wait"]，这里回填给 trace。
+        record["traffic"]["wait"] = bool(ctx.get("traffic_wait"))
 
         # ⑬ 处理结果
         success_task = None  # type: Optional[Any]

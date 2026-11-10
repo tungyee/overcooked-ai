@@ -8,13 +8,14 @@
 
 ```text
 麦克风 → PTT 按住录音 / RMS VAD 切句 → 火山流式 ASR
-      → 方舟 LLM 第一段（function calling：update_duties）
-      → 主循环落分工账本、回填工具结果
-      → 方舟 LLM 第二段（按真实结果说最终那句话）
+      → 方舟 LLM（多轮 function calling：execute_actions / cancel_action /
+        speak / set_division / get_world_state / read_cookbook）
+      → 主循环落地动作与分工、回填 tool 结果
+      → 模型继续下一轮，或给出最终 speak / content
       → LLM text 按句流式 → 火山流式 TTS → 扬声器播放
 ```
 
-第一段 / 第二段的 text 都按句喂给 TTS 流式播放；第一段带工具调用时也不丢弃、直接播（换更快体感，接受「先出口、随后第二段再确认」的少量重复）。
+只有 `speak` 出声；动作与 speak 同轮时先落地动作，成功才播；动作成功但没有 speak 就安静结束。没有单独的「第一段/第二段」路径，旧 trace/回放也走同一套多轮工具调用。
 
 - 代码在 `ai/dialog/`：`audio.py`（采集/播放/VAD）· `ptt.py`（全局按键 PTT）· `asr.py` · `tts.py` · `llm.py` · `policy.py`（主动开口/限频/新单合并）· `worker.py`（后台线程）· `duties.py`（分工账本/物料目录/工具 schema）· `schema.py`（偏好/作用域匹配/`VoiceConfig`）· `env.py`（`.env` 加载）。
 - 主循环仍是 **20 Hz** 的唯一决策者；`DialogWorker` 是独立 daemon 线程，只通过上下文快照（2 Hz）、事件、工具批次、ack 四个队列与主循环通信，**不读 World、不写 Blackboard**。
@@ -22,7 +23,7 @@
 
 ## 1.1 新工具协议（2026-11）
 
-对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型（代码保留，`ai/dialog/duties.py` 的 `ENABLE_LEGACY_TOOLS=False`，handler 仍可接收旧调用供回放/测试）。
+对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型，也没有单独的两段式回合路径。`execute_action` / `check_action` 的 handler 仅为旧数据保留，旧 trace/回放同样走下面的多轮工具调用。
 
 模型只看到 4 个工具：
 
@@ -31,10 +32,12 @@ execute_actions(actions=[{action, target?}, ...])
                                     一次提交一个或多个动作，按数组顺序排队；
                                     逐条返回 ok/status/reason
 cancel_action(action=None)          撤销当前命令和队列，停手约 5 秒
-speak(text)                         唯一发言通道；不调用就不出声
+speak(text)                         主要发言通道；模型不调用时，语音/播报类
+                                    事件允许用 content 兜底（见下）
 get_world_state()                   按需读取最新世界状态
 ```
 
+- 工具结果只以 `role=tool` 回填，不追加催 `speak` 的 system 提示；每轮都用 `tool_choice=auto`，是否发言由模型决定。`division` / `division_review` 的 content 不播（只认 `speak`），`speech` / `checkin` / `last_seconds` / `round_summary` / `batch` / `layout_review` 在没有工具调用的回合用 content 兜底播报。
 - `action` 用英文标识：`chop / cook / mix / plate / deliver / wash / fetch`（`prepare` 为后续目标级动作）。
 - `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/commands.py` 里做一次归一化。
 - 动作是**目标状态**：`cook(Tomato)` 会自动补取料、切；`plate(dish)` 会自动补上游。命令带 `scope` 和 `done`，不会因为第一个子任务成功就被消费。
@@ -121,9 +124,9 @@ python3 run_agent.py --voice --voice-debug
 
 `OC2_VOICE_RATE` / `OC2_VOICE_VOLUME` 的非法或非有限值（`nan`/`inf`）会告警并回退默认值；有限但超范围的值会收敛到边界。
 
-## 4. 对话与分工账本（legacy）
+## 4. 对话与分工账本（legacy，已移除）
 
-> 本节描述旧的 `assign_action` / 物料级分工；2026-11 起已停用，新协议见 §1.1。以下内容仅用于回放旧 trace 或回滚参考。
+> 本节描述旧的 `assign_action` / 物料级分工与两段式回合；2026-11 起已移除，新协议见 §1.1。以下内容仅作历史参考。
 
 - **一轮对话**：P1 的话作为 user 消息；世界状态（订单、灶、盘、P1/P2 在做什么、规划器接下来可做的、账本）作为本轮的 system 消息，不进历史。有工具调用时走两段式：第一段调用工具 → 主循环落地 → 第二段按真实结果说话（被拒的会如实说明）；闲聊/提问只请求一次。
 - **历史**：本关完整对话（user / assistant / tool 结果）留在 `DialogState.history`，最多 60 条；换关卡清空，暂停不清。

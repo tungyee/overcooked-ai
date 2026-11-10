@@ -28,7 +28,7 @@ from ai.dialog.worker import DutyBatch
 from ai.query.recipes import RecipeBook
 from ai.state.world import World
 from tests.test_agent_dialog import make_plate_world, make_world
-from tests.test_dialog_worker import (FakeLLM, duty, make_worker, reply,
+from tests.test_dialog_worker import (FakeLLM, make_worker, reply,
                                       run_async, wait_until)
 
 

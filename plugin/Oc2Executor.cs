@@ -395,6 +395,12 @@ namespace Oc2AI
         // 对岸路点超过这个距离就不 dash：木筏可能已漂远，dash 也够不到，
         // 交回 Python 重算比冲进水里好。2 格跳边的格心距是 2.4m，留 0.2m 余量。
         private const float DASH_REACH = 2.6f;
+        // 长距离跑动（run）：普通地面、路径直、离终点还远时隔一段按一次 Dash 提速。
+        // 与跳边那套分开——这里不做落点格校验，但仍要求 2m 前方有地板，防止从
+        // 平台边缘冲下去；冷却沿用 DASH_COOLDOWN，避免和跳边抢按键。
+        private const float RUN_MIN_DIST = 1.8f;      // 离当前路点太近不跑（会冲过拐角）
+        private const float RUN_STOP_DIST = 1.5f;     // 离终点太近不跑（要精确停下）
+        private const float RUN_STRAIGHT_DOT = 0.85f; // 前后两段方向夹角余弦下限
 
         // waypoint 锚点：Python 发的是发令时刻的世界坐标，但站在移动平台（气球篮/
         // 木筏）上时，平台上的点会被平台带走。冻结的世界坐标会落进平台台面里、
@@ -428,6 +434,7 @@ namespace Oc2AI
         // 新协议另发 dash_edges（落点下标列表）：只在真正的缝隙跳边段按 Dash，
         // 不再「整条路径任意边缘都跳」。旧 Python 不发时退回 dash 标记。
         private readonly bool _allowDash;
+        private readonly bool _allowRun;
         private readonly List<int> _dashEdges;
         private bool _dashDown;
         private float _dashUntil = -1f;
@@ -462,6 +469,7 @@ namespace Oc2AI
             _target = Req.Obj(cmd, "target");
             _kind = Req.Str(cmd, "kind");
             _allowDash = Req.Bool(cmd, "dash");
+            _allowRun = Req.Bool(cmd, "run");
             var edges = Req.List(cmd, "dash_edges");
             if (edges != null)
             {
@@ -701,6 +709,19 @@ namespace Oc2AI
             return _idx >= _anchors.Count || _anchors[_idx].T != null;
         }
 
+        // 跑动 dash 只在直段按：当前路点方向和下一段方向基本一致，否则一冲就
+        // 冲过拐角、插件还得折回来（格子中心路径在门/台面附近常是 90° 折）。
+        private bool RunStraight(Vector2 pos, int idx)
+        {
+            if (idx + 1 >= _path.Count) return true;
+            Vector2 here = PointAt(idx);
+            Vector2 next = PointAt(idx + 1);
+            Vector2 d1 = here - pos;
+            Vector2 d2 = next - here;
+            if (d1.sqrMagnitude < 1e-6f || d2.sqrMagnitude < 1e-6f) return true;
+            return Vector2.Dot(d1.normalized, d2.normalized) >= RUN_STRAIGHT_DOT;
+        }
+
         private void ReleaseDash()
         {
             if (!_dashDown) return;
@@ -735,6 +756,7 @@ namespace Oc2AI
                   .Append(" kind=").Append(_kind ?? "null")
                   .Append(" dash=").Append(_allowDash ? "1" : "0")
                   .Append(" dashEdges=").Append(DashEdgesText())
+                  .Append(" run=").Append(_allowRun ? "1" : "0")
                   .Append(" goal=(").Append(_goal.x).Append(',').Append(_goal.y)
                   .Append(") goal_floor=").Append(_goalAnchor.T != null ? _goalAnchor.T.name : "none")
                   .Append(" anchored=").Append(_anchoredCount).Append('/').Append(_path.Count)
@@ -947,7 +969,13 @@ namespace Oc2AI
 
             PadEngagement.Pad.Move(f.Chef, dir.x * mag, dir.y * mag);
 
-            if (gapAhead && dashHere && landOk && PadEngagement.Pad != null
+            // 长距离跑动：普通地面 + 直段 + 离终点还远 + 2m 前方有地板才按 Dash。
+            // 跳边段已有自己的授权和落点校验，两者共用冷却，避免同一拍抢按键。
+            bool runHere = _allowRun && !gapAhead
+                && farDist >= RUN_MIN_DIST && goalDist > RUN_STOP_DIST
+                && RunStraight(pos, _idx) && DashLandingReady(f, dir);
+            bool gapJump = gapAhead && dashHere && landOk;
+            if ((gapJump || runHere) && PadEngagement.Pad != null
                 && now - _lastDashAt > DASH_COOLDOWN)
             {
                 try
@@ -959,6 +987,7 @@ namespace Oc2AI
                     UnityEngine.Debug.Log("[EXEC] move dash t=" + now.ToString("0.00")
                         + " pos=(" + f.PosX + "," + f.PosZ
                         + ") idx=" + _idx + "/" + _path.Count
+                        + " run=" + (runHere && !gapJump ? "1" : "0")
                         + " target_id=" + TargetDesc());
                 }
                 catch (System.Exception e)

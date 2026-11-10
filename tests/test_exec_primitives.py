@@ -341,6 +341,7 @@ def test_approach_waits_at_curb_until_red_light():
     ctx = make_ctx(w, chef, ex, start=(-8, 1))
     bb = Blackboard()
     bb.tick = 0
+    bb.traffic_red_since = 0
     ctx["bb"] = bb
     # 绿灯：不安全，先走到路沿。
     w.traffic_lights = [{"n": "l1", "on": True, "on_car_b": False,
@@ -363,6 +364,7 @@ def test_approach_waits_at_curb_until_red_light():
     ctx2 = make_ctx(w, chef, ex2, start=(-8, 1))
     bb2 = Blackboard()
     bb2.tick = 0
+    bb2.traffic_red_since = 0
     ctx2["bb"] = bb2
     w.traffic_lights = [{"n": "l1", "on": False, "on_car_b": False,
                          "red": True, "yellow": False, "green": False,
@@ -385,6 +387,7 @@ def test_approach_waits_at_curb_until_red_light():
     ctx4 = make_ctx(w, chef_at_curb, ex4, start=(-4, 1))
     bb4 = Blackboard()
     bb4.tick = 100
+    bb4.traffic_red_since = 0        # 已经亮了 100 拍：长红灯窗口
     ctx4["bb"] = bb4
     ap4 = PR.Approach(lambda c: target, kind="pickup")
     assert ap4.tick(ctx4) == Status.RUNNING
@@ -407,6 +410,7 @@ def test_go_to_cell_waits_at_curb_for_light():
     ctx = make_ctx(w, chef, ex, start=(-8, 1))
     bb = Blackboard()
     bb.tick = 0
+    bb.traffic_red_since = 0
     ctx["bb"] = bb
 
     prim = PR.GoToCell(lambda c: (6, 1))
@@ -430,6 +434,7 @@ def test_go_to_cell_waits_at_curb_for_light():
     ctx2 = make_ctx(w, ctx["chef"], ex2, start=(-4, 1))
     bb2 = Blackboard()
     bb2.tick = 10
+    bb2.traffic_red_since = 10
     ctx2["bb"] = bb2
     assert PR.GoToCell(lambda c: (6, 1)).tick(ctx2) == Status.RUNNING
     assert ex2.issued[0]["goal"] == [6 * 1.2, 1.2]
@@ -467,6 +472,7 @@ def test_approach_diverts_to_median_when_light_changes_mid_crossing():
     ctx = make_ctx(w, chef, ex, start=(-4, 1))
     bb = Blackboard()
     bb.tick = 0
+    bb.traffic_red_since = 0
     ctx["bb"] = bb
     w.traffic_lights = red
 
@@ -516,6 +522,7 @@ def test_go_to_cell_diverts_to_median_when_light_changes():
     ctx = make_ctx(w, chef, ex, start=(7, 1))
     bb = Blackboard()
     bb.tick = 0
+    bb.traffic_red_since = 0
     ctx["bb"] = bb
     w.traffic_lights = red
 

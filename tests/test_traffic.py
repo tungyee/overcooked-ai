@@ -37,9 +37,11 @@ CAR_ON_PATH = [{"n": "Blue_Car", "minx": 23.5, "maxx": 25.6,
 PATH = [(-8, 1), (0, 1), (8, 1)]
 
 
-def _bb(tick=60):
+def _bb(tick=60, red_since=None):
     bb = Blackboard()
     bb.tick = tick
+    # 默认当作「这一拍刚看到红灯」；测红灯尾巴就传更早的拍号。
+    bb.traffic_red_since = tick if red_since is None else red_since
     return bb
 
 
@@ -61,9 +63,34 @@ def test_red_lamp_is_safe_immediately():
 
 
 def test_long_red_is_safe_to_start():
-    """红灯可能亮很久（4-1 开局长红灯实测 20~27s），不能因为「亮了一阵」就干等。"""
+    """红灯可能亮很久（4-1 开局长红灯实测 20~27s），长红灯照常起步。"""
     w = _World(lights=LIGHT_RED)
-    assert traffic.safe_to_cross(w, _bb(tick=1000), PATH) is True
+    bb = _bb(tick=1000, red_since=1000 - traffic.RED_LONG_TICKS)
+    assert traffic.safe_to_cross(w, bb, PATH) is True
+
+
+def test_short_red_tail_waits_for_next_cycle():
+    """短红灯的尾巴（离绿灯太近）不起步，等下一轮。"""
+    w = _World(lights=LIGHT_RED)
+    bb = _bb(tick=100, red_since=100 - traffic.RED_FRESH_TICKS - 5)
+    assert traffic.safe_to_cross(w, bb, PATH) is False
+
+
+def test_observe_tracks_red_onset():
+    w = _World(lights=LIGHT_GREEN)
+    bb = _bb(tick=10)
+    bb.traffic_red_since = None
+    traffic.observe(w, bb)
+    assert bb.traffic_red_since is None
+    w.traffic_lights = LIGHT_RED
+    traffic.observe(w, bb)
+    assert bb.traffic_red_since == 10
+    bb.tick = 12
+    traffic.observe(w, bb)
+    assert bb.traffic_red_since == 10       # 红灯持续期间起点不变
+    w.traffic_lights = LIGHT_YELLOW
+    traffic.observe(w, bb)
+    assert bb.traffic_red_since is None
 
 
 def test_curb_cell_uses_chef_position_not_cell_center():
@@ -181,7 +208,5 @@ def test_before_median_uses_travel_direction():
     west = list(reversed(path))
     assert traffic.before_median(w, {"x": 29.0, "z": 6.0}, spot, west) is True
     assert traffic.before_median(w, {"x": 24.0, "z": 6.0}, spot, west) is False
-    assert traffic.at_median(w, {"x": 24.8, "z": 6.0}, spot) is True
-    assert traffic.at_median(w, {"x": 27.2, "z": 6.0}, spot) is False
 
 

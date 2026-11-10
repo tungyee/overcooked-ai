@@ -190,9 +190,13 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
         cmd = _move_cmd(w, path[:curb + 1], field, bb,
                         list(w.to_world(*wait_goal)), target, kind, timeout_ms)
         return prim._begin_exec(ctx, ex, cmd)
-    if traffic.at_median(w, chef, spot) and traffic.pedestrian_red(w) is not True:
-        # 在中线等：灯不是红就不继续穿。
-        return _wait_for_light(prim, ctx, label, kind, cur, info)
+    # 中线等待：锁存状态管「改道过去」这一趟（5Hz 位置在移动中会差 1 格，
+    # 不能用来反复判到没到）；at_median 管「站定在中线」的其它情况（换任务后
+    # 新树从车道中间出发）。两者都只在红灯时放行。
+    if prim._median_wait or traffic.at_median(w, chef, spot):
+        if traffic.pedestrian_red(w) is not True:
+            return _wait_for_light(prim, ctx, label, kind, cur, info)
+        prim._median_wait = False
     if not traffic.safe_to_cross(w, bb, path, cur, chef):
         return _wait_for_light(prim, ctx, label, kind, cur, info)
     return None
@@ -217,6 +221,7 @@ class Approach(Primitive):
         self._traffic_wait_ticks = 0   # 4-1 路沿/中线等灯/车
         self._curb_cmd = False         # 在途的是「先走到路沿」的小段 move
         self._median_cmd = False       # 在途的是「改道到车道中间」的小段 move
+        self._median_wait = False      # 已到中线，锁存等下一轮红灯
 
     def reset(self):
         # type: () -> None
@@ -226,6 +231,7 @@ class Approach(Primitive):
         self._traffic_wait_ticks = 0
         self._curb_cmd = False
         self._median_cmd = False
+        self._median_wait = False
 
     def needs_reapproach(self, ctx):
         # type: (Dict) -> bool
@@ -363,6 +369,8 @@ class Approach(Primitive):
         status = self._poll_exec(ctx, ex)
         if self._curb_cmd or self._median_cmd:
             if status != Status.RUNNING:
+                if self._median_cmd and status == Status.SUCCESS:
+                    self._median_wait = True
                 self._curb_cmd = False
                 self._median_cmd = False
                 # 到路沿/中线不等于到目标：回去重新判灯，不能报 SUCCESS。
@@ -507,6 +515,7 @@ class GoToCell(Primitive):
         self.precise = precise
         self._curb_cmd = False     # 在途的是「先走到路沿」的小段 move
         self._median_cmd = False   # 在途的是「改道到车道中间」的小段 move
+        self._median_wait = False  # 已到中线，锁存等下一轮红灯
         self._traffic_wait_ticks = 0
         self._goal = None   # type: Optional[Tuple[int, int]]
         self._fails = 0
@@ -517,6 +526,7 @@ class GoToCell(Primitive):
         Primitive.reset(self)
         self._curb_cmd = False
         self._median_cmd = False
+        self._median_wait = False
         self._traffic_wait_ticks = 0
         self._goal = None
         self._fails = 0
@@ -598,6 +608,8 @@ class GoToCell(Primitive):
                 return s
             if self._curb_cmd or self._median_cmd:
                 # 到路沿/中线不等于到目标：回去按当前灯态重新判，别报 SUCCESS。
+                if self._median_cmd and s == Status.SUCCESS:
+                    self._median_wait = True
                 self._curb_cmd = False
                 self._median_cmd = False
                 if s == Status.FAILURE:

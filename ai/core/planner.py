@@ -95,6 +95,12 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     """
     plate_match = plate_match or {}
     cooker_match = cooker_match or {}
+    # send_requests 在候选生成阶段就要知道盘绑给了哪张单：否则同一块
+    # 装了一半的盘会被 SendAcross 当成另一张简单单的成品（拿起/放下）。
+    try:
+        world._plate_match = plate_match
+    except AttributeError:
+        pass
     candidates = []  # type: List[Candidate]
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
     hands_empty = P.hands_free(chef)

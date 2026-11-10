@@ -248,6 +248,7 @@ def plated_dish_sources(world, book, bb=None):
     hatches, p2_can, p1_can = _station_sides(world, near, far, "plate_station", bb)
     if not hatches or p2_can or not p1_can:
         return []
+    plate_match = getattr(world, "_plate_match", None) or {}
     out = []  # type: List[Tuple[Dict, Dict]]
     for p in P.all_plates(world):
         if p.get("held_by") == P.P1_NAME:
@@ -257,6 +258,19 @@ def plated_dish_sources(world, book, bb=None):
         if CH.slot_of(world, p, bb) is not None:
             continue
         if _side_of(world, near, far, p, bb) != "near":
+            continue
+        # 盘已经被 1:1 配给某张单（例如只放了薯条的 All 单）时，不要再把它
+        # 当另一张简单单的成品送走：SendAcross 和 TakeCookedToPlate 会同时
+        # 抢同一块盘，拿起又放下（trace-20261110-231906 t=512~652）。盘还缺
+        # 料就留给绑定单继续装；已料齐才按绑定单送。
+        bound = plate_match.get(str(p.get("n")))
+        if bound is not None:
+            order = next((o for o in world.orders
+                          if str(o.get("id")) == str(bound)), None)
+            if order is None:
+                continue
+            if book.matches(order, p):
+                out.append((p, order))
             continue
         for order in world.orders:
             if book.matches(order, p):

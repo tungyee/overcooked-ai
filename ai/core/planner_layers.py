@@ -73,7 +73,12 @@ def dirty_on_conveyor(world):
             continue
         if "conveyor" in str(it.get("on_station") or "").lower():
             return True
-    return False
+    # 已经捡起来了也要继续占 L4：否则拿起脏盘的那一拍它从传送带消失，
+    # WashPlate 掉回 L7，输给备菜，树首 EnsureHandsFree 把脏盘放到旁边
+    # 柜台（trace-20261110-234204 t=3363~3371：approach 洗碗池后下一拍
+    # 改选 Chop(Lettuce)，脏盘落在 countertop (6)）。
+    return any("dirtyplate" in str(it.get("n") or "").lower()
+               for it in getattr(world, "held_items", ()) or ())
 
 
 def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,

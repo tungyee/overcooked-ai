@@ -16,6 +16,7 @@ import os
 from ai import primitives as PR
 from ai.core import planner
 from ai.exec.bt import Status
+from ai.query import predicates as P
 from ai.query.recipes import RecipeBook
 from ai.space import reachability, shuttle
 from ai.state.bb_factory import make_bb
@@ -108,4 +109,28 @@ def test_wash_stance_keeps_searching_past_unlinkable_points():
     assert reachability.can_interact(ctx, sink)
     chosen, record = planner.plan(world, bb, None, book)
     assert chosen.TYPE == "WashPlate"
+    assert record["top_layer"] == 4
+
+
+def test_holding_dirty_plate_keeps_wash_task():
+    """拿起脏盘的下一拍不能把它放到旁边柜台。
+
+    trace-20261110-234204 t=3363~3371：WashPlate approach 洗碗池，下一拍
+    dirty_stack_entry 只查 items[]（手持物在 held_items），拿到 Raft One
+    够不着的另一摞 → 判 infeasible，planner 改选 Chop，EnsureHandsFree
+    把脏盘放到 countertop (6)。修后 dirty_stack_entry 先返回手里的脏盘，
+    WashPlate 保持 L4。
+    """
+    frame = json.loads(gzip.open(
+        os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                     "rapids42-wash-hold.ndjson.gz"), "rt").readline())
+    world, book, bb, ctx = _ctx(frame)
+    chef = next(c for c in world.chefs if c["name"] == P.P2_NAME)
+    assert chef["held"] == "DirtyPlateStack"
+    entry = PL.dirty_stack_entry(ctx)
+    assert entry is not None and entry.get("held_by") == P.P2_NAME
+    task = PL.WashPlate(resources=(_sink(world).get("n"),))
+    assert task.feasible(ctx) and not task.done(ctx)
+    chosen, record = planner.plan(world, bb, None, book)
+    assert chosen.TYPE == "WashPlate", chosen
     assert record["top_layer"] == 4

@@ -150,6 +150,15 @@ def dirty_stack_entry(ctx):
     'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
     都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
     """
+    # 手里已经端着脏盘时，它就是本次 WashPlate 的目标。旧逻辑只看 items[]，
+    # 手持物在 held_items 里，于是会去用场上另一摞（常常是 Raft One 够不着
+    # 的那摞）做可达性检查，WashPlate 当场翻成 infeasible，树被 Chop 抢走，
+    # 手里的脏盘被 EnsureHandsFree 放到旁边柜台
+    # （trace-20261110-234204 t=3363~3371）。
+    for it in getattr(ctx["w"], "held_items", ()) or ():
+        if "dirtyplate" in str(it.get("n") or "").lower() \
+                and str(it.get("held_by") or "") == P.P2_NAME:
+            return it
     stacks = [it for it in (getattr(ctx["w"], "items", ()) or ())
               if "dirtyplate" in str(it.get("n") or "").lower()]
     if not stacks:

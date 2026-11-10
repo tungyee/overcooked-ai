@@ -25,6 +25,7 @@ ai/revenue/handover.py）；能投的生料走 ThrowBatch。
 from typing import Dict, List, Optional, Tuple
 
 from ai.query import predicates as P
+from ai.space import occupancy
 from ai.space import reachability
 from ai.space import shuttle
 
@@ -43,6 +44,11 @@ SHUTTLE_KEEP_FREE = 1
 # 传送带通道刚可用过的宽限（拍）：4-2 两筏相对位置会让段可达性逐帧翻转。
 # 5Hz 一帧 = 4 拍；200 拍 = 10 秒，足够等到下一次接缝对齐。
 CONVEYOR_GRACE_TICKS = 200
+# 两筏带子「接上」的最近段距离（米）。实测：
+#   - rapids42-own-belt（两筏漂开）最近 4.7~4.95m → 不接；
+#   - rapids42-shared-belt / trace-20261111-005439 最近 2.47~2.75m → 接上。
+# 3.0 留一点余量，又不会把漂开的带子误判成通路。
+CONVEYOR_CONNECT_DIST = 3.0
 
 
 def conveyor_waitable(bb):
@@ -202,15 +208,56 @@ def plate_on_player_side_conveyor(world, plate, bb=None):
     return belt_reached_by_player(world, st, bb)
 
 
+def _chef_grid(world, chef):
+    # type: (object, Optional[Dict]) -> Optional[str]
+    """厨师所在的地面网格 id（只看会动的附属网格）。
+
+    用 Ground 层的世界 AABB 认：厨师所在的盒子与某个网格原点的盒子相同，
+    就说明人在这个网格上。不能用「离哪个原点近」——两筏交错时原点距离会
+    说反（trace-20261111-005439 t=906，P2 在 Raft Two，离 Raft One 原点更近）。
+    """
+    if not isinstance(chef, dict) or chef.get("x") is None:
+        return None
+    boxes = (getattr(world, "terrain", None) or {}).get(
+        occupancy.LAYER_GROUND) or []
+
+    def box_of(x, z):
+        for b in boxes:
+            if b[0] <= x <= b[1] and b[2] <= z <= b[3]:
+                return b
+        return None
+
+    chef_box = box_of(chef["x"], chef["z"])
+    if chef_box is None:
+        return None
+    best = None  # type: Optional[Tuple[float, str]]
+    for gid in getattr(getattr(world, "grids", None), "ids", lambda: [])():
+        if str(gid) == "GridManager":
+            continue
+        origin = world.grids.to_world(gid, 0, 0)
+        if origin is None:
+            continue
+        if box_of(*origin) is not chef_box:
+            continue
+        d = (origin[0] - chef["x"]) ** 2 + (origin[1] - chef["z"]) ** 2
+        if best is None or d < best[0]:
+            best = (d, str(gid))
+    return best[1] if best else None
+
+
 def conveyor_slots(world, bb=None):
     # type: (object, object) -> List[Dict]
-    """能往对面送东西的传送带段：P2 够得着、且这条带玩家也够得着。
+    """P2 自己这侧的送件带段；只在两筏的带子接上时才算可用。
 
-    每条带都只在自己这侧跑到末端垃圾桶，玩家够不着的那条不是送件通道：
-    放上去只会进自己这边的桶，还会被 `FetchConveyorPlate` 立刻抢回来，
-    变成「放上去 → 抢下来」的死循环（trace-20261111-000723 t=227~375：
-    盘 -18776 放在 Raft Two 带子 (4,0)，每 10 拍被抢一次）。两筏漂开、
-    只够得着自己这条带时就不送，等漂近到能碰到玩家那侧的带子再送。
+    4-2 的两条 L 形带分属 Raft Two / Raft One，玩家够不着 P2 这条的
+    **同一 grid**，但两筏靠近时带子的端头会接上。之前按「同一 grid 有段
+    玩家够得着」筛，P2 这侧的带子永远进不来，只剩对面 grid 的段被投影
+    坐标误判成可达——AI 于是走到缝边等 P1 的木筏（trace-20261111-005439
+    t=363/906）。
+    现在：
+      - 只取 chef 所在 grid 的段（`_chef_grid`）；
+      - 该段到任一 P1 可达段的最近距离 ≤ `CONVEYOR_CONNECT_DIST` 才算接上；
+      - 接不上就返回空，让 SendAcross 在宽限期内端盘等，而不是选对面段。
     """
     cache = getattr(world, "_conveyor_slots", None)
     if cache is not None:
@@ -221,18 +268,32 @@ def conveyor_slots(world, bb=None):
     out = []  # type: List[Dict]
     if is_split(world, bb):
         near, far = _fields(world, bb)
-        player_grids = set()  # type: set
-        for st in getattr(world, "stations", ()) or ():
-            if is_conveyor_station(world, st) \
-                    and _reach(world, far, st, P.P1_NAME):
-                player_grids.add(str(st.get("grid") or ""))
-        for st in getattr(world, "stations", ()) or ():
-            if not is_conveyor_station(world, st):
-                continue
-            if str(st.get("grid") or "") not in player_grids:
-                continue
-            if _reach(world, near, st, P.P2_NAME):
-                out.append(st)
+        chef = P.chef_by_name(getattr(world, "chefs", ()) or (), P.P2_NAME)
+        own_grid = _chef_grid(world, chef)
+        player_segs = [
+            st for st in (getattr(world, "stations", ()) or ())
+            if is_conveyor_station(world, st)
+            and _reach(world, far, st, P.P1_NAME)]
+        player_grids = {str(st.get("grid") or "") for st in player_segs}
+        # 比较整条玩家带，而不是只看 P1 此刻够得着的那一段：玩家带从接缝
+        # 一路走到取件段，接缝段本身 P1 够不着不代表带子没接上
+        # （rapids42-shared-belt：接缝段 p1=False，但它后面那段 p1=True）。
+        player_all = [
+            st for st in (getattr(world, "stations", ()) or ())
+            if is_conveyor_station(world, st)
+            and str(st.get("grid") or "") in player_grids]
+        near_segs = [
+            st for st in (getattr(world, "stations", ()) or ())
+            if is_conveyor_station(world, st)
+            and (own_grid is None or str(st.get("grid") or "") == own_grid)
+            and _reach(world, near, st, P.P2_NAME)]
+        if player_all and near_segs:
+            best = min(
+                ((a.get("x", 0.0) - b.get("x", 0.0)) ** 2
+                 + (a.get("z", 0.0) - b.get("z", 0.0)) ** 2) ** 0.5
+                for a in near_segs for b in player_all)
+            if best <= CONVEYOR_CONNECT_DIST:
+                out = near_segs
     if out and bb is not None:
         # 记下「这条通道刚开过」，供 SendAcross 在下一帧闪断时继续等。
         bb.conveyor_open_until[CONVEYOR] = (

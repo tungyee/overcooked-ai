@@ -266,6 +266,17 @@ def _task_resource_ids(task):
     return ids
 
 
+def _plate_reach_grace(ctx, target):
+    # type: (dict, dict) -> bool
+    """盘最近可交互的宽限内（移动筏投影逐帧翻转时别判 unreachable）。"""
+    bb = ctx.get("bb")
+    cache = getattr(bb, "plate_reachable_until", None) if bb is not None else None
+    if not isinstance(cache, dict):
+        return False
+    pid = str(target.get("n") or "")
+    return bool(pid) and cache.get(pid, 0) > getattr(bb, "tick", 0)
+
+
 def task_veto(task, ctx):
     # type: (object, dict) -> str
     # ThrowBatch 的消费站本就可能在对面（分割地图）：来源与出手位的可达性
@@ -281,6 +292,11 @@ def task_veto(task, ctx):
         if target is None:
             return 'missing_resource'
         if not can_interact(ctx, target):
+            # 盘在移动筏上时 can_interact 会逐帧翻转；最近够着过就先不否决，
+            # 由 TakeCookedToPlate 继续执行，别退回 RescueCooked 把锅端走。
+            if task.TYPE in ('TakeCookedToPlate', 'SendAcross') \
+                    and _plate_reach_grace(ctx, target):
+                continue
             # 渡运台面上的东西：篮子转回来就够得着，时间表能预测就不否决，
             # 由等待成本（task_wait_seconds → planner 等门让位）决定什么时候去。
             if (shuttle.station_of(ctx['w'], target) is None

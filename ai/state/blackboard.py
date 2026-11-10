@@ -118,6 +118,11 @@ class Blackboard:
     # 4-2 两筏相对位置会让 @conveyor 逐帧闪断：刚开过就允许 SendAcross 端着
     # 成品盘等接缝重开，而不是 failure 后把盘放下（trace-20261111-001945）。
     conveyor_open_until: Dict[Any, int] = field(default_factory=dict)
+    # 盘最近一次可交互的拍号（盘 id → 失效拍号）。移动筏的格子投影会让
+    # can_interact 逐帧翻转；宽限内仍算匹配，避免 TakeCookedToPlate 一帧
+    # 消失、planner 退回 RescueCooked 把锅端离灶台
+    # （trace-20261111-005439 t=449）。
+    plate_reachable_until: Dict[Any, int] = field(default_factory=dict)
     # 渡运台面（ai/space/shuttle.py）的可交互窗口时间表，同为 SeamClock：每个
     # 台面对 P2 可达区「够得着 / 够不着」当一道门。
     shuttle_clock: Any = None

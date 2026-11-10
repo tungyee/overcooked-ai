@@ -5,8 +5,8 @@
 从 Sushi_4_1 切进 4-2 后的第 12290 / 12863 拍）：
 
   - 两边各一条 L 形 `ConveyorStation` 台面传送带，人上不去；
-  - 每条带只在自己这侧跑到末端垃圾桶，**只有玩家够得着的那条**能送东西
-    （两边都够不着的那条放上去就是进桶：trace-20261111-000723 t=227~375）；
+  - P2 放**自己这侧带子的开头**；两筏带子的最近段距离 ≤3m 时算接上，
+    接不上才不送（放上去会进本侧桶：trace-20261111-000723 t=227~375）；
   - 一块切好的生菜挂在传送带段上，AI 够得着（接收侧）。
 
 这组测试钉住：主网格原点来自 `grids[].main`、竹筏不被当成渡运通道、
@@ -114,18 +114,19 @@ def test_plated_dish_uses_conveyor_channel():
     assert task.source_id == PID_SHARED
 
 
-def test_own_side_belt_is_not_a_send_channel():
-    """自己这侧、玩家够不着的带子不是送件通道（放上去只会进本侧桶）。"""
-    world = _world(_frames()[1])            # 两筏漂开，只够得着 Raft Two
+def test_own_side_belt_is_send_channel_when_connected():
+    """两筏带子接上时，P2 放自己这侧的带子开头（不是对面那段）。"""
+    world = _world(_frames()[1])            # 最近段 2.4m，已接上
     ctx, book = _ctx(world)
-    assert CH.conveyor_slots(world, ctx.get("bb")) == []
-    assert CH.CONVEYOR not in CH.channel_keys(world, ctx.get("bb"))
+    slots = CH.conveyor_slots(world, ctx.get("bb"))
+    assert slots and all(s.get("grid") == "Raft Two" for s in slots)
+    assert CH.CONVEYOR in CH.channel_keys(world, ctx.get("bb"))
     assert [r for r in HO.send_requests(world, book, ctx.get("bb"))
-            if r.kind == "plated_dish"] == []
+            if r.kind == "plated_dish"]
 
 
 def test_send_holding_plate_targets_a_belt_segment():
-    """端着成品盘：走到玩家那侧的传送带段旁，放置句柄指向该段。"""
+    """端着成品盘：走到自己这侧带子的开头，放置句柄指向该段。"""
     world = _world(_frame_shared(499))
     ctx, _book = _ctx(world)
     task = T.SendAcross("1", (PID_SHARED, CH.CONVEYOR), "plated_dish")
@@ -135,8 +136,8 @@ def test_send_holding_plate_targets_a_belt_segment():
     cmd = ctx["exec"].issued[-1]
     assert cmd["cmd"] == "move" and cmd["kind"] == "placement"
     assert cmd["target"]["name"].startswith("ConveyorStation")
-    assert cmd["target"]["grid"] == "Raft One"
-    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (-3, 2)
+    assert cmd["target"]["grid"] == "Raft Two"
+    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
 
 
 def test_send_done_when_plate_is_on_belt():
@@ -175,8 +176,8 @@ def test_chopped_salad_ingredients_are_thrown_not_conveyored():
     assert chosen.TYPE == "ThrowBatch" and chosen.item == "ChoppedLettuce"
 
 
-def test_send_skips_player_unreachable_far_end():
-    """放玩家够得着的那一段，不要放到玩家够不着的远端（0,2 / -1,2）。"""
+def test_send_uses_own_belt_start_not_far_end():
+    """放自己这侧带子开头（4,0），不要放到远端死胡同（0,2 / -1,2）。"""
     frame = _frame_shared(353)
     plate = next(p for p in frame["plates"] if str(p.get("n")) == PID_SHARED)
     plate["held_by"] = P.P2_NAME
@@ -190,5 +191,5 @@ def test_send_skips_player_unreachable_far_end():
     assert task.build().tick(ctx) == Status.RUNNING
     cmd = ctx["exec"].issued[-1]
     assert cmd["kind"] == "placement"
-    assert cmd["target"]["grid"] == "Raft One"
-    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (-2, 2)
+    assert cmd["target"]["grid"] == "Raft Two"
+    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)

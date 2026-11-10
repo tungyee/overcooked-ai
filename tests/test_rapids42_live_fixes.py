@@ -52,7 +52,7 @@ def _ctx(world, tick=0):
 def _frame_world(t, path=FIX):
     frame = _frame(t, path)
     world = _world(frame)
-    ctx, book = _ctx(world)
+    ctx, book = _ctx(world, tick=frame.get("_trace_t", 0))
     return frame, world, ctx, book
 
 
@@ -82,6 +82,27 @@ def test_no_feasible_freeze_becomes_send_wait():
     assert chosen is not None and chosen.TYPE == "SendAcross", chosen
     assert record["top_layer"] == 4
     assert not record.get("waiting") or record["waiting"].get("reason") != "no_feasible_task"
+
+
+def test_plate_match_survives_one_frame_reachability_flicker():
+    """t=445→449：盘的可交互句柄闪一帧，不能把盘从匹配里踢掉、退回 RescueCooked。"""
+    _f1, w1, ctx1, book1 = _frame_world(445)
+    bb = ctx1["bb"]
+    pm1 = planner._match_plates_to_orders(w1, bb, book1)
+    assert pm1.get("-20214") == "1"
+
+    _f2, w2, ctx2, book2 = _frame_world(449)
+    bb.tick = 449
+    pm2 = planner._match_plates_to_orders(w2, bb, book2)
+    assert pm2.get("-20214") == "1"       # 宽限内仍匹配
+
+    # 对照：没有宽限缓存时，这一帧确实匹配不到盘。
+    fresh = make_bb(449)
+    assert planner._match_plates_to_orders(w2, fresh, book2) == {}
+
+    chosen, record = planner.plan(w2, bb, None, book2)
+    assert chosen is not None and chosen.TYPE == "TakeCookedToPlate", chosen
+    assert record["top_layer"] == 2
 
 
 def test_hand_holding_needed_raw_blocks_rescue_preemption():

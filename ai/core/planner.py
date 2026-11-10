@@ -652,6 +652,13 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     # （trace-20261111-001945 t=2900 两块盘同时在台上）。
     # DeliverPlate 不拦：直接送队首的现成盘仍是更值钱的动作（3-6 实机
     # t=9772/9800，手里是别的盘、队首鸡肉卷盘已经料齐）。
+    if task.TYPE == "SendAcross" and not P.hands_free(chef) \
+            and not _holding_needed_for(task, ctx["w"], ctx.get("book")):
+        # 手里拿着切好的料/锅具：SendAcross 树首会把它放下
+        # （trace-20261111-005439 t=363 丢 ChoppedLettuce）。先让
+        # ThrowBatch/StashHeld 用掉/收好，再送盘；拿着来源本身则放行。
+        # TakeCookedToPlate 不拦：熟料不等人，端盘去盛优先。
+        return False, "hands_full_send"
     if task.TYPE == "SendAcross" and _holding_plated_dish(chef, ctx["w"]):
         held_plate = _held_plate_id(chef, ctx["w"])
         target = getattr(task, "source_id", None)
@@ -747,6 +754,7 @@ _HANDS_DROP_PRONE_TYPES = frozenset({
     "FillCooker", "PlaceCleanPlate", "MergePlates", "FetchToCarrier",
     "FillCarrier", "PlaceCarrierInCooker", "Chop", "Prefetch",
 })
+_HANDS_PENALTY_TYPES = _HANDS_DROP_PRONE_TYPES
 # 洗盘压力权重：干净空盘越少越该洗（同 pressure 口径：0=充足、1=只剩一块、
 # 2=用光）。无盘时拼装被卡死，需压过备菜与填灶；只剩一块时提前补盘但不盖过
 # 送餐。
@@ -955,6 +963,11 @@ def _pinned_plate_order(world, bb, book):
     return (pid, oid)
 
 
+# 盘可交互的宽限（拍）：移动筏的格子投影会让 can_interact 逐帧翻转。
+# 5 秒内仍把盘算进匹配，别让 TakeCookedToPlate 一帧消失、退回 RescueCooked。
+PLATE_REACH_GRACE_TICKS = 100
+
+
 def _match_plates_to_orders(world, bb, book, orders=None):
     # type: (World, Blackboard, RecipeBook, Optional[List[Dict]]) -> Dict[Any, Any]
     """盘↔订单 1:1 匹配（每拍重算、不写黑板）。返回 {plate_id: order_id}。
@@ -1045,7 +1058,20 @@ def _match_plates_to_orders(world, bb, book, orders=None):
         # （trace-20261110-233159 t=1600~1726：-19556 在 Raft One、
         # -19560 在 Raft Two，队首 All 单绑到 -19556，AI 静止）。
         if not held_by_p2:
-            if not reachability.can_interact(rctx, p):
+            pid_key = str(pid)
+            if reachability.can_interact(rctx, p):
+                if bb is not None:
+                    until = getattr(bb, "plate_reachable_until", None)
+                    if isinstance(until, dict):
+                        until[pid_key] = (
+                            getattr(bb, "tick", 0) + PLATE_REACH_GRACE_TICKS)
+            elif not (
+                    bb is not None
+                    and isinstance(getattr(bb, "plate_reachable_until", None),
+                                   dict)
+                    and bb.plate_reachable_until.get(pid_key, 0)
+                    > getattr(bb, "tick", 0)):
+                # 从没够着过、或宽限期已过：不把对面/漂远的盘配给订单。
                 continue
         tokens = book.plate_tokens(p)
         # 同等缺料时台面盘优先于堆顶空盘：已摆好的盘不该被晾成孤儿。
@@ -2174,6 +2200,24 @@ def _holding_plated_dish(chef, world):
     return False
 
 
+def _held_matches_source(chef, world, source_id):
+    # type: (Optional[Dict], World, Any) -> bool
+    """手里拿的是不是这个 task 的来源（盘 / 散锅 / 载体）。"""
+    if source_id is None or chef is None:
+        return False
+    if P.held_matches(chef, source_id):
+        return True
+    key = str(source_id)
+    for p in P.all_plates(world):
+        if str(p.get("n")) == key:
+            return P.holds_plate(chef, p)
+    for it in list(getattr(world, "items", ()) or ()) + list(
+            getattr(world, "held_items", ()) or ()):
+        if str(it.get("n")) == key:
+            return P.held_matches(chef, it.get("n"))
+    return False
+
+
 def _holding_needed_for(task, world, book=None):
     # type: (Any, World, Optional[Any]) -> bool
     """当前 task 是不是正拿着它下一步要用的料/盘。
@@ -2197,7 +2241,15 @@ def _holding_needed_for(task, world, book=None):
                 forms.add(str(form).lower())
         return held in forms
 
-    if task_type in ("SendAcross", "DeliverPlate", "TakeCookedToPlate"):
+    if task_type in ("SendAcross", "TakeCookedToPlate"):
+        # 端盘去盛/送，或直接拿着来源（散锅、载体）都算“拿着有用的东西”。
+        src = getattr(task, "source_id", None)
+        if src is None and task_type == "TakeCookedToPlate":
+            src = getattr(task, "cooker_id", None)
+        return bool(P.held_is_plate(chef)
+                    or _held_matches_source(chef, world, src))
+
+    if task_type == "DeliverPlate":
         return bool(P.held_is_plate(chef))
 
     if task_type in ("FetchToBoard", "Chop", "FetchToPlate", "ThrowBatch"):
@@ -2237,7 +2289,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # 手持贵重物（成品盘/熟锅）时，树首要 EnsureHandsFree 的 task 吃重罚。
     # 这不是硬否决：当前 task 若已经拿着它要的盘子/锅，由
     # _holding_needed_for 在承诺惯性里保护。
-    if (getattr(task, "TYPE", None) in _HANDS_DROP_PRONE_TYPES
+    if (getattr(task, "TYPE", None) in _HANDS_PENALTY_TYPES
             and _holding_valuable(chef, world)
             and not _holding_needed_for(task, world, book)):
         terms["hands"] = -W_HANDS_VALUABLE

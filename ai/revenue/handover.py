@@ -432,6 +432,12 @@ def _ingredient_on_channel(world, form, bb=None):
     return False
 
 
+def _p2_holds(world, form):
+    # type: (Any, str) -> bool
+    chef = P.chef_by_name(getattr(world, "chefs", None), P.P2_NAME)
+    return P.held_matches(chef, form)
+
+
 def _ingredient_sources(world, book, bb):
     # type: (Any, Any, Any) -> List[SendSource]
     if not CH.is_split(world, bb) or CH.CONVEYOR not in CH.channel_keys(world, bb):
@@ -445,7 +451,12 @@ def _ingredient_sources(world, book, bb):
             form = _chopped_form(book, raw)
             if not form or form.lower() in seen:
                 continue
-            if _ingredient_available(world, form) is None:
+            # 已经拿在手里也算可取来源：否则 task 的 source 解析成 None，
+            # EnsureHandsFree 会把刚拿起的料放下，再捡、再放，原地打转
+            # （trace-20261110-222521 t=710~1048： ChoppedLettuce 反复
+            # 拿起又落下，SendAcross 卡在 confirm target ['','']）。
+            if not _p2_holds(world, form) \
+                    and _ingredient_available(world, form) is None:
                 continue
             if _ingredient_on_channel(world, form, bb):
                 continue
@@ -460,7 +471,8 @@ def _ingredient_resolve(ctx, source_id, order_id):
     w, bb = ctx["w"], ctx.get("bb")
     if _p2_can_deliver(w, bb):
         return None
-    if _ingredient_available(w, source_id) is None:
+    if not P.held_matches(ctx["chef"], source_id) \
+            and _ingredient_available(w, source_id) is None:
         return None
     return SendSource(KIND_INGREDIENT, source_id, order_id)
 

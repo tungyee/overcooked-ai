@@ -221,7 +221,8 @@ def resource(world, rid):
     if isinstance(rid, tuple) and len(rid) == 2 and all(isinstance(v, (int, float)) for v in rid):
         return dict(gx=rid[0], gz=rid[1])
     groups = (P.all_plates(world), world.stations, world.cookers, world.workstations,
-              world.items, getattr(world, 'extinguishers', ()))
+              world.items, getattr(world, 'held_items', ()),
+              getattr(world, 'extinguishers', ()))
     for group in groups:
         for entry in group:
             if isinstance(rid, tuple):

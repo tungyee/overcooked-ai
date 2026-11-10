@@ -33,6 +33,8 @@ FIX = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
                    "rapids42-conveyor.ndjson.gz")
 FIX2 = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
                     "rapids42-ingredient.ndjson.gz")
+FIX3 = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                    "rapids42-hold.ndjson.gz")
 PID = "-205166"
 
 
@@ -43,6 +45,11 @@ def _frames():
 
 def _frames2():
     with gzip.open(FIX2, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def _frames3():
+    with gzip.open(FIX3, "rt", encoding="utf8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
@@ -182,3 +189,34 @@ def test_send_prefers_belt_start_over_far_end():
     cmd = ctx["exec"].issued[-1]
     assert cmd["kind"] == "placement"
     assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
+
+
+def test_ingredient_send_keeps_going_while_holding_it():
+    """已经拿着切好料时，source 解析不能变成 None，否则清手会把它放下。
+
+    trace-20261110-222521 t=710~1048：ChoppedLettuce 反复拿起/落下，
+    SendAcross 卡在 confirm，P2 看起来一直抱着东西原地打转。
+    """
+    frame = _frames3()[0]
+    world = _world(frame)
+    ctx, book = _ctx(world)
+    assert next(c for c in world.chefs
+                if c["name"] == P.P2_NAME)["held"] == "ChoppedLettuce"
+    reqs = [r for r in HO.send_requests(world, book, ctx.get("bb"))
+            if r.kind == "ingredient"]
+    assert any(str(r.source.source_id) == "ChoppedLettuce" for r in reqs)
+    task = T.SendAcross("4", ("ChoppedLettuce", CH.CONVEYOR), "ingredient")
+    assert task.feasible(ctx) and not task.done(ctx)
+    ctx = dict(ctx, exec=FakeExec(), tick=0)
+    assert task.build().tick(ctx) == Status.RUNNING
+    assert ctx["interaction"]["kind"] == "placement"
+    assert ctx["interaction"]["target"][1].startswith("ConveyorStation")
+
+
+def test_holding_ingredient_is_not_rejected_as_missing_resource():
+    """拿着料时 reachability 也要能找到它，否则 SendAcross 被 missing_resource 否决。"""
+    frame = _frames3()[0]
+    world = _world(frame)
+    ctx, book = _ctx(world)
+    task, _rec = planner.plan(world, ctx["bb"], None, book)
+    assert task.TYPE == "SendAcross" and task.item == "ingredient"

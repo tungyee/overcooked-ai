@@ -225,6 +225,88 @@ def before_median(world, chef, spot, path):
     return x > mx + 0.1
 
 
+# 车灯位 → 车名：on 是 Blue_Car 的绿灯，on_car_b 是 Green_Car 的（插件
+# Oc2Traffic.cs 的 LightsOn / LightsOn_CarB；两条 trace 里逐周期核对过：
+# on=True 时 Blue 在跑、Green 停在 -9.9；on_car_b=True 时反过来）。
+CAR_LAMP_KEYS = {"Blue_Car": "on", "Green_Car": "on_car_b"}
+
+
+def split_at_median(world, path, spot):
+    # type: (Any, Optional[List[Tuple[int, int]]], Any) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]
+    """过街路径按中线切成 (近侧腿, 远侧腿)。近/远按前进方向，不是按东西。"""
+    road = path_road_cells(world, path)
+    if not road or spot is None:
+        return road, []
+    try:
+        mx = spot[1][0]
+        x0 = world.to_world(*road[0])[0]
+        x1 = world.to_world(*road[-1])[0]
+    except (AttributeError, TypeError, ValueError):
+        return road, []
+    if abs(x1 - x0) < 0.1:
+        return road, []
+    east = x1 > x0
+    near, far = [], []  # type: (List[Tuple[int, int]], List[Tuple[int, int]])
+    for cell in road:
+        try:
+            x = world.to_world(*cell)[0]
+        except (AttributeError, TypeError, ValueError):
+            continue
+        beyond = x > mx + 0.1 if east else x < mx - 0.1
+        (far if beyond else near).append(cell)
+    return near, far
+
+
+def cars_overlapping(world, cells):
+    # type: (Any, Optional[List[Tuple[int, int]]]) -> List[Dict]
+    """车道（x 区间）与这组格重叠的车。"""
+    xs = []
+    for cell in cells or ():
+        try:
+            xs.append(world.to_world(*cell)[0])
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if not xs:
+        return []
+    lo, hi = min(xs), max(xs)
+    out = []  # type: List[Dict]
+    for car in getattr(world, "vehicles", ()) or ():
+        try:
+            minx, maxx = float(car["minx"]), float(car["maxx"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if minx <= hi and maxx >= lo:
+            out.append(car)
+    return out
+
+
+def car_running(world, car):
+    # type: (Any, Any) -> Optional[bool]
+    """这辆车此刻是否在跑（车灯亮）。None = 认不出车名/读不到车灯。"""
+    key = CAR_LAMP_KEYS.get(str(car.get("n")) if isinstance(car, dict) else "")
+    if key is None:
+        return None
+    lights = getattr(world, "traffic_lights", ()) or ()
+    vals = [_truthy(light.get(key)) for light in lights if key in light]
+    if not vals:
+        return None
+    return any(vals)
+
+
+def leg_safe(world, cells):
+    # type: (Any, Optional[List[Tuple[int, int]]]) -> bool
+    """这一腿经过的车道上没有正在跑的车。
+
+    4-1 每个信号周期只有一辆车跑（蓝/绿交替），另一条车道停着；所以近侧腿
+    和远侧腿可以各自放行——这正是玩家「先把料扔到路中间」的道理。车名认不出
+    或读不到车灯时按不安全处理（保守）。
+    """
+    for car in cars_overlapping(world, cells):
+        if car_running(world, car) is not False:
+            return False
+    return True
+
+
 def _lamp_state(light):
     # type: (Any) -> Optional[str]
     """返回 'red' / 'yellow' / 'green' / 'off'；None = 旧帧没有灯色字段。"""

@@ -445,19 +445,20 @@ def _traffic_world_with_median():
 
     class TrafficWorld(FakeWorld):
         traffic_road = {"minx": -3.6, "maxx": 7.2, "minz": -5.0, "maxz": 5.0}
-        # 两条车道：A 在格 -1，B 在格 2；中间缝隙 (-0.4, 2.0) 落在格 1。
+        # 两条车道：Blue 在格 -1（西/近侧），Green 在格 2（东/远侧）；
+        # 中间缝隙 (-0.4, 2.0) 落在格 1。
         vehicles = [
             # z 停在交叉口外，红灯时车体不压路径（压路径的兜底另有用例）。
-            {"n": "A", "minx": -1.6, "maxx": -0.4, "minz": -10, "maxz": -2},
-            {"n": "B", "minx": 2.0, "maxx": 3.2, "minz": 8, "maxz": 20},
+            {"n": "Blue_Car", "minx": -1.6, "maxx": -0.4, "minz": -10, "maxz": -2},
+            {"n": "Green_Car", "minx": 2.0, "maxx": 3.2, "minz": 8, "maxz": 20},
         ]
 
     w = TrafficWorld(walkable=lambda gx, gz: gz == 1 and -8 <= gx <= 8)
     return w
 
 
-def test_approach_diverts_to_median_when_light_changes_mid_crossing():
-    """过街途中灯变黄/绿、还没过中线 → 改道到两车道中间等，不硬穿。"""
+def test_approach_diverts_to_median_when_near_car_starts():
+    """近侧车道来车、人还没过中线 → 改道到两车道中间等，不硬穿。"""
     from ai.space.navigation import distance_field
 
     w = _traffic_world_with_median()
@@ -481,9 +482,9 @@ def test_approach_diverts_to_median_when_light_changes_mid_crossing():
     # 红灯刚亮、人在路沿：整段过街。
     assert ex.issued[0]["goal"] != [-4.8, 1.2]
 
-    # 走到车道中间偏西（还没过中线），灯变黄。
-    ctx["chef"] = {"name": "Player 2", "x": 0.0, "z": 1.2, "held": None}
-    ctx["field"] = distance_field((0, 1), w.walkable, w.belt_dir)
+    # 还走在近侧（Blue）车道里，Blue 开始跑（on=True）。
+    ctx["chef"] = {"name": "Player 2", "x": -1.0, "z": 1.2, "held": None}
+    ctx["field"] = distance_field((-1, 1), w.walkable, w.belt_dir)
     w.traffic_lights = yellow
     assert ap.tick(ctx) == Status.RUNNING
     # 改道命令只走到中线：缝隙 (-0.4, 2.0) 的中点 x=0.8，最后一段的路径格是 (1,1)。
@@ -493,7 +494,10 @@ def test_approach_diverts_to_median_when_light_changes_mid_crossing():
     ex.results.append(ex.ok_result(ex.issued[-1]["cmd_id"]))
     assert ap.tick(ctx) == Status.RUNNING          # 到中线，不报成功
 
-    # 在中线等黄灯：不发新命令，记 traffic_wait。
+    # 在中线：远侧（Green）车道开始跑 → 等（近侧有车不影响，已经在身后）。
+    w.traffic_lights = [{"n": "l1", "on": False, "on_car_b": True,
+                         "red": False, "yellow": False, "green": True,
+                         "has_lamps": True}]
     ctx["chef"] = {"name": "Player 2", "x": 0.8, "z": 1.2, "held": None}
     ctx["field"] = distance_field((1, 1), w.walkable, w.belt_dir)
     issued = len(ex.issued)
@@ -501,7 +505,7 @@ def test_approach_diverts_to_median_when_light_changes_mid_crossing():
     assert len(ex.issued) == issued
     assert ctx["traffic_wait"] is True
 
-    # 下一轮红灯刚亮：继续走完剩下的半条街。
+    # 远侧车停了（蓝车周期/红灯）：继续走完剩下的半条街。
     w.traffic_lights = red
     bb.tick = 100
     assert ap.tick(ctx) == Status.RUNNING
@@ -509,14 +513,14 @@ def test_approach_diverts_to_median_when_light_changes_mid_crossing():
     assert ex.issued[-1]["goal"] != [0.8, 1.2]
 
 
-def test_go_to_cell_diverts_to_median_when_light_changes():
+def test_go_to_cell_diverts_to_median_when_near_car_starts():
     from ai.space.navigation import distance_field
 
     w = _traffic_world_with_median()
     red = [{"n": "l1", "on": False, "on_car_b": False, "red": True,
             "yellow": False, "green": False, "has_lamps": True}]
-    yellow = [{"n": "l1", "on": True, "on_car_b": False, "red": False,
-               "yellow": True, "green": False, "has_lamps": True}]
+    green_car = [{"n": "l1", "on": False, "on_car_b": True, "red": False,
+                  "yellow": True, "green": False, "has_lamps": True}]
     chef = {"name": "Player 2", "x": 8.4, "z": 1.2, "held": None}
     ex = FakeExec()
     ctx = make_ctx(w, chef, ex, start=(7, 1))
@@ -531,20 +535,24 @@ def test_go_to_cell_diverts_to_median_when_light_changes():
     issued = len(ex.issued)
     assert issued == 1 and ex.issued[0]["goal"] != [0.8, 1.2]
 
-    # 往西走到东侧车道（还没过中线 x=1.2），灯变黄 → 改道去中线。
+    # 往西走到东侧（Green）车道里，Green 开始跑 → 改道去中线。
     ctx["chef"] = {"name": "Player 2", "x": 2.4, "z": 1.2, "held": None}
     ctx["field"] = distance_field((2, 1), w.walkable, w.belt_dir)
-    w.traffic_lights = yellow
+    w.traffic_lights = green_car
     assert prim.tick(ctx) == Status.RUNNING
     assert ex.issued[-1]["goal"] == [0.8, 1.2]
 
     ex.results.append(ex.ok_result(ex.issued[-1]["cmd_id"]))
     assert prim.tick(ctx) == Status.RUNNING       # 到中线，不报成功
 
+    # 向西时远侧是 Blue 车道：Blue 跑起来就在中线等。
+    w.traffic_lights = [{"n": "l1", "on": True, "on_car_b": False,
+                         "red": False, "yellow": False, "green": True,
+                         "has_lamps": True}]
     ctx["chef"] = {"name": "Player 2", "x": 0.8, "z": 1.2, "held": None}
     ctx["field"] = distance_field((1, 1), w.walkable, w.belt_dir)
     issued = len(ex.issued)
-    assert prim.tick(ctx) == Status.RUNNING       # 黄灯，在中线等
+    assert prim.tick(ctx) == Status.RUNNING       # 远侧来车，在中线等
     assert len(ex.issued) == issued
     assert ctx["traffic_wait"] is True
 

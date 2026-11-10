@@ -210,3 +210,55 @@ def test_before_median_uses_travel_direction():
     assert traffic.before_median(w, {"x": 24.0, "z": 6.0}, spot, west) is False
 
 
+
+
+# ---------------------------------------------------------------- 按车道放行
+
+LIGHT_BLUE_RUN = [_lamp("l1", green=True, on=True),
+                  _lamp("l2", green=True, on=True)]
+LIGHT_GREEN_RUN = [_lamp("l1", green=True, on_b=True),
+                   _lamp("l2", green=True, on_b=True)]
+
+BLUE_CAR = {"n": "Blue_Car", "minx": 23.55, "maxx": 25.63,
+            "minz": -10, "maxz": 40}
+GREEN_CAR = {"n": "Green_Car", "minx": 27.68, "maxx": 29.38,
+             "minz": -10, "maxz": 40}
+
+
+def test_car_running_reads_per_car_lamps():
+    """每个周期只有一辆车跑：on 是 Blue_Car，on_car_b 是 Green_Car。"""
+    w = _World(cars=[BLUE_CAR, GREEN_CAR], lights=LIGHT_BLUE_RUN)
+    assert traffic.car_running(w, BLUE_CAR) is True
+    assert traffic.car_running(w, GREEN_CAR) is False
+    w = _World(cars=[BLUE_CAR, GREEN_CAR], lights=LIGHT_GREEN_RUN)
+    assert traffic.car_running(w, BLUE_CAR) is False
+    assert traffic.car_running(w, GREEN_CAR) is True
+    assert traffic.car_running(w, {"n": "Unknown"}) is None
+
+
+def test_split_at_median_by_direction():
+    w = _World(cars=[BLUE_CAR, GREEN_CAR])
+    path = [(gx, 1) for gx in range(-3, 7)]
+    spot = traffic.median_spot(w, path)
+    near, far = traffic.split_at_median(w, path, spot)
+    assert all(w.to_world(*c)[0] <= spot[1][0] + 0.1 for c in near)
+    assert all(w.to_world(*c)[0] > spot[1][0] + 0.1 for c in far)
+    # 反向：近侧变成东半，远侧是西半。
+    near_w, far_w = traffic.split_at_median(w, list(reversed(path)), spot)
+    assert all(w.to_world(*c)[0] >= spot[1][0] - 0.1 for c in near_w)
+    assert all(w.to_world(*c)[0] < spot[1][0] - 0.1 for c in far_w)
+
+
+def test_leg_safe_only_needs_the_lane_car_stopped():
+    """一个周期只有一辆车跑：另一条车道的腿照样能走（玩家也把料扔在路中间）。"""
+    west_cells = [(-2, 1), (-1, 1), (0, 1)]      # 只压 Blue 车道
+    east_cells = [(2, 1), (3, 1), (4, 1)]        # 只压 Green 车道
+    w = _World(cars=[BLUE_CAR, GREEN_CAR], lights=LIGHT_GREEN_RUN)
+    assert traffic.leg_safe(w, west_cells) is True    # Blue 停着
+    assert traffic.leg_safe(w, east_cells) is False   # Green 在跑
+    w = _World(cars=[BLUE_CAR, GREEN_CAR], lights=LIGHT_BLUE_RUN)
+    assert traffic.leg_safe(w, west_cells) is False
+    assert traffic.leg_safe(w, east_cells) is True
+    # 红灯（两车都停）两条腿都安全。
+    w = _World(cars=[BLUE_CAR, GREEN_CAR], lights=LIGHT_RED)
+    assert traffic.leg_safe(w, west_cells + east_cells) is True

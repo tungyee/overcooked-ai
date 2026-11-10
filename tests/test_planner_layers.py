@@ -484,7 +484,7 @@ _ALL_TERMS = (
     "urgency", "pressure", "async_resource",
     "completion_ratio", "combo_head",
     "combo_break", "deadline_lookahead", "plate_pressure", "cooker_idle",
-    "no_plate_placed", "pref", "batch_bonus",
+    "no_plate_placed", "pref", "batch_bonus", "held_batch",
 )
 
 

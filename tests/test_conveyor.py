@@ -147,32 +147,24 @@ def test_send_done_when_plate_is_on_belt():
                               ctx.get("bb")) == CH.CONVEYOR
 
 
-# ---------------------------------------------------------------- 切好的料 / 带子开头
+# ---------------------------------------------------------------- 切好的料走投掷 / 带子开头
 
 
-def test_chopped_salad_ingredients_get_send_requests():
-    """生菜/番茄切好后，出餐口在对面且 P2 送不了：应生成 @conveyor 送件。"""
-    frame = _frames2()[-1]                  # t=680：两样切好料都在 P2 这侧
+def test_chopped_salad_ingredients_are_thrown_not_conveyored():
+    """生菜/番茄切好后直接扔给对面，不占传送带（盘子才不能扔）。"""
+    frame = _frames3()[0]                   # t=710：P2 正拿着 ChoppedLettuce
     world = _world(frame)
     ctx, book = _ctx(world)
-    reqs = [(r.kind, str(r.source.source_id), r.channel)
-            for r in HO.send_requests(world, book, ctx.get("bb"))
+    reqs = [r for r in HO.send_requests(world, book, ctx.get("bb"))
             if r.kind == "ingredient"]
-    assert sorted(reqs) == [("ingredient", "ChoppedLettuce", CH.CONVEYOR),
-                            ("ingredient", "ChoppedTomato", CH.CONVEYOR)]
-
-
-def test_ingredient_send_task_picks_the_chopped_item():
-    """送切好料：先走到砧板/台面拿 ChoppedLettuce，再去传送带。"""
-    frame = next(f for f in _frames2() if f["_trace_t"] == 360)
-    world = _world(frame)
-    ctx, _book = _ctx(world)
-    task = T.SendAcross("2", ("ChoppedLettuce", CH.CONVEYOR), "ingredient")
-    assert task.feasible(ctx) and not task.done(ctx)
-    ctx = dict(ctx, exec=FakeExec(), tick=0)
-    assert task.build().tick(ctx) == Status.RUNNING
-    assert ctx["interaction"]["kind"] == "pickup"
-    assert ctx["interaction"]["target"][1] == "ChoppedLettuce"
+    assert reqs == []
+    board = next(st for st in world.stations
+                 if st.get("n") == "countertop_01_chopping_board_swamp (1)")
+    task = T.ThrowBatch(None, (P.resource_id(board), "board",
+                              "Lettuce", "Lettuce"), "ChoppedLettuce")
+    assert task.feasible(ctx)
+    chosen, _rec = planner.plan(world, ctx["bb"], None, book)
+    assert chosen.TYPE == "ThrowBatch" and chosen.item == "ChoppedLettuce"
 
 
 def test_send_prefers_belt_start_over_far_end():
@@ -189,34 +181,3 @@ def test_send_prefers_belt_start_over_far_end():
     cmd = ctx["exec"].issued[-1]
     assert cmd["kind"] == "placement"
     assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
-
-
-def test_ingredient_send_keeps_going_while_holding_it():
-    """已经拿着切好料时，source 解析不能变成 None，否则清手会把它放下。
-
-    trace-20261110-222521 t=710~1048：ChoppedLettuce 反复拿起/落下，
-    SendAcross 卡在 confirm，P2 看起来一直抱着东西原地打转。
-    """
-    frame = _frames3()[0]
-    world = _world(frame)
-    ctx, book = _ctx(world)
-    assert next(c for c in world.chefs
-                if c["name"] == P.P2_NAME)["held"] == "ChoppedLettuce"
-    reqs = [r for r in HO.send_requests(world, book, ctx.get("bb"))
-            if r.kind == "ingredient"]
-    assert any(str(r.source.source_id) == "ChoppedLettuce" for r in reqs)
-    task = T.SendAcross("4", ("ChoppedLettuce", CH.CONVEYOR), "ingredient")
-    assert task.feasible(ctx) and not task.done(ctx)
-    ctx = dict(ctx, exec=FakeExec(), tick=0)
-    assert task.build().tick(ctx) == Status.RUNNING
-    assert ctx["interaction"]["kind"] == "placement"
-    assert ctx["interaction"]["target"][1].startswith("ConveyorStation")
-
-
-def test_holding_ingredient_is_not_rejected_as_missing_resource():
-    """拿着料时 reachability 也要能找到它，否则 SendAcross 被 missing_resource 否决。"""
-    frame = _frames3()[0]
-    world = _world(frame)
-    ctx, book = _ctx(world)
-    task, _rec = planner.plan(world, ctx["bb"], None, book)
-    assert task.TYPE == "SendAcross" and task.item == "ingredient"

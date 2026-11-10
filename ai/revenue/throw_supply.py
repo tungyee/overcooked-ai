@@ -80,6 +80,12 @@ def stages(book, product):
                 out.append((book.cook_input_form(raw), CONSUMER_COOKER, raw))
     elif book.needs_chopping(product):
         out.append((product, CONSUMER_BOARD, product))
+        # 已经在这边切好的形态也能直接扔过去（切好的料仍是 throwable；
+        # 4-2 沙拉：生菜/番茄切好后扔给对面，不要占传送带——传送带留给
+        # 放在盘子上的成品，盘子不能扔）。
+        chopped = book.chop_target(product)
+        if chopped and chopped.lower() != product.lower():
+            out.append((chopped, CONSUMER_BOARD, product))
     return out
 
 

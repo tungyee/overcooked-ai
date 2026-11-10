@@ -100,7 +100,8 @@ def test_plan_only_scores_top_layer_candidates():
     assert fc_ok is True
     assert fc_layer == PL.L_PREP
     assert fc_in_top is True
-    assert set(fc_terms) > PL.TERM_WHITELIST[PL.L_PREP]  # terms 全量，不是裁剪后的
+    # terms 全量，不是裁剪后的；held_batch 只由 ThrowBatch 产出。
+    assert set(fc_terms) >= set(PL.TERM_WHITELIST[PL.L_PREP]) - {"held_batch"}
     expected_score, _ = PL.filter_terms(fc_terms, PL.L_PREP)
     assert fc_score == pytest.approx(expected_score)
 

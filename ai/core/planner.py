@@ -2258,6 +2258,12 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
 W_BATCH = 0.5
 BATCH_DECAY = 0.5
 
+# 已经拿着这一批料时给 ThrowBatch 的固定加分：手里有可投的料，先投出去
+# 比换一个「要空手」的 task（FetchToBoard 等）更省——后者树首会把手里的
+# 料放下，再捡再放，4-2 沙拉料就是这么原地打转的
+# （trace-20261110-222521 t=710~1048）。
+W_HELD_BATCH = 1.0
+
 
 def _batch_bonus(n):
     # type: (int) -> float
@@ -2331,6 +2337,8 @@ def _score_throw_batch(world, bb, candidate, book=None, plate_match=None,
     if ctx is not None:
         n = task.batch_size(ctx)
     terms["batch_bonus"] = _batch_bonus(n)
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    terms["held_batch"] = W_HELD_BATCH if P.held_matches(chef, task.item) else 0.0
     if layer is not None:
         from ai.core.planner_layers import filter_terms
         score, _kept = filter_terms(terms, layer)

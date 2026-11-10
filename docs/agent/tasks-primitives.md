@@ -28,13 +28,14 @@
 | `carrier.py` | `FetchToCarrier`、`PlaceCarrierInCooker` |
 | `reposition.py` | `Reposition` |
 
-`SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道三种：渡运篮子（key = 渡运网格名）、台面传送带（key = `channels.CONVEYOR`，Rapids_4_2 双竹筏）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。传送带段用段名/段心认领（移动网格上不好按格子认），放料固定在带子**开头**（`channels.conveyor_start_rank`：先大 `gz`、再大 `gx`），不要放到远端死胡同；`on_station` 挂在带上的料/盘算「已送出」。渡运通道留 1 格回程，静态/传送带不留。任务本身只做「拿起来 → 放到通道格」；五种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
+`SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道三种：渡运篮子（key = 渡运网格名）、台面传送带（key = `channels.CONVEYOR`，Rapids_4_2 双竹筏）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。传送带段用段名/段心认领（移动网格上不好按格子认），放料固定在带子**开头**（`channels.conveyor_start_rank`：先大 `gz`、再大 `gx`），不要放到远端死胡同；`on_station` 挂在带上的料/盘算「已送出」。渡运通道留 1 格回程，静态/传送带不留。任务本身只做「拿起来 → 放到通道格」；四种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
 
 - `clean_plate`：对面缺干净盘（`cross_supply.send_deficit` / `far_plate_need`）；盘只放普通台面。
 - `carrier`：料齐的生载体，对应站型的灶只在对面、缺的料 P2 补不出来（`cross_supply.stuck_carriers`）；可退到两边都够得着的空砧板（`channels.free_carrier_slots`，砧板只给载体用）。
 - `dirty_plate`：洗碗池只在对面、P2 这侧有脏盘；一次一摞，P1 取走后才送下一摞。
 - `plated_dish`：出餐口只在对面、P2 这侧有料齐的成品盘；绑定对得上的订单。
-- `ingredient`：切好、不用下锅的料（4-2 沙拉的生菜/番茄）；出餐口在对面、P2 自己送不了时，把切好的料放上传送带让玩家装盘。
+
+**传送带只给「不能扔」的东西**（成品盘、盘、载体）；生料和切好的料仍走 `ThrowBatch`。4-2 实测：`ChoppedLettuce`/`ChoppedTomato` 的 `throwable=true`，盘子 `throwable=false`。
 
 `planner.generate_candidates` 只遍历 `handover.send_requests()`；`wash` / `deliver` 命令的 scope 分别带上 `dirty_plate` / `plated_dish` 的送件。原 1-3 中转台 `PlaceToRelay` / `relay_cells_for` 已删，由它取代。
 
@@ -42,7 +43,7 @@
 
 `Reposition`（`reposition.py`）：**订单无关**的换边，只在布局换向的连通窗口里出现。3-3（帧里报 `Wizard_3_2_2P`）的中央料箱每 34 秒在竖列/横排之间切换，把厨房切成左右或上下两半，**全图只连通 2.0~3.4 秒**（实测 trace-20261109-011932）。目标由 `ai/space/zoning.py` 的 `ZoneTracker` 算好放进 `bb.reposition`：`safe` = 见过的所有布局里都属于你的格（两种切法都对），`goal` = 其中离你最近、且当前可达的一格。树只有 `GoToCell(goal, arrived=进 safe)`；`claims()` 为空、不认领、`NO_ABANDON`。它**不是按层竞争**的：planner 的「马上去」闸（`_select_reposition`）在 `bb.reposition` 非空时硬选它，但让位给 L0/L1/L2（火 / 快糊 / 刚熟救锅）。窗口一关主循环就清 `bb.reposition`，任务随之不可行，不反复重试。
 
-`ThrowBatch`（`relay.py`）：**订单无关**的投掷备料，把一种可投掷料投向下一站消费站（砧板/灶）。**当前一次只投一份**（`relay.MAX_BATCH_UNITS = 1`，暂不做批量）。两类触发：分割地图（消费站只有 P1 够得着，Rapids_2_1 木筏↔厨房）与连通但远（料到消费站 > `throw_supply.THROW_MIN_DIST`，开关 `ENABLE_FAR_THROW`，**当前关闭**：单份远投没有摊销、料落在锅旁还要再捡）。缺口 = 可见订单需求 + `THROW_EXTRA_UNITS` − 已越过这一站的 − 已在这一站任一消费站附近（含飞行中）的，再封顶到 `MAX_BATCH_UNITS`；每拍重算。树 = `Timeout(取 → WaitUntil(有出手位) → GoToCell(出手位) → ThrowTo(消费站), 单轮)`，投完 SUCCESS 交还 Planner，要不要投下一份每拍重新决定。拿着本批料、承诺中时不因单帧判据翻转放下（far/split 都适用，`_carrying_this_batch`）。打分 = 等价取料 task（FetchToBoard/FetchToCooker，绑最急的单）的分 + `_batch_bonus(N)`（N=1 时为 0），L6 备菜层。供需与出手位在 `ai/revenue/throw_supply.py`，落点几何在 `ai/space/throw.py`，分区在 `ai/space/regions.py`。
+`ThrowBatch`（`relay.py`）：**订单无关**的投掷备料，把一种可投掷料投向下一站消费站（砧板/灶）。**当前一次只投一份**（`relay.MAX_BATCH_UNITS = 1`，暂不做批量）。两类触发：分割地图（消费站只有 P1 够得着，Rapids_2_1 木筏↔厨房）与连通但远（料到消费站 > `throw_supply.THROW_MIN_DIST`，开关 `ENABLE_FAR_THROW`，**当前关闭**：单份远投没有摊销、料落在锅旁还要再捡）。缺口 = 可见订单需求 + `THROW_EXTRA_UNITS` − 已越过这一站的 − 已在这一站任一消费站附近（含飞行中）的，再封顶到 `MAX_BATCH_UNITS`；每拍重算。树 = `Timeout(取 → WaitUntil(有出手位) → GoToCell(出手位) → ThrowTo(消费站), 单轮)`，投完 SUCCESS 交还 Planner，要不要投下一份每拍重新决定。拿着本批料、承诺中时不因单帧判据翻转放下（far/split 都适用，`_carrying_this_batch`）。`throw_supply.stages` 对「不烹饪、但可切」的料同时生成**生料**和**切好形态**两站：生料扔过去让对面切，切好的也能直接扔过去（4-2 沙拉）。打分 = 等价取料 task（FetchToBoard/FetchToCooker，绑最急的单）的分 + `_batch_bonus(N)`（N=1 时为 0）+ `held_batch`（手里正拿着这一批 +1.0，避免被「要空手」的 FetchToBoard 抢走而把料放下），L6 备菜层。供需与出手位在 `ai/revenue/throw_supply.py`，落点几何在 `ai/space/throw.py`，分区在 `ai/space/regions.py`。
 
 `FetchToBoard` 腾板（`chop.py`）：砧板上是**产物**（`book.needs_chopping` 为假：切好的料、切出来的饼……不按物料特判）、没人在切、P2 够得着、不是分割地图的共享砧板（`T.board_clearable`）时，树首先空手拿起板上的东西放到就近空台面，再取料上板。候选生成（`recipe_graph._inst_fetch_board`）只在 P2 够得着的空板一块都没有时才给可腾的板发候选。还没切的生料不腾（那是 `Chop` 的输入）。
 

@@ -234,10 +234,38 @@ def _touch_cells(cell):
     return [(gx + dx, gz + dz) for dx, dz in _NEIGHBORS]
 
 
+def _moving_grids(world):
+    # type: (Any) -> FrozenSet[str]
+    """会移动的网格 id（木筏/气球篮）。这些网格上的站点不参与「半场」判定：
+    它们跟着平台漂，把局部 gx/gz 当主网格坐标会落到完全不同的连通块。"""
+    raw = getattr(world, "raw", None) or {}
+    return frozenset(str(g.get("id")) for g in (raw.get("grids") or ())
+                     if isinstance(g, dict) and g.get("moving") is True
+                     and g.get("id"))
+
+
+def _station_cell(world, station):
+    # type: (Any, Dict) -> Optional[Tuple[int, int]]
+    """站点在**主网格**坐标系的格：优先按世界坐标投影。
+
+    移动平台（木筏/气球篮）的 gx/gz 是平台局部坐标，不能直接当主网格格用；
+    主网格站点有 x/z 时投影与 gx/gz 一致，行为不变。
+    """
+    x, z = station.get("x"), station.get("z")
+    to_grid = getattr(world, "to_grid", None)
+    if x is not None and z is not None and to_grid is not None:
+        return to_grid(x, z)
+    gx, gz = station.get("gx"), station.get("gz")
+    if gx is None or gz is None:
+        return None
+    return (int(gx), int(gz))
+
+
 def _kinds(world):
     # type: (Any) -> Dict[str, List[Tuple[int, int]]]
     """功能区 → 可站上去干活的格（站点/盘的四邻）。"""
     out = {}  # type: Dict[str, List[Tuple[int, int]]]
+    moving = _moving_grids(world)
 
     def add(kind, gx, gz):
         if gx is None or gz is None:
@@ -248,10 +276,14 @@ def _kinds(world):
     for station in getattr(world, "stations", None) or ():
         if not isinstance(station, dict):
             continue
+        if str(station.get("grid") or "") in moving:
+            continue
         kind = STATION_KINDS.get(str(station.get("t") or ""))
         if kind is None:
             continue
-        add(kind, station.get("gx"), station.get("gz"))
+        cell = _station_cell(world, station)
+        if cell is not None:
+            add(kind, cell[0], cell[1])
     for station in getattr(world, "stations", None) or ():
         if not isinstance(station, dict) or not ST._is_plate_source(station):
             continue
@@ -360,6 +392,37 @@ def pick(regions_list, kit, avoid=None):
         if other:
             fits = other
     return max(fits, key=lambda i: (regions_list[i].size, -i))
+
+
+def _separate(regions_list, kits, p1_index, p2_index):
+    # type: (List[Region], Tuple[FrozenSet[str], FrozenSet[str]], Optional[int], Optional[int]) -> Tuple[Optional[int], Optional[int]]
+    """把两人拆到不同区域（至少一人一边）。
+
+    分工分不开两侧（有一方选不中、或两人挤到同一半）时不再置空放弃——facts
+    为空会让 LLM 瞎编方位（trace-20261109-215745 t=344 把左右说成上下）。
+    优先保留已选中的一方（玩家先选、通常更受限），另一方挑「缺功能最少」的
+    另一边；即便那边装备不齐，也比整句方位丢失强。
+    """
+    if not regions_list:
+        return p1_index, p2_index
+    p2_kit, p1_kit = kits
+    n = len(regions_list)
+
+    def score(index, kit):
+        # type: (int, FrozenSet[str]) -> Tuple[int, int]
+        return (_fits(regions_list[index], kit), -regions_list[index].size)
+
+    if p1_index is not None and p2_index is not None and p1_index != p2_index:
+        return p1_index, p2_index
+    if p1_index is not None:
+        cands = [i for i in range(n) if i != p1_index]
+        return p1_index, min(cands, key=lambda i: score(i, p2_kit))
+    if p2_index is not None:
+        cands = [i for i in range(n) if i != p2_index]
+        return min(cands, key=lambda i: score(i, p1_kit)), p2_index
+    p1_index = min(range(n), key=lambda i: score(i, p1_kit))
+    cands = [i for i in range(n) if i != p1_index]
+    return p1_index, min(cands, key=lambda i: score(i, p2_kit))
 
 
 def _similar(old, new):
@@ -471,6 +534,18 @@ class ZoneTracker(object):
                 (r.size, round(r.center[0], 1), round(r.center[1], 1))
                 for r in regions_list))
             return report
+        # 两边都得有**工作站点**才算「分成两半」：干净盘是动态物，只带
+        # PLATE 的连通块不能当半场（AGENTS 约定分区判据只用砧板/灶/水槽）。
+        # 4-1 的马路是可行走的，`regions()` 会切出「厨房主区 + 外圈空走道」
+        # 两块；外圈没有站点，把它当成另一半会把左右说成上下（实机
+        # voice-20261110-011323）。4-2 两块竹筏的站点都在 moving 网格上，
+        # `_kinds` 已跳过，剩下的只有盘/地板，不能报分区。
+        station_kinds = frozenset((BOARD, OVEN, SINK, MIXING))
+        if len([r for r in regions_list if r.kinds & station_kinds]) < 2:
+            report.signature = tuple(sorted(
+                (r.size, round(r.center[0], 1), round(r.center[1], 1))
+                for r in regions_list))
+            return report
         self._seen_multi = True
         kits = role_kits(division)
         # 先给玩家选：玩家的装备（灶+水槽）通常更受限，选完再让你避开。
@@ -480,11 +555,12 @@ class ZoneTracker(object):
         p2_index = self._pick(regions_list, kits[0], "p2", avoid=p1_index)
         if p2_index is None:
             p2_index = self._pick(regions_list, kits[0], "p2")
-        if p2_index is not None and p2_index == p1_index:
-            # 两个人的活路落在同一半：这份分工分不开两侧，给建议只会把两人
-            # 挤在一起（真机 trace-20261109-124818：chop=both + 装盘不加功能
-            # 区，两个人的装备都只剩灶，UD 布局下都只能去下半边）。
-            p1_index = p2_index = None
+        if p2_index is None or p2_index == p1_index:
+            # 至少一人一边：分不开两侧（选不中 / 挤到同一半）时不再置空，
+            # facts 为空会让 LLM 瞎编方位（trace-20261109-215745 t=344 把
+            # 左右说成上下）。真机两边通常都有砧板+灶，只是被移动平台临时
+            # 挡住一格，不该因此丢掉整句方位。
+            p1_index, p2_index = _separate(regions_list, kits, p1_index, p2_index)
         report.district = "LR" if any(
             r.label in ("左", "右") for r in regions_list) else "UD"
         report.labels = tuple(r.label for r in regions_list)

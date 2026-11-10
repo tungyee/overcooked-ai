@@ -13,9 +13,14 @@ ai/revenue/handover.py）；能投的生料走 ThrowBatch。
 两边都够得着的**空砧板**也是静态通道的格（shared_boards），但只给载体用
 （披萨饼本来就是在砧板上切出来、在砧板上放料的）：盘子放上去会占住切菜位。
 
-通道 key：渡运 = 网格名；静态 = STATIC。SendAcross 的资源 id 第二位就是它。
-拓扑未知（旧合成帧无边界）或地图不分割时没有通道。不写 World 以外的状态；
-每帧缓存在 world 上。
+传送带通道（CONVEYOR）：Rapids_4_2（双竹筏水巷）两边各一条 L 形台面传送带，
+人过不去，加工好的东西放上自己这侧的传送带运到对面。传送带段是移动网格上
+的 `ConveyorStation`（不是可走地板），用段名而不是格子认身份；放上去就算
+「交给传送带」，不再追它此刻漂到哪。
+
+通道 key：渡运 = 网格名；静态 = STATIC；传送带 = CONVEYOR。SendAcross 的
+资源 id 第二位就是它。拓扑未知（旧合成帧无边界）或地图不分割时没有通道。
+不写 World 以外的状态；每帧缓存在 world 上。
 """
 from typing import Dict, List, Optional
 
@@ -24,10 +29,15 @@ from ai.space import reachability
 from ai.space import shuttle
 
 STATIC = "@static"
+CONVEYOR = "@conveyor"
+
+# 传送带段没有 collider 字段（插件只报段位置），散落物靠 on_station 段名
+# 或与段心的距离认领。格宽 1.2，半格 0.6 留一点余量。
+CONVEYOR_SLOT_DIST = 0.75
 
 # 每条通道至少留几格空着给对面往回送（成品 / 脏盘）。渡运台面一般 4~6 格，
 # 留 1；静态共享台面常常只有一两格，留格会让它永远送不出去，不留。
-KEEP_FREE = {STATIC: 0}
+KEEP_FREE = {STATIC: 0, CONVEYOR: 0}
 SHUTTLE_KEEP_FREE = 1
 
 
@@ -47,6 +57,109 @@ def is_split(world, bb=None):
 def _reach(world, field, entry, name):
     ctx = dict(w=world, chef=P.chef_by_name(world.chefs, name), field=field)
     return reachability.can_interact(ctx, entry)
+
+
+def is_conveyor_station(world, st):
+    # type: (object, Optional[Dict]) -> bool
+    """台面传送带段（插件 stations[].t == "conveyor"）。"""
+    return isinstance(st, dict) and st.get("t") == "conveyor"
+
+
+def _on_conveyor(entry, st):
+    # type: (Dict, Dict) -> bool
+    """entry（料/盘）是否在这段传送带上。
+
+    插件对台上的料给 `on_station="attach:<段名>"`；盘/旧帧没有该字段时按
+    世界坐标就近认（段没有 AABB 可查，只能按段心距离）。
+    """
+    on = str(entry.get("on_station") or "")
+    if ":" in on:
+        name = on.split(":", 1)[1].strip()
+        if name and name == str(st.get("n") or ""):
+            return True
+    x, z = entry.get("x"), entry.get("z")
+    sx, sz = st.get("x"), st.get("z")
+    if x is None or z is None or sx is None or sz is None:
+        return False
+    return ((float(sx) - float(x)) ** 2
+            + (float(sz) - float(z)) ** 2) <= CONVEYOR_SLOT_DIST ** 2
+
+
+def conveyor_slots(world, bb=None):
+    # type: (object, object) -> List[Dict]
+    """P2 这侧够得着的传送带段（地图不分割时为空）。"""
+    cache = getattr(world, "_conveyor_slots", None)
+    if cache is not None:
+        return cache
+    out = []  # type: List[Dict]
+    if is_split(world, bb):
+        near, _far = _fields(world, bb)
+        for st in getattr(world, "stations", ()) or ():
+            if is_conveyor_station(world, st) \
+                    and _reach(world, near, st, P.P2_NAME):
+                out.append(st)
+    world._conveyor_slots = out
+    return out
+
+
+def conveyor_interface_distance(world, st, bb=None):
+    # type: (object, Dict, object) -> float
+    """这段传送带离「对面那侧的传送带」最近多远（米）。
+
+    双竹筏靠拢时只有接口那几段真正跨水；送件优先放接口段，别放到
+    远端工作区（那里的带子可能朝反方向走）。对面没有传送带时返回 0，
+    不因此否决。
+    """
+    if not is_conveyor_station(world, st):
+        return 0.0
+    sx, sz = st.get("x"), st.get("z")
+    if sx is None or sz is None:
+        return 0.0
+    best = None  # type: Optional[float]
+    grid = str(st.get("grid") or "")
+    for other in getattr(world, "stations", ()) or ():
+        if other is st or not is_conveyor_station(world, other):
+            continue
+        if str(other.get("grid") or "") == grid:
+            continue                       # 同一条竹筏上的段，不是接口
+        ox, oz = other.get("x"), other.get("z")
+        if ox is None or oz is None:
+            continue
+        d = ((float(ox) - float(sx)) ** 2
+             + (float(oz) - float(sz)) ** 2) ** 0.5
+        if best is None or d < best:
+            best = d
+    return best or 0.0
+
+
+def conveyor_station_of(world, entry, slots=None):
+    # type: (object, Optional[Dict], Optional[List[Dict]]) -> Optional[Dict]
+    """entry 所在的传送带段；不在传送带上返回 None。"""
+    if not isinstance(entry, dict) or entry.get("held_by"):
+        return None
+    pool = slots if slots is not None else [
+        st for st in getattr(world, "stations", ()) or ()
+        if is_conveyor_station(world, st)]
+    for st in pool:
+        if _on_conveyor(entry, st):
+            return st
+    return None
+
+
+def slot_occupied(world, st):
+    # type: (object, Dict) -> bool
+    """通道格上已经有东西（盘/锅/料/板）。传送带按段名/段心认，不走投影格。"""
+    if is_conveyor_station(world, st):
+        groups = (getattr(world, "plates", None), getattr(world, "items", None))
+        for arr in groups:
+            for it in arr or ():
+                if not isinstance(it, dict) or it.get("held_by"):
+                    continue
+                if _on_conveyor(it, st):
+                    return True
+        return False
+    from ai.query.placement import counter_key, counter_occupied
+    return counter_occupied(world, counter_key(world, st))
 
 
 def static_slots(world, bb=None):
@@ -103,8 +216,10 @@ def free_carrier_slots(world, bb=None):
 
 def channel_keys(world, bb=None):
     # type: (object, object) -> List[str]
-    """此刻可用的通道（渡运网格按名排序在前，静态通道在后）。"""
+    """此刻可用的通道（渡运网格按名排序在前，传送带随后，静态通道在后）。"""
     keys = sorted(shuttle.shuttle_grids(world))
+    if conveyor_slots(world, bb):
+        keys.append(CONVEYOR)
     if static_slots(world, bb):
         keys.append(STATIC)
     return keys
@@ -112,9 +227,11 @@ def channel_keys(world, bb=None):
 
 def slots(world, key, bb=None):
     # type: (object, str, object) -> List[Dict]
-    """某条通道的全部台面。"""
+    """某条通道的全部台面（传送带通道返回可用的传送带段）。"""
     if key == STATIC:
         return list(static_slots(world, bb))
+    if key == CONVEYOR:
+        return list(conveyor_slots(world, bb))
     return [st for st in shuttle.shuttle_stations(world)
             if str(st.get("grid") or "") == str(key)]
 
@@ -124,6 +241,9 @@ def slot_of(world, entry, bb=None):
     """entry（盘 / 料）此刻放在哪条通道的台面上；手持 / 不在通道上返回 None。"""
     if not isinstance(entry, dict) or entry.get("held_by"):
         return None
+    st = conveyor_station_of(world, entry)
+    if st is not None:
+        return st
     st = shuttle.station_of(world, entry)
     if st is not None:
         return st
@@ -139,6 +259,8 @@ def slot_of(world, entry, bb=None):
 
 def channel_of_slot(world, st, bb=None):
     # type: (object, Dict, object) -> Optional[str]
+    if is_conveyor_station(world, st):
+        return CONVEYOR
     if shuttle.is_shuttle_station(world, st):
         return str(st.get("grid"))
     if any(s is st for s in static_slots(world, bb) + shared_boards(world, bb)):
@@ -153,13 +275,12 @@ def keep_free(key):
 
 def free_slots(world, key=None, bb=None):
     # type: (object, Optional[str], object) -> List[Dict]
-    """通道上空着的台面（没盘、没料、没锅）；key=None 时全部通道。"""
-    from ai.query.placement import counter_key, counter_occupied
+    """通道上空着的台面/传送带段（没盘、没料、没锅）；key=None 时全部通道。"""
     keys = [key] if key is not None else channel_keys(world, bb)
     out = []  # type: List[Dict]
     for k in keys:
         for st in slots(world, k, bb):
-            if not counter_occupied(world, counter_key(world, st)):
+            if not slot_occupied(world, st):
                 out.append(st)
     return out
 

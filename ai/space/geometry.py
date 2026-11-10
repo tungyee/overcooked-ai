@@ -96,18 +96,21 @@ class GridMapping:
         return self.cell
 
     @classmethod
-    def from_grid(cls, grid, stations=None):
-        # type: (Optional[Dict], Optional[List[Dict]]) -> "GridMapping"
+    def from_grid(cls, grid, stations=None, fallback=None):
+        # type: (Optional[Dict], Optional[List[Dict]], Optional[Dict]) -> "GridMapping"
         """从 grid 快照构造。传入 stations 时自动校准世界原点（推荐）。
 
         stations: state["stations"] 列表，用带 gx/gz 的站点反解原点。
-                  不传或无可用站点时回落到 ORIGIN_*_DEFAULT 兜底常量。
+                  不传或无可用站点时，先用 fallback（插件 grids[] 里
+                  main=true 的原点/格宽），再回落到 ORIGIN_*_DEFAULT。
                   多网格关卡下调用方应只传**主网格**的站点——移动平台
                   （气球篮）站点会把众数带漂（trace-20261017-215633）。
         """
         grid = grid or {}
         size = parse_vec(grid.get("size"))
-        cell = size[0] if size else CELL_DEFAULT
+        fallback = fallback or {}
+        cell = size[0] if size else float(
+            fallback.get("cell") or CELL_DEFAULT)
         # size 是 (x, y, z)：z 轴格宽取 size[2]，缺失时退回 x 轴格宽
         cell_z = size[2] if size and len(size) >= 3 else cell
 
@@ -123,10 +126,10 @@ class GridMapping:
 
         origin_x = _calibrate(stations, cell, "x", "gx")
         if origin_x is None:
-            origin_x = ORIGIN_X_DEFAULT
+            origin_x = float(fallback.get("ox", ORIGIN_X_DEFAULT))
         origin_z = _calibrate(stations, cell_z, "z", "gz")
         if origin_z is None:
-            origin_z = ORIGIN_Z_DEFAULT
+            origin_z = float(fallback.get("oz", ORIGIN_Z_DEFAULT))
 
         return cls(cell, off_x, off_z, origin_x, origin_z, cell_z)
 

@@ -2,7 +2,8 @@
 """跨区交接 task：SendAcross / ThrowBatch。
 
 SendAcross：不可投掷的干净盘 / 脏盘 / 成品盘 / 生载体放到通道台面上交给
-对面（ai/space/channels.py：渡运篮子 / 两边都够得着的静态共享台面）。每种
+对面（ai/space/channels.py：渡运篮子 / 台面传送带 / 两边都够得着的静态
+共享台面）。每种
 kind 的触发、取放与完成判定在 ai/revenue/handover.py 的规格表里。
 
 ThrowBatch：把一种可投掷料批量投向下一站消费站（砧板/灶）。两类触发：
@@ -54,17 +55,16 @@ def _channel_slot(ctx, key, lock, allow_boards=False):
     """往通道 key 上放的台面：锁住选中的那格（按站名跟着篮子走）；被占了重选。
 
     选法：此刻够得着的空格里走得最近的；静态通道优先普通台面、其次共享砧板
-    （只有载体允许放砧板，盘/脏盘不放，免得占住切菜位）。渡运台面都够不着时
-    按预测等待最短的。
+    （只有载体允许放砧板，盘/脏盘不放，免得占住切菜位）；传送带通道按段心
+    距离选最近的一段。渡运台面都够不着时按预测等待最短的。
     """
-    from ai.query.placement import counter_key, counter_occupied
     from ai.space import channels as CH
     from ai.space import reachability, shuttle
     w, field, bb = ctx["w"], ctx.get("field"), ctx.get("bb")
     name = lock.get("n")
     if name is not None:
         st = next((s for s in CH.slots(w, key, bb) if s.get("n") == name), None)
-        if st is not None and not counter_occupied(w, counter_key(w, st)):
+        if st is not None and not CH.slot_occupied(w, st):
             return st
         lock.clear()
     if key == CH.STATIC and allow_boards:
@@ -75,21 +75,25 @@ def _channel_slot(ctx, key, lock, allow_boards=False):
         return None
 
     def cost(st):
-        if key == CH.STATIC:
+        if key in (CH.STATIC, CH.CONVEYOR):
             goals = reachability._interact_goals(ctx, st)
             if goals is True:
                 return (0, 0)
             got = [field[g] for g in goals or () if field and g in field]
             if not got:
                 return (2, 1e9)
-            return (0 if st.get("t") == "counter" else 1, min(got))
+            tie = 0 if st.get("t") == "counter" else 1
+            if key == CH.CONVEYOR:
+                # 先看是不是接口段（离对面传送带最近），再看走过去多远。
+                tie = CH.conveyor_interface_distance(w, st, bb) * 10000 + min(got)
+            return (0, tie)
         now = shuttle.reachable_stances(w, st, field)
         if now:
             return (0, min(field[s["cell"]] for s in now) if field else 0)
         wait = reachability.shuttle_wait(ctx, st)
         return (1, wait if wait is not None else 1e9)
     best = min(free, key=cost)
-    if cost(best)[1] >= 1e9:
+    if cost(best)[0] >= 2 or cost(best)[1] >= 1e9:
         return None
     lock["n"] = best.get("n")
     return best

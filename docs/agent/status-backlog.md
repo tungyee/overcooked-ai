@@ -25,6 +25,18 @@
   - **换边不看手里拿的是什么**：端着成品盘时也可能被拉去换边，没做「送完再走」的例外。
   - `Reposition` 只保证「跨过去」，不保证站到能干活的格；到位后由 planner 正常选活。
 
+## 双竹筏传送带（2026-11-10，Rapids_4_2_2P，未实机验证）
+
+`trace-20261110-211743`（4-1 切进 4-2 后 65 秒）暴露的问题：
+
+- **布局复核每几秒翻一次**：4-2 所有功能站都在会漂的 `Raft One` / `Raft Two` 上。旧 `zoning._kinds` 把站点局部 `gx/gz` 当主网格坐标，连通块又按投影地板每帧变化，于是 `layout_review` 在「上下两半 / 左右两半 / 不分区」之间反复触发，模型最后把 `chop/cook/plate` 全塞给玩家，AI 自己几乎没活。修：`_kinds` 按世界坐标投影、跳过 `grids[].moving` 上的站点；`observe` 只认砧板/灶/水槽两种以上才算分区（干净盘不算）。
+- **竹筏被当成渡运篮子**：`shuttle_grids` 用「台面外包盒里有没有主网格可走格」认渡运，木筏漂到半格位置时外包盒里可能暂时没有可走格，`channel_keys` 偶尔出现 `Raft One`。修：台面上有非柜台站（砧板/灶/水槽/料箱）或厨师正站在外包盒里 → 不是渡运。
+- **跨筏物流没有通道**：成品盘只能端在手里；`SendAcross` 的通道只有渡运篮子/静态共享台面，4-2 两者都没有，`plated_dish` 永远不生成。修：`ai/space/channels.py` 增加 `CONVEYOR = "@conveyor"`，段用 `(grid, 站名)`/段名认领；`free_slots`/`slot_of` 认 `on_station` 或段心 0.75m；放置优先选**离对面传送带最近的接口段**（选走起来最近的会放到朝反方向走的远端段）。
+- **主网格原点**：4-2 没有主网格站点，`GridMapping` 会落到 Sushi_1_4 默认的 14.4/-6.0。修：`from_grid` 增加 `fallback`，用 `grids[].main` 的 ox/oz/cell。
+- **接收侧**：切好的土豆/鸡块挂在传送带段上时，`find_ingredient` 仍按普通散落料返回；`FillCooker` 的传送带锁段/等料（1-6 那套）直接复用。fixture `tests/fixtures/rapids/rapids42-conveyor.ndjson.gz`，测试 `tests/test_conveyor.py`。
+
+**已知限制**：插件 0.24.8 的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「离对面最近」猜接口；两筏漂开时放上去的料会先在带子上走，靠拢后再过水。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
+
 ## 半格走廊（2026-11-01，3_6_Dynamic_Lvl_02，未实机验证）
 
 - **现象**（`trace-20261101-184314`）：上层木筏 Raft One（带出餐口）停在中间平台正上方时，P2 只到得了平台下半截，鸡肉卷做好了也被判 `unreachable_destination`；Raft One 停在平台右侧（同一行横接）时正常。P1 实际走得过去。

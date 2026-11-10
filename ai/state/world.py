@@ -229,8 +229,19 @@ class World(object):
                                 if str(s.get("grid") or "") == primary_grid]
         else:
             primary_stations = self.stations
+
+        # 多网格坐标集合（spec §5.1）：换关卡/换帧直接重建，不反解。
+        # 必须在 GridMapping 之前建好：4-2 双竹筏没有主网格站点，校准会
+        # 落到默认原点（Sushi_1_4 的 14.4/-6.0）；有 grids[].main 时直接
+        # 用插件给的主网格原点，才不会把站点局部 gx/gz 算到别处。
+        self.grids = GridSet.from_frame(state.get("grids"))
+        main_grid = None
+        for g in state.get("grids") or ():
+            if isinstance(g, dict) and g.get("main") is True:
+                main_grid = g
+                break
         self.mapping = GridMapping.from_grid(
-            state.get("grid"), primary_stations)
+            state.get("grid"), primary_stations, fallback=main_grid)
 
         parsed = occupancy.parse_node_map(
             (state.get("grid") or {}).get("nodeMap"))
@@ -238,9 +249,6 @@ class World(object):
             self._node_map, self._nm_rows, self._nm_cols = None, 0, 0
         else:
             self._node_map, self._nm_rows, self._nm_cols = parsed
-
-        # 多网格坐标集合（spec §5.1）：换关卡/换帧直接重建，不反解。
-        self.grids = GridSet.from_frame(state.get("grids"))
 
         # station_blocked 不再喂给 walkable（新判定走 terrain 的
         # BLOCKING_LAYERS），但仍作为独立属性保留——调用方（如

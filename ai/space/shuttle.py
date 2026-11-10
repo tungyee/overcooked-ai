@@ -71,18 +71,45 @@ def shuttle_grids(world):
               if isinstance(g, dict) and g.get("moving") is True and g.get("id")}
     out = set()  # type: Set[str]
     for gid in moving:
-        boxes = [O._box_of(st) for st in getattr(world, "stations", ()) or ()
-                 if isinstance(st, dict) and str(st.get("grid") or "") == gid
-                 and st.get("t") == "counter"]
+        grid_stations = [st for st in getattr(world, "stations", ()) or ()
+                         if isinstance(st, dict)
+                         and str(st.get("grid") or "") == gid]
+        # 真正的渡运台面只有柜台；有砧板/灶/水槽/料箱 = 人能站着干活的
+        # 木筏（Rapids 4-2），不是「隔着围栏够」的篮子。
+        if any(st.get("t") != "counter" for st in grid_stations):
+            continue
+        boxes = [O._box_of(st) for st in grid_stations
+                 if st.get("t") == "counter"]
         boxes = [b for b in boxes if b is not None]
         if not boxes:
             continue
         hull = (min(b[0] for b in boxes), max(b[1] for b in boxes),
                 min(b[2] for b in boxes), max(b[3] for b in boxes))
+        # 人正站在台面外包盒里 = 这块平台能站人（Rapids 双竹筏）。主网格
+        # 可走格是按地形 AABB 投影的，木筏漂到半格位置时外包盒里可能暂时
+        # 一格可走都没有，单看 walkable 会把竹筏误判成渡运篮子。
+        if _chef_on_hull(world, hull):
+            continue
         if not _hull_has_walkable(world, hull):
             out.add(gid)
     world._shuttle_grids = out
     return out
+
+
+def _chef_on_hull(world, hull):
+    # type: (object, Tuple[float, float, float, float]) -> bool
+    """有没有厨师站在台面外包盒里（含半格外沿余量）。"""
+    margin = 0.6
+    for chef in getattr(world, "chefs", None) or ():
+        if not isinstance(chef, dict):
+            continue
+        x, z = chef.get("x"), chef.get("z")
+        if x is None or z is None:
+            continue
+        if (hull[0] - margin <= float(x) <= hull[1] + margin
+                and hull[2] - margin <= float(z) <= hull[3] + margin):
+            return True
+    return False
 
 
 def _hull_has_walkable(world, hull):

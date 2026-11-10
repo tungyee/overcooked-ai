@@ -92,6 +92,30 @@ def test_only_balloon22_has_shuttle():
         assert got == want, path
 
 
+def test_chef_standing_on_moving_hull_is_not_shuttle():
+    """木筏漂到半格位置、外包盒里暂时没可走格时，别把人能站的平台误判成篮子。"""
+    state = {
+        "phase": "level", "level": "synthetic", "paused": False,
+        "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0}],
+        "stations": [{"t": "counter", "n": "c", "grid": "Raft",
+                      "minx": 0.4, "maxx": 1.6, "minz": 0.4, "maxz": 1.6,
+                      "x": 1.0, "z": 1.0}],
+        "grids": [{"id": "Raft", "moving": True, "main": False,
+                   "ox": 0.0, "oz": 0.0, "cell": 1.2}],
+        "grid": {"size": 1.2},
+        "terrain": [], "occupancy": [], "items": [], "plates": [],
+        "cookers": [], "workstations": [], "orders": [], "recipes": [],
+        "extinguishers": [],
+    }
+    world = W.World(state)
+    world.walkable = lambda gx, gz: False      # 漂到半格位置：外包盒里暂时没可走格
+    assert SH.shuttle_grids(world) == set()
+    state["chefs"] = [{"name": "Player 2", "x": 8.0, "z": 8.0}]
+    world = W.World(state)
+    world.walkable = lambda gx, gz: False
+    assert SH.shuttle_grids(world) == {"Raft"}
+
+
 def test_counter_front_row_not_walkable(keyframes):
     """根因复现：台面 (gz=-6) 正前一排 gz=-5 全不可走，常规交互位为空。"""
     w = W.World(keyframes[57.9])

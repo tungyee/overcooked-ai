@@ -115,11 +115,46 @@ def test_region_labels_vertical_split():
     assert [r.label for r in regions] == ["下", "上"]
 
 
+def test_one_region_without_stations_is_not_a_split():
+    """4-1：厨房主区 + 外圈空走道，外圈没站点，不能报「上下两半」。"""
+    walk = set()
+    for gx in range(4):
+        for gz in range(4):
+            walk.add((gx, gz))
+    for gx in range(10, 13):
+        for gz in range(10, 13):
+            walk.add((gx, gz))
+    stations = [
+        {"t": "chopping", "n": "board", "gx": 1, "gz": 1},
+        {"t": "cooking", "n": "oven", "gx": 2, "gz": 2},
+        {"t": "washing", "n": "sink", "gx": 3, "gz": 3},
+    ]
+    world = _world(walk, stations)
+    assert len(zoning.regions(world)) == 2
+    report = _observe(zoning.ZoneTracker(), world)
+    assert report.district == ""
+    assert report.p2_label == ""
+    assert report.p1_label == ""
+
+
 def test_region_kinds_use_station_adjacency():
     regions = _regions()
     left, right = regions
     assert left.kinds == frozenset(["board", "oven", "sink", "plate"])
     assert right.kinds == frozenset(["board", "oven", "plate"])
+
+
+def test_region_kinds_project_world_coords_not_local_grid():
+    """站点带 x/z 时按主网格投影归区；局部 gx/gz 是平台自己的坐标系。"""
+    walk, stations, plates = _room_split_by_column()
+    # 局部坐标远远落在右侧，世界坐标却在左侧：应该算左半的砧板。
+    stations = [dict(st, x=1, z=1) if st["t"] == "chopping" else st
+                for st in stations]
+    stations = [dict(st, gx=99, gz=99) if st["t"] == "chopping" else st
+                for st in stations]
+    world = _world(walk, stations, plates)
+    left, _right = zoning.regions(world)
+    assert "board" in left.kinds
 
 
 def test_role_kits_default_when_division_empty():
@@ -250,11 +285,12 @@ def test_tracker_keeps_assignment_when_both_halves_fit():
     assert (second.p2_label, second.p1_label) == (first.p2_label, first.p1_label)
 
 
-def test_no_advice_when_division_cannot_separate_halves():
-    """两边只有半边能干活时不给建议：把两个人都赶去同一半没有意义。
+def test_force_separate_when_division_cannot_separate_halves():
+    """分工分不开两侧时至少一人一边，不再置空（置空会让 facts 为空）。
 
-    真机 trace-20261109-124818：分工 `下锅=you`、`装盘=player`（装盘不加功能
-    区）+ `切=both`，两个人的装备都只剩灶，UD 布局下都只能去下半边。
+    真机 trace-20261109-124818 的分工：`下锅=you`、`装盘=player`（装盘不加
+    功能区）+ `切=both`，两个人的装备都只剩灶，正常 pick 都只能去左半边。
+    强制拆开后玩家留左（有灶+水槽），你被分到右，方向仍有意义。
     """
     walk, stations, plates = _room_split_by_column()
     stations = [
@@ -266,8 +302,33 @@ def test_no_advice_when_division_cannot_separate_halves():
     division = _division([("下锅", "P2"), ("装盘", "P1"), ("切", "BOTH")])
     world = _world(walk, stations, plates, p2=(7, 1), p1=(1, 1))
     report = _observe(zoning.ZoneTracker(), world, division)
-    assert report.p2_label == "" and report.p1_label == ""
+    assert report.p2_label == "右" and report.p1_label == "左"
     assert report.p2_wrong is False and report.p1_wrong is False
+
+
+def test_force_separate_keeps_orientation_when_right_board_blocked():
+    """右半边临时没有砧板/水槽时也要给出「左右」方位（trace-20261109-215745 t=344）。
+
+    真机里左右都有砧板+灶，只是右侧砧板被移动平台临时挡住一格，导致右侧
+    区域只报 oven。此时 pick 会把两个人都挤到左半边，旧逻辑置空、facts 为空，
+    LLM 把左右说成上下。现在至少一人一边，玩家守左、你守右。
+    """
+    walk, stations, plates = _room_split_by_column()
+    stations = [
+        {"t": "chopping", "n": "boardL", "gx": 1, "gz": -1},
+        {"t": "cooking", "n": "ovenL", "gx": 0, "gz": -1},
+        {"t": "cooking", "n": "ovenR", "gx": 10, "gz": -1},
+        {"t": "washing", "n": "sink", "gx": -1, "gz": 1},
+    ]
+    division = _division([("装盘", "P2"), ("下锅", "P1"), ("切", "BOTH")])
+    world = _world(walk, stations, plates, p2=(7, 1), p1=(1, 1))
+    report = _observe(zoning.ZoneTracker(), world, division)
+    assert report.district == "LR"
+    assert report.p2_label == "右" and report.p1_label == "左"
+    facts = report.facts()
+    assert "左右" in facts
+    assert "你守右半边" in facts
+    assert "玩家守左半边" in facts
 
 
 def test_facts_always_state_both_sides():

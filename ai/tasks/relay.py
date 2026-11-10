@@ -84,8 +84,10 @@ def _channel_slot(ctx, key, lock, allow_boards=False):
                 return (2, 1e9)
             tie = 0 if st.get("t") == "counter" else 1
             if key == CH.CONVEYOR:
-                # 先看是不是接口段（离对面传送带最近），再看走过去多远。
-                tie = CH.conveyor_interface_distance(w, st, bb) * 10000 + min(got)
+                # 固定在带子开头放：先大 gz、再大 gx，最后才看走过去多远。
+                # 反向放到远端会让成品盘停在玩家够不着的那一端。
+                gz_rank, gx_rank = CH.conveyor_start_rank(st)
+                tie = gz_rank * 10000 + gx_rank * 100 + min(got)
             return (0, tie)
         now = shuttle.reachable_stances(w, st, field)
         if now:

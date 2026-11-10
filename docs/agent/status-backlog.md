@@ -31,11 +31,16 @@
 
 - **布局复核每几秒翻一次**：4-2 所有功能站都在会漂的 `Raft One` / `Raft Two` 上。旧 `zoning._kinds` 把站点局部 `gx/gz` 当主网格坐标，连通块又按投影地板每帧变化，于是 `layout_review` 在「上下两半 / 左右两半 / 不分区」之间反复触发，模型最后把 `chop/cook/plate` 全塞给玩家，AI 自己几乎没活。修：`_kinds` 按世界坐标投影、跳过 `grids[].moving` 上的站点；`observe` 只认砧板/灶/水槽两种以上才算分区（干净盘不算）。
 - **竹筏被当成渡运篮子**：`shuttle_grids` 用「台面外包盒里有没有主网格可走格」认渡运，木筏漂到半格位置时外包盒里可能暂时没有可走格，`channel_keys` 偶尔出现 `Raft One`。修：台面上有非柜台站（砧板/灶/水槽/料箱）或厨师正站在外包盒里 → 不是渡运。
-- **跨筏物流没有通道**：成品盘只能端在手里；`SendAcross` 的通道只有渡运篮子/静态共享台面，4-2 两者都没有，`plated_dish` 永远不生成。修：`ai/space/channels.py` 增加 `CONVEYOR = "@conveyor"`，段用 `(grid, 站名)`/段名认领；`free_slots`/`slot_of` 认 `on_station` 或段心 0.75m；放置优先选**离对面传送带最近的接口段**（选走起来最近的会放到朝反方向走的远端段）。
+- **跨筏物流没有通道**：成品盘只能端在手里；`SendAcross` 的通道只有渡运篮子/静态共享台面，4-2 两者都没有，`plated_dish` 永远不生成。修：`ai/space/channels.py` 增加 `CONVEYOR = "@conveyor"`，段用 `(grid, 站名)`/段名认领；`free_slots`/`slot_of` 认 `on_station` 或段心 0.75m。
 - **主网格原点**：4-2 没有主网格站点，`GridMapping` 会落到 Sushi_1_4 默认的 14.4/-6.0。修：`from_grid` 增加 `fallback`，用 `grids[].main` 的 ox/oz/cell。
 - **接收侧**：切好的土豆/鸡块挂在传送带段上时，`find_ingredient` 仍按普通散落料返回；`FillCooker` 的传送带锁段/等料（1-6 那套）直接复用。fixture `tests/fixtures/rapids/rapids42-conveyor.ndjson.gz`，测试 `tests/test_conveyor.py`。
 
-**已知限制**：插件 0.24.8 的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「离对面最近」猜接口；两筏漂开时放上去的料会先在带子上走，靠拢后再过水。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
+`trace-20261110-221304`（第二次实机，113 秒）又暴露两个问题，已修：
+
+- **成品盘放到带子远端死胡同**：上一版按「离对面传送带最近」选段，实际选了 `gx=0,gz=-2` 的远端段；盘子停在那里，玩家够不着。修：`channels.conveyor_start_rank` 固定选带子**开头**（先大 `gz`、再大 `gx`；Raft Two 会选 `(4,0)`），不看走路距离。
+- **切好的生菜/番茄不传**：AI 在砧板上切好 `ChoppedLettuce` / `ChoppedTomato` 后一直留在自己这侧，玩家没法装沙拉。修：`SendAcross` 增加 `ingredient` kind——出餐口在对面、P2 自己送不了时，把切好且不用下锅的料放上传送带（土豆/鸡块要炸，不走这条）。fixture `tests/fixtures/rapids/rapids42-ingredient.ndjson.gz`。
+
+**已知限制**：插件 0.24.8 的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「带子开头」的固定排序放；两筏漂开时放上去的料会先在带子上，靠拢后再过水。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
 
 ## 半格走廊（2026-11-01，3_6_Dynamic_Lvl_02，未实机验证）
 

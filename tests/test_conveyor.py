@@ -31,11 +31,18 @@ from tests.test_exec_primitives import FakeExec
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
                    "rapids42-conveyor.ndjson.gz")
+FIX2 = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                    "rapids42-ingredient.ndjson.gz")
 PID = "-205166"
 
 
 def _frames():
     with gzip.open(FIX, "rt", encoding="utf8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def _frames2():
+    with gzip.open(FIX2, "rt", encoding="utf8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
@@ -113,7 +120,7 @@ def test_send_holding_plate_targets_a_belt_segment():
     assert cmd["cmd"] == "move" and cmd["kind"] == "placement"
     assert cmd["target"]["name"].startswith("ConveyorStation")
     assert cmd["target"]["grid"] == "Raft Two"
-    # 选离对面传送带最近的接口段，而不是走起来最近的远端段。
+    # 放带子的开头（大 gz / 大 gx），不是远端死胡同 (0,-2)。
     assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
 
 
@@ -131,3 +138,47 @@ def test_send_done_when_plate_is_on_belt():
     assert task.done(ctx) and not task.feasible(ctx)
     assert CH.channel_of_slot(world, CH.slot_of(world, plate, ctx.get("bb")),
                               ctx.get("bb")) == CH.CONVEYOR
+
+
+# ---------------------------------------------------------------- 切好的料 / 带子开头
+
+
+def test_chopped_salad_ingredients_get_send_requests():
+    """生菜/番茄切好后，出餐口在对面且 P2 送不了：应生成 @conveyor 送件。"""
+    frame = _frames2()[-1]                  # t=680：两样切好料都在 P2 这侧
+    world = _world(frame)
+    ctx, book = _ctx(world)
+    reqs = [(r.kind, str(r.source.source_id), r.channel)
+            for r in HO.send_requests(world, book, ctx.get("bb"))
+            if r.kind == "ingredient"]
+    assert sorted(reqs) == [("ingredient", "ChoppedLettuce", CH.CONVEYOR),
+                            ("ingredient", "ChoppedTomato", CH.CONVEYOR)]
+
+
+def test_ingredient_send_task_picks_the_chopped_item():
+    """送切好料：先走到砧板/台面拿 ChoppedLettuce，再去传送带。"""
+    frame = next(f for f in _frames2() if f["_trace_t"] == 360)
+    world = _world(frame)
+    ctx, _book = _ctx(world)
+    task = T.SendAcross("2", ("ChoppedLettuce", CH.CONVEYOR), "ingredient")
+    assert task.feasible(ctx) and not task.done(ctx)
+    ctx = dict(ctx, exec=FakeExec(), tick=0)
+    assert task.build().tick(ctx) == Status.RUNNING
+    assert ctx["interaction"]["kind"] == "pickup"
+    assert ctx["interaction"]["target"][1] == "ChoppedLettuce"
+
+
+def test_send_prefers_belt_start_over_far_end():
+    """成品盘放带子开头（4,0），不要再放到远端 (0,-2)。"""
+    frame = next(f for f in _frames2() if f["_trace_t"] == 680)
+    plate = next(p for p in (frame.get("held_plates") or [])
+                 if str(p.get("n")) == "-18774")
+    world = _world(frame)
+    ctx, _book = _ctx(world)
+    task = T.SendAcross("3", ("-18774", CH.CONVEYOR), "plated_dish")
+    assert task.feasible(ctx) and not task.done(ctx)
+    ctx = dict(ctx, exec=FakeExec(), tick=0)
+    assert task.build().tick(ctx) == Status.RUNNING
+    cmd = ctx["exec"].issued[-1]
+    assert cmd["kind"] == "placement"
+    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)

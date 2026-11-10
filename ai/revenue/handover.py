@@ -17,8 +17,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from ai.query import predicates as P
+from ai.query import recipes as R
 from ai.space import channels as CH
 from ai.revenue import cross_supply as XS
+
+# 切好的非烹饪料（沙拉的生菜/番茄）：出餐口在对面、P2 自己送不了时，
+# 放到传送带上交给玩家装盘/上菜。烹饪料（土豆/鸡块）不走这里——那是 P2 自己炸。
+KIND_INGREDIENT = "ingredient"
 
 
 @dataclass(frozen=True)
@@ -387,6 +392,107 @@ SEND_SPECS[XS.KIND_PLATED_DISH] = SendSpec(
     resolve=_plated_resolve,
     channels=lambda world, bb: CH.channel_keys(world, bb),
     capacity=_plated_capacity,
+)
+
+
+# ---------------------------------------------------------------- ingredient
+
+
+def _p2_can_deliver(world, bb=None):
+    # type: (Any, Any) -> bool
+    """P2 这侧够得着出餐口：够得着就自己装盘上菜，不把切好的料送走。"""
+    near, _far = CH._fields(world, bb)
+    return any(CH._reach(world, near, st, P.P2_NAME)
+               for st in getattr(world, "stations", ()) or ()
+               if isinstance(st, dict) and st.get("t") == "plate_station")
+
+
+def _chopped_form(book, raw):
+    # type: (Any, str) -> Optional[str]
+    if not raw or book.needs_cooking(raw) or not book.needs_chopping(raw):
+        return None
+    return book.chop_target(raw)
+
+
+def _ingredient_available(world, form):
+    # type: (Any, str) -> Optional[Dict]
+    """场上可取的切好料：砧板上 / 台面 / 地上（不含盘里 / 手里）。"""
+    loc = R.find_ingredient(world, form)
+    if loc is None or loc.get("kind") in ("held", "plate"):
+        return None
+    return loc.get("st")
+
+
+def _ingredient_on_channel(world, form, bb=None):
+    # type: (Any, str, Any) -> bool
+    for it in getattr(world, "items", ()) or ():
+        if str(it.get("n") or "").lower() == str(form).lower() \
+                and CH.slot_of(world, it, bb) is not None:
+            return True
+    return False
+
+
+def _ingredient_sources(world, book, bb):
+    # type: (Any, Any, Any) -> List[SendSource]
+    if not CH.is_split(world, bb) or CH.CONVEYOR not in CH.channel_keys(world, bb):
+        return []
+    if _p2_can_deliver(world, bb):
+        return []
+    out = []  # type: List[SendSource]
+    seen = set()
+    for order in getattr(world, "orders", ()) or ():
+        for raw in book.requirements(order):
+            form = _chopped_form(book, raw)
+            if not form or form.lower() in seen:
+                continue
+            if _ingredient_available(world, form) is None:
+                continue
+            if _ingredient_on_channel(world, form, bb):
+                continue
+            seen.add(form.lower())
+            out.append(SendSource(KIND_INGREDIENT, form,
+                                  str(order.get("id") or "")))
+    return out
+
+
+def _ingredient_resolve(ctx, source_id, order_id):
+    # type: (Dict, Any, Any) -> Optional[SendSource]
+    w, bb = ctx["w"], ctx.get("bb")
+    if _p2_can_deliver(w, bb):
+        return None
+    if _ingredient_available(w, source_id) is None:
+        return None
+    return SendSource(KIND_INGREDIENT, source_id, order_id)
+
+
+def _ingredient_pickup(ctx, source):
+    # type: (Dict, SendSource) -> Optional[Dict]
+    return _ingredient_available(ctx["w"], source.source_id)
+
+
+def _ingredient_done(ctx, source, key):
+    # type: (Dict, SendSource, str) -> bool
+    if _ingredient_on_channel(ctx["w"], source.source_id, ctx.get("bb")):
+        return True
+    if P.held_matches(ctx["chef"], source.source_id):
+        return False                       # 拿在手里还没放上去
+    # 砧板/台面/地上还有 = 没送走；完全找不到（已被拿走/送到对面）= 完成。
+    return _ingredient_available(ctx["w"], source.source_id) is None
+
+
+SEND_SPECS[KIND_INGREDIENT] = SendSpec(
+    kind=KIND_INGREDIENT,
+    label="送切好的料",
+    sources=_ingredient_sources,
+    claims=lambda source_id, order_id: ((source_id, "send"),),
+    pickup=_ingredient_pickup,
+    held=lambda ctx, source: P.held_matches(ctx["chef"], source.source_id),
+    done=_ingredient_done,
+    resolve=_ingredient_resolve,
+    channels=lambda world, bb: ([CH.CONVEYOR]
+                                if CH.CONVEYOR in CH.channel_keys(world, bb)
+                                else []),
+    capacity=lambda ctx, key: CH.has_capacity(ctx["w"], key, ctx.get("bb")),
 )
 
 

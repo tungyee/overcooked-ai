@@ -22,7 +22,7 @@ ai/revenue/handover.py）；能投的生料走 ThrowBatch。
 资源 id 第二位就是它。拓扑未知（旧合成帧无边界）或地图不分割时没有通道。
 不写 World 以外的状态；每帧缓存在 world 上。
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ai.query import predicates as P
 from ai.space import reachability
@@ -102,34 +102,20 @@ def conveyor_slots(world, bb=None):
     return out
 
 
-def conveyor_interface_distance(world, st, bb=None):
-    # type: (object, Dict, object) -> float
-    """这段传送带离「对面那侧的传送带」最近多远（米）。
+def conveyor_start_rank(st):
+    # type: (Dict) -> Tuple[int, int]
+    """传送带段的「开头」排序键：先大 gz、再大 gx。
 
-    双竹筏靠拢时只有接口那几段真正跨水；送件优先放接口段，别放到
-    远端工作区（那里的带子可能朝反方向走）。对面没有传送带时返回 0，
-    不因此否决。
+    双竹筏的 L 形带从柱子顶端（gx 最大、gz 最大）绕到工作区那一端：
+    反着放会把东西送到远端死胡同（4-2 实测成品盘停在 `gx=0,gz=-2`，
+    玩家够不着）。这里只按局部格排，不猜方向，简单稳定。
     """
-    if not is_conveyor_station(world, st):
-        return 0.0
-    sx, sz = st.get("x"), st.get("z")
-    if sx is None or sz is None:
-        return 0.0
-    best = None  # type: Optional[float]
-    grid = str(st.get("grid") or "")
-    for other in getattr(world, "stations", ()) or ():
-        if other is st or not is_conveyor_station(world, other):
-            continue
-        if str(other.get("grid") or "") == grid:
-            continue                       # 同一条竹筏上的段，不是接口
-        ox, oz = other.get("x"), other.get("z")
-        if ox is None or oz is None:
-            continue
-        d = ((float(ox) - float(sx)) ** 2
-             + (float(oz) - float(sz)) ** 2) ** 0.5
-        if best is None or d < best:
-            best = d
-    return best or 0.0
+    try:
+        gx = int(st.get("gx") or 0)
+        gz = int(st.get("gz") or 0)
+    except (TypeError, ValueError):
+        return (0, 0)
+    return (-gz, -gx)
 
 
 def conveyor_station_of(world, entry, slots=None):

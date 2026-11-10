@@ -41,6 +41,7 @@
 - **切好的生菜/番茄不传**：`ThrowBatch.stages` 对可切料只生成生料一站，AI 切好后手里拿着 `ChoppedLettuce` 时找不到可投的站；玩家没法装沙拉。修：`throw_supply.stages` 对「不烹饪但可切」的料同时生成**生料**和**切好形态**两站（切好的料仍 `throwable=true`）。**不要再给切好的料加传送带送件**：4-2 里只有盘上的成品/盘子不能扔，传送带只给 `plated_dish` / 盘。
 - **分工说「本关没有 Potato/Chicken」**：开局订单只刷到 ChickenOnly + Salad，`Kitchen.materials` 来自当前订单 DAG，ChipsOnly 没出现时 DAG 里没有 `Potato`；模型写的 `Chicken` 是另一关披萨叶子料，本关料箱真实名是 `NuggetChicken`。修：`_known_materials` 并入全部料箱 `ing`；`resolve_material` 对料箱名做唯一子串归一（`Chicken`→`NuggetChicken`）；仍不认识时错误信息带上「可用：…」列表。voice-20261110-221304。
 - **拿着切好的料原地打转**（`trace-20261110-222521` t=710~1048）：P2 抱着 `ChoppedLettuce` 反复 `SendAcross/FetchToBoard`，exec 停在 `confirm ['','']`。根因是 planner 在「拿着可投的料」时仍选了一个要空手的 `FetchToBoard`，树首 `EnsureHandsFree` 把料放下、下一拍再捡。修：`ThrowBatch` 新增 `held_batch` 加分（手里正拿着这一批 +1.0），保证先扔出去；`reachability.resource` 补查 `held_items`（手持资源在可达性里找得到）。fixture `tests/fixtures/rapids/rapids42-hold.ndjson.gz`。
+- **投掷落进垃圾桶**（`trace-20261110-224136` t=171）：P2 从 Raft Two 往对面 Raft One 的砧板扔 `ChoppedLettuce`，直线正好从 `Bin 1` 上方过，料被垃圾桶接住（`on_station=attach:Bin 1`），玩家拿不到。旧 `walls_of` 只把地形墙/高差地面当飞行障碍，垃圾桶是普通站点、不参与。修：`throw_supply.walls_of` 把 `stations[].t == "bin"` 的 AABB 当无高度墙加进去；当前站位直线被截断时 `aim_here` 返回 None，`launch_plan` 另找出手格，落点收到桶前/桶旁。fixture `tests/fixtures/rapids/rapids42-throw-bin.ndjson.gz`，测试 `tests/test_throw_bin.py`。
 
 **已知限制**：插件 0.24.8 的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「带子开头」的固定排序放；两筏漂开时放上去的料会先在带子上，靠拢后再过水。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
 

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai.query import stations as S
 from ai.revenue import cook_supply as CS
+from ai.space import occupancy as O
 from ai.space import regions as RG
 from ai.space import throw as TH
 from ai.space import traffic
@@ -306,7 +307,19 @@ def walls_of(world, floor_y=None):
 
     def compute():
         terrain_y = getattr(world, "terrain_y", None)
-        return TH.throw_walls(terrain_y, floor_y) + TH.raised_ground(terrain_y, floor_y)
+        walls = (TH.throw_walls(terrain_y, floor_y)
+                 + TH.raised_ground(terrain_y, floor_y))
+        # 垃圾桶是“接住飞行物就吞掉”的站点：4-2 往对面砧板投生菜，直线正好
+        # 从 Bin 1 上方过，料被垃圾桶接住，玩家拿不到（trace-20261110-224136
+        # t=171，ChoppedLettuce 落在 attach:Bin 1）。把垃圾桶当无高度墙，
+        # 落点会沿出手方向收到桶前，料落在对面地上，玩家能捡。
+        for st in getattr(world, "stations", ()) or ():
+            if not isinstance(st, dict) or st.get("t") != "bin":
+                continue
+            box = O._box_of(st)
+            if box is not None:
+                walls.append(box)
+        return walls
     return _cached(world, ("walls", floor_y), compute)
 
 

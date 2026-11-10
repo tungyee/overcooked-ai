@@ -331,6 +331,9 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             continue
         if not CH.plate_on_conveyor(world, p):
             continue
+        # 玩家那侧的带子交给他自己拿；P2 抢回来会与 SendAcross 互相拆台。
+        if CH.plate_on_player_side_conveyor(world, p, bb):
+            continue
         cands.append(Candidate(T.FetchConveyorPlate(resources=(p.get("n"),)),
                                [], EST_FETCH))
 

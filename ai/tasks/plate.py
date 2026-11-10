@@ -447,6 +447,11 @@ class FetchConveyorPlate(Task):
     这是**抢救**，不是「就地使用」：拿起来就完成，后面由 planner 按当前
     局面重新决定送餐/装盘/放台面。HANDS="any"：手里有别的盘也先清手去接，
     因为传送带上的盘马上会被销毁。
+
+    只抢玩家那侧够不着的带子（`channels.plate_on_player_side_conveyor` 为假）。
+    玩家站得到的带子就是他取货的通道，P2 每拍抢回来会变成
+    「SendAcross 放上去 → 抢救拿下来 → 再放上去」（trace-20261110-235726
+    t=491~528）。
     """
 
     TYPE = "FetchConveyorPlate"
@@ -476,7 +481,11 @@ class FetchConveyorPlate(Task):
         if p.get("held_by") == P.P1_NAME:
             return False
         from ai.space import channels as CH
-        return CH.plate_on_conveyor(ctx["w"], p)
+        if not CH.plate_on_conveyor(ctx["w"], p):
+            return False
+        # 玩家那侧的带子（多半还是 P2 刚放上去的成品盘）交给他自己取，
+        # 抢下来再放回去会无限循环；只抢救玩家够不着、马上进桶的盘。
+        return not CH.plate_on_player_side_conveyor(ctx["w"], p, ctx.get("bb"))
 
     def build(self):
         # type: () -> Node

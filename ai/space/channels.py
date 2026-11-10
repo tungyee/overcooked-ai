@@ -85,6 +85,42 @@ def _on_conveyor(entry, st):
             + (float(sz) - float(z)) ** 2) <= CONVEYOR_SLOT_DIST ** 2
 
 
+def _station_by_name(world, name):
+    # type: (object, str) -> Optional[Dict]
+    for st in getattr(world, "stations", ()) or ():
+        if is_conveyor_station(world, st) and str(st.get("n") or "") == str(name):
+            return st
+    return None
+
+
+def plate_conveyor_station(world, plate):
+    # type: (object, Optional[Dict]) -> Optional[Dict]
+    """盘躺着的传送带段；认段口径与 plate_on_conveyor 一致（不按距离猜）。"""
+    if not isinstance(plate, dict):
+        return None
+    on = str(plate.get("on_station") or "")
+    if "conveyor" in on.lower() and ":" in on:
+        st = _station_by_name(world, on.split(":", 1)[1].strip())
+        if st is not None:
+            return st
+    name = str(plate.get("name") or "")
+    x, z = plate.get("x"), plate.get("z")
+    if not name or x is None or z is None:
+        return None
+    for it in getattr(world, "items", ()) or ():
+        if not isinstance(it, dict) or str(it.get("n") or "") != name:
+            continue
+        on = str(it.get("on_station") or "")
+        if "conveyor" not in on.lower() or ":" not in on:
+            continue
+        ix, iz = it.get("x"), it.get("z")
+        if ix is None or iz is None:
+            continue
+        if abs(float(ix) - float(x)) < 0.6 and abs(float(iz) - float(z)) < 0.6:
+            return _station_by_name(world, on.split(":", 1)[1].strip())
+    return None
+
+
 def plate_on_conveyor(world, plate):
     # type: (object, Optional[Dict]) -> bool
     """盘是否真的在传送带上。
@@ -113,6 +149,39 @@ def plate_on_conveyor(world, plate):
         if abs(float(ix) - float(x)) < 0.6 and abs(float(iz) - float(z)) < 0.6:
             return True
     return False
+
+
+def belt_reached_by_player(world, st, bb=None):
+    # type: (object, Optional[Dict], object) -> bool
+    """这条传送带上有没有哪一段是玩家（P1）够得着的。
+
+    传送带是整条 L 形带，人常常只站得到其中一段（P2 这侧的是带子开头，
+    玩家站的是下一段）。只要玩家能站到任意一段，带上的东西就归玩家取，
+    P2 不该抢——抢了会变成「放上去 → 抢下来 → 再放上去」
+    （trace-20261110-235726 t=491~528：盘 -20214 在 Raft One 带子上，
+    P1 在下一段接得到，P2 每拍都去拿）。
+    """
+    grid = str(st.get("grid") or "")
+    if not grid or not is_split(world, bb):
+        return False
+    _near, far = _fields(world, bb)
+    for other in getattr(world, "stations", ()) or ():
+        if not is_conveyor_station(world, other):
+            continue
+        if str(other.get("grid") or "") != grid:
+            continue
+        if _reach(world, far, other, P.P1_NAME):
+            return True
+    return False
+
+
+def plate_on_player_side_conveyor(world, plate, bb=None):
+    # type: (object, Optional[Dict], object) -> bool
+    """盘是否躺在玩家那侧的传送带上（=玩家会自己来取，不用抢救）。"""
+    st = plate_conveyor_station(world, plate)
+    if st is None:
+        return False
+    return belt_reached_by_player(world, st, bb)
 
 
 def conveyor_slots(world, bb=None):

@@ -39,7 +39,7 @@
 
 `planner.generate_candidates` 只遍历 `handover.send_requests()`；`wash` / `deliver` 命令的 scope 分别带上 `dirty_plate` / `plated_dish` 的送件。原 1-3 中转台 `PlaceToRelay` / `relay_cells_for` 已删，由它取代。
 
-`FetchConveyorPlate`（`plate.py`）：4-2 的台面传送带末端是垃圾桶。非脏盘（干净盘 / 成品盘）在传送带上时，`channels.plate_on_conveyor` 判它真的在带上（按同名 item 的 `on_station`，不是段心距离——旁边柜台上的盘不能误抢），生成 L4 抢救候选：`HANDS="any"`，树首 `EnsureHandsFree` 后 `pickup`，拿起即完成，后续送餐/装盘由 Planner 按当前局面重选。脏盘仍由 `WashPlate` 处理，避免两个任务抢同一摞。
+`FetchConveyorPlate`（`plate.py`）：4-2 的台面传送带末端是垃圾桶。非脏盘（干净盘 / 成品盘）在传送带上时，`channels.plate_on_conveyor` 判它真的在带上（按同名 item 的 `on_station`，不是段心距离——旁边柜台上的盘不能误抢），生成 L4 抢救候选：`HANDS="any"`，树首 `EnsureHandsFree` 后 `pickup`，拿起即完成，后续送餐/装盘由 Planner 按当前局面重选。**只抢救玩家那侧够不着的带子**：`channels.plate_on_player_side_conveyor`（整条带只要有一段 P1 站得到）为真时不生成，否则会和 `SendAcross` 变成「放上去 → 抢下来 → 再放上去」的死循环（`trace-20261110-235726` t=491~528）。脏盘仍由 `WashPlate` 处理，避免两个任务抢同一摞。
 
 `FetchToCarrier` / `PlaceCarrierInCooker`（`carrier.py`）：**可烹饪载体**（披萨饼 = 反编译 `CookablePreparationContainer`：可放料 + 自带 CookingHandler）。链 = 底料切成饼 → 配料放到饼上 → 料齐的饼整份放进站型对得上的空灶（烤箱）→ `TakeCookedToPlate` 端盘取 → 出餐。判据只读插件协议 8 的能力字段（`crate.chop_cookable` / `items[].cookable` / `cookers[].station_type`），旧帧没有就不发这条链。载体实例每拍按 `carriers.match_prep_carriers` 配给订单（P2 够得着的优先，其次料多的），task 身份只带载体形态名。
 

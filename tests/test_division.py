@@ -196,3 +196,42 @@ def test_rapids35_fixture_station_signature_is_stable():
         frames = [json.loads(line) for line in fh if line.strip()]
     sigs = {D.station_signature(World(f)) for f in frames[:3]}
     assert len(sigs) == 1
+
+
+def test_validate_entry_knows_crates_outside_current_orders(monkeypatch):
+    """订单只刷到沙拉时，玩家那侧的土豆/鸡块料箱仍要能认领。
+
+    voice-20261110-221304：ChickenOnly + Salad 开局，模型写 Potato/Chicken，
+    校验只看当前订单 DAG，把土豆也报成「本关没有物料」。
+    """
+    monkeypatch.setattr(D, "_reachable", lambda *a, **k: True)
+    world = SimpleNamespace(stations=[
+        {"t": "chopping"},
+        {"t": "crate", "ing": "Potato"},
+        {"t": "crate", "ing": "NuggetChicken"},
+        {"t": "crate", "ing": "Lettuce"},
+    ])
+    # 当前订单只有沙拉：DAG 里没有土豆/鸡块
+    kitchen = SimpleNamespace(materials={"Lettuce": SimpleNamespace(items={"Lettuce"})})
+
+    class Book(object):
+        @staticmethod
+        def needs_chopping(item):
+            return item.lower() in ("potato", "nuggetchicken")
+
+    for item in ("Potato", "NuggetChicken"):
+        ok, reason, _ = D.validate_entry(world, None, kitchen, Book(),
+                                         "chop", "player", item)
+        assert ok, (item, reason)
+
+    # 模型写「鸡块」→ Chicken：料箱里唯一子串匹配是 NuggetChicken，归一再校验。
+    assert D.resolve_material(world, kitchen, "Chicken") == "NuggetChicken"
+    ok, reason, _ = D.validate_entry(
+        world, None, kitchen, Book(), "chop", "player",
+        D.resolve_material(world, kitchen, "Chicken"))
+    assert ok, reason
+
+    # 归不到唯一料箱的名字仍要拒绝，并把可用物料列给模型。
+    ok, reason, _ = D.validate_entry(world, None, kitchen, Book(),
+                                     "chop", "player", "Chips")
+    assert not ok and "NuggetChicken" in reason

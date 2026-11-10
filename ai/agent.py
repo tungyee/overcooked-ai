@@ -23,8 +23,8 @@ from ai.dialog.duties import (Kitchen, TaskMeta, TOOL_ACTIONS, node_key,
                               tool_schemas)
 from ai.dialog.division import (DIVISION_ACTIONS, TOOL_ACTION_NAMES,
                                 TOOL_OWNER_NAMES, diff_entries,
-                                station_signature, tool_actions,
-                                validate_entry)
+                                resolve_material, station_signature,
+                                tool_actions, validate_entry)
 from ai.dialog.help import cost_to
 from ai.dialog.policy import EventQueue
 from ai.dialog.schema import DialogState
@@ -750,7 +750,7 @@ class Agent:
                 continue
             action_tool = row.get("action")
             owner_tool = row.get("owner")
-            item = row.get("item")
+            item = resolve_material(world, kitchen, row.get("item"))
             ok, reason, warning = validate_entry(
                 world, self.bb, kitchen, book, action_tool, owner_tool, item)
             action = TOOL_ACTION_NAMES.get(str(action_tool or "").strip())

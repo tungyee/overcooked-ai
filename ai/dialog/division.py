@@ -265,14 +265,56 @@ def _reachable(world, bb, owner, action):
                for name in names for s in stations)
 
 
-def _known_materials(kitchen):
-    # type: (Any) -> set
-    known = set()  # type: set
+def _known_materials(kitchen, world=None):
+    # type: (Any, Any) -> Dict[str, str]
+    """本关可认领的物料名：{小写: 原始写法}。
+
+    不能只看当前订单 DAG：开局订单轮换，4-2 先刷到沙拉时 DAG 里只有
+    生菜/番茄，玩家那侧的土豆/鸡块会被误判「本关没有这个物料」
+    （voice-20261110-221304）。料箱是关卡静态事实，全部并进来。
+    """
+    known = {}  # type: Dict[str, str]
+
+    def add(name):
+        # type: (Any) -> None
+        text = str(name or "").strip()
+        if text:
+            known.setdefault(text.lower(), text)
+
     for name, material in (getattr(kitchen, "materials", None) or {}).items():
-        known.add(str(name).lower())
+        add(name)
         for item in getattr(material, "items", None) or ():
-            known.add(str(item).lower())
+            add(item)
+    for st in getattr(world, "stations", None) or ():
+        if not isinstance(st, dict) or st.get("t") != "crate":
+            continue
+        add(st.get("ing"))
     return known
+
+
+def resolve_material(world, kitchen, item):
+    # type: (Any, Any, Any) -> Any
+    """把模型写的物料名归到本关料箱的真实名（只做唯一匹配）。
+
+    例：4-2 玩家说「鸡块」，模型写 `Chicken`，而这关料箱是
+    `NuggetChicken`（`Chicken` 是另一关披萨的叶子料）。`chicken` 是
+    `NuggetChicken` 的子串且料箱里唯一，就归一到后者。匹配不唯一时
+    原样返回，交给 `validate_entry` 报「本关没有物料 + 可用列表」。
+    """
+    text = str(item or "").strip()
+    if not text:
+        return item
+    known = _known_materials(kitchen, world)
+    if text.lower() in known:
+        return known[text.lower()]
+    crates = []  # type: List[str]
+    for st in getattr(world, "stations", None) or ():
+        if isinstance(st, dict) and st.get("t") == "crate" and st.get("ing"):
+            crates.append(str(st["ing"]))
+    matches = sorted({c for c in crates if text.lower() in c.lower()})
+    if len(matches) == 1:
+        return matches[0]
+    return text
 
 
 def validate_entry(world, bb, kitchen, book, action_tool, owner_tool,
@@ -297,9 +339,10 @@ def validate_entry(world, bb, kitchen, book, action_tool, owner_tool,
 
     item_l = str(item or "").strip().lower()
     if item_l:
-        known = _known_materials(kitchen)
+        known = _known_materials(kitchen, world)
         if known and item_l not in known:
-            return False, "本关没有物料 %s" % (item,), ""
+            hint = "；可用：%s" % "、".join(sorted(known.values())) if known else ""
+            return False, "本关没有物料 %s%s" % (item, hint), ""
         if action == "切" and book is not None:
             try:
                 needed = bool(book.needs_chopping(item))

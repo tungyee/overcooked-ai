@@ -321,20 +321,28 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
                                    ["hands_empty"], EST_FETCH))
 
-    # 传送带上的盘（非脏盘）快到末端垃圾桶：先抢救下来。脏盘有 WashPlate，
-    # 这里跳过，避免两个任务抢同一摞。
+    # 传送带上的盘/脏盘摞快到末端垃圾桶：先抢救下来。脏盘摞和盘是同一类
+    # 东西（都在 `attach:ConveyorStation` 上走），WashPlate 够不着传送带上的
+    # 散落物，所以这里也要给它发 FetchConveyorPlate，别让 P2 看着它进桶
+    # （trace-20261111-010521 t=3510）。
     from ai.space import channels as CH
+    entries = []  # type: List[Dict]
     for p in P.all_plates(world):
         if not p.get("n") or p.get("held_by"):
             continue
         if "dirtyplate" in str(p.get("n") or "").lower():
             continue
-        if not CH.plate_on_conveyor(world, p):
+        entries.append(p)
+    for it in world.items:
+        if "dirtyplate" in str(it.get("n") or "").lower():
+            entries.append(it)
+    for e in entries:
+        if not CH.plate_on_conveyor(world, e):
             continue
         # 玩家那侧的带子交给他自己拿；P2 抢回来会与 SendAcross 互相拆台。
-        if CH.plate_on_player_side_conveyor(world, p, bb):
+        if CH.plate_on_player_side_conveyor(world, e, bb):
             continue
-        cands.append(Candidate(T.FetchConveyorPlate(resources=(p.get("n"),)),
+        cands.append(Candidate(T.FetchConveyorPlate(resources=(e.get("n"),)),
                                [], EST_FETCH))
 
     for c in _cookers(world):

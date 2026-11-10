@@ -105,6 +105,29 @@ def test_plate_match_survives_one_frame_reachability_flicker():
     assert record["top_layer"] == 2
 
 
+def test_conveyor_dirty_stack_rescued_like_plates():
+    """脏盘摞在 P2 这侧传送带上，和普通盘一样走 FetchConveyorPlate 抢救。"""
+    _frame, world, ctx, book = _frame_world(3510)
+    dirty = next(i.get("n") for i in world.items
+                 if "dirty" in str(i.get("n") or "").lower())
+    task = T.FetchConveyorPlate(resources=(dirty,))
+    assert task.feasible(ctx)
+
+    chosen, record = planner.plan(world, ctx["bb"], None, book)
+    assert chosen is not None and chosen.TYPE == "FetchConveyorPlate", chosen
+    assert str(chosen.plate_id) == dirty
+    assert record["top_layer"] == 4
+
+
+def test_wash_not_feasible_when_only_p1_holds_dirty():
+    """只有 P1 手里端着一摞脏盘时，WashPlate 不可行——别空跑三次后冻结。"""
+    _frame, world, ctx, _book = _frame_world(3486)
+    task = T.WashPlate(resources=("WashingPart",))
+    assert not task.feasible(ctx)
+    chosen, _record = planner.plan(world, ctx["bb"], None, _book)
+    assert chosen is None or chosen.TYPE != "WashPlate"
+
+
 def test_hand_holding_needed_raw_blocks_rescue_preemption():
     """t=477：手里拿着 NuggetChoppedChicken，不能被 TakeCookedToPlate 抢走。"""
     _frame, world, ctx, book = _frame_world(477)

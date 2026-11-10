@@ -297,6 +297,12 @@ def task_veto(task, ctx):
             if task.TYPE in ('TakeCookedToPlate', 'SendAcross') \
                     and _plate_reach_grace(ctx, target):
                 continue
+            # 传送带上的盘/脏盘摞：带子格在主网格投影里不可走，can_interact
+            # 恒假，但执行层 Approach 用 belt 兜底去接，和别的传送带物料一样。
+            if task.TYPE == 'FetchConveyorPlate':
+                from ai.space import channels as CH
+                if CH.plate_on_conveyor(ctx['w'], target):
+                    continue
             # 渡运台面上的东西：篮子转回来就够得着，时间表能预测就不否决，
             # 由等待成本（task_wait_seconds → planner 等门让位）决定什么时候去。
             if (shuttle.station_of(ctx['w'], target) is None

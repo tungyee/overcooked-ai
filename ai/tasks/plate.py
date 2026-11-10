@@ -372,12 +372,21 @@ class WashPlate(Task):
         active = getattr(commitment, "active_task", None) \
             if commitment is not None else None
         if active is not None and active == self:
-            return True
-        # 不在续洗态 → 只判物理可行性：有要洗的盘就可行。「要不要洗」的软闸
-        # （场上还有干净盘 / 装配盘就别洗）已拆到 L4 层谓词（spec §A.3）——
-        # feasible 这里若再拦，`now 洗盘` 这种硬指令就够不到 WashPlate 候选，
-        # 因为 _select_imperative 只在 feasible 过滤后的候选里选。
-        return dirty_plate_exists(ctx, self.sink_id)
+            # 续洗只在「P2 真的有活可干」时成立：脏盘摞在换帧的瞬间会从
+            # items[] 里消失一下（进传送带/被 P1 端走），这时树会空跑
+            # 三次失败 → 被 abandoned → recovery_cooldown 冻结整局
+            # （trace-20261111-010521 t=3486~3488）。没活就让承诺自然切换。
+            return dirty_stack_entry(ctx) is not None \
+                or sink_plate_count(ctx, self.sink_id) > 0
+        # 不在续洗态 → 只判物理可行性：有 P2 能处理的活就可行。「要不要洗」
+        # 的软闸（场上还有干净盘 / 装配盘就别洗）已拆到 L4 层谓词
+        # （spec §A.3）——feasible 这里若再拦，`now 洗盘` 这种硬指令就够不到
+        # WashPlate 候选，因为 _select_imperative 只在 feasible 过滤后的候选里选。
+        # 注意不能用 dirty_plate_exists：它会算上 P1 手里端着的那摞，P2 够不着，
+        # 于是候选可行但树首找不到目标 → 空跑失败 → recovery_cooldown 冻结
+        # （trace-20261111-010521 t=3486）。
+        return dirty_stack_entry(ctx) is not None \
+            or sink_plate_count(ctx, self.sink_id) > 0
 
     def build(self):
         # type: () -> Node
@@ -458,6 +467,9 @@ class FetchConveyorPlate(Task):
     DESC = "把传送带上快进垃圾桶的盘拿起来"
     LABEL = "抢救传送带上的盘"
     HANDS = "any"
+    # 抢救的是马上会被销毁的东西；别让连续失败把它 abandoned 进 recovery_cooldown，
+    # 否则这摞盘一路进桶、AI 还整局冻结（trace-20261111-010521）。
+    NO_ABANDON = True
 
     @property
     def plate_id(self):
@@ -466,38 +478,54 @@ class FetchConveyorPlate(Task):
     def claims(self):
         return ((self.plate_id, "rescue"),)
 
+    def _entry(self, ctx):
+        # type: (Dict) -> Optional[Dict]
+        """资源可能是 `plates[]` 里的盘，也可能是 `items[]` 里的脏盘摞。"""
+        rid = self.plate_id
+        p = plate_by_id(ctx, rid)
+        if p is not None:
+            return p
+        for it in (list(ctx["w"].items)
+                   + list(getattr(ctx["w"], "held_items", ()) or ())):
+            if str(it.get("n") or "") == str(rid):
+                return it
+        return None
+
+    def _held(self, ctx):
+        # type: (Dict) -> bool
+        e = self._entry(ctx)
+        if e is None:
+            return False
+        if e.get("held_by") == P.P2_NAME:
+            return True
+        return P.held_matches(ctx["chef"], e.get("name") or e.get("n"))
+
     def done(self, ctx):
         # type: (Dict) -> bool
-        p = plate_by_id(ctx, self.plate_id)
-        if p is None:
-            return True
-        return P.holds_plate(ctx["chef"], p)
+        return self._entry(ctx) is None or self._held(ctx)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
-        p = plate_by_id(ctx, self.plate_id)
-        if p is None or self.done(ctx):
+        e = self._entry(ctx)
+        if e is None or self.done(ctx):
             return False
-        if p.get("held_by") == P.P1_NAME:
+        if e.get("held_by") == P.P1_NAME:
             return False
         from ai.space import channels as CH
-        if not CH.plate_on_conveyor(ctx["w"], p):
+        if not CH.plate_on_conveyor(ctx["w"], e):
             return False
         # 玩家那侧的带子（多半还是 P2 刚放上去的成品盘）交给他自己取，
         # 抢下来再放回去会无限循环；只抢救玩家够不着、马上进桶的盘。
-        return not CH.plate_on_player_side_conveyor(ctx["w"], p, ctx.get("bb"))
+        return not CH.plate_on_player_side_conveyor(ctx["w"], e, ctx.get("bb"))
 
     def build(self):
         # type: () -> Node
-        pid = self.plate_id
-
-        def held(c):
-            return P.holds_plate(c["chef"], plate_by_id(c, pid))
+        held = self._held
 
         return PR.Timeout(Sequence([
             # 手里有别的盘也先放下（就近台面）：不接的话传送带上的盘直接进桶。
             PR.EnsureHandsFree(keep=held),
-            PR.InteractWith(lambda c: plate_by_id(c, pid), "pickup", held),
+            PR.InteractWith(lambda c: self._entry(c), "pickup", held),
         ]), TASK_TIMEOUT_TICKS)
 
 

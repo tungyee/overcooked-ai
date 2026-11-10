@@ -190,8 +190,8 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
         cmd = _move_cmd(w, path[:curb + 1], field, bb,
                         list(w.to_world(*wait_goal)), target, kind, timeout_ms)
         return prim._begin_exec(ctx, ex, cmd)
-    if traffic.at_median(w, chef, spot) and not traffic.red_fresh(w, bb):
-        # 在中线等：灯不是刚红就不继续穿。
+    if traffic.at_median(w, chef, spot) and traffic.pedestrian_red(w) is not True:
+        # 在中线等：灯不是红就不继续穿。
         return _wait_for_light(prim, ctx, label, kind, cur, info)
     if not traffic.safe_to_cross(w, bb, path, cur, chef):
         return _wait_for_light(prim, ctx, label, kind, cur, info)

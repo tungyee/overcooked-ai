@@ -1306,8 +1306,6 @@ def plan(world, bb, order, book):
     # 后重新打分），不再有那个问题。要恢复这条行为时取消注释即可。
     # 函数与相关测试保留。
     # _update_supply_watch(world, bb, book)
-    # ⓪.7 4-1 过街灯态：记录行人红灯的起始拍（Approach 只在刚亮时起步）。
-    traffic.observe(world, bb)
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
     # 已装料载体（包了熟肉的卷饼等）↔订单：覆盖的料不再配锅、不再备料

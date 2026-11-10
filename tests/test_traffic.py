@@ -37,11 +37,9 @@ CAR_ON_PATH = [{"n": "Blue_Car", "minx": 23.5, "maxx": 25.6,
 PATH = [(-8, 1), (0, 1), (8, 1)]
 
 
-def _bb(tick=60, red_since=None):
+def _bb(tick=60):
     bb = Blackboard()
     bb.tick = tick
-    # 默认当作「这一拍刚看到红灯」；要测红灯尾巴就传更早的拍号。
-    bb.traffic_red_since = tick if red_since is None else red_since
     return bb
 
 
@@ -62,19 +60,10 @@ def test_red_lamp_is_safe_immediately():
     assert traffic.safe_to_cross(w, _bb(tick=1), PATH) is True
 
 
-def test_stale_red_waits_for_next_cycle():
-    """红灯已经亮了一阵才到路沿：这一轮来不及，等下一轮。"""
+def test_long_red_is_safe_to_start():
+    """红灯可能亮很久（4-1 开局长红灯实测 20~27s），不能因为「亮了一阵」就干等。"""
     w = _World(lights=LIGHT_RED)
-    bb = _bb(tick=100, red_since=100 - traffic.RED_FRESH_TICKS - 1)
-    assert traffic.safe_to_cross(w, bb, PATH) is False
-
-
-def test_red_without_observation_waits():
-    """没观测到红灯起点（黑板没记）时不猜，停在路沿。"""
-    w = _World(lights=LIGHT_RED)
-    bb = _bb()
-    bb.traffic_red_since = None
-    assert traffic.safe_to_cross(w, bb, PATH) is False
+    assert traffic.safe_to_cross(w, _bb(tick=1000), PATH) is True
 
 
 def test_curb_cell_uses_chef_position_not_cell_center():
@@ -92,23 +81,6 @@ def test_chef_actually_on_road_keeps_going():
     w = _World(lights=LIGHT_GREEN)
     chef = {"name": "Player 2", "x": 24.8, "z": 6.0}
     assert traffic.safe_to_cross(w, _bb(), PATH, cur=(0, 1), chef=chef) is True
-
-
-def test_observe_tracks_red_onset():
-    w = _World(lights=LIGHT_GREEN)
-    bb = _bb(tick=10, red_since=None)
-    bb.traffic_red_since = None
-    traffic.observe(w, bb)
-    assert bb.traffic_red_since is None
-    w.traffic_lights = LIGHT_RED
-    traffic.observe(w, bb)
-    assert bb.traffic_red_since == 10
-    bb.tick = 12
-    traffic.observe(w, bb)
-    assert bb.traffic_red_since == 10       # 红灯持续期间起点不变
-    w.traffic_lights = LIGHT_YELLOW
-    traffic.observe(w, bb)
-    assert bb.traffic_red_since is None
 
 
 def test_green_lamp_blocks_crossing():
@@ -213,12 +185,3 @@ def test_before_median_uses_travel_direction():
     assert traffic.at_median(w, {"x": 27.2, "z": 6.0}, spot) is False
 
 
-def test_red_fresh_requires_observed_onset():
-    w = _World(lights=LIGHT_RED)
-    assert traffic.red_fresh(w, _bb(tick=10, red_since=8)) is True
-    assert traffic.red_fresh(w, _bb(tick=10, red_since=0)) is False
-    assert traffic.red_fresh(w, _bb(tick=10, red_since=10)) is True
-    bb = _bb()
-    bb.traffic_red_since = None
-    assert traffic.red_fresh(w, bb) is False
-    assert traffic.red_fresh(_World(lights=LIGHT_GREEN), _bb()) is False

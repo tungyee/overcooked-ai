@@ -20,10 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 CAR_X_MARGIN = 0.8         # 车宽方向余量
 CAR_Z_MARGIN = 3.0         # 车沿 z 跑，前后各留 3m
-# 红灯起步窗口（拍，20 Hz）：红灯只亮约 1.8 秒，而横穿要 ~2 秒，只有**刚亮**
-# 的时候起步才来得及在黄灯前离开车道。红灯已经亮了一阵才走到路沿的，等下一轮。
-RED_FRESH_TICKS = 6
-
 
 def _truthy(value):
     # type: (Any) -> bool
@@ -207,13 +203,16 @@ def before_median(world, chef, spot, path):
     try:
         mx = spot[1][0]
         sx = world.to_world(*path[0])[0]
+        ex = world.to_world(*path[-1])[0]
     except (AttributeError, TypeError, ValueError):
         return False
-    if sx < mx:
+    # 方向看路径终点相对起点，不能看起点相对中线：人已经过中线时，
+    # 按起点判会把「继续向东」误判成向西，改道命令反而把人拽回中线。
+    if abs(ex - sx) < 0.1:
+        return False
+    if ex > sx:
         return x < mx - 0.1
-    if sx > mx:
-        return x > mx + 0.1
-    return False
+    return x > mx + 0.1
 
 
 def _lamp_state(light):
@@ -269,46 +268,15 @@ def _vehicle_blocks(world, road_cells):
     return False
 
 
-def observe(world, bb):
-    # type: (Any, Any) -> None
-    """每拍记录「行人红灯从哪一拍亮起」；没有灯/路网、或灯不是红时清空。"""
-    if bb is None:
-        return
-    if not getattr(world, "traffic_lights", None) or road_box(world) is None:
-        bb.traffic_red_since = None
-        return
-    if pedestrian_red(world) is not True:
-        bb.traffic_red_since = None
-        return
-    if getattr(bb, "traffic_red_since", None) is None:
-        bb.traffic_red_since = getattr(bb, "tick", 0) or 0
-
-
-def red_fresh(world, bb):
-    # type: (Any, Any) -> bool
-    """行人红灯是否刚亮起（这一轮还来得及横穿）。
-
-    `bb` 为 None（离线调用）时只看灯色；否则要求观察到红灯起点且在
-    `RED_FRESH_TICKS` 内——红灯只有 ~1.8 秒，尾巴起步会卡在车道上。
-    """
-    if pedestrian_red(world) is not True:
-        return False
-    if bb is None:
-        return True
-    since = getattr(bb, "traffic_red_since", None)
-    if since is None:
-        return False
-    return (getattr(bb, "tick", 0) or 0) - since <= RED_FRESH_TICKS
-
-
 def safe_to_cross(world, bb, path, cur=None, chef=None):
     # type: (Any, Any, Optional[List[Tuple[int, int]]], Optional[Tuple[int, int]], Any) -> bool
     """路径要过街时是否可以从当前格起步。
 
     已经在马路条带里（厨师**实际位置**在 road）→ True：半途不因灯变绿停下，
-    先把这一趟走完；否则看行人灯：红 = 可走，黄/绿 = 等。红灯必须是刚亮起
-    （`RED_FRESH_TICKS` 内），否则横穿到一半就撞上黄灯起步的车。车 KillPlane
-    AABB 覆盖到路径格时仍然不走（兜底）。
+    先把这一趟走完；否则看行人灯：红 = 可走，黄/绿 = 等。红灯可能很短（~1.8s）
+    也可能很长（开局实测 20~27s），不在起步时猜剩余时间——红灯尾巴起步由
+    `_crossing_guard` 的「途中变灯去中线等」兜底。车 KillPlane AABB 覆盖到
+    路径格时仍然不走（兜底）。
 
     `chef` 缺省时退回按格心判「是否已在马路上」，只给不认识厨师的旧调用方用。
     """
@@ -322,8 +290,8 @@ def safe_to_cross(world, bb, path, cur=None, chef=None):
         return True
     if road_box(world) is None or not getattr(world, "traffic_lights", None):
         return True
-    if not red_fresh(world, bb):
-        # 红之外（黄/绿）、读不到灯色、或红灯已经亮了一阵，都不走。
+    if pedestrian_red(world) is not True:
+        # 红之外（黄/绿）以及读不到灯色都不走。
         return False
     return not _vehicle_blocks(world, road_cells)
 

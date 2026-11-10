@@ -122,9 +122,6 @@ class Blackboard:
     supply_idle_since: Optional[int] = None   # 当前短缺连续段的起始拍
     supply_ok_since: Optional[int] = None     # 当前非短缺连续段的起始拍
     supply_override: bool = False             # 短缺超过宽限期 → 撤销 cook 负分
-    # 4-1 过街：行人红灯亮起的起始拍（None = 非红/无过街数据）。红灯只有
-    # ~1.8 秒，AI 只在刚亮时起步；由 traffic.observe 每拍维护。
-    traffic_red_since: Optional[int] = None
 
     # ---------- 对话层（spec §4.5–4.7）----------
     # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。

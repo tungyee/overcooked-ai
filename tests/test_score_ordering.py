@@ -240,3 +240,23 @@ def test_table_compares_scores_not_constants():
         checked += 1
     # 表是空的也算通过就没意义了
     assert checked >= 7, "只检查到 %d 个断言，表的规模不对" % checked
+
+
+def test_holding_plate_beats_rescuing_pot():
+    """已经端着目标盘去盛熟料时，不该输给把锅端离灶台的兜底。
+
+    trace-20261110-231906 / 用户实机：拿着盘子去盛米饭，RescueCooked
+    的 pressure 分更高，锅被端走、盘还空着。端盘盛饭同样能停烧糊计时，
+    还把这单往前推，应优先。
+    """
+    from ai.query import predicates as P
+    c = _cooker("c1", cooked=True, cooking=True, contents=["sushirice"])
+    c["cooking_time"] = 12.0
+    c["cooking_progress"] = 13.0
+    plate = dict(_PLATE_EMPTY, held_by=P.P2_NAME)
+    w = _world([c], plates=[plate], held="plate")
+    by = _score(w, [
+        T.TakeCookedToPlate("1", ("c1", "p1"), "BoiledSushiRice"),
+        T.RescueCooked(resources=("c1",)),
+    ])
+    assert by["TakeCookedToPlate"] > by["RescueCooked"], by

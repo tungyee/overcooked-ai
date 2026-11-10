@@ -213,8 +213,8 @@ TERM_WHITELIST = {
     # pref 是对话偏好（spec §4.5）。L1/L2 只给**正分**开口：负分在
     # planner._matching_preferences 里已被免疫规则跳过，所以「我来煮」的
     # 负 claim 不会把「饭要糊了」压下去，而「你去煮」的 direct 仍能生效。
-    L_IRREVERSIBLE: frozenset(["pressure", "pref"]),
-    L_RESCUE: frozenset(["pressure", "pref"]),
+    L_IRREVERSIBLE: frozenset(["pressure", "pref", "held_plate"]),
+    L_RESCUE: frozenset(["pressure", "pref", "held_plate"]),
     # L3 兑现：送哪种菜。combo 是这层的主角（它只能选菜、不能选单，
     # 见 planner._credited_order_id 的 55/0 实测）。
     L_REDEEM: frozenset(["combo_head", "combo_break", "urgency", "pref"]),
@@ -240,6 +240,8 @@ TERM_WHITELIST = {
         # 三单全过期）。只给 FillCooker 算，按单发射的 FetchToCooker 走
         # async_resource，不重复给。
         "cooker_idle",
+        # 端着目标盘去盛熟料：优先于把锅端走的兜底。
+        "held_plate",
         # ThrowBatch 的批量加分：W_BATCH × (N−1)，见 planner._score_throw_batch。
         "batch_bonus",
         # 手上正拿着这一批料：先投出去，别选要空手的 task 把手里的料放下。

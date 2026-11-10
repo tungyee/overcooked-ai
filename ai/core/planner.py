@@ -699,6 +699,12 @@ W_URGENCY = 5.0
 # 时间压力权重：锅熟了/快糊了要越早去端。pressure 曲线 0~2（0=生、1=刚熟、
 # 2=快糊），权重越高，熟料/快糊锅越能压过备菜、送餐等普通候选。
 W_PRESSURE = 5.0
+
+# 已经端着目标盘去盛熟料时的加分：端盘盛饭本身就能把料从锅里取走、停
+# 烧糊计时，还顺带完成这单；不该输给「把锅端离灶台」的救锅兜底。
+# 2.0 足够压过同一口锅 pressure 的差值（实测 4.5~6.0 一带），但压不过
+# 真正的快糊/火情（L1/L2 的 pressure 更高，且这里只在 L_RESCUE/L_PREP 生效）。
+W_HELD_PLATE = 2.0
 # 洗盘压力权重：干净空盘越少越该洗（同 pressure 口径：0=充足、1=只剩一块、
 # 2=用光）。无盘时拼装被卡死，需压过备菜与填灶；只剩一块时提前补盘但不盖过
 # 送餐。
@@ -967,6 +973,7 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     p2_held_plate = P.held_name(p2) if p2 is not None else ""
     p1 = P.chef_by_name(world.chefs, P.P1_NAME)
     p1_held_plate = P.held_name(p1) if p1 is not None else ""
+    rctx = reachability.context(world, bb)
     edges = []
     for p in P.all_plates(world):
         pid = p.get("n")
@@ -987,6 +994,14 @@ def _match_plates_to_orders(world, bb, book, orders=None):
         stack_top = not held_by_p1 and P.plate_stack_top(p)
         if not (on_counter or held_by_p2 or loose_with_contents or stack_top):
             continue
+        # 盘先要 P2 够得着才有意义：4-2 的盘会随竹筏漂到对面，把 P2
+        # 够不着的盘配给队首单会让 TakeCookedToPlate 恒 unreachable，
+        # 同时占住 P2 这侧唯一能用的空盘，整局没任务可做
+        # （trace-20261110-233159 t=1600~1726：-19556 在 Raft One、
+        # -19560 在 Raft Two，队首 All 单绑到 -19556，AI 静止）。
+        if not held_by_p2:
+            if not reachability.can_interact(rctx, p):
+                continue
         tokens = book.plate_tokens(p)
         # 同等缺料时台面盘优先于堆顶空盘：已摆好的盘不该被晾成孤儿。
         stack_rank = 1 if (stack_top and P.plate_count(p) == 0) else 0
@@ -2084,7 +2099,14 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     if task.TYPE == "ThrowBatch":
         return _score_throw_batch(world, bb, candidate, book, plate_match,
                                   slack_map, cooker_match, layer)
-    terms = {}
+    terms = {"held_plate": 0.0}
+    if task.TYPE == "TakeCookedToPlate":
+        pid = getattr(task, "plate_id", None)
+        p = next((x for x in P.all_plates(world)
+                  if str(x.get("n")) == str(pid)), None)
+        chef = P.chef_by_name(world.chefs, P.P2_NAME)
+        if p is not None and P.holds_plate(chef, p):
+            terms["held_plate"] = W_HELD_PLATE
 
     # 送餐的「有效订单」是游戏会记账的那一单，不是 task 绑的那个（实测 55/0：
     # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 完成度都该按它求值。

@@ -51,3 +51,19 @@ def test_send_across_candidate_is_gone_while_plate_is_held_for_all_order():
     frame = next(f for f in _frames() if f["_trace_t"] == 541)
     task, _record = _plan(frame)
     assert "order#1" in str(task)
+
+
+def test_unreachable_plate_is_not_matched_to_the_head_order():
+    """队首单的盘漂到对面时，别占住 P2 这侧唯一能用的盘，导致整局没任务。
+
+    trace-20261110-233159 t=1726：-19556 在 Raft One（P2 够不着），
+    -19560 在 Raft Two；旧匹配把队首 All 单绑到 -19556，TakeCookedToPlate
+    恒 unreachable，P2 静止到结束。
+    """
+    frame = json.loads(gzip.open(
+        os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                     "rapids42-static.ndjson.gz"), "rt").readline())
+    task, record = _plan(frame)
+    assert "-19556" not in record["plate_match"]
+    assert task is not None and task.TYPE == "TakeCookedToPlate"
+    assert "-19560" in str(task)

@@ -5,7 +5,8 @@
 `veto=infeasible`，候选里 `chosen` 却在 WashPlate 与 FillCooker 之间 2:1
 来回跳，而 `exec.task` 一直是 WashPlate。
 
-机制：`_apply_commitment_inertia` 攒到 INFEASIBLE_THRESHOLD=3 决定改选，
+机制：`_apply_commitment_inertia` 攒到 INFEASIBLE_THRESHOLD（按 5Hz 帧计）
+决定改选，
 `agent._tick_once` ⑨.5 的「后置条件已成立就让它把 SUCCESS 报完」又把旧
 task 接回去 → streak 清零 → 下一拍重新计数，于是永远攒不满。
 

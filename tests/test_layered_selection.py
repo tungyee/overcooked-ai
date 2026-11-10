@@ -289,7 +289,8 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
 
     当前承诺在 L6，这一拍出现 L5 候选 → 承诺不在 in_layer → 不在 scored
     → _apply_commitment_inertia 的 ③ 把它当「不在可行候选中」，走
-    infeasible_streak 的 3 拍宽限再改选，而不是立即切。
+    infeasible_streak 的宽限（按 5Hz 帧计，见 INFEASIBLE_THRESHOLD）
+    再改选，而不是立即切。
     """
     from ai.state.blackboard import Blackboard, Commitment
     from ai import tasks as T
@@ -304,12 +305,10 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
     # 只有 L5 候选进了 scored（承诺的 L6 被分层挡在外面）
     scored = [(fill, 4.8, {"cooker_idle": 4.8})]
 
-    # 前两拍保持承诺
-    assert planner._apply_commitment_inertia(scored, None, bb) == prep
-    assert bb.commitment.infeasible_streak == 1
-    assert planner._apply_commitment_inertia(scored, None, bb) == prep
-    assert bb.commitment.infeasible_streak == 2
-    # 第三拍改选
+    # 宽限期内保持承诺；达到 INFEASIBLE_THRESHOLD 才改选。
+    for i in range(1, planner.INFEASIBLE_THRESHOLD):
+        assert planner._apply_commitment_inertia(scored, None, bb) == prep
+        assert bb.commitment.infeasible_streak == i
     assert planner._apply_commitment_inertia(scored, None, bb) == fill
     assert bb.commitment.infeasible_streak == 0
 

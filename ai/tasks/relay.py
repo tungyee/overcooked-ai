@@ -23,6 +23,7 @@ from ai import primitives as PR
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.revenue import handover as HO
 from ai.revenue import throw_supply as TS
+from ai.space import channels as CH
 from ai.space import regions as RG
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            _grid_matches, _station_for_item,
@@ -48,6 +49,14 @@ THROW_BATCH_TICKS = THROW_ROUND_TICKS * 12
 # （Rapids_2_1 分割地图把料投给对面的 P1）。批量的问题——缺口不按锅位封顶、
 # batch_bonus 叠加后压过别的备料、中途常被打断——等单份跑稳再说。
 MAX_BATCH_UNITS = 1
+
+# 传送带接缝漂开时，端着东西在带子旁等它重新对上的上限（拍）。10 秒：
+# 4-2 两筏一圈约 30~40 秒，但接缝窗口不止一次；等满仍没有就交还 Planner，
+# 不让 P2 端着成品盘无限站桩。
+CONVEYOR_WAIT_TICKS = 200
+# SendAcross 正常取放 + 等接缝的总预算。内层 Timeout 必须与外层一致，
+# 否则 Executor 的外层放宽会被内层更紧的 Timeout 静默吃掉。
+SEND_ACROSS_TIMEOUT_TICKS = TASK_TIMEOUT_TICKS + CONVEYOR_WAIT_TICKS
 
 
 def _channel_slot(ctx, key, lock, allow_boards=False):
@@ -123,6 +132,12 @@ class SendAcross(Task):
     HANDS = "empty"
 
     @property
+    def TIMEOUT_TICKS(self):
+        # type: () -> int
+        """取放 + 等接缝的总预算（内层 Timeout 用同一表达式）。"""
+        return SEND_ACROSS_TIMEOUT_TICKS
+
+    @property
     def source_id(self):
         return self._resources[0]
 
@@ -141,7 +156,19 @@ class SendAcross(Task):
         spec = self._spec()
         if spec is None:
             return None
-        return spec.resolve(ctx, self.source_id, self.order_id)
+        source = spec.resolve(ctx, self.source_id, self.order_id)
+        if source is not None:
+            return source
+        # 接缝刚漂开的那一帧，send_requests/sources 会因为 channel_keys 为空
+        # 不再返回来源；但东西还在 P2 手里/这侧，应该能等下一帧重开，而不是
+        # 把任务判成不可行。只在通道宽限期内给 fallback，避免把本侧带子当
+        # 送件通道（那种情况 channel 从没开过，waitable 为假）。
+        if self.channel == CH.CONVEYOR and CH.conveyor_waitable(ctx.get("bb")):
+            probe = HO.SendSource(self.item, self.source_id, self.order_id)
+            target = spec.pickup(ctx, probe)
+            if target is not None and target.get("held_by") in (None, P.P2_NAME):
+                return probe
+        return None
 
     def wait_targets(self, ctx):
         # type: (Dict) -> List[Dict]
@@ -179,10 +206,15 @@ class SendAcross(Task):
         source = self._source(ctx)
         if source is None:
             return False
+        slot = _channel_slot(ctx, self.channel, {}, spec.allow_boards)
+        if slot is None:
+            # 传送带接缝漂开：刚开过就允许端着成品盘等下一帧重开。
+            # 没开过的通道仍然不可送（自己这侧的带子会进本侧桶）。
+            return (self.channel == CH.CONVEYOR
+                    and CH.conveyor_waitable(ctx.get("bb")))
         if not spec.capacity(ctx, self.channel):
             return False
-        # 至少有一格此刻够得着、或时间表能预测什么时候够得着
-        return _channel_slot(ctx, self.channel, {}, spec.allow_boards) is not None
+        return True
 
     def build(self):
         # type: () -> Node
@@ -191,6 +223,7 @@ class SendAcross(Task):
             return PR.Timeout(PR.EnsureHandsFree(), TASK_TIMEOUT_TICKS)
         key = self.channel
         lock = {}  # type: Dict[str, Any]
+        timeout = self.TIMEOUT_TICKS
 
         def source(c):
             return self._source(c)
@@ -210,14 +243,23 @@ class SendAcross(Task):
                                            self.order_id)
             return spec.done(c, s, key)
 
-        return PR.Timeout(Sequence([
+        steps = [
             PR.EnsureHandsFree(keep=held),
             PR.InteractWith(pickup, "pickup", held),
+        ]
+        if key == CH.CONVEYOR:
+            # 4-2 接缝会逐帧漂开：先把东西拿在手里，等在带子旁直到有槽位，
+            # 而不是让 InteractWith 拿到 None 直接 failure。
+            steps.append(PR.WaitUntil(
+                lambda c: _channel_slot(c, key, lock,
+                                        spec.allow_boards) is not None,
+                CONVEYOR_WAIT_TICKS))
+        steps.append(
             # 篮子不在口上时 Approach 原地等 / 先去候车格（不占本 task 超时预算）
             PR.InteractWith(lambda c: _channel_slot(c, key, lock,
                                                     spec.allow_boards),
-                            "placement", placed),
-        ]), TASK_TIMEOUT_TICKS)
+                            "placement", placed))
+        return PR.Timeout(Sequence(steps), timeout)
 
 
 def _dest_station(ctx, dest_id):

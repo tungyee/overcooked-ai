@@ -365,14 +365,14 @@ class FillCarrier(Task):
         def filled(c):
             return held_matches_contents(c, base_form, self._after(c))
 
-        # 端卷饼盛料：端卷饼 → 提前站到锅前等熟 → 熟了盛进卷饼。交互句柄用
-        # kind=None（通用朝向句柄），与 TakeCookedToPlate 同理由（端容器面对锅
-        # 时 placement 句柄为 null、pickup 会被脚边散料抢走）。
+        # 端卷饼盛料：端卷饼 → 提前站到锅前等熟 → 熟了盛进卷饼。交互用
+        # kind="use"，与 TakeCookedToPlate 同理由（端容器面对锅时 placement
+        # 句柄为 null、pickup 会被脚边散料抢走）。
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding),
             PR.InteractWith(wrapper_source, "pickup", holding),
             PR.Approach(source_target, None),
             PR.Face(source_target),
             PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),
-            PR.InteractWith(source_target, None, filled),
+            PR.InteractWith(source_target, "use", filled),
         ]), TAKE_COOKED_TIMEOUT_TICKS)

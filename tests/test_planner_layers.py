@@ -485,6 +485,7 @@ _ALL_TERMS = (
     "completion_ratio", "combo_head",
     "combo_break", "deadline_lookahead", "plate_pressure", "cooker_idle",
     "no_plate_placed", "pref", "batch_bonus", "held_batch", "held_plate",
+    "hands",
 )
 
 

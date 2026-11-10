@@ -253,6 +253,9 @@ TERM_WHITELIST = {
         "batch_bonus",
         # 手上正拿着这一批料：先投出去，别选要空手的 task 把手里的料放下。
         "held_batch",
+        # 手持贵重物（成品盘/熟锅）时，需要空手的备菜 task 的腾手代价。
+        # 见 planner.W_HANDS_VALUABLE；否则低分 task 会把成品盘放下。
+        "hands",
     ]),
     # L7 清理：只剩对话偏好；同分时按候选顺序（稳定排序）。
     L_CLEANUP: frozenset(["pref"]),

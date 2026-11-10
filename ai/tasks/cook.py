@@ -611,10 +611,10 @@ class TakeCookedToPlate(Task):
             p = plate_by_id(c, plate_id)
             return p is not None and c["book"].plate_has(p, cooked)
 
-        # 盛饭的交互句柄用 kind=None（通用朝向句柄）：端盘面对锅时，游戏的
-        # placement 句柄为 null、pickup 句柄会被地上的散料抢走（实机：脚边有
-        # 散米时 pickup=SushiRice 而非锅），只有 m_gridLocation（面朝的那格）
-        # 稳定指向锅。改回 "placement" 会因句柄 null 而 re-aim 空转。
+        # 盛饭的交互用 kind="use"：端盘面对锅时，游戏的 placement 句柄为
+        # null、pickup 句柄会被地上的散料抢走（实机：脚边有散米时
+        # pickup=SushiRice 而非锅）。插件按 UseName / 朝向句柄校验，句柄
+        # 指向旁边的柜台时不会误按（4-2 散炸篮 vs 柜台，trace-20261111-001945）。
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding_plate),
             PR.InteractWith(plate_target, "pickup", holding_plate),
@@ -623,7 +623,7 @@ class TakeCookedToPlate(Task):
             PR.Approach(source_target, None),
             PR.Face(source_target),
             PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),
-            PR.InteractWith(source_target, None, poured),
+            PR.InteractWith(source_target, "use", poured),
             # 树尾不许挂等待节点（与旧实现同款原因）：盘里一有料本 task 就
             # 不可行 → planner 下一拍换 task → executor halt 这棵树；若树尾有
             # 等待节点，成功记账（释放认领）会被静默吞掉，下一拍又去取熟料

@@ -40,6 +40,24 @@ CONVEYOR_SLOT_DIST = 0.75
 KEEP_FREE = {STATIC: 0, CONVEYOR: 0}
 SHUTTLE_KEEP_FREE = 1
 
+# 传送带通道刚可用过的宽限（拍）：4-2 两筏相对位置会让段可达性逐帧翻转。
+# 5Hz 一帧 = 4 拍；200 拍 = 10 秒，足够等到下一次接缝对齐。
+CONVEYOR_GRACE_TICKS = 200
+
+
+def conveyor_waitable(bb):
+    # type: (object) -> bool
+    """传送带通道最近是否可用过（宽限期内）。
+
+    `SendAcross` 用它把「接缝暂时漂开」从不可行变成可等：否则一帧可达性
+    翻转就会 failure，下一棵树的 EnsureHandsFree 把成品盘放下
+    （trace-20261111-001945 t=409/2524）。
+    """
+    if bb is None:
+        return False
+    until = (getattr(bb, "conveyor_open_until", None) or {}).get(CONVEYOR, 0)
+    return until > getattr(bb, "tick", 0)
+
 
 def _fields(world, bb=None):
     near = reachability.field_for(world, bb, P.P2_NAME)
@@ -196,6 +214,9 @@ def conveyor_slots(world, bb=None):
     """
     cache = getattr(world, "_conveyor_slots", None)
     if cache is not None:
+        if cache and bb is not None:
+            bb.conveyor_open_until[CONVEYOR] = (
+                getattr(bb, "tick", 0) + CONVEYOR_GRACE_TICKS)
         return cache
     out = []  # type: List[Dict]
     if is_split(world, bb):
@@ -212,6 +233,10 @@ def conveyor_slots(world, bb=None):
                 continue
             if _reach(world, near, st, P.P2_NAME):
                 out.append(st)
+    if out and bb is not None:
+        # 记下「这条通道刚开过」，供 SendAcross 在下一帧闪断时继续等。
+        bb.conveyor_open_until[CONVEYOR] = (
+            getattr(bb, "tick", 0) + CONVEYOR_GRACE_TICKS)
     world._conveyor_slots = out
     return out
 
@@ -318,7 +343,10 @@ def channel_keys(world, bb=None):
     # type: (object, object) -> List[str]
     """此刻可用的通道（渡运网格按名排序在前，传送带随后，静态通道在后）。"""
     keys = sorted(shuttle.shuttle_grids(world))
-    if conveyor_slots(world, bb):
+    # 刚开过的传送带也在 keys 里：候选仍要生成，SendAcross 会端着东西等
+    # 接缝重开。否则一帧 flash 就让所有送件候选消失，AI 直接停摆
+    # （trace-20261111-001945 t=2934）。
+    if conveyor_slots(world, bb) or conveyor_waitable(bb):
         keys.append(CONVEYOR)
     if static_slots(world, bb):
         keys.append(STATIC)

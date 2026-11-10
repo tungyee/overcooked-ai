@@ -641,6 +641,22 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
         return False, "abandoned"
     if _breaks_combo(task, ctx["w"]):
         return False, "combo_break"
+    # 端着有内容的成品盘时，不许为了备菜/扔料把它放下。空盘可以放；
+    # 成品盘放下后很容易被忘在台面上（trace-20261111-001945 t=458/2950）。
+    chef = P.chef_by_name(ctx["w"].chefs, P.P2_NAME)
+    if task.TYPE in _HANDS_DROP_PRONE_TYPES:
+        if _holding_plated_dish(chef, ctx["w"]):
+            return False, "hands_full_plate"
+    # 已经端着一盘有内容的菜时，SendAcross 只准送手里这块：选另一块盘的
+    # SendAcross 会先 EnsureHandsFree 把手里这盘放下
+    # （trace-20261111-001945 t=2900 两块盘同时在台上）。
+    # DeliverPlate 不拦：直接送队首的现成盘仍是更值钱的动作（3-6 实机
+    # t=9772/9800，手里是别的盘、队首鸡肉卷盘已经料齐）。
+    if task.TYPE == "SendAcross" and _holding_plated_dish(chef, ctx["w"]):
+        held_plate = _held_plate_id(chef, ctx["w"])
+        target = getattr(task, "source_id", None)
+        if target is not None and str(target) != held_plate:
+            return False, "hands_full_plate"
     # 终局否决暂时禁用（用户反馈：临近结束角色停摆，看起来像卡了）。
     # 需要恢复时取消下面两行注释即可。
     # if _is_endgame_waste(task, cand, time_left):
@@ -721,6 +737,16 @@ W_PRESSURE = 5.0
 # 2.0 足够压过同一口锅 pressure 的差值（实测 4.5~6.0 一带），但压不过
 # 真正的快糊/火情（L1/L2 的 pressure 更高，且这里只在 L_RESCUE/L_PREP 生效）。
 W_HELD_PLATE = 2.0
+# 手里端着成品盘/熟锅时，需要空手的备菜 task 的腾手代价。必须压过
+# ThrowBatch(2.5) 这类低分候选：否则送餐一失败就切去扔料，树首
+# EnsureHandsFree 把成品盘放到柜台上（trace-20261111-001945 t=458）。
+W_HANDS_VALUABLE = 6.0
+# 这些 task 的树首是 EnsureHandsFree；手里有贵重物时选它们 = 直接放下。
+_HANDS_DROP_PRONE_TYPES = frozenset({
+    "ThrowBatch", "FetchToBoard", "FetchToPlate", "FetchToCooker",
+    "FillCooker", "PlaceCleanPlate", "MergePlates", "FetchToCarrier",
+    "FillCarrier", "PlaceCarrierInCooker", "Chop", "Prefetch",
+})
 # 洗盘压力权重：干净空盘越少越该洗（同 pressure 口径：0=充足、1=只剩一块、
 # 2=用光）。无盘时拼装被卡死，需压过备菜与填灶；只剩一块时提前补盘但不盖过
 # 送餐。
@@ -857,7 +883,10 @@ W_NO_PLATE_PLACED = 3.0
 # 承诺惯性常量（spec §6.5）
 COMMITMENT_MARGIN = 2.0         # 改选门槛（分数差）
 PROGRESS_BONUS_PER_STEP = 1.0   # 每完成一步的进度加成
-INFEASIBLE_THRESHOLD = 3        # 连续多少拍不可行才放弃
+# 连续多少拍不可行才放弃承诺。插件 5Hz（一帧 4 拍），3 拍 < 一帧：
+# 移动筏的格子投影闪一帧就够把任务切走，随后另一棵树的首步把手里的料/盘
+# 放下（trace-20261111-001945 t=477~529）。8 拍 = 2 帧，留一帧迟滞。
+INFEASIBLE_THRESHOLD = 8
 
 
 # ==================== 每拍 1:1 匹配（盘↔订单 / 灶↔订单）====================
@@ -1476,8 +1505,9 @@ def plan(world, bb, order, book):
             # ⑤ 承诺惯性（Plan 3 Task 6）。**分层不改这里一行**：分层管
             # 「挑哪个」，抢占仍由 COMMITMENT_MARGIN 与 pressure>=1.0 跳过
             # 惯性负责（spec §8）。当前承诺若落在低层，它不在 scored 里 →
-            # 走 infeasible_streak 的 3 拍宽限再改选，白捡一个防抖。
-            chosen_task = _apply_commitment_inertia(scored, world, bb)
+            # 走 infeasible_streak 的宽限（INFEASIBLE_THRESHOLD，按 5Hz
+            # 帧计）再改选，白捡一个防抖。
+            chosen_task = _apply_commitment_inertia(scored, world, bb, book)
             # ⑤.5 过街承诺：已经走到马路上时不因“刚熟”换任务；火/快糊仍可抢。
             crossing_task = _crossing_hold(world, bb, feasible, chosen_task)
             if crossing_task is not None:
@@ -2103,6 +2133,86 @@ def _is_rescue_action(task):
         "Extinguish", "TakeCookedToPlate", "FillCarrier")
 
 
+def _holding_valuable(chef, world):
+    # type: (Optional[Dict], World) -> bool
+    """手里是不是「放下就亏」的东西：盘子（含成品盘）或锅具。"""
+    if chef is None or P.hands_free(chef):
+        return False
+    return bool(P.held_is_plate(chef)
+                or P.held_is_cookware(chef, getattr(world, "recipes", None)))
+
+
+def _held_plate_id(chef, world):
+    # type: (Optional[Dict], World) -> Optional[str]
+    """P2 手里那块盘的实例 id；不是盘返回 None。"""
+    if chef is None or not P.held_is_plate(chef):
+        return None
+    name = P.held_name(chef)
+    fallback = None
+    for p in P.all_plates(world):
+        if str(p.get("name") or "").lower() != name:
+            continue
+        # 盘名会重复（equipment_plate_01 / (1) / (2)），必须优先按 held_by
+        # 认手里那块；只按名字会拿到台面上同名的另一块（3-6 实机帧里
+        # -88364 在手上、-61740 在台面，二者同名）。
+        if p.get("held_by") == P.P2_NAME:
+            return str(p.get("n"))
+        if p.get("held_by") is None and fallback is None:
+            fallback = str(p.get("n"))
+    return fallback
+
+
+def _holding_plated_dish(chef, world):
+    # type: (Optional[Dict], World) -> bool
+    """手里是不是端着一盘有内容的菜（不是空盘）。"""
+    plate_id = _held_plate_id(chef, world)
+    if plate_id is None:
+        return False
+    for p in P.all_plates(world):
+        if str(p.get("n")) == plate_id:
+            return P.plate_count(p) > 0
+    return False
+
+
+def _holding_needed_for(task, world, book=None):
+    # type: (Any, World, Optional[Any]) -> bool
+    """当前 task 是不是正拿着它下一步要用的料/盘。
+
+    用于承诺惯性：FillCooker 拿着 NuggetChoppedChicken 时，L2 的熟锅不该
+    把它抢走——抢走的第一步 EnsureHandsFree 就会把料放下，下一拍再回来捡，
+    形成「拿起 → 放下」循环（trace-20261111-001945 t=477~529）。
+    """
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    if chef is None or P.hands_free(chef):
+        return False
+    held = P.held_name(chef)
+    task_type = getattr(task, "TYPE", None)
+
+    if task_type in ("FillCooker", "FetchToCooker"):
+        raws = getattr(task, "raws", ()) or ()
+        forms = set()
+        for raw in raws:
+            form = book.cook_input_form(raw) if book is not None else raw
+            if form:
+                forms.add(str(form).lower())
+        return held in forms
+
+    if task_type in ("SendAcross", "DeliverPlate", "TakeCookedToPlate"):
+        return bool(P.held_is_plate(chef))
+
+    if task_type in ("FetchToBoard", "Chop", "FetchToPlate", "ThrowBatch"):
+        item = getattr(task, "item", None)
+        if item and P.held_matches(chef, item):
+            return True
+        if book is not None and item:
+            form = book.cook_input_form(item)
+            if form and held == str(form).lower():
+                return True
+        return False
+
+    return False
+
+
 def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                      slack_map=None, cooker_match=None, layer=None):
     # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
@@ -2115,14 +2225,22 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     if task.TYPE == "ThrowBatch":
         return _score_throw_batch(world, bb, candidate, book, plate_match,
                                   slack_map, cooker_match, layer)
-    terms = {"held_plate": 0.0}
+    terms = {"held_plate": 0.0, "hands": 0.0}
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
     if task.TYPE == "TakeCookedToPlate":
         pid = getattr(task, "plate_id", None)
         p = next((x for x in P.all_plates(world)
                   if str(x.get("n")) == str(pid)), None)
-        chef = P.chef_by_name(world.chefs, P.P2_NAME)
         if p is not None and P.holds_plate(chef, p):
             terms["held_plate"] = W_HELD_PLATE
+
+    # 手持贵重物（成品盘/熟锅）时，树首要 EnsureHandsFree 的 task 吃重罚。
+    # 这不是硬否决：当前 task 若已经拿着它要的盘子/锅，由
+    # _holding_needed_for 在承诺惯性里保护。
+    if (getattr(task, "TYPE", None) in _HANDS_DROP_PRONE_TYPES
+            and _holding_valuable(chef, world)
+            and not _holding_needed_for(task, world, book)):
+        terms["hands"] = -W_HANDS_VALUABLE
 
     # 送餐的「有效订单」是游戏会记账的那一单，不是 task 绑的那个（实测 55/0：
     # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 完成度都该按它求值。
@@ -2720,8 +2838,8 @@ def _find_order_by_id(world, order_id):
 
 # ==================== 承诺惯性实现（Plan 3 Task 6）====================
 
-def _apply_commitment_inertia(scored, world, bb):
-    # type: (List[Tuple[Any, float, Any]], World, Blackboard) -> Optional[Any]
+def _apply_commitment_inertia(scored, world, bb, book=None):
+    # type: (List[Tuple[Any, float, Any]], World, Blackboard, Optional[Any]) -> Optional[Any]
     """承诺惯性：除非完成/失败/连续不可行/出现显著更高分者，否则不改选（spec §6.5）。
 
     两条规则：
@@ -2759,6 +2877,11 @@ def _apply_commitment_inertia(scored, world, bb):
     if (_time_pressure(top_task, world) >= 1.0
             and not _tasks_equal(top_task, current_task)
             and _time_pressure(current_task, world) < 1.0):
+        # 当前 task 正拿着它下一步要用的料/盘时，L2 熟锅也不能抢：抢走的
+        # 第一步 EnsureHandsFree 会把料放下，下一拍再回来捡（4-2 鸡块
+        # 在 FillCooker ↔ TakeCookedToPlate 之间反复丢，t=477~529）。
+        if _holding_needed_for(current_task, world, book):
+            return current_task
         return top_task
 
     # 在候选中查找当前承诺的 task

@@ -114,6 +114,10 @@ class Blackboard:
     # 平台接缝门洞的开关时间表（ai/space/seam_clock.SeamClock）：跨帧学周期，
     # 寻路按到达时刻查要等多久。Agent 每拍 observe；切关随黑板整体换新。
     seam_clock: Any = None
+    # 传送带送件通道最近一次有可用槽位的拍号（key=通道 key，value=失效拍号）。
+    # 4-2 两筏相对位置会让 @conveyor 逐帧闪断：刚开过就允许 SendAcross 端着
+    # 成品盘等接缝重开，而不是 failure 后把盘放下（trace-20261111-001945）。
+    conveyor_open_until: Dict[Any, int] = field(default_factory=dict)
     # 渡运台面（ai/space/shuttle.py）的可交互窗口时间表，同为 SeamClock：每个
     # 台面对 P2 可达区「够得着 / 够不着」当一道门。
     shuttle_clock: Any = None

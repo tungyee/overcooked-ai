@@ -23,7 +23,17 @@ from ai.query import predicates
 # 常量
 INTERRUPT_FAILURE_THRESHOLD = 3  # 中断 task 连续失败 N 次强制退回 Normal
 BLACKLIST_TICKS = 100  # 拉黑目标的时长（拍数）
-STUCK_SAME_CELL_THRESHOLD = 3  # 连续多少拍在同一格算卡住
+# 连续多少拍在同一格算卡住。插件 5Hz（一帧 4 拍），3 拍 < 一帧，切菜/
+# 洗碗/盛盘站定一帧就报 stuck（trace-20261111-001945 里 125 次误报）。
+# 20 拍 = 1 秒；原地动作另由 _STATIONARY_TASK_TYPES 直接排除。
+STUCK_SAME_CELL_THRESHOLD = 20
+
+# 这些 task 的完成本来就要站定，不能用「同格」判卡住；真正走不动由执行层
+# motion.stalled 兜底（trace._stuck_info 的第二分支）。
+_STATIONARY_TASK_TYPES = frozenset({
+    "Chop", "WashPlate", "FillCooker", "TakeCookedToPlate",
+    "PlaceCleanPlate", "MergePlates", "ResetPlate",
+})
 HANDLING_DISTANCE = 2.0  # P1 在灶附近多少距离算"正在处理"
 
 
@@ -104,6 +114,14 @@ def _is_stuck(world, bb):
         return False
 
     scratch = bb.scratch
+
+    # 原地动作（切菜/洗碗/盛盘）本来就不动，不能算卡住；清零并刷新格，
+    # 换到移动 task 时从新格重新计数。走不动由执行层 motion.stalled 兜底。
+    active = getattr(getattr(bb, "commitment", None), "active_task", None)
+    if getattr(active, "TYPE", None) in _STATIONARY_TASK_TYPES:
+        scratch.last_cell = current_cell
+        scratch.same_count = 0
+        return False
 
     # 先检查当前是否已经卡住
     is_currently_stuck = scratch.same_count >= STUCK_SAME_CELL_THRESHOLD

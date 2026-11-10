@@ -510,14 +510,16 @@ def test_tick_once_forwards_branches_and_rescue_override(dagent, world):
 
 
 def test_context_reports_stuck_from_scratch(dagent, world):
+    from ai.core import arbiter
     from ai.state.blackboard import StuckScratch
-    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=5)
+    n = arbiter.STUCK_SAME_CELL_THRESHOLD
+    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=n)
 
     ctx = dagent._build_dialog_context(world)
 
     stuck = ctx["p2"]["stuck"]
     assert stuck is not None
-    assert "卡在" in stuck and "(3,4)" in stuck and "5 拍" in stuck
+    assert "卡在" in stuck and "(3,4)" in stuck and ("%d 拍" % n) in stuck
 
 
 def test_context_stuck_none_below_threshold_or_no_scratch(dagent, world):
@@ -530,11 +532,14 @@ def test_context_stuck_none_below_threshold_or_no_scratch(dagent, world):
 
 
 def test_tick_once_emits_stuck_event(dagent, world):
+    from ai.core import arbiter
     from ai.state.blackboard import StuckScratch
     from unittest.mock import patch
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
+    active = T.FetchToBoard(order_id=1, resources=("board_01",),
+                            item="Cucumber")
+    n = arbiter.STUCK_SAME_CELL_THRESHOLD
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 2)
-    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=7)
+    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=n)
 
     with patch("ai.agent.arbiter.select_mode",
                return_value=("Normal", "stuck detected")), \
@@ -545,10 +550,10 @@ def test_tick_once_emits_stuck_event(dagent, world):
 
     stuck = emit.call_args[0][0]["stuck"]
     assert stuck == {
-        "task": "Chop:Cucumber（订单 #1）",
+        "task": "FetchToBoard:Cucumber（订单 #1）",
         "reason": "stuck detected",
         "pos": [3, 4],
-        "duration_ticks": 7,
+        "duration_ticks": n,
         "retries": 2,
     }
 

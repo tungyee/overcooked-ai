@@ -88,3 +88,24 @@ def test_approach_uses_wash_stance_goal():
     goal = cmd["goal"]
     assert abs(goal[0] - sink["x"]) < 0.2
     assert abs(goal[1] - 1.2) < 0.2
+
+
+def test_wash_stance_keeps_searching_past_unlinkable_points():
+    """池前最近的能站点挂不到可走格时，继续往外找，别直接判没有站位。
+
+    trace-20261110-232403 t=2300：竹筏边缘的 WashingPart 最近的能站点
+    (z=0.85) 离可走格 >1m，旧 _edge_stances 在这里 break 掉，wash_stances
+    返回空，WashPlate 全程 infeasible，脏盘被传送带送进 Bin 1。
+    """
+    frame = json.loads(gzip.open(
+        os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                     "rapids42-wash-edge.ndjson.gz"), "rt").readline())
+    world, book, bb, ctx = _ctx(frame)
+    sink = _sink(world)
+    stances = shuttle.wash_stances(world, sink)
+    assert stances
+    assert stances[0]["cell"] in (ctx["field"] or {})
+    assert reachability.can_interact(ctx, sink)
+    chosen, record = planner.plan(world, bb, None, book)
+    assert chosen.TYPE == "WashPlate"
+    assert record["top_layer"] == 4

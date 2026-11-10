@@ -235,7 +235,7 @@ def wash_stances(world, st):
         half = 0.55
         box = (float(x) - half, float(x) + half,
                float(z) - half, float(z) + half)
-    return _edge_stances(world, st, box, LINK_DIST)
+    return _edge_stances(world, st, box, LINK_DIST, search_past_unlinked=True)
 
 
 def hatch_stances(world, st):
@@ -286,8 +286,8 @@ def _hatch_box(world, st):
     return O._box_of(st)
 
 
-def _edge_stances(world, st, box, link_dist):
-    # type: (object, Dict, Optional[Tuple[float, float, float, float]], float) -> List[Dict]
+def _edge_stances(world, st, box, link_dist, search_past_unlinked=False):
+    # type: (object, Dict, Optional[Tuple[float, float, float, float]], float, bool) -> List[Dict]
     cache = getattr(world, "_shuttle_stances", None)
     if cache is None:
         cache = world._shuttle_stances = {}
@@ -307,16 +307,23 @@ def _edge_stances(world, st, box, link_dist):
                 while d <= STANCE_REACH + 1e-6:
                     x, z = ex + dx * d, ez + dz * d
                     if _standable(world, x, z):
-                        if best is None or d < best[0]:
-                            best = (d, x, z)
-                        break
+                        # 能站还不够：这个点要能挂到寻路落脚格。太贴墙时
+                        # 最近的可站点可能离可走格 > link_dist（4-2 竹筏
+                        # 边缘洗碗池），search_past_unlinked=True 时继续往外找；
+                        # 渡运台面保持旧行为（最近能站点挂不上就这个方向没有）。
+                        cell = _link_cell(world, x, z, link_dist)
+                        if cell is not None:
+                            if best is None or d < best[0]:
+                                best = (d, x, z, cell)
+                            break
+                        if not search_past_unlinked:
+                            best = (d, x, z, None)
+                            break
                     d += STANCE_STEP
-            if best is None:
+            if best is None or best[3] is None:
                 continue
-            cell = _link_cell(world, best[1], best[2], link_dist)
-            if cell is None:
-                continue
-            out.append({"x": best[1], "z": best[2], "face": (-dx, -dz), "cell": cell})
+            out.append({"x": best[1], "z": best[2], "face": (-dx, -dz),
+                        "cell": best[3]})
     cache[key] = out
     return out
 

@@ -183,6 +183,11 @@ def _interact_goals(ctx, entry):
         cells = sink_place_cells(entry, world.stations, world.to_grid)
         goals = set(navigation.interact_cells_multi(
             cells, world.walkable, world.belt_cells, include_belts=True))
+        if not goals:
+            # 竹筏边缘的洗碗池：主网格量化后整排交互格被台面/边缘挡住，
+            # 用格外站位（池前约 0.9m）兜底，否则 WashPlate 恒判不可达，
+            # 传送带送来的脏盘一路进垃圾桶。
+            goals = {s['cell'] for s in shuttle.wash_stances(world, entry)}
     else:
         # 与执行层 move._station_interact_cells 同一口径：按占地（含承载台面）
         # 取交互位，移动篮亚格偏移时盘不会因量化到台面后一格而判不可达。

@@ -150,13 +150,22 @@ def dirty_stack_entry(ctx):
     'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
     都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
     """
-    stack = None
-    for it in getattr(ctx["w"], "items", ()) or ():
-        if "dirtyplate" in str(it.get("n") or "").lower():
-            stack = it
-            break
-    if stack is None:
+    stacks = [it for it in (getattr(ctx["w"], "items", ()) or ())
+              if "dirtyplate" in str(it.get("n") or "").lower()]
+    if not stacks:
         return None
+    # 4-2 两边竹筏各有一摞脏盘时，items[] 顺序不保证先给 P2 这侧；
+    # 取第一个会把 Raft One 上够不着的那摞当成目标，WashPlate 恒 infeasible，
+    # 而 P2 这侧传送带上的脏盘一路被送进垃圾桶（trace-20261110-230514
+    # t=900：Raft One 的 workstation_plate_return 排在 Raft Two 的
+    # ConveyorStation 前面）。有可达场时优先可达的那摞。
+    field = ctx.get("field")
+    if field:
+        from ai.space import reachability
+        reachable = [it for it in stacks if reachability.can_interact(ctx, it)]
+        if reachable:
+            stacks = reachable
+    stack = stacks[0]
     sx, sz = stack.get("x"), stack.get("z")
     if sx is None or sz is None:
         return stack

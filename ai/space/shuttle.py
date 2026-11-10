@@ -217,6 +217,27 @@ def stances(world, st):
     return _edge_stances(world, st, O._box_of(st), LINK_DIST)
 
 
+def wash_stances(world, st):
+    # type: (object, Dict) -> List[Dict]
+    """洗碗池的格外站位：格子交互位为空时的兜底（同 stances 的形状）。
+
+    4-2 洗碗池在竹筏边缘，主网格量化后交互格整排被台面/边缘挡住；实际
+    站在池子前 0.9m 就能洗。按池子世界坐标合成 1.1m 见方的 box，从外沿
+    找能站的点，再挂到最近可走主网格格。只在常规交互位为空时由调用方使用。
+    """
+    if not isinstance(st, dict) or st.get("t") != "washing":
+        return []
+    box = O._box_of(st)
+    if box is None:
+        x, z = st.get("x"), st.get("z")
+        if x is None or z is None:
+            return []
+        half = 0.55
+        box = (float(x) - half, float(x) + half,
+               float(z) - half, float(z) + half)
+    return _edge_stances(world, st, box, LINK_DIST)
+
+
 def hatch_stances(world, st):
     # type: (object, Dict) -> List[Dict]
     """出餐口的格外站位：格内交互位一个都没有时的兜底（同 stances 的形状）。

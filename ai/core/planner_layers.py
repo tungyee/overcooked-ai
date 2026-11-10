@@ -59,6 +59,23 @@ LAYER_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
                     "TakeCookedToPlate", "ThrowBatch", "MergePlates")
 
 
+def dirty_on_conveyor(world):
+    # type: (Any) -> bool
+    """P2 这侧传送带上有没有脏盘：不洗就会被带进垃圾桶销毁。
+
+    4-2 传送带末端就是 Bin 1，玩家把脏盘送过来后，WashPlate 若还按
+    L_CLEANUP 排队，会先去备菜，脏盘一路进桶（trace-20261110-230514
+    t=1800：DirtyPlateStack 落在 attach:Bin 1）。这种「有时限的清理」提到
+    L_UNBLOCK，和「0 盘」同级。
+    """
+    for it in getattr(world, "items", ()) or ():
+        if "dirtyplate" not in str(it.get("n") or "").lower():
+            continue
+        if "conveyor" in str(it.get("on_station") or "").lower():
+            return True
+    return False
+
+
 def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
                 usable_plate_fn=None, plate_total_fn=None):
     # type: (Callable, Callable, Callable, Optional[Callable], Optional[Callable]) -> Tuple
@@ -95,6 +112,8 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
             # 跨区送盘：只在对面缺盘时才是候选（cross_supply.send_deficit），
             # 缺盘就是拼装被卡住，同摆盘一层
             or t.TYPE == "SendAcross"
+            # 脏盘已经上了传送带：不洗就会被带进垃圾桶销毁，别排到 L7。
+            or (t.TYPE == "WashPlate" and dirty_on_conveyor(w))
         )),
         # L_CAPACITY 现在没有成员，见下方 L_CAPACITY 常量处的说明。规则表里
         # 保留这一行（谓词恒假）而不是删掉，是为了让层号与表的行一一对应 ——

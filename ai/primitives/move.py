@@ -24,6 +24,8 @@ FACE_MAX_TICKS = 40
 MOVE_TIMEOUT_MS = 8000
 # 路沿等灯/车的上限（拍）：实机红绿周期约 5 秒，留 40 秒余量。
 TRAFFIC_WAIT_TICKS = 800
+# 跑动 dash 的最短路径（格）：短距离不跑，免得在台面边/交互位附近冲过头。
+RUN_MIN_CELLS = 5
 
 
 def _nav_debug(msg):
@@ -87,14 +89,19 @@ def _move_cmd(w, path, field, bb, goal, target, kind, timeout_ms, tail=None):
     按 Dash。整条路径只要有一段缝就给 dash=True 会让插件在任意平台边缘
     提前起跳（trace-20261110-003648 的 5 次落水有 4 次是这种误跳）。
 
+    `run`：长距离普通地面路径授权插件按 Dash 提速（不是跳边）。插件自己再判
+    直段/离终点还远/2m 前方有地板，短路径和跨缝、门洞、传送门段一律不开。
+
     tail：路点末尾追加的世界点（渡运站位朝台面推一点）。
     """
     points, gates, hops, extra_s = portals.route(w, path, field, bb)
     if tail is not None:
         points = list(points) + [tail]
     edges = gaps.command_gap_edges(w, points)
+    # 跑动 dash：只给干净的普通地面长路径；跨缝/等门/过传送门时插件要精细控制。
+    run = not edges and not gates and not hops and len(path) >= RUN_MIN_CELLS
     cmd = build_command("move", goal=goal, path=points, target=target, kind=kind,
-                        dash=bool(edges), dash_edges=edges,
+                        dash=bool(edges), dash_edges=edges, run=run,
                         # 门洞口等门 / 过传送门时放宽超时（插件按 max_wait 等）
                         timeout_ms=timeout_ms + int(1000 * extra_s))
     if gates:
@@ -288,11 +295,18 @@ class Approach(Primitive):
             # 漂移出餐口此刻没有格内交互位：在格外站位旁（或其落脚格）即算到位
             return not (shuttle.at_stance(chef, hatch)
                         or cur in {s["cell"] for s in hatch})
-        if cur == cell and (w.walkable(*cell) or P.interact_ready(chef, st, self.kind, w.to_grid)):
-            return False
         goals = _station_interact_cells(st, cell, w, self.kind,
                                         include_belts=True,
                                         field=ctx.get('field'))
+        wash = (shuttle.wash_stances(w, st)
+                if isinstance(st, dict) and st.get("t") == "washing" and not goals
+                else [])
+        if wash:
+            # 竹筏边缘洗碗池没有格内交互位：站在格外站位旁即算到位
+            return not (shuttle.at_stance(chef, wash)
+                        or cur in {s["cell"] for s in wash})
+        if cur == cell and (w.walkable(*cell) or P.interact_ready(chef, st, self.kind, w.to_grid)):
+            return False
         if cur not in goals:
             _nav_debug("reapproach t=%s target=%s kind=%s cur=%s cell=%s goals=%s"
                        % (_nav_time(ctx), _nav_target(st), self.kind,
@@ -351,9 +365,15 @@ class Approach(Primitive):
         if hatch:
             return self._tick_hatch(ctx, ex, st, hatch)
 
-        blocked = _blocked_cells(ctx, P.resource_id(st))
         goals = _station_interact_cells(st, cell, w, self.kind,
                                         field=ctx.get("field"))
+        wash = (shuttle.wash_stances(w, st)
+                if isinstance(st, dict) and st.get("t") == "washing" and not goals
+                else [])
+        if wash:
+            return self._tick_hatch(ctx, ex, st, wash)
+
+        blocked = _blocked_cells(ctx, P.resource_id(st))
         if self.allow_target:
             goals = [cell] + goals
         if not goals:

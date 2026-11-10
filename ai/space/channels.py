@@ -186,16 +186,31 @@ def plate_on_player_side_conveyor(world, plate, bb=None):
 
 def conveyor_slots(world, bb=None):
     # type: (object, object) -> List[Dict]
-    """P2 这侧够得着的传送带段（地图不分割时为空）。"""
+    """能往对面送东西的传送带段：P2 够得着、且这条带玩家也够得着。
+
+    每条带都只在自己这侧跑到末端垃圾桶，玩家够不着的那条不是送件通道：
+    放上去只会进自己这边的桶，还会被 `FetchConveyorPlate` 立刻抢回来，
+    变成「放上去 → 抢下来」的死循环（trace-20261111-000723 t=227~375：
+    盘 -18776 放在 Raft Two 带子 (4,0)，每 10 拍被抢一次）。两筏漂开、
+    只够得着自己这条带时就不送，等漂近到能碰到玩家那侧的带子再送。
+    """
     cache = getattr(world, "_conveyor_slots", None)
     if cache is not None:
         return cache
     out = []  # type: List[Dict]
     if is_split(world, bb):
-        near, _far = _fields(world, bb)
+        near, far = _fields(world, bb)
+        player_grids = set()  # type: set
         for st in getattr(world, "stations", ()) or ():
             if is_conveyor_station(world, st) \
-                    and _reach(world, near, st, P.P2_NAME):
+                    and _reach(world, far, st, P.P1_NAME):
+                player_grids.add(str(st.get("grid") or ""))
+        for st in getattr(world, "stations", ()) or ():
+            if not is_conveyor_station(world, st):
+                continue
+            if str(st.get("grid") or "") not in player_grids:
+                continue
+            if _reach(world, near, st, P.P2_NAME):
                 out.append(st)
     world._conveyor_slots = out
     return out

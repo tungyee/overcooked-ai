@@ -5,11 +5,13 @@
 从 Sushi_4_1 切进 4-2 后的第 12290 / 12863 拍）：
 
   - 两边各一条 L 形 `ConveyorStation` 台面传送带，人上不去；
-  - 一块成品盘 -205162 / -205166 在 AI 这侧，出餐口在玩家那侧，只能送上传送带；
+  - 每条带只在自己这侧跑到末端垃圾桶，**只有玩家够得着的那条**能送东西
+    （两边都够不着的那条放上去就是进桶：trace-20261111-000723 t=227~375）；
   - 一块切好的生菜挂在传送带段上，AI 够得着（接收侧）。
 
 这组测试钉住：主网格原点来自 `grids[].main`、竹筏不被当成渡运通道、
-移动网格站点不参与「上下/左右半场」、成品盘走 `SendAcross(@conveyor)`。
+移动网格站点不参与「上下/左右半场」、成品盘走 `SendAcross(@conveyor)`
+且只放到玩家够得着的带子段上。
 """
 import gzip
 import json
@@ -31,11 +33,12 @@ from tests.test_exec_primitives import FakeExec
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
                    "rapids42-conveyor.ndjson.gz")
-FIX2 = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
-                    "rapids42-ingredient.ndjson.gz")
 FIX3 = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
                     "rapids42-hold.ndjson.gz")
+FIX_SHARED = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                          "rapids42-shared-belt.ndjson.gz")
 PID = "-205166"
+PID_SHARED = "-20214"
 
 
 def _frames():
@@ -43,14 +46,15 @@ def _frames():
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def _frames2():
-    with gzip.open(FIX2, "rt", encoding="utf8") as fh:
-        return [json.loads(line) for line in fh if line.strip()]
-
-
 def _frames3():
     with gzip.open(FIX3, "rt", encoding="utf8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+def _frame_shared(t):
+    with gzip.open(FIX_SHARED, "rt", encoding="utf8") as fh:
+        return next(json.loads(line) for line in fh
+                    if line.strip() and json.loads(line)["_trace_t"] == t)
 
 
 def _world(frame):
@@ -99,36 +103,40 @@ def test_ingredient_on_belt_is_receivable():
 
 def test_plated_dish_uses_conveyor_channel():
     """出餐口在玩家那侧、P2 够不着：成品盘应生成 SendAcross(@conveyor)。"""
-    world = _world(_frames()[1])
+    world = _world(_frame_shared(499))      # P2 端着生菜+番茄盘，玩家那侧带子够得着
     ctx, book = _ctx(world)
     reqs = [r for r in HO.send_requests(world, book, ctx.get("bb"))
             if r.kind == "plated_dish"]
     assert [(str(r.source.source_id), r.channel) for r in reqs] == [
-        (PID, CH.CONVEYOR)]
+        (PID_SHARED, CH.CONVEYOR)]
     task, _rec = planner.plan(world, ctx["bb"], None, book)
     assert task.TYPE == "SendAcross" and task.channel == CH.CONVEYOR
-    assert task.source_id == PID
+    assert task.source_id == PID_SHARED
+
+
+def test_own_side_belt_is_not_a_send_channel():
+    """自己这侧、玩家够不着的带子不是送件通道（放上去只会进本侧桶）。"""
+    world = _world(_frames()[1])            # 两筏漂开，只够得着 Raft Two
+    ctx, book = _ctx(world)
+    assert CH.conveyor_slots(world, ctx.get("bb")) == []
+    assert CH.CONVEYOR not in CH.channel_keys(world, ctx.get("bb"))
+    assert [r for r in HO.send_requests(world, book, ctx.get("bb"))
+            if r.kind == "plated_dish"] == []
 
 
 def test_send_holding_plate_targets_a_belt_segment():
-    """端着成品盘：走到自己这侧的传送带段旁，放置句柄指向该段。"""
-    frame = _frames()[1]
-    plate = next(p for p in frame["plates"] if str(p.get("n")) == PID)
-    plate["held_by"] = P.P2_NAME
-    chef = next(c for c in frame["chefs"] if c.get("name") == P.P2_NAME)
-    chef["held"] = plate.get("name")
-    world = _world(frame)
+    """端着成品盘：走到玩家那侧的传送带段旁，放置句柄指向该段。"""
+    world = _world(_frame_shared(499))
     ctx, _book = _ctx(world)
-    task = T.SendAcross("2", (PID, CH.CONVEYOR), "plated_dish")
+    task = T.SendAcross("1", (PID_SHARED, CH.CONVEYOR), "plated_dish")
     assert task.feasible(ctx) and not task.done(ctx)
     ctx = dict(ctx, exec=FakeExec(), tick=0)
     assert task.build().tick(ctx) == Status.RUNNING
     cmd = ctx["exec"].issued[-1]
     assert cmd["cmd"] == "move" and cmd["kind"] == "placement"
     assert cmd["target"]["name"].startswith("ConveyorStation")
-    assert cmd["target"]["grid"] == "Raft Two"
-    # 放带子的开头（大 gz / 大 gx），不是远端死胡同 (0,-2)。
-    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
+    assert cmd["target"]["grid"] == "Raft One"
+    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (-3, 2)
 
 
 def test_send_done_when_plate_is_on_belt():
@@ -167,17 +175,20 @@ def test_chopped_salad_ingredients_are_thrown_not_conveyored():
     assert chosen.TYPE == "ThrowBatch" and chosen.item == "ChoppedLettuce"
 
 
-def test_send_prefers_belt_start_over_far_end():
-    """成品盘放带子开头（4,0），不要再放到远端 (0,-2)。"""
-    frame = next(f for f in _frames2() if f["_trace_t"] == 680)
-    plate = next(p for p in (frame.get("held_plates") or [])
-                 if str(p.get("n")) == "-18774")
+def test_send_skips_player_unreachable_far_end():
+    """放玩家够得着的那一段，不要放到玩家够不着的远端（0,2 / -1,2）。"""
+    frame = _frame_shared(353)
+    plate = next(p for p in frame["plates"] if str(p.get("n")) == PID_SHARED)
+    plate["held_by"] = P.P2_NAME
+    chef = next(c for c in frame["chefs"] if c.get("name") == P.P2_NAME)
+    chef["held"] = plate.get("name")
     world = _world(frame)
     ctx, _book = _ctx(world)
-    task = T.SendAcross("3", ("-18774", CH.CONVEYOR), "plated_dish")
+    task = T.SendAcross("1", (PID_SHARED, CH.CONVEYOR), "plated_dish")
     assert task.feasible(ctx) and not task.done(ctx)
     ctx = dict(ctx, exec=FakeExec(), tick=0)
     assert task.build().tick(ctx) == Status.RUNNING
     cmd = ctx["exec"].issued[-1]
     assert cmd["kind"] == "placement"
-    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
+    assert cmd["target"]["grid"] == "Raft One"
+    assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (-2, 2)

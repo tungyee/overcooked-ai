@@ -28,7 +28,7 @@
 | `carrier.py` | `FetchToCarrier`、`PlaceCarrierInCooker` |
 | `reposition.py` | `Reposition` |
 
-`SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道三种：渡运篮子（key = 渡运网格名）、台面传送带（key = `channels.CONVEYOR`，Rapids_4_2 双竹筏）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。传送带段用段名/段心认领（移动网格上不好按格子认），放料固定在带子**开头**（`channels.conveyor_start_rank`：先大 `gz`、再大 `gx`），不要放到远端死胡同；`on_station` 挂在带上的料/盘算「已送出」。渡运通道留 1 格回程，静态/传送带不留。任务本身只做「拿起来 → 放到通道格」；四种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
+`SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道三种：渡运篮子（key = 渡运网格名）、台面传送带（key = `channels.CONVEYOR`，Rapids_4_2 双竹筏）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。传送带段用段名/段心认领（移动网格上不好按格子认），放料固定在带子**开头**（`channels.conveyor_start_rank`：先大 `gz`、再大 `gx`），不要放到远端死胡同；**只放玩家够得着的那条带子**（`channels.conveyor_slots` 会滤掉自己这侧、末端通本侧垃圾桶的带子——放上去必进桶，还会被 `FetchConveyorPlate` 抢回来）；`on_station` 挂在带上的料/盘算「已送出」。渡运通道留 1 格回程，静态/传送带不留。任务本身只做「拿起来 → 放到通道格」；四种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
 
 - `clean_plate`：对面缺干净盘（`cross_supply.send_deficit` / `far_plate_need`）；盘只放普通台面。
 - `carrier`：料齐的生载体，对应站型的灶只在对面、缺的料 P2 补不出来（`cross_supply.stuck_carriers`）；可退到两边都够得着的空砧板（`channels.free_carrier_slots`，砧板只给载体用）。

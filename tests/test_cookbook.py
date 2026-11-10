@@ -36,6 +36,13 @@ def test_resolve_story_pattern_fallback():
     assert book.resolve("3_6_Dynamic_Lvl_02_2P").key == "story/3-6"
 
 
+def test_resolve_p2_suffix_variant():
+    """实机 4-1 的资产名是 Sushi_4_1_P2（后缀 _P2，不是 _2P）。"""
+    book = default_cookbook()
+    assert book.resolve("Sushi_4_1_P2").key == "story/4-1"
+    assert book.resolve("Sushi_4_1").key == "story/4-1"
+
+
 def test_resolve_human_number_and_rel_path():
     book = default_cookbook()
     assert book.resolve("5-5").key == "story/5-5"

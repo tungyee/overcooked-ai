@@ -40,11 +40,13 @@ _SECTION_LABEL = {
 SECTION_NAMES = ("summary", "division", "mechanics", "traps", "recipes", "all")
 
 _INTERNAL_RE = re.compile(r"`([A-Za-z0-9_]+)`")
-_P2_SUFFIX = re.compile(r"_2P$")
+# 双人后缀两种写法都见过：Sushi_1_4_2P（_2P）和 Sushi_4_1_P2（_P2）。
+_P2_SUFFIX = re.compile(r"_(?:2P|P2)$", re.IGNORECASE)
 
 
 def _strip_p2(level):
     # type: (str) -> str
+    """去掉双人后缀；`_2P` / `_P2` 两种写法都认。"""
     return _P2_SUFFIX.sub("", str(level or "").strip())
 
 

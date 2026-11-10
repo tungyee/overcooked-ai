@@ -135,6 +135,61 @@ def test_initial_division_event_and_context(agent, worker):
             "chop", "cook", "plate"]
 
 
+def test_initial_division_waits_for_level(agent, worker):
+    """关卡名没到位时不能发开局分工：否则 prompt 里没有攻略。"""
+    world = make_world(level=None)
+    agent.book = RecipeBook(world.recipes, world.stations)
+    agent._service_dialog(world)
+    assert "division" not in [event[0] for event in worker.events]
+
+    world.level = "Wizard_5_5_2P"
+    agent._service_dialog(world)
+    assert "division" in [event[0] for event in worker.events]
+
+
+def test_initial_division_waits_for_guide(agent, worker):
+    """攻略为空就不发开局分工；攻略加载后下一拍再发。"""
+    world = make_world()
+    agent.book = RecipeBook(world.recipes, world.stations)
+    # 假装这一关已经观察过，避免 _maybe_reset_dialog_level 重新加载攻略。
+    agent._dialog_scene_key = ("s", 1, "Wizard_5_5_2P")
+    agent._guide = None
+    agent._service_dialog(world)
+    assert "division" not in [event[0] for event in worker.events]
+
+    agent._guide = FakeGuide()
+    agent._service_dialog(world)
+    assert "division" in [event[0] for event in worker.events]
+
+
+def test_load_guide_prefers_level_number(agent, monkeypatch):
+    calls = []
+
+    class Book(object):
+        def resolve(self, key):
+            calls.append(key)
+            return FakeGuide() if key == "4-1" else None
+
+    monkeypatch.setattr("ai.agent.default_cookbook", lambda: Book())
+    agent._load_guide("Sushi_4_1_P2", "4-1")
+    assert calls == ["4-1"]
+    assert agent._guide is not None
+
+
+def test_load_guide_falls_back_to_asset_name(agent, monkeypatch):
+    calls = []
+
+    class Book(object):
+        def resolve(self, key):
+            calls.append(key)
+            return FakeGuide() if key == "Wizard_5_5_2P" else None
+
+    monkeypatch.setattr("ai.agent.default_cookbook", lambda: Book())
+    agent._load_guide("Wizard_5_5_2P")
+    assert calls == ["Wizard_5_5_2P"]
+    assert agent._guide is not None
+
+
 def test_set_division_applies_and_weights(agent, worker):
     world = make_world()
     agent.book = RecipeBook(world.recipes, world.stations)

@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.6")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.8")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -26,6 +26,9 @@ namespace Oc2AI
         int _colliderDumpEpoch = -1;
         string _staticJson;
         string _level;
+        // UI 编号（如 "4-1"），来自场景目录 SceneDirectoryEntry；只对主线
+        // World.One..Six 输出，DLC/Kevin 留空由 Python 走资产名回退。
+        string _levelNumber;
         int _staticTries;
         int _droppedStates;
         // chop 索引的单调缓存（食材名小写 → [切成什么, 几刀]）。Dynamic 关卡里
@@ -75,7 +78,7 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.24.6 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.24.8 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             _trafficProbeEnabled = Config.Bind<bool>("Diagnostics", "TrafficProbe", true, "Log cars/traffic lights in Sushi_4_1 (diagnostic only).");
             BindWalkProbe();
@@ -233,9 +236,67 @@ namespace Oc2AI
 
         string ReadLevel()
         {
-            MonoBehaviour pc = FindMB("PlayerControls");
-            object lv = GetField(pc, "m_levelConfigBase");
-            if (lv is UnityEngine.Object uo && uo != null) return uo.name;
+            // 实机 Sushi_4_1（trace-20261110-124427）：PlayerControls.m_levelConfigBase
+            // 到 level_time≈1.06s 才有值，而 GameUtils.GetLevelConfig() 在 0.02s
+            // 就可读。攻略加载和开局分工都等不起这一秒。
+            try
+            {
+                LevelConfigBase config = GameUtils.GetLevelConfig();
+                return config != null ? config.name : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // 关卡资产名 → UI 编号（"4-1"）。场景目录的顺序就是关卡顺序，
+        // World 枚举是章节：World.One 的第一个 = 1-1。只对主线输出；
+        // DLC/Kevin 的 "1-1" 会和 story/1-1 撞车，交给 Python 用资产名回退。
+        string ReadLevelNumber(string level)
+        {
+            try
+            {
+                GameSession session = GameUtils.GetGameSession();
+                GameProgress progress = session != null ? session.Progress : null;
+                SceneDirectoryData dir = progress != null ? progress.GetSceneDirectory() : null;
+                LevelConfigBase current = GameUtils.GetLevelConfig();
+                if (dir == null || dir.Scenes == null || current == null) return null;
+                foreach (var entry in dir.Scenes)
+                {
+                    if (entry == null || entry.SceneVarients == null) continue;
+                    foreach (var pp in entry.SceneVarients)
+                    {
+                        if (pp == null || !ReferenceEquals(pp.LevelConfig, current)) continue;
+                        // 用枚举名而不是数值：World 的底层值不是 0..7 连续
+                        // （实机 Four 的 (int) 不是 5，按数值算会得到 3-1）。
+                        // 只认主线 One..Six；DLC/Kevin 的编号会和 story/1-1 撞车。
+                        int world;
+                        switch (entry.World.ToString())
+                        {
+                            case "One": world = 1; break;
+                            case "Two": world = 2; break;
+                            case "Three": world = 3; break;
+                            case "Four": world = 4; break;
+                            case "Five": world = 5; break;
+                            case "Six": world = 6; break;
+                            default: return null;
+                        }
+                        int index = 0;
+                        foreach (var e in dir.Scenes)
+                        {
+                            if (e == null || e.World != entry.World) continue;
+                            index++;
+                            if (e == entry) break;
+                        }
+                        return world + "-" + index;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[LEVEL] 读关卡编号失败：" + e.Message);
+            }
             return null;
         }
 
@@ -251,6 +312,9 @@ namespace Oc2AI
             if (cur != _level || flowId != _flowId)
             {
                 _level = cur;
+                _levelNumber = ReadLevelNumber(cur);
+                Logger.LogInfo("[LEVEL] asset=" + cur + " number="
+                    + (_levelNumber ?? "null"));
                 _flowId = flowId; _sceneEpoch++;
                 _staticJson = null;       // 下一拍 BuildState() 会重建 stations/recipes
                 // 切关重启延迟刷出食材的低频重扫（上一关可能已收敛停止）。
@@ -267,6 +331,13 @@ namespace Oc2AI
                 _gridAnchors = null;        // 非主网格锚点随关卡失效
                 RawNames.Clear();           // 生料改名表随关卡重建（BuildStatic → BuildChopIndex）
                 _stationGridCache = null;   // 站点→grid 缓存随关卡失效
+            }
+            else if (_levelNumber == null)
+            {
+                // 目录/会话刚加载时可能还读不到，下一拍重试（52 条 entry，开销可忽略）。
+                _levelNumber = ReadLevelNumber(cur);
+                if (_levelNumber != null)
+                    Logger.LogInfo("[LEVEL] number=" + _levelNumber);
             }
         }
 
@@ -1163,10 +1234,12 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.24.6\",\"protocol_version\":9,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.24.8\",\"protocol_version\":10,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))
+              // 主线 UI 编号（"4-1"）；DLC/Kevin 为 null，攻略回退到资产名。
+              .Append(",\"level_number\":").Append(Jstr(_levelNumber))
               .Append(",\"paused\":").Append(IsPaused() ? "true" : "false")
               // 关卡时钟（受暂停/timeScale 影响，与篮子动画同步）：seam_clock 记门洞开关沿用
               .Append(",\"level_time\":").Append(Time.timeSinceLevelLoad.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture));

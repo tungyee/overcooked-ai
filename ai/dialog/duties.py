@@ -283,8 +283,10 @@ def _set_division_schema(actions):
                 "只包含本关可分工的动作；"
                 "送餐和洗盘谁近谁做，不在分工里。开局按攻略里「玩家/你」的"
                 "对应关系写，不要按出生点猜。同一动作分物料时在 item 里写物料名"
-                "（例如 chop Meat 给玩家、chop Lettuce 给你）；两人都要做、又分不清"
-                "物料的动作整个不写，不要写成一个人的动作级分工；不确定的动作不要写。"
+                "（例如 chop Meat 给玩家、chop Lettuce 给你，但只是示例，必须换成本关"
+                "攻略/目录里的物料）；两人都要做、又分不清物料的动作整个不写，"
+                "不要写成一个人的动作级分工；不确定的动作不要写。"
+                "如果【本关攻略】为空，不要调用本工具。"
             ),
             "parameters": {
                 "type": "object",
@@ -302,7 +304,7 @@ def _set_division_schema(actions):
                                 },
                                 "item": {
                                     "type": "string",
-                                    "description": "可选：同一动作分物料时填，例如 Meat / Lettuce / Cheese。",
+                                    "description": "可选：同一动作分物料时填，例如 Meat / Lettuce / Cheese；只填本关目录里真实存在的物料名。",
                                 },
                             },
                             "required": ["action", "owner"],

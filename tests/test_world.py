@@ -180,7 +180,16 @@ def test_world_parses_scalar_fields():
     w = W.World({"phase": "play", "level": "Sushi_1_4_2P", "paused": True})
     assert w.phase == "play"
     assert w.level == "Sushi_1_4_2P"
+    assert w.level_number is None
     assert w.paused is True
+
+
+def test_world_parses_level_number():
+    """插件按场景目录给的 UI 编号（4-1），攻略优先用它，不靠资产名。"""
+    w = W.World({"phase": "level", "level": "Sushi_4_1_P2",
+                 "level_number": "4-1"})
+    assert w.level == "Sushi_4_1_P2"
+    assert w.level_number == "4-1"
 
 
 def test_world_paused_only_true_for_exact_true():

@@ -157,6 +157,9 @@ class World(object):
         self.raw = state
         self.phase = state.get("phase")
         self.level = state.get("level")
+        # 主线 UI 编号（如 "4-1"），插件按场景目录算；DLC/Kevin 为 None。
+        # 攻略优先按它解析，避免依赖关卡资产名（Sushi_4_1_P2 这种）。
+        self.level_number = state.get("level_number")
         # 用 `is True`：插件漏发该字段时是 None，不能当成"已暂停"
         self.paused = state.get("paused") is True
         # 插件不发 tick 字段（实测帧无 tick），缺失或为 None 时退化为 0。

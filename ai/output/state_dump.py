@@ -33,6 +33,8 @@ def snapshot(world):
     raw = getattr(world, "raw", None) or {}
     return {
         "level": getattr(world, "level", None),
+        # 主线 UI 编号（"4-1"）；trace 回放时攻略解析也按它优先。
+        "level_number": getattr(world, "level_number", None),
         "phase": getattr(world, "phase", None),
         "paused": bool(getattr(world, "paused", False)),
         "plugin_version": raw.get('plugin_version'),

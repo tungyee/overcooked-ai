@@ -1149,16 +1149,24 @@ class Agent:
         """分工表是唯一事实来源：重编 `bb.preferences`。"""
         self.bb.preferences[:] = self.bb.division.preferences()
 
-    def _load_guide(self, level):
-        # type: (Any) -> None
-        """换关加载攻略；失败不影响主循环。"""
+    def _load_guide(self, level, level_number=None):
+        # type: (Any, Any) -> None
+        """换关加载攻略；失败不影响主循环。
+
+        优先用插件给的 UI 编号（"4-1"）：关卡资产名里的数字不等于 UI 编号
+        （Sushi_4_1_P2 是 4-1，但 Wizard_3_2_2P 是 3-3），按编号解析最稳。
+        DLC/Kevin 没有编号时回退资产名；`_strip_p2` 兼容 `_2P`/`_P2` 两种后缀。
+        """
         try:
-            self._guide = default_cookbook().resolve(level)
+            book = default_cookbook()
+            self._guide = book.resolve(level_number) if level_number else None
+            if self._guide is None:
+                self._guide = book.resolve(level)
         except Exception:                       # noqa: BLE001
-            log.exception("加载攻略失败：%s", level)
+            log.exception("加载攻略失败：%s（编号 %s）", level, level_number)
             self._guide = None
         if self._guide is None:
-            log.info("本关没有攻略：%s", level)
+            log.info("本关没有攻略：%s（编号 %s）", level, level_number)
 
     def _reset_division_state(self):
         # type: () -> None
@@ -1230,6 +1238,14 @@ class Agent:
         去改分工会把「能装盘」误报成「够不着」。
         """
         if not self._division_initial_fired:
+            # 关卡名/攻略还没就绪就先不发。开局分工 prompt 必须带【本关攻略】，
+            # 否则模型只能照示例物料猜（实机 Sushi_4_1_P2 被带出 Meat/Lettuce/
+            # Cheese）。level 到位后 `_maybe_reset_dialog_level` 会先加载攻略，
+            # 下一拍再进这里发事件。
+            if not getattr(world, "level", None):
+                return
+            if self._guide is None:
+                return
             self._division_initial_fired = True
             self._division_station_sig = station_signature(world)
             self._division_last_check_tick = tick
@@ -1367,11 +1383,12 @@ class Agent:
         level = getattr(world, "level", None)
         if level is None:
             return
+        level_number = getattr(world, "level_number", None)
         raw = getattr(world, "raw", {})
         key = (raw.get("session_id"), raw.get("scene_epoch"), level)
         if self._dialog_scene_key is None:
             self._dialog_scene_key = key
-            self._load_guide(level)
+            self._load_guide(level, level_number)
             self._reset_division_state()
             self._log_dialog_level_start(level)
             return
@@ -1379,7 +1396,7 @@ class Agent:
             return
         self._dialog_scene_key = key
         self._log_dialog_level_start(level)
-        self._load_guide(level)
+        self._load_guide(level, level_number)
         self._reset_division_state()
         self.commands.clear()
         self._last_command_result = None

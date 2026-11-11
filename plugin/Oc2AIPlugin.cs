@@ -31,6 +31,8 @@ namespace Oc2AI
         string _levelNumber;
         int _staticTries;
         int _droppedStates;
+        // 一次性：把竹筏传送带组件字段打到日志，找方向字段（4-2 vx/vz 恒 0）。
+        bool _conveyDirectionDumped = false;
         // chop 索引的单调缓存（食材名小写 → [切成什么, 几刀]）。Dynamic 关卡里
         // 鱼/米/海苔开局后才刷出，一次性 BuildStatic 会漏掉；每帧把新扫到的
         // 食材合并进来，一旦出现新键就让 recipes 重建。只增不减：食材类型一旦
@@ -2737,6 +2739,16 @@ namespace Oc2AI
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null || mb.GetType().Name != "ConveyorStation") continue;
+                if (!_conveyDirectionDumped)
+                {
+                    _conveyDirectionDumped = true;
+                    DumpFields("CONVSTATION:" + mb.GetType().Name, mb);
+                    foreach (string cn in new[] { "ServerConveyorStation", "ClientConveyorStation" })
+                    {
+                        Component c = mb.GetComponent(cn);
+                        if (c != null) DumpFields("CONVSTATION:" + cn, c);
+                    }
+                }
                 Vector3 p = mb.transform.position;
                 object stGm = GridManagerObj(mb);
                 string[] gidx = GridIndexOn(stGm, p).Split(',');

@@ -206,3 +206,36 @@ def test_send_uses_own_belt_start_not_far_end():
     assert cmd["kind"] == "placement"
     assert cmd["target"]["grid"] == "Raft Two"
     assert (cmd["target"]["gx"], cmd["target"]["gz"]) == (4, 0)
+
+
+def _switch_world(vx):
+    class W(object):
+        stations = [
+            {"t": "switch", "n": "SwitchStation", "gx": 0, "gz": 0},
+            {"t": "conveyor", "n": "ConveyorStation (85)", "gx": 0, "gz": 0,
+             "vx": vx, "vz": 0.0},
+        ]
+    return W()
+
+
+def test_switch_direction_reads_conveyor_vx():
+    assert CH.switch_direction(_switch_world(0.6)) == ">"
+    assert CH.switch_direction(_switch_world(-0.6)) == "<"
+
+
+def test_switch_direction_none_without_switch():
+    class W(object):
+        stations = [{"t": "conveyor", "n": "c", "gx": 0, "gz": 0,
+                     "vx": 0.6, "vz": 0.0}]
+    assert CH.switch_direction(W()) is None
+
+
+def test_conveyor_direction_ok_heuristic():
+    assert CH.conveyor_direction_ok(_switch_world(0.6)) is True
+    assert CH.conveyor_direction_ok(_switch_world(-0.6)) is False
+
+
+def test_conveyor_direction_ok_defaults_true_without_switch():
+    class W(object):
+        stations = []
+    assert CH.conveyor_direction_ok(W()) is True

@@ -38,7 +38,10 @@ KIND_CARRIER = "carrier"
 KIND_DIRTY_PLATE = "dirty_plate"
 # 成品盘：出餐口只在对面、P2 这侧有料齐的盘时，送到共享台面让 P1 送。
 KIND_PLATED_DISH = "plated_dish"
-KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH)
+# 切好的料（鱼/黄瓜）：P1 那边没砧板自己切、P2 有砧板，切好的菜送过去装盘。
+KIND_CHOPPED_INGREDIENT = "chopped_ingredient"
+KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH,
+         KIND_CHOPPED_INGREDIENT)
 
 # 对面最多备几块空盘（含在途）：P1 一般同时装 1~2 单，再多就是把盘从我这边
 # 搬去对面闲着，回头我这边要用（洗好的盘也在这边）还得送回来。
@@ -277,6 +280,32 @@ def plated_dish_sources(world, book, bb=None):
                 out.append((p, order))
                 break
     return out
+
+
+def chopped_ingredient_sources(world, book, bb=None):
+    # type: (object, object, object) -> List[str]
+    """P2 该送过去的切好料名：P1 没砧板自己切、P2 有砧板、订单要该料。
+
+    只返回料名（不返回具体某一块）：切好的料可替换，送哪块都一样；拿哪块、
+    有没有在途由 handover 的 pickup/done 再判。
+    """
+    if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
+        return []
+    # 4-5 有方向开关：方向不对时先按开关（PressSwitch），不送——送过去进垃圾桶。
+    if not CH.conveyor_direction_ok(world, bb):
+        return []
+    near, far = CH._fields(world, bb)
+    _boards, p2_can, p1_can = _station_sides(world, near, far, "chopping", bb)
+    if not p2_can or p1_can:
+        return []
+    want = set()  # type: Set[str]
+    for o in world.orders:
+        for ing in book.requirements(o):
+            if book.needs_chopping(ing):
+                target = book.chop_target(ing)
+                if target:
+                    want.add(target)
+    return sorted(want)
 
 
 def _can_supply(ctx, book, ing):

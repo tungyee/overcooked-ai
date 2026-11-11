@@ -24,6 +24,7 @@ from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.revenue import handover as HO
 from ai.revenue import throw_supply as TS
 from ai.space import channels as CH
+from ai.space import reachability
 from ai.space import regions as RG
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            _grid_matches, _station_for_item,
@@ -265,6 +266,60 @@ class SendAcross(Task):
                                                     spec.allow_boards),
                             "placement", placed))
         return PR.Timeout(Sequence(steps), timeout)
+
+
+# 按开关后等方向翻转到位的拍数（20Hz）：开关翻转有 1~2 帧延迟。
+SWITCH_PRESS_TICKS = 40
+
+
+@_register
+class PressSwitch(Task):
+    """按 4-5 传送带方向开关：方向不对时翻到对的方向。
+
+    done 判「方向已正确」而非「按过一下」：开关是 toggle，若按「按了」判
+    完成会连按两次又翻回原方向。方向判断见 channels.conveyor_direction_ok。
+    """
+
+    TYPE = "PressSwitch"
+    DESC = "按下传送带方向开关，把方向调到对的那边"
+    LABEL = "按开关"
+    HANDS = "any"
+
+    def claims(self):
+        return ()
+
+    def _switch(self, ctx):
+        # type: (Dict) -> Optional[Dict]
+        for st in ctx["w"].stations:
+            if isinstance(st, dict) and st.get("t") == "switch":
+                return st
+        return None
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        return CH.conveyor_direction_ok(ctx["w"], ctx.get("bb"))
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        if self.done(ctx):
+            return False
+        sw = self._switch(ctx)
+        if sw is None:
+            return False
+        return reachability.can_interact(ctx, sw)
+
+    def build(self):
+        # type: () -> Node
+        def target(c):
+            return self._switch(c)
+
+        return PR.Timeout(Sequence([
+            PR.Approach(target, None),
+            PR.Face(target),
+            # 按 WorkstationInteract 直到方向翻到对的一侧；pred（done）成立即松键。
+            PR.HoldUntil("switch", self.done, timeout=SWITCH_PRESS_TICKS,
+                         target=target),
+        ]), TASK_TIMEOUT_TICKS)
 
 
 def _dest_station(ctx, dest_id):

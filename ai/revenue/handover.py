@@ -390,6 +390,93 @@ SEND_SPECS[XS.KIND_PLATED_DISH] = SendSpec(
 )
 
 
+# ---------------------------------------------------------------- chopped_ingredient
+
+
+def _chopped_item(world, name, bb=None):
+    # type: (Any, Any, Any) -> Optional[Dict]
+    """P2 这侧一块名为 name 的切好料（P1 没拿、不在通道上）。"""
+    near, far = CH._fields(world, bb)
+    want = str(name or "").lower()
+    for it in (list(getattr(world, "items", ()) or ())
+               + list(getattr(world, "held_items", ()) or ())):
+        if not isinstance(it, dict) or it.get("held_by") == P.P1_NAME:
+            continue
+        if str(it.get("n") or "").lower() != want:
+            continue
+        if XS._side_of(world, near, far, it, bb) == "near":
+            return it
+    return None
+
+
+def _chopped_on_channel(world, name, key, bb=None):
+    # type: (Any, Any, str, Any) -> bool
+    """名为 name 的切好料是否已经放在 key 这条通道上。"""
+    want = str(name or "").lower()
+    for it in getattr(world, "items", ()) or ():
+        if not isinstance(it, dict) or it.get("held_by"):
+            continue
+        if str(it.get("n") or "").lower() != want:
+            continue
+        st = CH.slot_of(world, it, bb)
+        if st is not None and CH.channel_of_slot(world, st, bb) == key:
+            return True
+    return False
+
+
+def _chopped_sources(world, book, bb):
+    # type: (Any, Any, Any) -> List[SendSource]
+    return [SendSource(XS.KIND_CHOPPED_INGREDIENT, name, None, None)
+            for name in XS.chopped_ingredient_sources(world, book, bb)]
+
+
+def _chopped_resolve(ctx, source_id, order_id):
+    # type: (Dict, Any, Any) -> Optional[SendSource]
+    w, book, bb = ctx["w"], ctx.get("book"), ctx.get("bb")
+    if source_id not in XS.chopped_ingredient_sources(w, book, bb):
+        return None
+    return SendSource(XS.KIND_CHOPPED_INGREDIENT, source_id, None, None)
+
+
+def _chopped_pickup(ctx, source):
+    # type: (Dict, SendSource) -> Optional[Dict]
+    item = _chopped_item(ctx["w"], source.source_id, ctx.get("bb"))
+    if item is None:
+        return None
+    return _station_for_item(ctx["w"], item) or item
+
+
+def _chopped_held(ctx, source):
+    # type: (Dict, SendSource) -> bool
+    return P.held_matches(ctx["chef"], source.source_id)
+
+
+def _chopped_done(ctx, source, key):
+    # type: (Dict, SendSource, str) -> bool
+    if not P.hands_free(ctx["chef"]):
+        return False
+    return _chopped_on_channel(ctx["w"], source.source_id, key, ctx.get("bb"))
+
+
+def _chopped_capacity(ctx, key):
+    # type: (Dict, str) -> bool
+    return XS.has_send_capacity(ctx["w"], key, ctx.get("bb"))
+
+
+SEND_SPECS[XS.KIND_CHOPPED_INGREDIENT] = SendSpec(
+    kind=XS.KIND_CHOPPED_INGREDIENT,
+    label="送切好的料",
+    sources=_chopped_sources,
+    claims=lambda source_id, order_id: (),
+    pickup=_chopped_pickup,
+    held=_chopped_held,
+    done=_chopped_done,
+    resolve=_chopped_resolve,
+    channels=lambda world, bb: CH.channel_keys(world, bb),
+    capacity=_chopped_capacity,
+)
+
+
 # ---------------------------------------------------------------- 对外入口
 
 

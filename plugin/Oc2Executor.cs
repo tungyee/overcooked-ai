@@ -133,6 +133,7 @@ namespace Oc2AI
             "StaticGridLocation", "DynamicGridLocation", "ServerAttachStation",
             "ServerWorkstation", "ServerCookingStation", "ServerHeatedCookingStation",
             "ServerPlateStation", "ServerWashingStation", "ConveyorStation",
+            "ServerSwitchStation",
         };
 
         private static readonly Dictionary<int, string> _unique = new Dictionary<int, string>();

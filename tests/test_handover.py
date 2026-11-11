@@ -93,7 +93,8 @@ def test_send_specs_cover_all_kinds():
     from ai.revenue import handover as HO
     assert set(HO.SEND_SPECS) == set(XS.KINDS)
     assert set(XS.KINDS) == {XS.KIND_CLEAN_PLATE, XS.KIND_CARRIER,
-                             XS.KIND_DIRTY_PLATE, XS.KIND_PLATED_DISH}
+                             XS.KIND_DIRTY_PLATE, XS.KIND_PLATED_DISH,
+                             XS.KIND_CHOPPED_INGREDIENT}
 
 
 def test_request_objects_expose_kind_source_and_channel(frames):

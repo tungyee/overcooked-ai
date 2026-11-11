@@ -270,32 +270,46 @@ def conveyor_slots(world, bb=None):
         near, far = _fields(world, bb)
         chef = P.chef_by_name(getattr(world, "chefs", ()) or (), P.P2_NAME)
         own_grid = _chef_grid(world, chef)
-        player_segs = [
-            st for st in (getattr(world, "stations", ()) or ())
-            if is_conveyor_station(world, st)
-            and _reach(world, far, st, P.P1_NAME)]
-        player_grids = {str(st.get("grid") or "") for st in player_segs}
-        # 比较整条玩家带，而不是只看 P1 此刻够得着的那一段：玩家带从接缝
-        # 一路走到取件段，接缝段本身 P1 够不着不代表带子没接上
-        # （rapids42-shared-belt：接缝段 p1=False，但它后面那段 p1=True）。
-        player_all = [
-            st for st in (getattr(world, "stations", ()) or ())
-            if is_conveyor_station(world, st)
-            and str(st.get("grid") or "") in player_grids]
-        # 自己这侧整条带都够得着：P2 就站在同一块竹筏地板上。不用 _reach
-        # 逐段判——主网格投影会随竹筏亚格漂移闪断，把明明能站到的段判成
-        # 不可达（trace-20261111-115549 t=367 等，7 段只有 4 段被认可达）。
-        near_segs = [
-            st for st in (getattr(world, "stations", ()) or ())
-            if is_conveyor_station(world, st)
-            and own_grid is not None
-            and str(st.get("grid") or "") == own_grid]
-        if player_all and near_segs:
-            best = min(
-                ((a.get("x", 0.0) - b.get("x", 0.0)) ** 2
-                 + (a.get("z", 0.0) - b.get("z", 0.0)) ** 2) ** 0.5
-                for a in near_segs for b in player_all)
-            if best <= CONVEYOR_CONNECT_DIST:
+        if own_grid is not None:
+            # —— 4-2 竹筏：两条 L 形带分属两筏，临时对接 ——
+            player_segs = [
+                st for st in (getattr(world, "stations", ()) or ())
+                if is_conveyor_station(world, st)
+                and _reach(world, far, st, P.P1_NAME)]
+            player_grids = {str(st.get("grid") or "") for st in player_segs}
+            # 比较整条玩家带，而不是只看 P1 此刻够得着的那一段：玩家带从接缝
+            # 一路走到取件段，接缝段本身 P1 够不着不代表带子没接上
+            # （rapids42-shared-belt：接缝段 p1=False，但它后面那段 p1=True）。
+            player_all = [
+                st for st in (getattr(world, "stations", ()) or ())
+                if is_conveyor_station(world, st)
+                and str(st.get("grid") or "") in player_grids]
+            # 自己这侧整条带都够得着：P2 就站在同一块竹筏地板上。不用 _reach
+            # 逐段判——主网格投影会随竹筏亚格漂移闪断，把明明能站到的段判成
+            # 不可达（trace-20261111-115549 t=367 等，7 段只有 4 段被认可达）。
+            near_segs = [
+                st for st in (getattr(world, "stations", ()) or ())
+                if is_conveyor_station(world, st)
+                and str(st.get("grid") or "") == own_grid]
+            if player_all and near_segs:
+                best = min(
+                    ((a.get("x", 0.0) - b.get("x", 0.0)) ** 2
+                     + (a.get("z", 0.0) - b.get("z", 0.0)) ** 2) ** 0.5
+                    for a in near_segs for b in player_all)
+                if best <= CONVEYOR_CONNECT_DIST:
+                    out = near_segs
+        else:
+            # —— 4-5 静态环：传送带挂在主网格上、恒接通，按 P2 可达场筛自己
+            # 这侧的段。物品放上去沿环转到 P1 可达段（无对接窗口，不用距离门控）。
+            near_segs = [
+                st for st in (getattr(world, "stations", ()) or ())
+                if is_conveyor_station(world, st)
+                and _reach(world, near, st, P.P2_NAME)]
+            player_segs = [
+                st for st in (getattr(world, "stations", ()) or ())
+                if is_conveyor_station(world, st)
+                and _reach(world, far, st, P.P1_NAME)]
+            if near_segs and player_segs:
                 out = near_segs
     if out and bb is not None:
         # 记下「这条通道刚开过」，供 SendAcross 在下一帧闪断时继续等。
@@ -303,6 +317,40 @@ def conveyor_slots(world, bb=None):
             getattr(bb, "tick", 0) + CONVEYOR_GRACE_TICKS)
     world._conveyor_slots = out
     return out
+
+
+def switch_direction(world, bb=None):
+    # type: (object, object) -> Optional[str]
+    """4-5 传送带方向开关当前的开关格方向：'>'（右）或 '<'（左）；拿不到返回 None。
+
+    开关格 = 与 switch 站点同格的 conveyor 段，读该段的 vx 符号。
+    """
+    switches = [st for st in getattr(world, "stations", ()) or ()
+                if isinstance(st, dict) and st.get("t") == "switch"]
+    if not switches:
+        return None
+    sw = switches[0]
+    sx, sz = sw.get("gx"), sw.get("gz")
+    for st in getattr(world, "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != "conveyor":
+            continue
+        if st.get("gx") == sx and st.get("gz") == sz:
+            vx = st.get("vx") or 0.0
+            if abs(vx) > 0.01:
+                return ">" if vx > 0 else "<"
+    return None
+
+
+def conveyor_direction_ok(world, bb=None):
+    # type: (object, object) -> bool
+    """4-5 传送带方向是否「正确」（把料送向 P1 而非垃圾桶）。
+
+    TODO(实机核实)：目前按开关格方向 '>' 为正确、'<' 为错误——这是从
+    trace-20261111-233924 里按钮把 (0,0) 从 '<' 翻成 '>' 推断的，未经游戏
+    实测确认。没有开关（其它关卡）恒 True。
+    """
+    d = switch_direction(world, bb)
+    return d is None or d == ">"
 
 
 def conveyor_interact_cells(world, st):

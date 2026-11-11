@@ -2781,6 +2781,27 @@ namespace Oc2AI
                 si++;
             }
 
+            // 传送带方向开关（ServerSwitchStation）：面对它按 WorkstationInteract 即翻转
+            // 传送带方向。只报位置（方向本身从 conveyor 段的 vx/vz 读），供 Python
+            // 在「方向不对」时走 PressSwitch 去按。
+            foreach (MonoBehaviour mb in _all)
+            {
+                if (mb == null || mb.GetType().Name != "ServerSwitchStation") continue;
+                Vector3 p = mb.transform.position;
+                object stGm = GridManagerObj(mb);
+                string[] gidx = GridIndexOn(stGm, p).Split(',');
+                if (si > 0) sb.Append(',');
+                sb.Append("{\"t\":\"switch\",\"n\":").Append(Jstr(ObjNames.Of(mb)))
+                    .Append(",\"grid\":").Append(
+                        stGm is UnityEngine.Object ugm && ugm != null ? Jstr(ugm.name) : "null")
+                    .Append(",\"gx\":").Append(gidx[0])
+                    .Append(",\"gz\":").Append(gidx[1])
+                    .Append(",\"x\":").Append(p.x.ToString("0.0"))
+                    .Append(",\"z\":").Append(p.z.ToString("0.0"))
+                    .Append('}');
+                si++;
+            }
+
             // 干净盘子堆：CleanPlateUtensilRespawnBehaviour（每堆一个）
             foreach (MonoBehaviour mb in _all)
             {

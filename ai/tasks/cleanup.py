@@ -285,6 +285,52 @@ class RecoverLoosePot(Task):
         ]), TASK_TIMEOUT_TICKS)
 
 
+def _held_plate_orphan(ctx, chef):
+    # type: (Dict, Optional[Dict]) -> bool
+    """手里是「孤儿半成品盘」时允许 StashHeld 放下。
+
+    成品盘不算（走 SendAcross/DeliverPlate）、空盘也不算（走 PlaceCleanPlate /
+    ResetPlate）。只有「有内容、但没有任何存活订单还想要这些内容」的盘才算
+    孤儿——内容对不上任何单（订单被放弃 / 料配错）。「内容还是某单的子集、
+    只是没做满」的盘不是孤儿：它该继续 FillCooker/Chop 补料，不该被放下
+    （否则就是拿起来又放下，浪费一块半成品）。
+    """
+    if chef is None or not P.held_is_plate(chef):
+        return False
+    name = P.held_name(chef)
+    plate = None
+    fallback = None
+    for p in P.all_plates(ctx["w"]):
+        if str(p.get("name") or "").lower() != name:
+            continue
+        if p.get("held_by") == P.P2_NAME:
+            plate = p
+            break
+        if p.get("held_by") is None and fallback is None:
+            fallback = p
+    plate = plate or fallback
+    if plate is None or P.plate_count(plate) == 0:
+        return False
+    book = ctx.get("book")
+    if book is None:
+        return False
+    tokens = book.plate_tokens(plate)
+    if not tokens:
+        return False
+    bb = ctx.get("bb")
+    abandoned = getattr(bb, "abandoned_orders", None) or {}
+    tick = getattr(bb, "tick", 0)
+    for o in ctx["w"].orders:
+        if abandoned.get(o.get("id"), 0) > tick:
+            continue
+        allowed = book.order_want_tokens(o)
+        for ing in o.get("optional") or ():
+            allowed |= book.want_tokens(ing)
+        if tokens <= allowed:
+            return False       # 还有单想要这些内容，别放
+    return True
+
+
 @_register
 class StashHeld(Task):
     """第 13 号：手里莫名拿着无用物时清空手。
@@ -325,7 +371,11 @@ class StashHeld(Task):
             if state != P.COOKWARE_BURNT:
                 return False
         if P.held_is_plate(chef):
-            return False       # 盘走 PlaceCleanPlate / DeliverPlate / ResetPlate
+            # 盘默认走 PlaceCleanPlate / DeliverPlate / ResetPlate。唯一例外是
+            # 「孤儿半成品盘」：有内容、但没有任何存活订单还想要这些内容（订单
+            # 被放弃 / 料配错），攥着它只会占手、让 AI 静止
+            # （trace-20261111-124037 t=1260）。这时允许放下。
+            return _held_plate_orphan(ctx, chef)
         held = P.held_name(chef)
 
         # 手持生食材 + 有空灶可用 → 不该 stash，应该走 FetchToCooker。

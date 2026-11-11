@@ -46,7 +46,11 @@ def _world(frame):
 def _ctx(world, tick=0):
     book = RecipeBook(world.recipes, world.stations, world.items)
     bb = make_bb(tick)
-    return planner._make_context(world, bb, book), book
+    ctx = planner._make_context(world, bb, book)
+    # 与 plan() 的可行性过滤对齐：_holding_plated_dish 要看「手里盘绑给哪单」
+    # 判它是不是成品，缺了会把成品盘当半成品放开 hands_full_plate。
+    ctx["plate_match"] = planner._match_plates_to_orders(world, bb, book)
+    return ctx, book
 
 
 def _frame_world(t, path=FIX):

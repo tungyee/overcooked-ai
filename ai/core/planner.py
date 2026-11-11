@@ -653,7 +653,8 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     # 成品盘放下后很容易被忘在台面上（trace-20261111-001945 t=458/2950）。
     chef = P.chef_by_name(ctx["w"].chefs, P.P2_NAME)
     if task.TYPE in _HANDS_DROP_PRONE_TYPES:
-        if _holding_plated_dish(chef, ctx["w"]):
+        if _holding_plated_dish(chef, ctx["w"], ctx.get("book"),
+                                ctx.get("plate_match")):
             return False, "hands_full_plate"
     # 已经端着一盘有内容的菜时，SendAcross 只准送手里这块：选另一块盘的
     # SendAcross 会先 EnsureHandsFree 把手里这盘放下
@@ -667,7 +668,9 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
         # ThrowBatch/StashHeld 用掉/收好，再送盘；拿着来源本身则放行。
         # TakeCookedToPlate 不拦：熟料不等人，端盘去盛优先。
         return False, "hands_full_send"
-    if task.TYPE == "SendAcross" and _holding_plated_dish(chef, ctx["w"]):
+    if task.TYPE == "SendAcross" and \
+            _holding_plated_dish(chef, ctx["w"], ctx.get("book"),
+                                 ctx.get("plate_match")):
         held_plate = _held_plate_id(chef, ctx["w"])
         target = getattr(task, "source_id", None)
         if target is not None and str(target) != held_plate:
@@ -689,6 +692,11 @@ def filter_feasible(world, bb, candidates, book):
     """可行性过滤（spec §6.2）。"""
     feasible = []  # type: List[Candidate]
     ctx = _make_context(world, bb, book)
+    # _holding_plated_dish 要看「手里的盘绑给哪张单」判它是不是成品，这里也
+    # 得喂同一份 1:1 匹配；缺了会把成品盘当半成品、放开 hands_full_plate。
+    # 离线/单测的 FakeWorld 可能没有 orders，直接给空匹配（无盘可绑）。
+    ctx["plate_match"] = (_match_plates_to_orders(world, bb, book)
+                          if getattr(world, "orders", None) is not None else {})
     for cand in candidates:
         ok, _ = _feasibility_of(cand, ctx, bb)
         if ok:
@@ -2196,16 +2204,32 @@ def _held_plate_id(chef, world):
     return fallback
 
 
-def _holding_plated_dish(chef, world):
-    # type: (Optional[Dict], World) -> bool
-    """手里是不是端着一盘有内容的菜（不是空盘）。"""
+def _holding_plated_dish(chef, world, book=None, plate_match=None):
+    # type: (Optional[Dict], World, Optional[Any], Optional[Dict[Any, Any]]) -> bool
+    """手里是不是端着一盘「已经做满它所绑订单」的成品菜。
+
+    半成品盘不算贵重：端着只有薯条的盘、且这盘被绑给缺鸡块的 All 单时，
+    还需要 FillCooker 下鸡块 / Chop 备菜才能做满；旧的「有内容就算」判据会把
+    这些活全否决（trace-20261111-124037 t=1260：-18838 薯条盘绑给队首 All，
+    但内容只够 ChipsOnly，hands_full_plate 把 38 个备菜/下锅候选全否掉，P2
+    整局静止）。成品判定只认「这盘对当前绑定的订单 book.matches」：对别的
+    单做满、但对绑定的单还缺料时，仍算半成品、可以放下继续备料。
+    """
     plate_id = _held_plate_id(chef, world)
     if plate_id is None:
         return False
-    for p in P.all_plates(world):
-        if str(p.get("n")) == plate_id:
-            return P.plate_count(p) > 0
-    return False
+    plate = next((p for p in P.all_plates(world)
+                  if str(p.get("n")) == plate_id), None)
+    if plate is None or P.plate_count(plate) == 0:
+        return False
+    if book is None:
+        # 没有 book 时退回旧判据：有内容就算贵重（宁可不放）。
+        return True
+    oid = plate_match.get(plate_id) if plate_match else None
+    if oid is None:
+        return False           # 没绑任何单：算孤儿半成品，可放下
+    order = next((o for o in world.orders if o.get("id") == oid), None)
+    return book.matches(order, plate)
 
 
 def _held_matches_source(chef, world, source_id):

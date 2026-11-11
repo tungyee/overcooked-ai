@@ -31,8 +31,6 @@ namespace Oc2AI
         string _levelNumber;
         int _staticTries;
         int _droppedStates;
-        // 一次性：把竹筏传送带组件字段打到日志，找方向字段（4-2 vx/vz 恒 0）。
-        bool _conveyDirectionDumped = false;
         // chop 索引的单调缓存（食材名小写 → [切成什么, 几刀]）。Dynamic 关卡里
         // 鱼/米/海苔开局后才刷出，一次性 BuildStatic 会漏掉；每帧把新扫到的
         // 食材合并进来，一旦出现新键就让 recipes 重建。只增不减：食材类型一旦
@@ -2739,48 +2737,26 @@ namespace Oc2AI
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null || mb.GetType().Name != "ConveyorStation") continue;
-                if (!_conveyDirectionDumped)
-                {
-                    _conveyDirectionDumped = true;
-                    DumpFields("CONVSTATION:" + mb.GetType().Name, mb);
-                    foreach (string cn in new[] { "ServerConveyorStation", "ClientConveyorStation" })
-                    {
-                        Component c = mb.GetComponent(cn);
-                        if (c != null) DumpFields("CONVSTATION:" + cn, c);
-                    }
-                }
                 Vector3 p = mb.transform.position;
                 object stGm = GridManagerObj(mb);
                 string[] gidx = GridIndexOn(stGm, p).Split(',');
-                // 4-2 竹筏传送带的方向在 Server/ClientConveyorStation 组件上，
-                // 基类 ConveyorStation 读 m_conveyanceDirectionXZ 恒为 null。
-                // 优先从服务端/客户端组件读，仍拿不到再退回基类。
-                object dir = null, spd = null;
-                MonoBehaviour dirSrc = null;
-                foreach (string cn in new[] { "ServerConveyorStation", "ClientConveyorStation" })
-                {
-                    Component c = mb.GetComponent(cn);
-                    if (c == null) continue;
-                    object d = GetField(c, "m_conveyanceDirectionXZ");
-                    if (d != null) { dirSrc = c as MonoBehaviour; dir = d; spd = GetField(c, "m_conveySpeed"); break; }
-                }
-                if (dirSrc == null)
-                {
-                    dirSrc = mb;
-                    dir = GetField(mb, "m_conveyanceDirectionXZ");
-                    spd = GetField(mb, "m_conveySpeed");
-                }
+                // 方向是枚举（Rightwards/Leftwards/Upwards/Downwards），不是 Vector。
+                // 枚举是局部朝向，需乘 transform 旋转才得到世界朝向；速度单独读。
+                object dir = GetField(mb, "m_conveyanceDirectionXZ");
+                object spd = GetField(mb, "m_conveySpeed");
                 float speed = spd is float f ? f : 0f;
                 float dx = 0f, dz = 0f;
                 if (dir is Vector2 v2) { dx = v2.x; dz = v2.y; }
                 else if (dir is Vector3 v3) { dx = v3.x; dz = v3.z; }
-                if ((dx == 0f && dz == 0f) && dirSrc != null)
+                else if (dir != null)
                 {
-                    // 字段拿不到（或为 0）时退回表面速度：GetSurfaceVelocity 返回
-                    // 世界空间速度，含竹筏漂移；下面会把主网格/竹筏速度扣掉一点
-                    // 但这里只做兜底，能让 vx/vz 不再恒 0。
-                    object vel = CallMethod(dirSrc, "GetSurfaceVelocity");
-                    if (vel is Vector3 sv) { dx = sv.x; dz = sv.z; }
+                    string dn = dir.ToString();
+                    if (dn.IndexOf("Right") >= 0) dx = 1f;
+                    else if (dn.IndexOf("Left") >= 0) dx = -1f;
+                    else if (dn.IndexOf("Up") >= 0) dz = 1f;
+                    else if (dn.IndexOf("Down") >= 0) dz = -1f;
+                    Vector3 wd = mb.transform.TransformDirection(new Vector3(dx, 0f, dz));
+                    dx = wd.x; dz = wd.z;
                 }
                 if (si > 0) sb.Append(',');
                 sb.Append("{\"t\":\"conveyor\",\"n\":").Append(Jstr(ObjNames.Of(mb)))

@@ -157,30 +157,36 @@ def test_send_done_when_plate_is_on_belt():
                               ctx.get("bb")) == CH.CONVEYOR
 
 
-# ---------------------------------------------------------------- 切好的沙拉料自己装盘 / 带子开头
+# ---------------------------------------------------------------- 切好的沙拉料按「对面有干净盘」门控 / 带子开头
 
 
-def test_chopped_salad_ingredients_are_plated_not_thrown():
-    """生菜/番茄切好后自己装盘、成品走传送带，不再扔给对面。
+def test_chopped_salad_thrown_only_when_far_has_clean_plate():
+    """切好的生菜/番茄可以投给对面，但只在对面有干净盘能装沙拉时才投。
 
-    旧实现给「不烹饪但可切」的料同时生成生料和切好形态两站投掷，于是 P2 切完
-    生菜/番茄后把它扔到 P1 的砧板旁；P1 那边没有稳定干净盘、又忙着切土豆/
-    鸡块，切好的料堆在地上没人接（voice-20261111-224619）。切好的料应该留在
-    P2 这侧装盘（PlaceCleanPlate → FetchToPlate），成品盘再走 SendAcross。
+    旧实现把切好料的「下一站」写成砧板（CONSUMER_BOARD），对面两块砧板恒在 →
+    没盘也一直扔，料堆在 P1 那边没人接（voice-20261111-224619）。现在下一站是
+    CONSUMER_PLATE（装盘），由 gap 里「对面有干净盘」的门控决定投不投。
     """
     frame = _frames3()[0]                   # t=710：P2 正拿着 ChoppedLettuce
     world = _world(frame)
     ctx, book = _ctx(world)
-    # 沙拉成分只保留「生料投给砧板」一站，不再有「切好形态投给砧板」。
-    assert TS.stages(book, "Lettuce") == [("Lettuce", TS.CONSUMER_BOARD, "Lettuce")]
-    assert TS.stages(book, "Tomato") == [("Tomato", TS.CONSUMER_BOARD, "Tomato")]
-    # 切好的生菜不再生成 ThrowBatch 候选（生料那一站仍保留）。
-    chosen, rec = planner.plan(world, ctx["bb"], None, book)
-    assert not any(c[0].TYPE == "ThrowBatch"
-                   and c[0].item in ("ChoppedLettuce", "ChoppedTomato")
-                   for c in rec["candidates"])
-    assert not (chosen.TYPE == "ThrowBatch"
-                and chosen.item in ("ChoppedLettuce", "ChoppedTomato"))
+    # 下一站是「装盘」而非「砧板」。
+    assert TS.stages(book, "Lettuce") == [
+        ("Lettuce", TS.CONSUMER_BOARD, "Lettuce"),
+        ("ChoppedLettuce", TS.CONSUMER_PLATE, "Lettuce"),
+    ]
+    board = next(st for st in world.stations
+                 if st.get("n") == "countertop_01_chopping_board_swamp (1)")
+    task = T.ThrowBatch(None, (P.resource_id(board), TS.CONSUMER_PLATE,
+                              "Lettuce", "Lettuce"), "ChoppedLettuce")
+    # 对面有干净盘（fixture 里 2 块在 Raft One）→ 可投。
+    assert task.feasible(ctx)
+
+    # 对面没有干净盘 → 缺口归零、不可投，沙拉留在 P2 这侧装盘。
+    farless = json.loads(json.dumps(frame))
+    farless["plates"] = []
+    ctx2, _ = _ctx(_world(farless))
+    assert not task.feasible(ctx2)
 
 
 def test_send_uses_own_belt_start_not_far_end():

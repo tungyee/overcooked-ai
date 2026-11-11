@@ -6,7 +6,7 @@ SendAcross：不可投掷的干净盘 / 脏盘 / 成品盘 / 生载体放到通�
 共享台面）。每种
 kind 的触发、取放与完成判定在 ai/revenue/handover.py 的规格表里。
 
-ThrowBatch：把一种可投掷料批量投向下一站消费站（砧板/灶）。两类触发：
+ThrowBatch：把一种可投掷料批量投向下一站消费站（砧板/灶/装盘）。两类触发：
   - 分割地图：消费站只有对面够得着（Rapids_2_1 木筏 ↔ 厨房）；
   - 连通但远：料到消费站 > THROW_MIN_DIST，投过去比来回跑快。
 历史教训（tests/test_tasks.py 的两条 no_batch_throw 钉子）：批量取+投曾塞在
@@ -284,7 +284,7 @@ def _dest_station(ctx, dest_id):
 
 @_register
 class ThrowBatch(Task):
-    """把一种可投掷料批量投向消费站（砧板 / 灶）：一份一投，直到缺口归零。
+    """把一种可投掷料批量投向消费站（砧板 / 灶 / 装盘）：一份一投，直到缺口归零。
 
     身份 = (dest_id, consumer, raw, product) + item（要投的形态）。N 不进身份：
     缺口每拍重算，投一份少一份，进身份的话每投一次就换一个 task、承诺惯性失效。

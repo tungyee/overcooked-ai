@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai.query import stations as S
 from ai.revenue import cook_supply as CS
+from ai.revenue import cross_supply as XS
 from ai.space import occupancy as O
 from ai.space import regions as RG
 from ai.space import throw as TH
@@ -59,6 +60,9 @@ SPLIT_MAX_LAND_FAR = 9.0
 
 CONSUMER_BOARD = "board"
 CONSUMER_COOKER = "cooker"
+# 切好的沙拉料（生菜/番茄等不烹饪、只切）的下一站是「装盘」：没有固定站点，
+# 触发条件是「对面有干净盘」。dest 仍用对面砧板作出手瞄准点，见 dest_candidates。
+CONSUMER_PLATE = "plate"
 
 MODE_SPLIT = "split"
 MODE_FAR = "far"
@@ -80,11 +84,14 @@ def stages(book, product):
             if not carrier:
                 out.append((book.cook_input_form(raw), CONSUMER_COOKER, raw))
     elif book.needs_chopping(product):
-        # 只投生料这一站：切好的形态不上投掷链。4-2 沙拉（生菜/番茄）切好后
-        # 应在 P2 这侧装盘、成品走传送带（plated_dish），不要投给对面——对面
-        # 没有稳定干净盘、又忙着切土豆/鸡块，切好的料扔过去只会堆在地上没人
-        # 接（voice-20261111-224619）。
         out.append((product, CONSUMER_BOARD, product))
+        # 已经切好的形态也能直接扔过去（切好的料仍是 throwable），下一站是
+        # 装盘（CONSUMER_PLATE）：只在对面有干净盘能接盘装沙拉时才投，对面没
+        # 盘时这一站缺口归零（见 gap），沙拉留在 P2 这侧装盘、成品走传送带
+        # （voice-20261111-224619）。
+        chopped = book.chop_target(product)
+        if chopped and chopped.lower() != product.lower():
+            out.append((chopped, CONSUMER_PLATE, product))
     return out
 
 
@@ -176,6 +183,12 @@ def gap(world, book, product, form, consumer, raw, dest, mode, bb=None):
     need = demand(world, book, product, raw)
     if need <= 0:
         return 0
+    # 切好的沙拉料投给对面（split）只有在对面有干净盘能接盘装沙拉时才有意义：
+    # 对面没盘就别投，料堆在对面没人接（voice-20261111-224619）。生料站（board）
+    # 不受此限——生料投过去是让对面切，接盘与否不卡这一站。
+    if (mode == MODE_SPLIT and consumer == CONSUMER_PLATE
+            and not _far_has_clean_plate(world, book, bb)):
+        return 0
     # 已就位按「这一站的任一消费站附近」计、每份只算一次：只看本站的话，
     # 投满 1 号灶旁边后 2、3 号灶仍各报满缺口，同一批料会被重复投三遍。
     dests = dest_candidates(world, book, consumer, product) or [dest]
@@ -183,6 +196,12 @@ def gap(world, book, product, form, consumer, raw, dest, mode, bb=None):
                  if any(near_dest(world, it, d, mode, bb) for d in dests))
     have = downstream(world, book, product, form, consumer) + placed
     return max(0, need + THROW_EXTRA_UNITS - have)
+
+
+def _far_has_clean_plate(world, book, bb):
+    # type: (Any, Any, Any) -> bool
+    """对面区有没有可用的干净空盘（含传送带在途）。"""
+    return XS.far_plate_need(world, book, bb).get("far", 0) > 0
 
 
 def sources(world, form, raw, dest, mode, bb=None, dests=None):
@@ -461,8 +480,13 @@ def _d(a, b):
 
 def dest_candidates(world, book, consumer, product):
     # type: (Any, Any, str, str) -> List[Dict]
-    """能接 product 这一站的消费站：砧板全部；灶按炊具匹配。"""
-    if consumer == CONSUMER_BOARD:
+    """能接 product 这一站的消费站：砧板全部；灶按炊具匹配。
+
+    CONSUMER_PLATE 没有固定站点，复用砧板作出手瞄准点：MODE_SPLIT 的落点按
+    P1 可达场判（region_test），dest 只是朝哪个方向投；真正「该不该投」由 gap
+    里「对面有干净盘」的门控决定。
+    """
+    if consumer in (CONSUMER_BOARD, CONSUMER_PLATE):
         return [st for st in world.stations if st.get("t") == "chopping"]
     out = []
     want = (book.cookware_of(product) or "").lower()

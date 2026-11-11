@@ -2503,7 +2503,7 @@ BATCH_DECAY = 0.5
 # 已经拿着这一批料时给 ThrowBatch 的固定加分：手里有可投的料，先投出去
 # 比换一个「要空手」的 task（FetchToBoard 等）更省——后者树首会把手里的
 # 料放下，再捡再放。切好投锅（4-2 切好的土豆/鸡块）与生料远投都适用；
-# 沙拉料已不再生成「切好形态」投掷站（见 throw_supply.stages）。
+# 切好的沙拉料也适用，但它先过「对面有干净盘」的门控（throw_supply.gap）。
 W_HELD_BATCH = 1.0
 
 
@@ -2557,7 +2557,7 @@ def _throw_proxy(world, bb, task, book=None, gap=None):
                 order_id = oid
                 break
             covered -= units
-    if task.consumer == TS.CONSUMER_BOARD:
+    if task.consumer in (TS.CONSUMER_BOARD, TS.CONSUMER_PLATE):
         return T.FetchToBoard(order_id, (task.dest_id,), task.raw)
     return T.FetchToCooker(order_id, (task.dest_id, (task.raw,)), task.product)
 

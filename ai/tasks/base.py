@@ -598,6 +598,48 @@ def loose_count(world, raw):
     return n
 
 
+# 台面传送带上等料经过的最长拍数（15s）。1-6 米/鱼/海苔在传送带上循环移动，
+# 走到锁定段旁等它经过；一轮循环约 30~40 秒但场上同时有多份料，等到下一份
+# 的间隔远短于此。超时交还 Planner，而不是无限等一份可能永远不来的料。
+CONVEYOR_WAIT_TICKS = 300
+
+
+def conveyor_pickup(resolve, held, arrived, face=True):
+    # type: (Callable, Callable, Callable, bool) -> Any
+    """从台面传送带取一件在移动的料/盘：锁段等料，不追移动物。
+
+    与普通 InteractWith 的区别：resolve 返回的目标若是 conveyor 段，就锁死
+    这一段（固定站位），Approach 走到段旁，等 arrived(ctx, 段) 成立再按键；
+    不是 conveyor（料箱/柜台/裸散料）时行为与普通 pickup 一致。
+
+    三段都是 callable：
+      - resolve(ctx) -> 目标 dict：散料走 ingredient_source（会返回 conveyor 段）；
+      - held(ctx) -> bool：是否已拿到这件东西（InteractWith 的 expect）；
+      - arrived(ctx, segment) -> bool：目标是否已到锁定的段（loose_on_station
+        或盘/脏盘的 plate_conveyor_station 判据）。
+    """
+    from ai import primitives as PR
+    locked = {}  # type: Dict[str, Any]
+
+    def target(ctx):
+        st = locked.get("st")
+        if st is not None:
+            return st
+        st = resolve(ctx)
+        if isinstance(st, dict) and st.get("t") == "conveyor":
+            locked["st"] = st
+        return st
+
+    def wait(ctx):
+        st = locked.get("st")
+        if not isinstance(st, dict) or st.get("t") != "conveyor":
+            return True
+        return arrived(ctx, st)
+
+    return PR.InteractWith(target, "pickup", held, face=face,
+                           wait_pred=wait, wait_timeout=CONVEYOR_WAIT_TICKS)
+
+
 def loose_on_station(world, raw, segment):
     # type: (Any, str, Any) -> bool
     """散落生料 raw 当前是否挂在站点 segment 上（传送带拦截等料判据）。

@@ -16,7 +16,8 @@ from ai.query import stations as S
 from ai.exec.bt import Node, Sequence
 from ai.query.plate_tokens import parse_plate_detail
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           ingredient_source)
+                           conveyor_pickup, ingredient_source,
+                           loose_on_station)
 
 # 垃圾桶的资源 id。站点实例名随关卡变（实测 "Bin 1"），但认领只需要一个
 # 稳定的标识符——同一关卡内只有一个垃圾桶被认领就够了。
@@ -397,8 +398,11 @@ class Prefetch(Task):
         # type: () -> Node
         item = self.item
         return PR.Timeout(Sequence([
-            PR.InteractWith(lambda c: ingredient_source(c, item), "pickup",
-                            lambda c: P.held_matches(c["chef"], item)),
+            conveyor_pickup(
+                resolve=lambda c: ingredient_source(c, item),
+                held=lambda c: P.held_matches(c["chef"], item),
+                arrived=lambda c, seg: loose_on_station(c["w"], item, seg),
+                face=True),
             PR.EnsureHandsFree(),
         ]), TASK_TIMEOUT_TICKS)
 

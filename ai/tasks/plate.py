@@ -11,7 +11,8 @@ from ai import primitives as PR
 from ai.query import stations as S
 from ai.query.placement import counter_cell_now, counter_occupied
 from ai.exec.bt import Condition, Node, Selector, Sequence
-from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
+from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup, plate_by_id,
                            plate_cell, plate_on_counter, station_at_cell)
 
 # 洗盘按住交互键的上限（拍）。done() 现在是「一池子全洗完」（见 WashPlate.done），
@@ -522,10 +523,28 @@ class FetchConveyorPlate(Task):
         # type: () -> Node
         held = self._held
 
+        def resolve(c):
+            # 抢救要站到贴 Bin 的末端段等盘过来，而不是追盘当前段（盘单向走）。
+            from ai.space import channels as CH
+            e = self._entry(c)
+            if e is None:
+                return None
+            cur = CH.plate_conveyor_station(c["w"], e)
+            if cur is None:
+                return None
+            return CH.terminal_conveyor_segment(c["w"], str(cur.get("grid") or ""))
+
+        def arrived(c, seg):
+            from ai.space import channels as CH
+            cur = CH.plate_conveyor_station(c["w"], self._entry(c))
+            return cur is not None and str(cur.get("n") or "") == str(
+                seg.get("n") or "")
+
         return PR.Timeout(Sequence([
             # 手里有别的盘也先放下（就近台面）：不接的话传送带上的盘直接进桶。
             PR.EnsureHandsFree(keep=held),
-            PR.InteractWith(lambda c: self._entry(c), "pickup", held),
+            conveyor_pickup(resolve=resolve, held=held, arrived=arrived,
+                            face=True),
         ]), TASK_TIMEOUT_TICKS)
 
 

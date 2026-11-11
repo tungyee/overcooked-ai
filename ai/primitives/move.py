@@ -125,7 +125,15 @@ def _station_interact_cells(st, cell, w, kind, include_belts=False, field=None):
         return navigation.serving_hatch_interact_cells(
             fp, w.walkable, w.belt_cells, field=field,
             include_belts=include_belts)
-    if st.get("t") == "washing" and kind == "placement":
+    if st.get("t") == "conveyor":
+        from ai.space import channels as CH
+        moving = CH.conveyor_interact_cells(w, st)
+        if moving is not None:
+            # 已经是可站位的竹筏地板格，直接返回，不再取四邻。
+            return list(moving)
+        cells = O.interaction_footprint(st, cell, getattr(w, "stations", ()),
+                                        w.to_grid, w.to_world, w.walkable)
+    elif st.get("t") == "washing" and kind == "placement":
         cells = sink_place_cells(st, w.stations, w.to_grid)
     else:
         # 与规划层 reachability.can_interact 同一口径（见 interaction_footprint）。

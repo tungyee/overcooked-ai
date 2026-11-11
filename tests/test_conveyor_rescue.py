@@ -117,4 +117,5 @@ def test_rescue_task_picks_the_plate_up():
     ctx = dict(ctx, exec=FakeExec(), tick=0)
     assert task.build().tick(ctx) == Status.RUNNING
     assert ctx["interaction"]["kind"] == "pickup"
-    assert ctx["interaction"]["target"][1] == PID
+    # 锁段等料：目标是盘所在的传送带段（固定），不是盘本身。
+    assert ctx["interaction"]["target"][1].startswith("ConveyorStation")

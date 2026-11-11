@@ -188,6 +188,19 @@ def _interact_goals(ctx, entry):
             # 用格外站位（池前约 0.9m）兜底，否则 WashPlate 恒判不可达，
             # 传送带送来的脏盘一路进垃圾桶。
             goals = {s['cell'] for s in shuttle.wash_stances(world, entry)}
+    elif entry.get("t") == "conveyor":
+        from ai.space import channels as CH
+        moving = CH.conveyor_interact_cells(world, entry)
+        if moving is not None:
+            # 已经是「竹筏地板上可站、映射回主网格」的站位格，直接用作 goals；
+            # 不再走 interact_cells_multi（那会再取四邻，把站位推到别的格）。
+            goals = set(moving)
+        else:
+            cells = occupancy.interaction_footprint(
+                entry, cell, world.stations, world.to_grid, world.to_world,
+                world.walkable)
+            goals = set(navigation.interact_cells_multi(
+                cells, world.walkable, world.belt_cells, include_belts=True))
     else:
         # 与执行层 move._station_interact_cells 同一口径：按占地（含承载台面）
         # 取交互位，移动篮亚格偏移时盘不会因量化到台面后一格而判不可达。

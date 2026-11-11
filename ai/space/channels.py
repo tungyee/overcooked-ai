@@ -22,7 +22,7 @@ ai/revenue/handover.py）；能投的生料走 ThrowBatch。
 资源 id 第二位就是它。拓扑未知（旧合成帧无边界）或地图不分割时没有通道。
 不写 World 以外的状态；每帧缓存在 world 上。
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ai.query import predicates as P
 from ai.space import occupancy
@@ -303,6 +303,71 @@ def conveyor_slots(world, bb=None):
             getattr(bb, "tick", 0) + CONVEYOR_GRACE_TICKS)
     world._conveyor_slots = out
     return out
+
+
+def conveyor_interact_cells(world, st):
+    # type: (object, Dict) -> Optional[Set[Tuple[int, int]]]
+    """移动网格（竹筏）上 conveyor 段的交互站位：用该网格本地邻格映射回主网格。
+
+    静态主网格的 conveyor 走常规 interaction_footprint；移动网格的段投影到
+    主网格后不是可行走格、四邻也不在 P2 可达场里（trace-20261111-121429
+    t=640：盘 -18832 投影格 (4,2) in_field=False），所以要用段的本地 gx/gz
+    的邻格，映射回主网格后取可行走的那些。
+    非移动网格（grid 缺失 / GridManager）返回 None，调用方退回 footprint。
+    """
+    gid = str(st.get("grid") or "")
+    if not gid or gid == "GridManager":
+        return None
+    gx, gz = st.get("gx"), st.get("gz")
+    if gx is None or gz is None:
+        return None
+    grids = getattr(world, "grids", None)
+    if grids is None:
+        return None
+    try:
+        gx, gz = int(gx), int(gz)
+    except (TypeError, ValueError):
+        return None
+    cells = set()  # type: Set[Tuple[int, int]]
+    for dx, dz in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        point = grids.to_world(gid, gx + dx, gz + dz)
+        if point is None:
+            continue
+        cell = world.to_grid(point[0], point[1])
+        if cell is not None and world.walkable(*cell):
+            cells.add(cell)
+    return cells or None
+
+
+def terminal_conveyor_segment(world, grid):
+    # type: (object, str) -> Optional[Dict]
+    """该 grid 上贴 Bin 的传送带末端段（离 Bin 最近的那段）。
+
+    4-2 每条 L 形带一端接着自己的 Bin：Raft Two Bin(-1,-2) 贴段 (0,-2)，
+    Raft One Bin(1,2) 贴段 (0,2)。抢救/拦截就站在这一段旁等东西到末端，
+    不追它当前所在段（盘子单向走，追当前段会永远追不上）。
+    """
+    gid = str(grid or "")
+    if not gid:
+        return None
+    bins = [st for st in getattr(world, "stations", ()) or ()
+            if st.get("t") == "bin" and str(st.get("grid") or "") == gid]
+    if not bins:
+        return None
+    segs = [st for st in getattr(world, "stations", ()) or ()
+            if is_conveyor_station(world, st)
+            and str(st.get("grid") or "") == gid]
+    if not segs:
+        return None
+
+    def cell_dist(st, b):
+        try:
+            return (int(st.get("gx") or 0) - int(b.get("gx") or 0)) ** 2 \
+                + (int(st.get("gz") or 0) - int(b.get("gz") or 0)) ** 2
+        except (TypeError, ValueError):
+            return 1e9
+
+    return min(segs, key=lambda st: min(cell_dist(st, b) for b in bins))
 
 
 def conveyor_start_rank(st):

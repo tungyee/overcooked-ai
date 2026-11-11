@@ -18,9 +18,11 @@ from ai.query import predicates as P
 from ai import primitives as PR
 from ai.exec.bt import Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           _station_for_item, cooker_state, cooker_station,
+                           _station_for_item, conveyor_pickup,
+                           cooker_state, cooker_station,
                            cooked_sources, held_matches_contents,
-                           ingredient_available, ingredient_source)
+                           ingredient_available, ingredient_source,
+                           loose_on_station)
 from ai.tasks.cook import (_cooker_ready_to_take, TAKE_COOKED_TIMEOUT_TICKS,
                            WAIT_COOKED_TIMEOUT_TICKS)
 
@@ -126,8 +128,12 @@ class FetchToCarrier(Task):
 
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding),
-            PR.InteractWith(lambda c: ingredient_source(c, _fetch_form(c, item)),
-                            "pickup", holding),
+            conveyor_pickup(
+                resolve=lambda c: ingredient_source(c, _fetch_form(c, item)),
+                held=holding,
+                arrived=lambda c, seg: loose_on_station(
+                    c["w"], _fetch_form(c, item), seg),
+                face=True),
             PR.InteractWith(target, "placement", placed),
         ]), TASK_TIMEOUT_TICKS)
 
@@ -370,7 +376,11 @@ class FillCarrier(Task):
         # 句柄为 null、pickup 会被脚边散料抢走）。
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding),
-            PR.InteractWith(wrapper_source, "pickup", holding),
+            conveyor_pickup(
+                resolve=wrapper_source,
+                held=holding,
+                arrived=lambda c, seg: loose_on_station(c["w"], base_form, seg),
+                face=True),
             PR.Approach(source_target, None),
             PR.Face(source_target),
             PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),

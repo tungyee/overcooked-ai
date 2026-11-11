@@ -12,8 +12,9 @@ from ai import primitives as PR
 from ai.query import stations as S
 from ai.exec.bt import Guard, Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           held_matches_contents, ingredient_available,
-                           ingredient_source, plate_by_id, plate_matches_order)
+                           conveyor_pickup, held_matches_contents,
+                           ingredient_available, ingredient_source,
+                           loose_on_station, plate_by_id, plate_matches_order)
 
 
 def _plate_on_serving_hatch(ctx, plate):
@@ -183,7 +184,12 @@ class FetchToPlate(Task):
             # 树首清手：被抢占时手里可能还端着上一 task 的盘子（spec §7.4）；
             # keep：手里已经是目标料就别放下再捡（拿错同名不同料的会被放下）
             PR.EnsureHandsFree(keep=holding),
-            PR.InteractWith(src, "pickup", holding),
+            conveyor_pickup(
+                resolve=src,
+                held=holding,
+                arrived=lambda c, seg: loose_on_station(
+                    c["w"], _fetch_form_of(c, item), seg),
+                face=True),
             PR.InteractWith(lambda c: plate_by_id(c, plate_id),
                             "placement", in_plate),
         ]), TASK_TIMEOUT_TICKS)

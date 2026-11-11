@@ -13,6 +13,7 @@ from ai.query import stations as S
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.query.plate_tokens import parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
                            loose_count, loose_on_station, plate_by_id,
@@ -30,11 +31,6 @@ TAKE_COOKED_TIMEOUT_TICKS = 400
 # 再早去（例如刚下锅）就只能端着盘子在锅边干等，把后面的命令（洗碗等）
 # 全堵住；留 4s 给取盘+走位，既不会从 0% 开始等，也不会晚到烧糊。
 TAKE_COOKED_LEAD_S = 4.0
-
-# 传送带拦截等料的最长拍数（15s）。米/鱼/海苔在传送带上循环移动，走到锁定
-# 段旁等它经过；一轮循环实测约 30~40 秒但场上同时有多份料，等到下一份的
-# 间隔远短于此。超时交还 Planner，而不是无限等一份可能永远不来的料。
-CONVEYOR_WAIT_TICKS = 300
 
 # 下料是**两趟**差事（空手走到料箱、拿着料走回灶），和灭火同构，默认 200
 # 拍压根不够：实机 trace-20261015-165358 九次 FillCooker 里四次撞线
@@ -241,39 +237,12 @@ class FetchToCooker(Task):
                     cc.get("pot_contents") or [])
 
             def pickup():
-                # ingredient_source 对「挂站点上的散落料」返回站点（有朝向），
-                # face=True 让 Face 转身；裸散落料 Face 内部直接 SUCCESS 跳过，
-                # 行为与旧 face=False 等价。
-                #
-                # 传送带上的料（1-6 的米/鱼/海苔）在持续移动：ingredient_source
-                # 每拍把料解析成它当前所在的传送带段，段随料跨段移动而变，角色
-                # 追着移动的料跑永远追不上（trace-20261021-131529 全程 0 帧拿到
-                # 米、灶从没开煮）。这里把取料目标**锁死在第一次解析出的站点**，
-                # 再 WaitUntil 等料经过这一段才 tap——拦截等料，不追移动目标。
-                #
-                # 只锁传送带段：散落料解析出的是 item 快照（带当时的 x/z），
-                # 锁住就是锁住旧坐标，料被弹开/踢走后 P2 走向空地反复拾取
-                # （trace-20261029-202903 t=231~312）。箱子/台面/散落每拍重新解析。
-                locked = {}
-
-                def target(c):
-                    st = locked.get("st")
-                    if st is not None:
-                        return st
-                    st = ingredient_source(c, form(c))
-                    if isinstance(st, dict) and st.get("t") == "conveyor":
-                        locked["st"] = st
-                    return st
-
-                def arrived(c):
-                    st = locked.get("st")
-                    if not isinstance(st, dict) or st.get("t") != "conveyor":
-                        return True       # 箱子/板/散落不是传送带，不需等
-                    return loose_on_station(c["w"], form(c), st)
-
-                return PR.InteractWith(
-                    target, "pickup", holding, face=True,
-                    wait_pred=arrived, wait_timeout=CONVEYOR_WAIT_TICKS)
+                # 传送带上的料锁段等料；箱子/台面/散落行为与普通 pickup 一致。
+                return conveyor_pickup(
+                    resolve=lambda c: ingredient_source(c, form(c)),
+                    held=holding,
+                    arrived=lambda c, seg: loose_on_station(c["w"], form(c), seg),
+                    face=True)
 
             def drop():
                 # 最后几步：离锅还远、能直线投进时精准投进锅（ThrowOntoStation），
@@ -340,9 +309,12 @@ class FetchToCooker(Task):
 
             steps = [PR.EnsureHandsFree(keep=lambda c: holding(c, raws[0]))]
             for r in raws:
-                steps.append(PR.InteractWith(
-                    lambda c, r=r: raw_src(c, r), "pickup",
-                    lambda c, r=r: holding(c, r)))
+                steps.append(conveyor_pickup(
+                    resolve=lambda c, r=r: raw_src(c, r),
+                    held=lambda c, r=r: holding(c, r),
+                    arrived=lambda c, seg, r=r: loose_on_station(
+                        c["w"], c["book"].cook_input_form(r), seg),
+                    face=True))
                 steps.append(PR.InteractWith(
                     lambda c: cooker_station(c, cooker_id), "placement",
                     lambda c, r=r: placed(c, r)))

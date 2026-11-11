@@ -12,8 +12,9 @@ from ai.query import stations as S
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.query.recipes import find_ingredient
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup,
                            ingredient_available, ingredient_source,
-                           loose_count)
+                           loose_count, loose_on_station)
 
 # ---------- 切菜常量 ----------
 
@@ -187,11 +188,11 @@ class FetchToBoard(Task):
                                 str(board_id)) == str(raw).lower()
 
         def pickup():
-            # ingredient_source 现在对「挂在站点上的散落料」返回站点（带朝向
-            # 信号），故 face=True 让 Face 转身面向站点；裸散落料（无站点）
-            # 时 interact_ready 走名字兜底，Face 仍能到位。
-            return PR.InteractWith(
-                lambda x: ingredient_source(x, raw), "pickup", holding,
+            # 传送带上的料锁段等料；箱子/台面/散落行为与普通 pickup 一致。
+            return conveyor_pickup(
+                resolve=lambda x: ingredient_source(x, raw),
+                held=holding,
+                arrived=lambda c, seg: loose_on_station(c["w"], raw, seg),
                 face=True)
 
         # 不投上板：投掷射程固定 ≈7.5m，而砧板是普通台面（ServerAttachStation，

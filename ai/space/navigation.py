@@ -13,17 +13,27 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 BELT_REVERSE_COST = 1
 
+# 快带（4-3 的 5 m/s）逆行走不动，硬挡；1-4 的 2.5 m/s 还能逆行 + dash 顶住。
+# 阈值取两者中间。belt_speed（occupancy.parse_belts 保留的 |v|）超过它就判快带。
+FAST_BELT_SPEED = 3.5
+
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
-def step_cost(belt_dir, cur, nxt):
-    # type: (Dict, Tuple[int, int], Tuple[int, int]) -> int
-    """cur → nxt 的移动代价。逆着传送方向走要长按，代价高。"""
+def step_cost(belt_dir, cur, nxt, belt_speed=None):
+    # type: (Dict, Tuple[int, int], Tuple[int, int], Optional[Dict[Tuple[int, int], float]]) -> Optional[int]
+    """cur → nxt 的移动代价；返回 None 表示这一步走不了（快带逆行）。
+
+    逆着传送方向走要长按，慢带（1-4）记 BELT_REVERSE_COST；快带（4-3）
+    走不动，直接挡掉（None），逼寻路绕带 / 顺带，而不是顶带卡死。
+    """
     d = (nxt[0] - cur[0], nxt[1] - cur[1])
     bd = belt_dir.get(cur)
-    if bd and d[0] * bd[0] + d[1] * bd[1] < 0:
-        return BELT_REVERSE_COST
-    return 1
+    if not bd or d[0] * bd[0] + d[1] * bd[1] >= 0:
+        return 1
+    if belt_speed and belt_speed.get(cur, 0.0) > FAST_BELT_SPEED:
+        return None
+    return BELT_REVERSE_COST
 
 
 def cross_grid_bridges(primary_to_world, other_cells_world, max_gap=0.5):
@@ -68,14 +78,17 @@ class Field(dict):
         dict.__init__(self, *args, **kwargs)
         self.waits = {}        # type: Dict[Tuple[int, int], int]
         self.wait_cost = None  # type: Optional[Callable]
+        # 快带速度表（occupancy.parse_belts 的第三返回值）；trace_back 回溯时
+        # 用它做与建场一致的「快带逆行硬挡」账。
+        self.belt_speed = None  # type: Optional[Dict[Tuple[int, int], float]]
         # 经跳边（seams.nav_jumps：门洞格 ↔ 开门时对面那格现在的位置）到达的格 → 前驱
         self.via = {}          # type: Dict[Tuple[int, int], Tuple[int, int]]
 
 
 def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
                    soft_cost=None, bridges=None, edge_blocked=None, wait_cost=None,
-                   jumps=None, jump_cost=None):
-    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]], Optional[Callable]) -> Dict[Tuple[int, int], int]
+                   jumps=None, jump_cost=None, belt_speed=None):
+    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]], Optional[Callable], Optional[Dict], Optional[Dict], Optional[Dict[Tuple[int, int], float]]) -> Dict[Tuple[int, int], int]
     """从 start 做 Dijkstra，返回 {格子: 最小代价}。
 
     wait_cost(cost, cur, nxt) -> Optional[int]：走进 nxt 前要等几步（门洞没开
@@ -105,6 +118,7 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
     bridges = bridges or {}
     dist = Field({start: 0})
     dist.wait_cost = wait_cost
+    dist.belt_speed = belt_speed
     waits = dist.waits
     via = dist.via
     jumps = jumps or {}
@@ -131,7 +145,12 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
                 if wait is None:
                     continue
             # 基础代价 + P1 软代价 + 等门
-            base = jump_cost.get((cur, nxt), 1) if jumped else step_cost(belt_dir, cur, nxt)
+            if jumped:
+                base = jump_cost.get((cur, nxt), 1)
+            else:
+                base = step_cost(belt_dir, cur, nxt, belt_speed)
+                if base is None:
+                    continue          # 快带逆行：走不动，直接不展开
             ncost = cost + base + soft_cost.get(nxt, 0) + wait
             if ncost < dist.get(nxt, 1 << 60):
                 dist[nxt] = ncost
@@ -327,6 +346,7 @@ def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None, wait_c
     extra = (soft_cost or {}).get(cur, 0)
     if want is None:
         return None
+    belt_speed = getattr(field, "belt_speed", None)
     for dx, dz in _NEIGHBORS:
         n = (cur[0] + dx, cur[1] + dz)
         c = field.get(n)
@@ -341,7 +361,10 @@ def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None, wait_c
             wait = wait_cost(c, n, cur)
             if wait is None:
                 continue
-        if c + step_cost(belt_dir, n, cur) + extra + wait == want:
+        sc = step_cost(belt_dir, n, cur, belt_speed)
+        if sc is None:
+            continue          # 快带逆行：建场时就没走过这条边
+        if c + sc + extra + wait == want:
             return n
     return None
 
@@ -385,3 +408,19 @@ def first_step(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
     if not path or len(path) < 2:
         return None
     return path[1]
+
+
+def path_blocked_by_fast_belt(path, belt_dir, belt_speed=None):
+    # type: (List[Tuple[int, int]], Dict, Optional[Dict[Tuple[int, int], float]]) -> bool
+    """路径里有没有「快带逆行」的步。
+
+    传送带方向翻转后，发令时冻结的路径会变得走不动：move 原语每拍用它判
+    「方向变了、得改方向」，一旦命中就提前中止在途 move，交回 Planner 按
+    新方向重算，而不是硬等插件 8s 超时。
+    """
+    if not belt_speed:
+        return False
+    for i in range(len(path) - 1):
+        if step_cost(belt_dir, path[i], path[i + 1], belt_speed) is None:
+            return True
+    return False

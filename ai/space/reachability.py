@@ -36,6 +36,7 @@ def field_for(world, bb=None, name=P.P2_NAME, soft_cost=None):
         # 寻路谓词叠了平台接缝门洞（ai/space/seams.py）与传送门（ai/space/portals.py），
         # 站位判定仍用 world.walkable。
         cache[key] = navigation.distance_field(start, belt_dir=world.belt_dir,
+            belt_speed=getattr(world, 'belt_speed', None),
             blocked=blocked, soft_cost=soft_cost, **portals.nav_args(world, bb, blocked))
     return cache[key]
 

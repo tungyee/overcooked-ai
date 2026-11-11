@@ -283,7 +283,8 @@ class World(object):
                 for dx in (0, 1):      # 出餐口约 2 格宽
                     for dz in (1,):    # 只挡北邻一排（墙后死路）
                         occ_cells.add((cell[0] + dx, cell[1] + dz))
-        self.belt_cells, self.belt_dir = occupancy.parse_belts(state.get("belts"))
+        self.belt_cells, self.belt_dir, self.belt_speed = occupancy.parse_belts(
+            state.get("belts"))
 
         # belt_cells 必须在 walkable 之前解析好：传送带格要从运行时占用里
         # 豁免（ConveyorStation 自己占住那格，但角色能走上去）。

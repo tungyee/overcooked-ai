@@ -254,6 +254,30 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
     return _wait_for_light(prim, ctx, label, kind, cur, info)
 
 
+def _abort_on_belt_flip(prim, ctx):
+    # type: (Any, Dict) -> Optional[str]
+    """4-3 快带方向翻转：冻结路径上出现快带逆行 → 提前中止在途 move。
+
+    方向一变，发令时算好的路径就走不动了（快带逆行走不过去）。与其等插件
+    8s stuck 超时，不如每拍看一次，命中就 halt 交回 Planner 按新方向重算。
+    只在主 move 在途时生效（curb/median 小段 move 不设 _belt_path，且 4-1
+    没有快带）。
+    """
+    if prim._pending_cmd is None:
+        return None
+    path = getattr(prim, "_belt_path", None)
+    if not path:
+        return None
+    w = ctx.get("w")
+    if w is None or not navigation.path_blocked_by_fast_belt(
+            path, w.belt_dir, getattr(w, 'belt_speed', None)):
+        return None
+    prim._exec_halt()
+    prim._belt_path = None
+    _nav_debug("belt-flip t=%s path=%s" % (_nav_time(ctx), _nav_path(path)))
+    return Status.FAILURE
+
+
 class Approach(Primitive):
     """走到能跟 target 交互的位置（委托后端：把走位交给插件 move 命令）。
 
@@ -274,6 +298,7 @@ class Approach(Primitive):
         self._curb_cmd = False         # 在途的是「先走到路沿」的小段 move
         self._median_cmd = False       # 在途的是「改道到车道中间」的小段 move
         self._median_wait = False      # 已到中线，锁存等下一轮红灯
+        self._belt_path = None         # 发令时冻结的路径（方向翻转检测用）
 
     def reset(self):
         # type: () -> None
@@ -284,6 +309,7 @@ class Approach(Primitive):
         self._curb_cmd = False
         self._median_cmd = False
         self._median_wait = False
+        self._belt_path = None
 
     def needs_reapproach(self, ctx):
         # type: (Dict) -> bool
@@ -430,7 +456,11 @@ class Approach(Primitive):
             cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*goal)),
                             handle_desc(st, target_grid_callbacks(w, st)[0]), self.kind,
                             MOVE_TIMEOUT_MS)
+            self._belt_path = path
             return self._begin_exec(ctx, ex, cmd)
+        aborted = _abort_on_belt_flip(self, ctx)
+        if aborted is not None:
+            return aborted
         status = self._poll_exec(ctx, ex)
         if self._curb_cmd or self._median_cmd:
             if status != Status.RUNNING:
@@ -585,6 +615,7 @@ class GoToCell(Primitive):
         self._goal = None   # type: Optional[Tuple[int, int]]
         self._fails = 0
         self._nudged = False
+        self._belt_path = None   # 发令时冻结的路径（方向翻转检测用）
 
     def reset(self):
         # type: () -> None
@@ -596,6 +627,7 @@ class GoToCell(Primitive):
         self._goal = None
         self._fails = 0
         self._nudged = False
+        self._belt_path = None
 
     def _done(self):
         # type: () -> str
@@ -668,6 +700,9 @@ class GoToCell(Primitive):
                     self._goal = tuple(goal)      # 段内定格目标格
                 return guard
         if self._pending_cmd is not None:
+            aborted = _abort_on_belt_flip(self, ctx)
+            if aborted is not None:
+                return aborted
             s = self._poll_exec(ctx, ctx["exec"])
             if s == Status.RUNNING:
                 return s
@@ -701,6 +736,7 @@ class GoToCell(Primitive):
         self._goal = tuple(goal)
         cmd = _move_cmd(w, path, field, ctx.get("bb"), list(w.to_world(*self._goal)),
                         None, None, GOTO_MOVE_TIMEOUT_MS)
+        self._belt_path = path
         return self._begin_exec(ctx, ctx["exec"], cmd)
 
 

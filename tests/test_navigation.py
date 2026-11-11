@@ -3,12 +3,14 @@ import pytest
 from ai.space import navigation as N
 from ai.space.navigation import (
     BELT_REVERSE_COST,
+    FAST_BELT_SPEED,
     cross_grid_bridges,
     distance_field,
     interact_cells,
     interact_cells_multi,
     interact_cells_with_belts,
     nearest_cost,
+    path_blocked_by_fast_belt,
     serving_hatch_interact_cells,
     step_cost,
 )
@@ -29,6 +31,43 @@ def test_step_cost_returns_reverse_cost_for_against_belt():
     assert step_cost(belt, (0, 0), (-1, 0)) == BELT_REVERSE_COST
     assert step_cost(belt, (0, 0), (1, 0)) == 1
     assert step_cost(belt, (0, 0), (0, 1)) == 1
+
+
+def test_step_cost_blocks_against_fast_belt():
+    """快带（4-3 的 5 m/s）逆行走不动 → None 硬挡；慢带仍只记逆向代价。"""
+    belt = {(0, 0): (1, 0)}
+    fast = {(0, 0): 5.0}
+    slow = {(0, 0): 2.5}
+
+    assert step_cost(belt, (0, 0), (-1, 0), fast) is None
+    assert step_cost(belt, (0, 0), (1, 0), fast) == 1
+    assert step_cost(belt, (0, 0), (0, 1), fast) == 1
+    assert step_cost(belt, (0, 0), (-1, 0), slow) == BELT_REVERSE_COST
+
+
+def test_distance_field_blocks_against_fast_belt():
+    """快带逆行不展开：只能绕带，绕不过去则该格不可达。"""
+    # (0,0) 站在快带上，带把人向 +x 推；往 -x（(0,0)→(-1,0)）是逆行。
+    walkable = lambda gx, gz: -1 <= gx <= 1 and gz == 0
+    belt = {(0, 0): (1, 0)}
+    fast = {(0, 0): 5.0}
+
+    field = distance_field((0, 0), walkable, belt, belt_speed=fast)
+
+    # (-1,0) 逆带：挡掉，不可达；(+1,0) 顺带可达。
+    assert (-1, 0) not in field
+    assert field[(1, 0)] == 1
+
+
+def test_path_blocked_by_fast_belt_detects_reverse_step():
+    belt = {(1, 0): (1, 0)}
+    fast = {(1, 0): 5.0}
+    # (0,0)→(1,0)→(0,0)：第二步 (1,0)→(0,0) 是快带逆行。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0), (0, 0)], belt, fast) is True
+    # 顺带路径不命中。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0)], belt, fast) is False
+    # 无速度表时不判定（旧行为兼容）。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0), (0, 0)], belt, None) is False
 
 
 def test_distance_field_expands_uniformly():

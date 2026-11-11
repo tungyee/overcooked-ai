@@ -133,6 +133,7 @@ def _map(world):
     """
     belt_cells = getattr(world, "belt_cells", None) or set()
     belt_dir = getattr(world, "belt_dir", None) or {}
+    belt_speed = getattr(world, "belt_speed", None) or {}
     hazards = getattr(world, "hazards", None) or []
     chefs = getattr(world, "chefs", None) or []
     p2 = P.chef_by_name(chefs, P.P2_NAME)
@@ -167,6 +168,7 @@ def _map(world):
         "teleports": raw.get('teleports') or [],
         "belt_cells": sorted([list(c) for c in belt_cells]),
         "belt_dir": _belt_dir(belt_dir),
+        "belt_speed": _belt_speed(belt_speed),
         "p2_cell": _chef_cell(world, p2) if p2 else None,
         "p1_cell": _chef_cell(world, p1) if p1 else None,
     }
@@ -182,4 +184,17 @@ def _belt_dir(belt_dir):
         else:
             key = str(cell)
         out[key] = list(d) if isinstance(d, (tuple, list)) else d
+    return out
+
+
+def _belt_speed(belt_speed):
+    # type: (Dict) -> Dict
+    """传送带速度表：{(gx,gz): |v|} → {"gx,gz": |v|}（复盘 4-3 快带用）。"""
+    out = {}
+    for cell, s in belt_speed.items():
+        if isinstance(cell, tuple) and len(cell) == 2:
+            key = "%d,%d" % (cell[0], cell[1])
+        else:
+            key = str(cell)
+        out[key] = s
     return out

@@ -263,7 +263,7 @@ def test_make_walkable_real_frame_baseline():
     parsed = O.parse_node_map(frame["grid"].get("nodeMap"))
     assert parsed is not None
     nm, rows, cols = parsed
-    cells, _ = O.parse_belts(frame.get("belts"))
+    cells, _, _ = O.parse_belts(frame.get("belts"))
     walk = O.make_walkable(
         nm, rows, cols,
         O.playable_bounds(frame["stations"]),
@@ -726,18 +726,30 @@ def test_parse_belts_direction_from_velocity():
     """传送带方向从 vx/vz 归一化，不信任任何枚举字段。"""
     raw = [{"grid": "GridManager", "gx": -4, "gz": 2, "vx": 2.5, "vz": 0.0},
            {"grid": "GridManager", "gx": -4, "gz": -3, "vx": -2.5, "vz": 0.0}]
-    cells, dirs = O.parse_belts(raw)
+    cells, dirs, speeds = O.parse_belts(raw)
     assert cells == {(-4, 2), (-4, -3)}
     assert dirs[(-4, 2)] == (1, 0)
     assert dirs[(-4, -3)] == (-1, 0)
+    assert speeds[(-4, 2)] == 2.5
+    assert speeds[(-4, -3)] == 2.5
 
 
 def test_parse_belts_empty_on_zero_velocity():
-    """vx/vz 都是 0 时该格仍算传送带（belt_cells），但不记方向。"""
+    """vx/vz 都是 0 时该格仍算传送带（belt_cells），但不记方向/速度。"""
     raw = [{"grid": "G", "gx": 0, "gz": 0, "vx": 0.0, "vz": 0.0}]
-    cells, dirs = O.parse_belts(raw)
+    cells, dirs, speeds = O.parse_belts(raw)
     assert cells == {(0, 0)}
-    assert dirs == {}   # 方向不可定义，但格仍可走
+    assert dirs == {}    # 方向不可定义，但格仍可走
+    assert speeds == {}
+
+
+def test_parse_belts_speed_magnitude():
+    """速度保留 |v|（斜向带也给模长），供 navigation 判「快带逆行硬挡」。"""
+    raw = [{"grid": "G", "gx": 0, "gz": 0, "vx": 3.0, "vz": 4.0}]
+    cells, dirs, speeds = O.parse_belts(raw)
+    assert cells == {(0, 0)}
+    assert dirs[(0, 0)] == (1, 1)     # 斜向按符号取整
+    assert speeds[(0, 0)] == 5.0
 
 
 def test_station_block_cells_plate_station_uses_layer20():

@@ -688,15 +688,19 @@ def parse_wind_zones(wind_list):
 
 
 def parse_belts(belts_list):
-    # type: (Optional[List[Dict]]) -> Tuple[Set[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]]]
-    """传送带格集合与方向（spec §5.4）：方向来自 GetSurfaceVelocity() 归一化。
+    # type: (Optional[List[Dict]]) -> Tuple[Set[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]], Dict[Tuple[int, int], float]]
+    """传送带格集合、方向与速度（spec §5.4）：方向来自 GetSurfaceVelocity() 归一化。
 
     取代 occupancy.BELTS 关卡硬编码表。vx/vz 都是 0（速度为零，异常数据）
     时该格仍算传送带（belt_cells 决定"是不是传送带"，不决定推力方向），
-    但不记方向——navigation 的逆向代价判定对无方向格天然不生效。
+    但不记方向/速度——navigation 的逆向代价判定对无方向格天然不生效。
+
+    速度（|v|）单独保留：4-3 的快带（5 m/s）逆行走不动，navigation 据此
+    硬挡；1-4 的慢带（2.5 m/s）仍允许逆行 + dash 顶住。
     """
-    cells = set()  # type: Set[Tuple[int, int]]
-    dirs = {}      # type: Dict[Tuple[int, int], Tuple[int, int]]
+    cells = set()   # type: Set[Tuple[int, int]]
+    dirs = {}       # type: Dict[Tuple[int, int], Tuple[int, int]]
+    speeds = {}     # type: Dict[Tuple[int, int], float]
     for b in belts_list or ():
         if not isinstance(b, dict):
             continue
@@ -720,7 +724,8 @@ def parse_belts(belts_list):
             (1 if vx_f > 0 else -1) if vx_f != 0 else 0,
             (1 if vz_f > 0 else -1) if vz_f != 0 else 0,
         )
-    return cells, dirs
+        speeds[cell] = (vx_f * vx_f + vz_f * vz_f) ** 0.5
+    return cells, dirs, speeds
 
 
 def station_block_cells(station, terrain_by_layer, mapping):

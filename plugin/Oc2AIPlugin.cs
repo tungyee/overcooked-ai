@@ -2740,12 +2740,36 @@ namespace Oc2AI
                 Vector3 p = mb.transform.position;
                 object stGm = GridManagerObj(mb);
                 string[] gidx = GridIndexOn(stGm, p).Split(',');
-                object dir = GetField(mb, "m_conveyanceDirectionXZ");
-                object spd = GetField(mb, "m_conveySpeed");
+                // 4-2 竹筏传送带的方向在 Server/ClientConveyorStation 组件上，
+                // 基类 ConveyorStation 读 m_conveyanceDirectionXZ 恒为 null。
+                // 优先从服务端/客户端组件读，仍拿不到再退回基类。
+                object dir = null, spd = null;
+                MonoBehaviour dirSrc = null;
+                foreach (string cn in new[] { "ServerConveyorStation", "ClientConveyorStation" })
+                {
+                    Component c = mb.GetComponent(cn);
+                    if (c == null) continue;
+                    object d = GetField(c, "m_conveyanceDirectionXZ");
+                    if (d != null) { dirSrc = c as MonoBehaviour; dir = d; spd = GetField(c, "m_conveySpeed"); break; }
+                }
+                if (dirSrc == null)
+                {
+                    dirSrc = mb;
+                    dir = GetField(mb, "m_conveyanceDirectionXZ");
+                    spd = GetField(mb, "m_conveySpeed");
+                }
                 float speed = spd is float f ? f : 0f;
                 float dx = 0f, dz = 0f;
                 if (dir is Vector2 v2) { dx = v2.x; dz = v2.y; }
                 else if (dir is Vector3 v3) { dx = v3.x; dz = v3.z; }
+                if ((dx == 0f && dz == 0f) && dirSrc != null)
+                {
+                    // 字段拿不到（或为 0）时退回表面速度：GetSurfaceVelocity 返回
+                    // 世界空间速度，含竹筏漂移；下面会把主网格/竹筏速度扣掉一点
+                    // 但这里只做兜底，能让 vx/vz 不再恒 0。
+                    object vel = CallMethod(dirSrc, "GetSurfaceVelocity");
+                    if (vel is Vector3 sv) { dx = sv.x; dz = sv.z; }
+                }
                 if (si > 0) sb.Append(',');
                 sb.Append("{\"t\":\"conveyor\",\"n\":").Append(Jstr(ObjNames.Of(mb)))
                     .Append(",\"grid\":").Append(

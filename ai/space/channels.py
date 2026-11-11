@@ -282,11 +282,14 @@ def conveyor_slots(world, bb=None):
             st for st in (getattr(world, "stations", ()) or ())
             if is_conveyor_station(world, st)
             and str(st.get("grid") or "") in player_grids]
+        # 自己这侧整条带都够得着：P2 就站在同一块竹筏地板上。不用 _reach
+        # 逐段判——主网格投影会随竹筏亚格漂移闪断，把明明能站到的段判成
+        # 不可达（trace-20261111-115549 t=367 等，7 段只有 4 段被认可达）。
         near_segs = [
             st for st in (getattr(world, "stations", ()) or ())
             if is_conveyor_station(world, st)
-            and (own_grid is None or str(st.get("grid") or "") == own_grid)
-            and _reach(world, near, st, P.P2_NAME)]
+            and own_grid is not None
+            and str(st.get("grid") or "") == own_grid]
         if player_all and near_segs:
             best = min(
                 ((a.get("x", 0.0) - b.get("x", 0.0)) ** 2

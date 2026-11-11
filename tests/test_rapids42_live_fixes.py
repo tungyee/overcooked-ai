@@ -105,6 +105,25 @@ def test_plate_match_survives_one_frame_reachability_flicker():
     assert record["top_layer"] == 2
 
 
+def test_own_belt_segments_all_reachable_when_on_raft():
+    """P2 在自己竹筏上时，自己这侧整条传送带都应可达，不被投影闪断漏掉。"""
+    _frame, world, ctx, _book = _frame_world(367)
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    own = CH._chef_grid(world, chef)
+    assert own == "Raft Two"
+    segs = {s.get("n") for s in world.stations
+            if s.get("t") == "conveyor" and s.get("grid") == own}
+    slots = {s.get("n") for s in CH.conveyor_slots(world, ctx["bb"])}
+    assert slots == segs and slots
+
+    from ai.tasks import relay
+    from ai import tasks as T
+    task = T.SendAcross("1", ("-19508", CH.CONVEYOR), "plated_dish")
+    assert task.feasible(ctx)
+    slot = relay._channel_slot(ctx, CH.CONVEYOR, {}, False)
+    assert slot is not None and slot.get("grid") == own
+
+
 def test_conveyor_dirty_stack_rescued_like_plates():
     """脏盘摞在 P2 这侧传送带上，和普通盘一样走 FetchConveyorPlate 抢救。"""
     _frame, world, ctx, book = _frame_world(3510)

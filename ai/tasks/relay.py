@@ -83,12 +83,17 @@ def _channel_slot(ctx, key, lock, allow_boards=False):
     if not free:
         return None
 
+    own = CH._chef_grid(w, ctx.get("chef"))
     def cost(st):
         if key in (CH.STATIC, CH.CONVEYOR):
             goals = reachability._interact_goals(ctx, st)
             if goals is True:
                 return (0, 0)
             got = [field[g] for g in goals or () if field and g in field]
+            # 自己这侧整条带都够得着：主网格投影会闪断，别因一帧没有投影
+            # 交互格就把带子判成不可放（trace-20261111-115549 t=367）。
+            if key == CH.CONVEYOR and str(st.get("grid") or "") == own:
+                got = [0]
             if not got:
                 return (2, 1e9)
             tie = 0 if st.get("t") == "counter" else 1

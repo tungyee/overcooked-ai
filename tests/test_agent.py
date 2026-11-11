@@ -434,6 +434,19 @@ def test_task_own_failure_still_abandons(agent):
     assert agent.bb.scratch.abandoned_actions[task.claims()[0]] == agent.tick + A.ABANDON_TTL_TICKS
 
 
+def test_abandon_cooldown_is_five_seconds():
+    """整体放弃冷却 = 100 拍（5 秒）。
+
+    10 秒（200 拍）会让移动木筏关卡里的送餐被锁过久：接缝/篮子停靠窗口只有
+    约 10~16 秒，10 秒冷却一出，窗口就错过、成品盘干放到终局
+    （trace-20261111-220835 的 SendAcross -87392 三次捡盘失败后 10s 冷却，
+    冷却没结束接缝又断开）。但仍要长于清手短冷却（HANDS_CLEAR_COOLDOWN_TICKS）。
+    """
+    from ai import agent as A
+    assert A.ABANDON_TTL_TICKS == 100
+    assert A.HANDS_CLEAR_COOLDOWN_TICKS < A.ABANDON_TTL_TICKS
+
+
 # ---- Task 4: _validate_action（用 2-1 真实帧） ----
 
 import gzip

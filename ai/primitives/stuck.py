@@ -19,7 +19,11 @@ from ai.primitives.base import Primitive
 # "本文档中'拍'统一指 Python 循环拍（50 ms）"。混用两套时基会让测试
 # 必须 sleep。4.0 秒 → 20 Hz 下 80 拍。
 BAD_CELL_TTL_TICKS = 80
-ABANDON_TTL_TICKS = 200
+# 整体放弃的冷却（拍）。5 秒：10 秒（200 拍）会让移动木筏关卡里的送餐被锁
+# 过久——接缝/篮子停靠窗口约 10~16 秒，10 秒冷却一出窗口就错过、成品盘干放
+# 到终局（trace-20261111-220835 SendAcross -87392 三次捡盘失败后冷却还没
+# 结束接缝又断开）。仍须长于 HANDS_CLEAR_COOLDOWN_TICKS（清手短冷却）。
+ABANDON_TTL_TICKS = 100
 
 
 def _ensure_stuck_scratch(ctx):
@@ -62,7 +66,7 @@ def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
         check = getattr(world, "chef_in_wind", None)
         if callable(check) and check(chef):
             return
-    # 端锅/盛饭/灭火这类任务不能拉黑资源：拉黑期(200拍)超过烧糊倒计时，
+    # 端锅/盛饭/灭火这类任务不能拉黑资源：拉黑期再短也可能让锅烧糊，
     # 等于判那口锅死刑（实机：盛饭失败把端锅一起拉黑 → 熟锅烧糊起火）。
     # bad_cells 仍照写——寻路绕开被堵的那一格，只废格、不废整个资源。
     if getattr(task, "NO_ABANDON", False):

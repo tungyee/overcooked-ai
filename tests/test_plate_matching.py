@@ -642,7 +642,7 @@ def test_filter_feasible_keeps_cooked_pot_task_despite_abandoned():
     """停火关键任务不受 abandoned 拉黑约束（NO_ABANDON）。
 
     散熟锅即使被写进 scratch.abandoned，TakeCookedToPlate（盛饭）也仍然
-    可行——拉黑期（200 拍）比烧糊倒计时还长，过滤掉它熟锅必糊必着火
+    可行——拉黑期再短也可能让锅烧糊，过滤掉它熟锅必糊必着火
     （实机 trace-20261018-153802：盛饭失败把端锅一起拉黑 → 熟锅烧糊起火）。
     """
     from ai.state.blackboard import StuckScratch

@@ -218,6 +218,23 @@ def test_plated_dish_is_not_dropped_for_prep():
     assert chosen.source_id == "-19502", chosen
 
 
+def test_loose_cooked_basket_targets_containing_counter():
+    """散炸篮盛料要对着承载它的台面盛，不是对着炸篮 item。
+
+    4-2 trace-20261111-130956 t=3260+：炸篮被端出锅后，TakeCookedToPlate
+    若还对着炸篮 item 盛，游戏的句柄是台面、名字对不上 → handle mismatch。
+    """
+    _frame, world, ctx, book = _frame_world(2900)
+    pid = next(p["n"] for p in world.all_plates
+               if not p.get("contents") and not p.get("held_by"))
+    task = T.TakeCookedToPlate("3", ("FrierBasket (1)", pid),
+                               "FriedChickenNuggets")
+    src = task._source(ctx)
+    assert src is not None and src["kind"] == "loose"
+    assert src["target"].get("t") == "counter"
+    assert src["target"].get("n") == "countertop_01_standard_swamp (7)"
+
+
 def test_infeasible_threshold_survives_one_5hz_frame():
     """3 拍 < 一帧 4 拍；阈值必须至少撑过 2 帧，单帧抖动不切任务。"""
     _frame, world, ctx, book = _frame_world(477)

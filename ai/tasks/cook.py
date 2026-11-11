@@ -17,7 +17,7 @@ from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
                            loose_count, loose_on_station, plate_by_id,
-                           plate_matches_order)
+                           plate_matches_order, _station_for_item)
 
 # 端盘在锅前等熟的最长拍数（15s）。煮一锅饭实测约 11s，取盘+走到锅前再
 # 留足余量；超时交还 Planner，避免无限等一个可能永远不成立的状态。
@@ -549,7 +549,16 @@ class TakeCookedToPlate(Task):
                 continue
             if token and token not in src["tokens"]:
                 continue
-            return {"kind": "loose", "target": src["item"]}
+            item = src["item"]
+            # 锅具（煮锅/炸篮）散在台面上时，游戏的句柄是台面、不是锅具本身，
+            # 要对着承载它的站点盛（与灶上锅对着灶站盛是同一个道理），否则目标名
+            # 对不上 → handle mismatch（4-2 散炸篮 trace-20261111-130956 t=3260+）。
+            # 散在地上（on_station=null）的散物句柄就是它自己，照旧对 item 盛。
+            # 熟载体（整份披萨）不是锅具，句柄是载体本身，保持对 item 盛。
+            station = _station_for_item(ctx["w"], item)
+            if P.item_is_cookware(item, ctx["w"].recipes) and station is not None:
+                return {"kind": "loose", "target": station}
+            return {"kind": "loose", "target": item}
         return None
 
     def build(self):

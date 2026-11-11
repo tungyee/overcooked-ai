@@ -271,6 +271,34 @@ def test_combo_bonus_goes_to_the_queue_head_order():
     assert terms["combo_break"] == 0.0
 
 
+def test_send_across_plated_dish_gets_delivery_combo_score():
+    """跨区送成品盘（SendAcross plated_dish）与 DeliverPlate 一样吃 combo 队首分。
+
+    送餐打分里 `is_deliver` 若只认 DeliverPlate，SendAcross(plated_dish) 的
+    combo_head/combo_break 恒 0——在 Rapids 这类出餐口在对岸的关卡，真正的
+    送餐永远 0 分、排不过备菜，成品盘堆在手里。
+    """
+    world = _make_test_world(
+        orders=[{"id": "1", "dish": "Chips", "remaining": 30,
+                 "composition": ["FriedChips"]}],
+        stations=[])
+    world.tick = 200
+
+    bb = Blackboard()
+    bb.tick = 200
+    bb.commitment = Commitment()
+
+    cand = planner.Candidate(
+        task=T.SendAcross("1", ("-20216", "conveyor"), "plated_dish"),
+        preconditions=[],
+        estimated_steps=5)
+
+    score, terms = planner._score_candidate(world, bb, cand)
+
+    assert terms["combo_head"] > 0, "送队首的成品盘应有 combo 加成"
+    assert terms["combo_break"] == 0.0
+
+
 def test_deadline_penalty_when_cooker_will_burn():
     """截止前瞻：启动任务后会导致锅烧糊，惩罚。
 

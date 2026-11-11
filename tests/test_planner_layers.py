@@ -17,6 +17,15 @@ class _T(object):
         self.TYPE = type_name
 
 
+class _ItemTask(object):
+    """带 item 的 task 替身：L_REDEEM 的 SendAcross 判据要读 item。"""
+
+    def __init__(self, type_name, item=None):
+        # type: (str, Any) -> None
+        self.TYPE = type_name
+        self.item = item
+
+
 def _rules(pressure=0.0, plate_pressure=0.0, placed=False, plate_total=99):
     # type: (float, float, bool, int) -> tuple
     """固定返回值的规则表，让层判定与三条曲线的实现解耦。"""
@@ -58,6 +67,19 @@ def test_pressure_thresholds_are_inclusive():
 
 def test_deliver_is_redeem_layer():
     assert PL.layer_of(_T("DeliverPlate"), None, rules=_rules()) == PL.L_REDEEM
+
+
+def test_send_across_plated_dish_is_redeem_layer():
+    """成品盘跨区送 = 送餐兑现，归 L_REDEEM；其它 kind 仍是解拼装卡。
+
+    出餐口在河对岸时 DeliverPlate 不可行，真正送餐的是 SendAcross(plated_dish)。
+    它若不进 L_REDEEM 就吃不到 combo/urgency 送餐分，恒 0 分、永远输给备菜。
+    """
+    assert PL.layer_of(_ItemTask("SendAcross", "plated_dish"),
+                       None, rules=_rules()) == PL.L_REDEEM
+    for item in ("clean_plate", "dirty_plate", "carrier", None):
+        assert PL.layer_of(_ItemTask("SendAcross", item),
+                           None, rules=_rules()) == PL.L_UNBLOCK
 
 
 def test_plate_tasks_move_between_unblock_and_cleanup():

@@ -649,13 +649,7 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
         return False, "abandoned"
     if _breaks_combo(task, ctx["w"]):
         return False, "combo_break"
-    # 端着有内容的成品盘时，不许为了备菜/扔料把它放下。空盘可以放；
-    # 成品盘放下后很容易被忘在台面上（trace-20261111-001945 t=458/2950）。
     chef = P.chef_by_name(ctx["w"].chefs, P.P2_NAME)
-    if task.TYPE in _HANDS_DROP_PRONE_TYPES:
-        if _holding_plated_dish(chef, ctx["w"], ctx.get("book"),
-                                ctx.get("plate_match")):
-            return False, "hands_full_plate"
     # 已经端着一盘有内容的菜时，SendAcross 只准送手里这块：选另一块盘的
     # SendAcross 会先 EnsureHandsFree 把手里这盘放下
     # （trace-20261111-001945 t=2900 两块盘同时在台上）。
@@ -2389,7 +2383,9 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # 所以备菜也给（打折，见 COMBO_PREP_DISCOUNT）。
     combo_head = 0.0
     combo_break = 0.0
-    is_deliver = (task.TYPE == "DeliverPlate")
+    is_deliver = (task.TYPE == "DeliverPlate"
+                  or (task.TYPE == "SendAcross"
+                      and getattr(task, "item", None) == "plated_dish"))
     if task.order_id is not None and (is_deliver or task.TYPE in _COMBO_PREP_TYPES):
         head = _combo_head_id(world.orders)
         dish = _dish_of_order(world.orders, task.order_id)

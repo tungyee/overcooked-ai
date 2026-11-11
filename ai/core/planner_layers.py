@@ -101,7 +101,13 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
         (L_FIRE,         lambda t, w: t.TYPE == "Extinguish"),
         (L_IRREVERSIBLE, lambda t, w: pressure_fn(t, w) >= PRESSURE_IRREVERSIBLE),
         (L_RESCUE,       lambda t, w: pressure_fn(t, w) >= PRESSURE_RESCUE),
-        (L_REDEEM,       lambda t, w: t.TYPE == "DeliverPlate"),
+        (L_REDEEM,       lambda t, w: (
+            t.TYPE == "DeliverPlate"
+            # 出餐口只在对面时，真正的送餐是 SendAcross(plated_dish)：它和
+            # DeliverPlate 一样是「料齐的盘兑现成 60 分」，归兑现层才能吃到
+            # combo/urgency 送餐分，否则恒 0 分、永远排不过备菜。
+            or (t.TYPE == "SendAcross"
+                and getattr(t, "item", None) == "plated_dish"))),
         (L_UNBLOCK,      lambda t, w: (
             # 2 盘关（3-5）：只要不是两块都干净就进 L4——另一块已经脏了，
             # 等装配盘送完就断供。3 块盘以上仍用旧的「0 盘 + 无装配盘」守卫。

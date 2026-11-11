@@ -84,7 +84,8 @@ def test_no_feasible_freeze_becomes_send_wait():
     bb.conveyor_open_until[CH.CONVEYOR] = bb.tick + CH.CONVEYOR_GRACE_TICKS
     chosen, record = planner.plan(world, bb, None, book)
     assert chosen is not None and chosen.TYPE == "SendAcross", chosen
-    assert record["top_layer"] == 4
+    # 成品盘跨区送现在归 L_REDEEM（送餐兑现），不再是 L_UNBLOCK 的解拼装卡。
+    assert record["top_layer"] == 3
     assert not record.get("waiting") or record["waiting"].get("reason") != "no_feasible_task"
 
 
@@ -188,8 +189,14 @@ def test_plated_dish_gets_hands_penalty_for_empty_hand_tasks():
     assert terms2["hands"] == 0.0
 
 
-def test_plated_dish_is_not_dropped_for_prep():
-    """端着有内容的成品盘时，备菜 task 直接不可行，避免把盘放下。"""
+def test_plated_dish_prep_not_hard_vetoed():
+    """端着成品盘时备菜不再被硬否决（送餐分修好后软罚 -6.0 兜底即可）。
+
+    送餐路被 combo_break / 通道不可达堵死时，硬否决会让 P2 端着盘干等
+    （trace-20261111-211624 里 755 拍持盘空转）。改成只靠 _HANDS_PENALTY_TYPES
+    的 -6.0 软罚：送餐可行时送餐分更高自然赢，送餐不可行时 AI 能放下盘做
+    点别的，不再冻结。
+    """
     _frame, world, ctx, _book = _frame_world(2900)
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
     assert P.held_is_plate(chef)
@@ -198,19 +205,19 @@ def test_plated_dish_is_not_dropped_for_prep():
                           "Lettuce")
     cand = planner.Candidate(task, ["hands_empty"], planner.EST_FETCH)
     ok, veto = planner._feasibility_of(cand, ctx, ctx["bb"])
-    assert not ok and veto == "hands_full_plate"
+    assert ok, veto
 
-    # 空盘不算成品盘：允许先放下去备菜。
+    # 空盘同样可行（本来就不算成品盘）。
     _frame2, world2, ctx2, _book2 = _frame_world(600)
     task2 = T.FetchToBoard("2", (("Raft Two",
                                   "countertop_01_chopping_board_swamp (2)"),),
                            "Lettuce")
     cand2 = planner.Candidate(task2, ["hands_empty"], planner.EST_FETCH)
     ok2, veto2 = planner._feasibility_of(cand2, ctx2, ctx2["bb"])
-    assert not (not ok2 and veto2 == "hands_full_plate")
+    assert ok2, veto2
 
-    # 端着 -19502 时，不能被另一块盘 -19500 的 SendAcross 抢走（那会先把
-    # 手里的盘放下）。t=2900 两块盘同时可送。
+    # 端着 -19502 时，仍不能被另一块盘 -19500 的 SendAcross 抢走（那会先把
+    # 手里的盘放下）。t=2900 两块盘同时可送——这条硬否决保留。
     bb = ctx["bb"]
     bb.conveyor_open_until[CH.CONVEYOR] = bb.tick + CH.CONVEYOR_GRACE_TICKS
     chosen, _record = planner.plan(world, bb, None, _book)

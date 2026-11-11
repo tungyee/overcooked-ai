@@ -79,6 +79,11 @@ namespace Oc2AI
     {
         private static readonly Dictionary<string, string> _map = new Dictionary<string, string>();
 
+        // Unity 会给同屏第 N 份同料 GameObject 自动加 " (n)" 后缀。食材名里这只是
+        // 自动编号、不区分实例；盘/锅的 " (n)" 有实例语义，不能用这里剥。
+        private static readonly System.Text.RegularExpressions.Regex _instanceSuffix =
+            new System.Text.RegularExpressions.Regex(@"\s*\(\d+\)\s*$");
+
         public static void Clear() { _map.Clear(); }
 
         public static void Add(string raw, string node)
@@ -94,6 +99,18 @@ namespace Oc2AI
             if (string.IsNullOrEmpty(name) || _map.Count == 0) return name;
             string mapped;
             return _map.TryGetValue(name.ToLowerInvariant(), out mapped) ? mapped : name;
+        }
+
+        // 食材名映射：先剥掉实例编号后缀再查改名表；没有改名项时剥掉后缀的
+        // 基名就是食材身份（Seaweed (1) → Seaweed）。
+        public static string MapIngredient(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            string baseName = _instanceSuffix.Replace(name, "");
+            string mapped;
+            if (_map.Count > 0 && _map.TryGetValue(baseName.ToLowerInvariant(), out mapped))
+                return mapped;
+            return baseName;
         }
     }
 

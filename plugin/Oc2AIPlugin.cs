@@ -1008,12 +1008,18 @@ namespace Oc2AI
             return Jstr(o.ToString());
         }
 
-        // 物品名（过 RawNames 改名表）：手持/砧板/散落/句柄这类「可能是生料」的
-        // 名字用它，站点/网格名不用。与 Fmt 对 UnityEngine.Object 的输出格式一致。
+        // 物品名：食材剥掉 Unity 实例编号后缀 (n) 再过改名表；盘/锅等非食材
+        // 保留后缀（Python 侧拿它们当实例 id）。手持/砧板/散落用这里，站点/网格名不用。
         string ItemName(object o)
         {
             if (o == null) return "null";
-            if (o is UnityEngine.Object uo) return Jstr(uo == null ? "" : RawNames.Map(uo.name));
+            if (o is UnityEngine.Object uo && uo != null)
+            {
+                string node = IngredientNode(uo);
+                return Jstr(string.IsNullOrEmpty(node)
+                    ? RawNames.Map(uo.name)
+                    : RawNames.MapIngredient(uo.name));
+            }
             return Jstr(RawNames.Map(o.ToString()));
         }
 
@@ -2186,7 +2192,10 @@ namespace Oc2AI
                 string[] cip = ci.Split(',');
                 string has = cip[0];
                 string cooked = cip[1];
-                sb.Append("{\"n\":").Append(Jstr(RawNames.Map(mb.name)))
+                string inode = IngredientNode(mb);
+                sb.Append("{\"n\":").Append(Jstr(string.IsNullOrEmpty(inode)
+                    ? RawNames.Map(mb.name)
+                    : RawNames.MapIngredient(mb.name)))
                   .Append(",\"x\":").Append(p.x.ToString("0.0"))
                   .Append(",\"z\":").Append(p.z.ToString("0.0"))
                   .Append(",\"y\":").Append(p.y.ToString("0.00"))
@@ -2197,7 +2206,7 @@ namespace Oc2AI
                   .Append(",\"cookware\":").Append(IsCookware(mb) ? "true" : "false")
                   .Append(",\"cookable\":").Append(CookableJson(mb))
                   .Append(",\"flying\":").Append(IsFlying(mb) ? "true" : "false")
-                  .Append(",\"node\":").Append(Jstr(IngredientNode(mb)))
+                  .Append(",\"node\":").Append(Jstr(inode))
                   .Append(",\"grid\":").Append(Jstr(GridOfItem(mb.gameObject, stationMap, stationGrid)))
                   .Append(",\"on_station\":").Append(
                       Jstr(stationMap.TryGetValue(mb.gameObject, out string os) ? os : null))

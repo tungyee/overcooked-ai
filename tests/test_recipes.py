@@ -461,18 +461,6 @@ def test_find_ingredient_exact_name_not_substring():
     assert R.find_ingredient(w, "Cucumber") is None
 
 
-def test_find_ingredient_loose_ignores_instance_suffix():
-    """散落物带 Unity 实例编号后缀 (n) 时仍按食材名找到。
-
-    4-5 同屏多片海苔被 Unity 命名成 Seaweed / Seaweed (1) / Seaweed (2)，
-    精确匹配 n 会漏掉带后缀的（实机 FetchToPlate(Seaweed) 判 infeasible、P2 卡死）。
-    """
-    it = {"n": "Seaweed (1)", "x": 1.0, "z": 2.0}
-    w = FakeWorld(items=[it], stations=[])
-    got = R.find_ingredient(w, "Seaweed")
-    assert got["kind"] == "loose" and got["st"] is it
-
-
 def test_find_ingredient_missing_is_none():
     assert R.find_ingredient(FakeWorld(stations=[]), "Lettuce") is None
     assert R.find_ingredient(FakeWorld(), None) is None

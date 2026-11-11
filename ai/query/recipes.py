@@ -589,8 +589,7 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
         # 只认自己手里的：P1 手里的料 P2 拿不到，跳过继续找箱子/板/散落
         if str(c.get("name") or "").strip().lower() != str(self_name).strip().lower():
             continue
-        if P.ingredient_name_matches(P.held_name(c), il) \
-                and held_contents(world, c.get("name")) == want:
+        if P.held_name(c) == il and held_contents(world, c.get("name")) == want:
             return {"kind": "held", "chef": c.get("name")}
 
     if can_access is None:
@@ -599,7 +598,7 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
         can_access = lambda st: reachability.can_interact(route, st)
 
     for ws in getattr(world, "workstations", None) or ():
-        if not want and P.ingredient_name_matches(ws.get("item"), il):
+        if not want and str(ws.get("item") or "").lower() == il:
             station = _merge_station_coords(ws, getattr(world, "stations", None))
             if can_access(station):
                 return {"kind": "board", "st": station}
@@ -619,7 +618,7 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
         # 不相干的料一起倒进盘（trace-20261031-233010）。
         if item_contents(it) != want:
             continue
-        if P.ingredient_name_matches(it.get("n"), il) and can_access(it):
+        if str(it.get("n") or "").lower() == il and can_access(it):
             return {"kind": "loose", "st": it}
 
     if want:
@@ -627,6 +626,6 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
     for st in getattr(world, "stations", None) or ():
         if not isinstance(st, dict) or st.get("t") != "crate":
             continue
-        if P.ingredient_name_matches(st.get("ing"), il) and can_access(st):
+        if str(st.get("ing") or "").lower() == il and can_access(st):
             return {"kind": "crate", "st": st}
     return None

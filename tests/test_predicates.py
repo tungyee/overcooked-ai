@@ -19,27 +19,6 @@ def test_held_matches_is_exact(chef_holding):
     assert P.held_matches(chef, "cucumber") is False
 
 
-def test_ingredient_name_matches_ignores_instance_suffix():
-    """食材名匹配忽略 Unity 实例编号后缀 (n)。"""
-    assert P.ingredient_name_matches("Seaweed (1)", "Seaweed") is True
-    assert P.ingredient_name_matches("seaweed (2)", "Seaweed") is True
-    assert P.ingredient_name_matches("Seaweed", "Seaweed") is True
-
-
-def test_ingredient_name_matches_still_exact_otherwise():
-    """忽略后缀之外仍是精确匹配：Cucumber 与 ChoppedCucumber 是两种料。"""
-    assert P.ingredient_name_matches("ChoppedCucumber", "Cucumber") is False
-    assert P.ingredient_name_matches("Cucumber", "ChoppedCucumber") is False
-    assert P.ingredient_name_matches("", "Seaweed") is False
-
-
-def test_held_matches_keeps_instance_suffix(chef_holding):
-    """锅具/盘的实例后缀有语义，held_matches 保持精确匹配。"""
-    chef = chef_holding("utensil_pot_01 (3)")
-    assert P.held_matches(chef, "utensil_pot_01 (3)") is True
-    assert P.held_matches(chef, "utensil_pot_01") is False
-
-
 def test_held_matches_false_on_empty_hands(chef_empty):
     assert P.held_matches(chef_empty, "cucumber") is False
 

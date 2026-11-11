@@ -438,7 +438,7 @@ def held_matches_contents(ctx, item, contents=()):
     """
     from ai.query.carriers import held_contents
     chef = ctx["chef"]
-    if not P.ingredient_name_matches(P.held_name(chef), item):
+    if not P.held_matches(chef, item):
         return False
     return held_contents(ctx["w"], chef.get("name")) == frozenset(contents or ())
 

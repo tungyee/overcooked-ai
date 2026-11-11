@@ -22,11 +22,6 @@ PLATE_KEYWORD = "plate"
 P1_NAME = "Player 1"
 P2_NAME = "Player 2"
 
-# Unity 实例编号后缀：同屏多个同名 GameObject 时 Unity 会自动给后出生的加
-# " (1)"、" (2)"。站点/锅具名里它区分不同物理实例（station_name_matches 要求
-# 一致）；食材名里它只是自动编号、不区分实例（ingredient_name_matches 忽略）。
-_INSTANCE_SUFFIX = re.compile(r"\s*\(\d+\)\s*$")
-
 
 # ---------- 手持 ----------
 def held_name(chef):
@@ -34,20 +29,6 @@ def held_name(chef):
     if not chef:
         return ""
     return str(chef.get("held") or "").lower()
-
-
-def ingredient_name_matches(a, b):
-    # type: (Optional[str], Optional[str]) -> bool
-    """食材名匹配：忽略 Unity 实例编号后缀 (n)。
-
-    同屏多份同料会被 Unity 自动命名成 Seaweed / Seaweed (1) / Seaweed (2)，
-    对食材来说编号只是自动编号、不区分实例——与 station_name_matches 相反
-    （同名站点/锅具是不同物理实例，后缀必须一致，不能用这里的方式比）。
-    仍不做子串匹配：Cucumber 与 ChoppedCucumber 是两种不同的料。
-    """
-    a = _INSTANCE_SUFFIX.sub("", str(a or "")).strip().lower()
-    b = _INSTANCE_SUFFIX.sub("", str(b or "")).strip().lower()
-    return bool(a) and bool(b) and a == b
 
 
 def held_matches(chef, item):
@@ -426,6 +407,7 @@ def cooker_started(cooker):
 
 
 # ---------- 站点名匹配 ----------
+_INSTANCE_SUFFIX = re.compile(r"\s*\(\d+\)\s*$")
 
 
 def _instance_id(name):

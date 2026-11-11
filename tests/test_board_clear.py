@@ -111,8 +111,8 @@ def test_occupied_board_gets_fetch_candidates_when_no_free_board(frames):
     ok = [c[0] for c in rec["candidates"]
           if c[0].TYPE == "FetchToBoard" and c[0].board_id == RIGHT and c[3]]
     assert {t.item for t in ok} >= {"Cheese", "Tomato"}
-    # 手里拿着番茄时 ThrowBatch 可能先胜出（切好的料也能扔）；候选侧仍要给
-    # 被占着的右板发 FetchToBoard，本用例只钉候选存在性。
+    # 生料也可能走远投（把番茄扔到对面够得着的板），于是 ThrowBatch 先胜出；
+    # 候选侧仍要给被占着的右板发 FetchToBoard，本用例只钉候选存在性。
     assert task.TYPE in ("FetchToBoard", "ThrowBatch")
 
 

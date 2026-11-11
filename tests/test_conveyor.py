@@ -24,6 +24,7 @@ from ai.query import predicates as P
 from ai.query import recipes as R
 from ai.query.recipes import RecipeBook
 from ai.revenue import handover as HO
+from ai.revenue import throw_supply as TS
 from ai.space import channels as CH
 from ai.space import shuttle
 from ai.space import zoning
@@ -156,24 +157,30 @@ def test_send_done_when_plate_is_on_belt():
                               ctx.get("bb")) == CH.CONVEYOR
 
 
-# ---------------------------------------------------------------- 切好的料走投掷 / 带子开头
+# ---------------------------------------------------------------- 切好的沙拉料自己装盘 / 带子开头
 
 
-def test_chopped_salad_ingredients_are_thrown_not_conveyored():
-    """生菜/番茄切好后直接扔给对面，不占传送带（盘子才不能扔）。"""
+def test_chopped_salad_ingredients_are_plated_not_thrown():
+    """生菜/番茄切好后自己装盘、成品走传送带，不再扔给对面。
+
+    旧实现给「不烹饪但可切」的料同时生成生料和切好形态两站投掷，于是 P2 切完
+    生菜/番茄后把它扔到 P1 的砧板旁；P1 那边没有稳定干净盘、又忙着切土豆/
+    鸡块，切好的料堆在地上没人接（voice-20261111-224619）。切好的料应该留在
+    P2 这侧装盘（PlaceCleanPlate → FetchToPlate），成品盘再走 SendAcross。
+    """
     frame = _frames3()[0]                   # t=710：P2 正拿着 ChoppedLettuce
     world = _world(frame)
     ctx, book = _ctx(world)
-    reqs = [r for r in HO.send_requests(world, book, ctx.get("bb"))
-            if r.kind == "ingredient"]
-    assert reqs == []
-    board = next(st for st in world.stations
-                 if st.get("n") == "countertop_01_chopping_board_swamp (1)")
-    task = T.ThrowBatch(None, (P.resource_id(board), "board",
-                              "Lettuce", "Lettuce"), "ChoppedLettuce")
-    assert task.feasible(ctx)
-    chosen, _rec = planner.plan(world, ctx["bb"], None, book)
-    assert chosen.TYPE == "ThrowBatch" and chosen.item == "ChoppedLettuce"
+    # 沙拉成分只保留「生料投给砧板」一站，不再有「切好形态投给砧板」。
+    assert TS.stages(book, "Lettuce") == [("Lettuce", TS.CONSUMER_BOARD, "Lettuce")]
+    assert TS.stages(book, "Tomato") == [("Tomato", TS.CONSUMER_BOARD, "Tomato")]
+    # 切好的生菜不再生成 ThrowBatch 候选（生料那一站仍保留）。
+    chosen, rec = planner.plan(world, ctx["bb"], None, book)
+    assert not any(c[0].TYPE == "ThrowBatch"
+                   and c[0].item in ("ChoppedLettuce", "ChoppedTomato")
+                   for c in rec["candidates"])
+    assert not (chosen.TYPE == "ThrowBatch"
+                and chosen.item in ("ChoppedLettuce", "ChoppedTomato"))
 
 
 def test_send_uses_own_belt_start_not_far_end():

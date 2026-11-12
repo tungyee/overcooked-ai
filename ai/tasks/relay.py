@@ -309,6 +309,10 @@ class ReceiveConveyor(Task):
             return False
         if _switch_target(ctx) is None:
             return False
+        # 刚送走的盘还没通过中点开关格时先别按开关，否则方向翻成朝 P2 会让
+        # 它流到中点后掉头回 P2（trace-20261113-005351 同类）。
+        if CH.outgoing_on_p2_vertical(ctx["w"], ctx.get("bb")):
+            return False
         return XS.dirty_plate_to_receive(ctx["w"], ctx.get("bb"))
 
     def build(self):

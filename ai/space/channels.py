@@ -330,14 +330,14 @@ def conveyor_slots(world, bb=None):
     return out
 
 
-def switch_direction(world, bb=None):
-    # type: (object, object) -> Optional[str]
-    """4-5 传送带方向开关当前的开关格方向：'>'（右）或 '<'（左）；拿不到返回 None。
+def switch_cell(world):
+    # type: (object) -> Optional[Dict]
+    """4-5 方向开关控制的那格 conveyor（中点 (0,0)）；没有开关返回 None。
 
-    开关格是传送带系统中点 (0,0) 那格 conveyor——按钮（switch 站点）挂在
-    (1,1)/(-1,-1)，但随按钮翻转的是中点格的 vx（trace-20261111-233924 按钮把
-    (0,0) 从 '<' 翻成 '>'）。读该格的 vx 符号。
-    """
+    按钮（switch 站点）挂在 (1,1)/(-1,-1)，随按钮翻转的是中点 (0,0) 那格的
+    vx（trace-20261111-233924 按钮把 (0,0) 从 '<' 翻成 '>'）。中点格是竖带
+    （gx==0、gz!=0）与横带（gz==0）的交点，盘过了它进横带后才不会被方向
+    翻转拉回来。"""
     if not any(isinstance(st, dict) and st.get("t") == "switch"
                for st in getattr(world, "stations", ()) or ()):
         return None
@@ -345,10 +345,57 @@ def switch_direction(world, bb=None):
         if not isinstance(st, dict) or st.get("t") != "conveyor":
             continue
         if st.get("gx") == 0 and st.get("gz") == 0:
-            vx = st.get("vx") or 0.0
-            if abs(vx) > 0.01:
-                return ">" if vx > 0 else "<"
+            return st
     return None
+
+
+def switch_direction(world, bb=None):
+    # type: (object, object) -> Optional[str]
+    """4-5 传送带方向开关当前的开关格方向：'>'（右）或 '<'（左）；拿不到返回 None。"""
+    st = switch_cell(world)
+    if st is None:
+        return None
+    vx = st.get("vx") or 0.0
+    if abs(vx) > 0.01:
+        return ">" if vx > 0 else "<"
+    return None
+
+
+def outgoing_on_p2_vertical(world, bb=None):
+    # type: (object, object) -> bool
+    """P2 这侧竖带上还有没通过中点开关格的外发物（盘/料/锅）→ 先别按开关。
+
+    4-5 竖带（gx==中点格 gx、gz!=中点格 gz）两半都朝中点流。P2 刚送走的盘若
+    还在自己这半竖带上，此刻按开关把方向翻成「朝 P2」，它流到中点就会掉头
+    回 P2。所以只在「P2 够得着的竖带段 + 中点格」上没有外发物时，才允许
+    ReceiveConveyor 去按开关（trace-20261113-005351 同类）。
+
+    只在有方向开关且地图分割时生效；其它关卡返回 False。P2 侧用可达场判，
+    不硬编码南/北——P2 在哪半，就只拦哪半的竖带段。"""
+    if not is_split(world, bb):
+        return False
+    sc = switch_cell(world)
+    if sc is None:
+        return False
+    near, _far = _fields(world, bb)
+    sx, sz = sc.get("gx"), sc.get("gz")
+    # 中点格无条件纳入：盘正过中点的这一拍也算「还没过」。
+    segs = [sc]
+    for st in getattr(world, "stations", ()) or ():
+        if not is_conveyor_station(world, st):
+            continue
+        if st.get("gx") != sx or st.get("gz") == sz:
+            continue
+        if _reach(world, near, st, P.P2_NAME):
+            segs.append(st)
+    for entry in (list(getattr(world, "plates", ()) or ())
+                  + list(getattr(world, "items", ()) or ())):
+        if not isinstance(entry, dict) or entry.get("held_by"):
+            continue
+        for st in segs:
+            if _on_conveyor(entry, st):
+                return True
+    return False
 
 
 def _bin_reachable_by(world, bb, name, gx):

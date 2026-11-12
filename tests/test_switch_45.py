@@ -112,6 +112,50 @@ def test_receive_conveyor_feasible_when_dirty_and_direction_toward_p1():
     assert task.feasible(ctx) is True
 
 
+def _put_plate_on_seg(frame, gx, gz):
+    """把一块空盘放到 (gx, gz) 的传送带段上，模拟刚被 SendAcross 放上去。"""
+    f = copy.deepcopy(frame)
+    seg = next(s for s in f["stations"]
+               if s.get("t") == "conveyor" and s.get("gx") == gx
+               and s.get("gz") == gz)
+    p = next(p for p in f["plates"]
+             if not p.get("held_by") and (p.get("count") or 0) == 0)
+    p["x"] = seg["x"]
+    p["z"] = seg["z"]
+    p["on_station"] = "attach:" + seg["n"]
+    return f, p["n"]
+
+
+def test_outgoing_on_p2_vertical_true_when_plate_on_p2_side():
+    """P2 这半竖带（gz=-1）还有刚送出的盘 → 还没过中点，先别按开关。"""
+    frame, _ = _put_plate_on_seg(_frame(), 0, -1)
+    w, _book, bb, _ctx_ = _ctx(frame)
+    assert CH.outgoing_on_p2_vertical(w, bb) is True
+
+
+def test_outgoing_on_p2_vertical_false_when_plate_past_middle():
+    """盘已经在横带（gz=0、gx!=0）上 → 已过中点，开关可放行。"""
+    frame, _ = _put_plate_on_seg(_frame(), 5, 0)
+    w, _book, bb, _ctx_ = _ctx(frame)
+    assert CH.outgoing_on_p2_vertical(w, bb) is False
+
+
+def test_outgoing_on_p2_vertical_false_without_plate():
+    w, _book, bb, _ctx_ = _ctx(_frame())
+    assert CH.outgoing_on_p2_vertical(w, bb) is False
+
+
+def test_receive_conveyor_infeasible_when_outgoing_plate_pending():
+    """方向朝 P1 + P1 侧有脏盘 + P2 刚送出的盘还没过中点 → 先别按开关。"""
+    frame, _ = _put_plate_on_seg(_frame(), 0, -1)
+    frame = _set_center_vx(_put_dirty_on_far_side(frame), 0.6)
+    w, _book, bb, ctx = _ctx(frame)
+    assert CH.conveyor_direction_toward_p2(w, bb) is False
+    assert XS.dirty_plate_to_receive(w, bb) is True
+    task = T.ReceiveConveyor()
+    assert task.feasible(ctx) is False
+
+
 def test_belt_reached_by_player_follows_switch_direction():
     """4-5 单环：盘归不归 P1，看方向开关，不看「P1 够得着任意一段」。"""
     w, _book, bb, _ctx_ = _ctx(_frame())

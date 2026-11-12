@@ -290,8 +290,10 @@ class PressSwitch(Task):
 
     def _switch(self, ctx):
         # type: (Dict) -> Optional[Dict]
+        """P2 够得着的那台开关（两人各一台，P2 只能按自己这侧那台）。"""
         for st in ctx["w"].stations:
-            if isinstance(st, dict) and st.get("t") == "switch":
+            if isinstance(st, dict) and st.get("t") == "switch" \
+                    and reachability.can_interact(ctx, st):
                 return st
         return None
 
@@ -303,10 +305,7 @@ class PressSwitch(Task):
         # type: (Dict) -> bool
         if self.done(ctx):
             return False
-        sw = self._switch(ctx)
-        if sw is None:
-            return False
-        return reachability.can_interact(ctx, sw)
+        return self._switch(ctx) is not None
 
     def build(self):
         # type: () -> Node

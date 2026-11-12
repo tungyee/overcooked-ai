@@ -127,6 +127,8 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
             or (t.TYPE == "WashPlate" and dirty_on_conveyor(w))
             # 传送带上的盘（非脏盘）马上进垃圾桶：同「解卡」。
             or t.TYPE == "FetchConveyorPlate"
+            # 4-5 方向朝 P1 时，P1 送来的脏盘到不了 P2 这侧，先按开关翻到朝 P2。
+            or t.TYPE == "ReceiveConveyor"
         )),
         # L_CAPACITY 现在没有成员，见下方 L_CAPACITY 常量处的说明。规则表里
         # 保留这一行（谓词恒假）而不是删掉，是为了让层号与表的行一一对应 ——

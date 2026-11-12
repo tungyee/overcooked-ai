@@ -592,9 +592,9 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
         if P.held_name(c) == il and held_contents(world, c.get("name")) == want:
             return {"kind": "held", "chef": c.get("name")}
 
+    from ai.space import reachability
+    route = reachability.context(world, name=self_name)
     if can_access is None:
-        from ai.space import reachability
-        route = reachability.context(world, name=self_name)
         can_access = lambda st: reachability.can_interact(route, st)
 
     for ws in getattr(world, "workstations", None) or ():
@@ -608,6 +608,10 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
             if il in P.plate_contents(p) and can_access(p):
                 return {"kind": "plate", "st": p}
 
+    # 取料源（散落 + 箱子）按「可达 + 行走距离」排序取最近：以前散落恒优先于
+    # 箱子，P2 会去追传送带上的散料，而不是转身去旁边的箱子
+    # （trace-20261112-230754 追鱼、追海苔卡住）。
+    candidates = []  # type: List[Tuple[str, Dict, Optional[int]]]
     for it in getattr(world, "items", None) or ():
         # 飞行中的料（投掷途中）不算散落来源：坐标是空中的过渡点，走过去
         # 料早已落在别处（trace-20261029-202903 t=231：锁定 x=18.7 的飞行
@@ -619,13 +623,19 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
         if item_contents(it) != want:
             continue
         if str(it.get("n") or "").lower() == il and can_access(it):
-            return {"kind": "loose", "st": it}
+            candidates.append(("loose", it, reachability.interact_cost(route, it)))
 
-    if want:
-        return None
-    for st in getattr(world, "stations", None) or ():
-        if not isinstance(st, dict) or st.get("t") != "crate":
-            continue
-        if str(st.get("ing") or "").lower() == il and can_access(st):
-            return {"kind": "crate", "st": st}
+    if not want:
+        for st in getattr(world, "stations", None) or ():
+            if not isinstance(st, dict) or st.get("t") != "crate":
+                continue
+            if str(st.get("ing") or "").lower() == il and can_access(st):
+                candidates.append(("crate", st, reachability.interact_cost(route, st)))
+
+    if candidates:
+        # 距离未知（无可达场/离线）排最后；同距离时散落优先于箱子（旧行为）。
+        candidates.sort(key=lambda c: (
+            c[2] is None, c[2] if c[2] is not None else 1e9,
+            c[0] == "crate"))
+        return {"kind": candidates[0][0], "st": candidates[0][1]}
     return None

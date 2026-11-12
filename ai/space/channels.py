@@ -177,14 +177,21 @@ def plate_on_conveyor(world, plate):
 
 def belt_reached_by_player(world, st, bb=None):
     # type: (object, Optional[Dict], object) -> bool
-    """这条传送带上有没有哪一段是玩家（P1）够得着的。
+    """这条传送带上的盘是不是该归 P1 取（=不用 P2 抢救）。
 
-    传送带是整条 L 形带，人常常只站得到其中一段（P2 这侧的是带子开头，
-    玩家站的是下一段）。只要玩家能站到任意一段，带上的东西就归玩家取，
-    P2 不该抢——抢了会变成「放上去 → 抢下来 → 再放上去」
-    （trace-20261110-235726 t=491~528：盘 -20214 在 Raft One 带子上，
-    P1 在下一段接得到，P2 每拍都去拿）。
+    4-5 单环有方向开关：盘流向哪边就归哪边。方向朝 P1（conveyor_direction_ok）
+    时盘会流到 P1 的接收桶，P2 不该抢；方向朝 P2 时盘流到 P2 这侧，P2 该接。
+    不能按「P1 够得着任意一段」判——单环 83 段都在同一个 grid，P1 够得着上半段
+    就会把整条环都误判成玩家侧（trace-20261112-220508：P1 放的半成品盘流到
+    P2 侧，P2 既不接也不抢救）。
+
+    4-2 双带没有方向开关：传送带是整条 L 形带，人常常只站得到其中一段（P2
+    这侧的是带子开头，玩家站的是下一段）。只要玩家能站到任意一段，带上的
+    东西就归玩家取，P2 不该抢——抢了会变成「放上去 → 抢下来 → 再放上去」
+    （trace-20261110-235726 t=491~528）。
     """
+    if switch_direction(world, bb) is not None:
+        return conveyor_direction_ok(world, bb)
     grid = str(st.get("grid") or "")
     if not grid or not is_split(world, bb):
         return False
@@ -379,6 +386,27 @@ def conveyor_direction_ok(world, bb=None):
     return d == ">"       # 未知/两端都可 → 回退左端收
 
 
+def conveyor_direction_toward_p2(world, bb=None):
+    # type: (object, object) -> bool
+    """4-5 传送带方向是否「朝 P2」（把料送向 P2 够得着的接收桶）。
+
+    与 conveyor_direction_ok 对称：那边判 P1 的接收端（供 SendAcross 送件用），
+    这里判 P2 的接收端（供 ReceiveConveyor 把方向设成朝自己收）。开关是方向
+    设定器——P2 的按钮只能把方向设成朝 P2，P1 的按钮设成朝 P1。没有开关
+    （其它关卡）返回 False（无所谓「朝 P2」）。
+    """
+    d = switch_direction(world, bb)
+    if d is None:
+        return False
+    left = _bin_reachable_by(world, bb, P.P2_NAME, -6)
+    right = _bin_reachable_by(world, bb, P.P2_NAME, 6)
+    if left is True and right is not True:
+        return d == ">"   # P2 只在左端收 → 需要 raw vx>0（实际向左）
+    if right is True and left is not True:
+        return d == "<"   # P2 只在右端收 → 需要 raw vx<0（实际向右）
+    return d == ">"       # 未知/两端都可 → 回退左端收
+
+
 def conveyor_interact_cells(world, st):
     # type: (object, Dict) -> Optional[Set[Tuple[int, int]]]
     """移动网格（竹筏）上 conveyor 段的交互站位：用该网格本地邻格映射回主网格。
@@ -549,9 +577,12 @@ def channel_keys(world, bb=None):
     # 刚开过的传送带也在 keys 里：候选仍要生成，SendAcross 会端着东西等
     # 接缝重开。否则一帧 flash 就让所有送件候选消失，AI 直接停摆
     # （trace-20261111-001945 t=2934）。
-    # 4-5 的方向开关不在这里闸：方向不对由 SendAcross 树里的 _ensure_direction_ok
-    # 前置节点去翻，不把候选掐掉。
-    if conveyor_slots(world, bb) or conveyor_waitable(bb):
+    # 4-5 有方向开关：方向朝 P1 时传送带通道才开放（供 SendAcross 送件）。方向
+    # 朝 P2 时关闭——P2 的按钮只能把方向设成朝 P2（ReceiveConveyor 收件用），
+    # 设不了朝 P1，方向不对还送的话料会流回 P2 这侧（trace-20261112-131340
+    # 按开关卡死、trace-20261112-122718 料全进右桶）。
+    if (conveyor_slots(world, bb) or conveyor_waitable(bb)) \
+            and conveyor_direction_ok(world, bb):
         keys.append(CONVEYOR)
     if static_slots(world, bb):
         keys.append(STATIC)

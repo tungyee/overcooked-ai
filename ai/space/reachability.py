@@ -106,6 +106,22 @@ def interact_wait(ctx, entry):
     return min(reach)[1] * seams.SEC_PER_STEP
 
 
+def interact_cost(ctx, entry):
+    # type: (dict, dict) -> Optional[int]
+    """走到 entry 旁交互的最短行走代价（可达场步数）；无场/不可达返回 None。
+
+    取料源按距离排序用：散落/箱子哪个近选哪个。自己拿着（goals=True）返回 0。
+    """
+    field = ctx.get('field')
+    if field is None:
+        return None
+    goals = _interact_goals(ctx, entry)
+    if goals is True:
+        return 0
+    costs = [field[g] for g in (goals or ()) if g in field]
+    return min(costs) if costs else None
+
+
 def task_shuttle_wait_seconds(task, ctx):
     # type: (object, dict) -> float
     """task 要碰的资源里，在渡运台面上、最晚那个还要等篮子几秒（不在 / 预测不了 = 0）。"""

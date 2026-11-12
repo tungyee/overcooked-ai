@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.exec.bt import Condition, Node, Selector, Sequence
+from ai.revenue import cross_supply as XS
 from ai.revenue import handover as HO
 from ai.revenue import throw_supply as TS
 from ai.space import channels as CH
@@ -250,9 +251,6 @@ class SendAcross(Task):
             return spec.done(c, s, key)
 
         steps = []  # type: List[Node]
-        if key == CH.CONVEYOR:
-            # 4-5 方向不对时先翻开关（前置动作），否则料放上去直接进桶。
-            steps.append(_ensure_direction_ok())
         steps.append(PR.EnsureHandsFree(keep=held))
         steps.append(PR.InteractWith(pickup, "pickup", held))
         if key == CH.CONVEYOR:
@@ -284,19 +282,41 @@ def _switch_target(ctx):
     return None
 
 
-def _ensure_direction_ok():
-    # type: () -> Node
-    """方向已正确 → 直接过；否则走到开关按到正确（4-5 送料的前置动作）。
+@_register
+class ReceiveConveyor(Task):
+    """按 P2 自己的开关把 4-5 传送带方向设成朝 P2（收 P1 送来的脏盘）。
 
-    不是独立打分 task：作为 SendAcross 树里的一个前置节点，只在该送料时顺手
-    把方向翻对。
+    开关是「方向设定器」而非 toggle：P2 的按钮只能把方向设成朝 P2，P1 的按钮
+    设成朝 P1；按钮红 = 方向已朝自己（按了没用），没有冷却。所以只在方向朝
+    P1（按钮可按）时去按一次，翻到朝 P2 就完成——重复按等价于没变化。
     """
-    def direction_ok(c):
-        return CH.conveyor_direction_ok(c["w"], c.get("bb"))
 
-    return Selector([
-        Condition(direction_ok),
-        Sequence([
+    TYPE = "ReceiveConveyor"
+    DESC = "按开关把传送带方向调到朝自己这边"
+    LABEL = "收传送带"
+    HANDS = "any"
+
+    def claims(self):
+        return ()
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        return CH.conveyor_direction_toward_p2(ctx["w"], ctx.get("bb"))
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        if self.done(ctx):
+            return False
+        if _switch_target(ctx) is None:
+            return False
+        return XS.dirty_plate_to_receive(ctx["w"], ctx.get("bb"))
+
+    def build(self):
+        # type: () -> Node
+        def direction_ok(c):
+            return CH.conveyor_direction_toward_p2(c["w"], c.get("bb"))
+
+        return PR.Timeout(Sequence([
             PR.Approach(_switch_target, None),
             PR.Face(_switch_target),
             # kind="spray"：开关是 grid 对象（m_gridLocation）、m_interactable=null，
@@ -304,8 +324,7 @@ def _ensure_direction_ok():
             # 朝向句柄（HandleMatches(kind=null)），同 Extinguish 喷灶。
             PR.HoldUntil("switch", direction_ok, timeout=SWITCH_PRESS_TICKS,
                          target=_switch_target, kind="spray"),
-        ]),
-    ])
+        ]), TASK_TIMEOUT_TICKS)
 
 
 def _dest_station(ctx, dest_id):

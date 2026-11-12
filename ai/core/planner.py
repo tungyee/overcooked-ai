@@ -345,6 +345,13 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         cands.append(Candidate(T.FetchConveyorPlate(resources=(e.get("n"),)),
                                [], EST_FETCH))
 
+    # 4-5：P1 把脏盘放上传送带、方向朝 P1 时，P2 先按自己的开关把方向翻到朝
+    # P2，才能接住流过来的脏盘。开关是方向设定器，P2 的按钮只能设朝 P2。
+    from ai.revenue import cross_supply as XS
+    if CH.switch_direction(world) is not None \
+            and XS.dirty_plate_to_receive(world, bb):
+        cands.append(Candidate(T.ReceiveConveyor(), [], EST_FETCH))
+
     for c in _cookers(world):
         if not c.get("n"):
             continue

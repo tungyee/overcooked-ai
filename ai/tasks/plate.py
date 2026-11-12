@@ -257,6 +257,11 @@ class PlaceCleanPlate(Task):
             return False                   # 移动台面不在快照里
         if counter_occupied(ctx["w"], self.counter_cell, self.plate_id):
             return False                   # 台面上已有锅/料/别的盘
+        # 盘已经在通道上（正在送给对面）：别抢回来摆盘，否则和 SendAcross 反复
+        # 「放上去 → 抢下来」振荡（trace-20261112-222007 末段空盘 -40680）。
+        from ai.space import channels as CH
+        if CH.slot_of(ctx["w"], p, ctx.get("bb")) is not None:
+            return False
         return P.plate_count(p) == 0       # 必须是干净空盘
 
     def build(self):

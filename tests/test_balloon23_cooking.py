@@ -200,22 +200,26 @@ def _tick(tree, frame, ex, bb, i):
 
 
 def test_flying_item_is_not_loose_source(landed):
-    """飞行中的料不算散落来源：坐标是空中过渡点，落地点在别处。"""
+    """飞行中的料不算取料源：坐标是空中过渡点，落地点在别处。"""
     from ai.query.recipes import find_ingredient
     from ai.tasks.base import loose_count
     w = W.World(landed[0])
     assert any(it.get("flying") for it in w.items if it["n"] == "Pasta")
     assert loose_count(w, "Pasta") == 2
     loc = find_ingredient(w, "Pasta", exclude_plate=True)
-    assert loc["kind"] == "loose" and loc["st"].get("flying") is not True
+    # 飞行中的料被跳过；取料源按可达+距离排序，最近的箱子（比落地的散料近）胜出
+    assert loc["st"].get("flying") is not True
+    assert loc["kind"] == "crate"
 
 
 def test_fill_cooker_skips_flying_pasta(landed):
-    """t=231：FillCooker 走向已落地的意面 (13,0) 旁，不去追 x=18.7 的空中那份。"""
+    """t=231：取料按距离走最近的箱子，不去追 x=18.7 的空中那份。"""
     ex = _Exec()
     _tick(_fill_pasta().build(), landed[0], ex, make_bb(100), 0)
     move = ex.issued[0]
-    assert move["cmd"] == "move" and move["goal"][0] > 20.0
+    assert move["cmd"] == "move"
+    # 目标是最近的箱子（x≈12），不是飞行中的意面（x=18.7）
+    assert move["goal"][0] < 18.0
 
 
 def test_fill_cooker_retries_toward_moved_pasta(landed):

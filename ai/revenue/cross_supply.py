@@ -38,10 +38,7 @@ KIND_CARRIER = "carrier"
 KIND_DIRTY_PLATE = "dirty_plate"
 # 成品盘：出餐口只在对面、P2 这侧有料齐的盘时，送到共享台面让 P1 送。
 KIND_PLATED_DISH = "plated_dish"
-# 切好的料（鱼/黄瓜）：P1 那边没砧板自己切、P2 有砧板，切好的菜送过去装盘。
-KIND_CHOPPED_INGREDIENT = "chopped_ingredient"
-KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH,
-         KIND_CHOPPED_INGREDIENT)
+KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH)
 
 # 对面最多备几块空盘（含在途）：P1 一般同时装 1~2 单，再多就是把盘从我这边
 # 搬去对面闲着，回头我这边要用（洗好的盘也在这边）还得送回来。
@@ -279,44 +276,95 @@ def plated_dish_sources(world, book, bb=None):
             if book.matches(order, p):
                 out.append((p, order))
                 break
+    # 半成品盘：缺的料里有「只在 P1 侧」的（比如米饭）→ 也送过去补。
+    out.extend(partial_plate_sources(world, book, bb))
     return out
 
 
-def chopped_ingredient_sources(world, book, bb=None):
-    # type: (object, object, object) -> List[str]
-    """P2 该送过去的切好料名：P1 没砧板自己切、P2 有砧板、订单要该料。
+def _ingredient_far_only(world, book, near, far, ing, bb=None):
+    # type: (object, object, Dict, Dict, str, object) -> bool
+    """ing（订单顶层成分、最终形态）是否只在 P1 那侧能补——P2 这侧拿不到也做不出。
 
-    只返回料名（不返回具体某一块）：切好的料可替换，送哪块都一样；拿哪块、
-    有没有在途由 handover 的 pickup/done 再判。
+    熟料（如 BoiledSushiRice）额外查「有没有 P2 够得着的匹配灶」：灶只在 P1 侧
+    且熟的没现成散落在 P2 侧 → P2 煮不了 → 只在对面。切料/生料复用 _can_supply。
+    """
+    from ai.tasks.base import ingredient_available
+    ctx = dict(reachability.context(world, bb, P.P2_NAME), book=book)
+    if book.needs_cooking(ing):
+        if ingredient_available(ctx, ing):
+            return False               # 熟的已经在 P2 侧
+        want = (book.cookware_of(ing) or "").lower()
+        cookers = []
+        for c in world.cookers:
+            ck = P.cooker_cookware(c)
+            if want and ck and not P.cookware_matches(ck, want):
+                continue               # 灶明确不配这种锅，跳过
+            cookers.append(c)          # 匹配，或灶上没报炊具（未知，当作兼容）
+        return bool(cookers) and _cookers_side_of(world, near, far, cookers, bb) == {"far"}
+    return not _can_supply(ctx, book, ing)
+
+
+def partial_plate_sources(world, book, bb=None):
+    # type: (object, object, object) -> List[Tuple[Dict, Dict]]
+    """P2 这侧有半成品盘、缺的料里有一种「只在 P1 侧」→ 送过去补（仿 stuck_carriers）。
+
+    寿司是两边协作组装：P2 放海苔/鱼/黄瓜、P1 放米饭。盘只差米饭时米饭在 P1
+    的灶，P2 补不了，就该把半成品盘送上带子交给 P1（trace-20261112-222007 末段
+    盘 -20580 黄瓜+鱼缺米饭，一直送不出去）。料齐的盘不在这里处理（走
+    plated_dish 的 book.matches 分支）。
     """
     if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
         return []
     near, far = CH._fields(world, bb)
-    _boards, p2_can, p1_can = _station_sides(world, near, far, "chopping", bb)
-    if not p2_can or p1_can:
+    hatches, p2_can, p1_can = _station_sides(world, near, far, "plate_station", bb)
+    if not hatches or p2_can or not p1_can:
         return []
-    want = set()  # type: Set[str]
-    for o in world.orders:
-        for ing in book.requirements(o):
-            if book.needs_chopping(ing):
-                target = book.chop_target(ing)
-                if target:
-                    want.add(target.lower())
-    if not want:
-        return []
-    # 只发「P2 这侧真的有一块切好的料可送」的源——没料时发源会让
-    # SendAcross(chopped_ingredient) 在 L_UNBLOCK 层被选中、pickup 却找不到料、
-    # 每拍 failure 空转（trace-20261112-120920：P2 全程没切菜，只在这两个
-    # SendAcross 间来回失败）。
-    available = set()  # type: Set[str]
+    out = []  # type: List[Tuple[Dict, Dict]]
+    for p in P.all_plates(world):
+        if p.get("held_by") == P.P1_NAME or P.plate_count(p) <= 0:
+            continue
+        if CH.slot_of(world, p, bb) is not None:
+            continue
+        if _side_of(world, near, far, p, bb) != "near":
+            continue
+        if any(book.matches(o, p) for o in world.orders):
+            continue                      # 料齐的走 plated_dish 成品分支
+        tokens = book.plate_tokens(p)
+        if not tokens:
+            continue
+        for order in world.orders:
+            if not tokens <= book.order_want_tokens(order):
+                continue                  # 盘里有订单外的料，不是这张单的前缀
+            missing = book.missing(order, p)
+            if not missing:
+                continue
+            if any(_ingredient_far_only(world, book, near, far, m, bb)
+                   for m in missing):
+                out.append((p, order))
+                break
+    return out
+
+
+def dirty_plate_to_receive(world, bb=None):
+    # type: (object, object) -> bool
+    """P1 那侧 / 传送带上有脏盘、洗碗池只在 P2 这侧——P2 该把方向设成朝自己收。
+
+    4-5 的镜像场景（dirty_plate_sources 的反向）：洗碗池在 P2 这侧、P1 洗不了，
+    P1 把脏盘放上带子送过来，P2 要先按自己的开关把方向翻到朝 P2 才能接到。
+    """
+    if not CH.is_split(world, bb):
+        return False
+    near, far = CH._fields(world, bb)
+    sinks, p2_can, p1_can = _station_sides(world, near, far, "washing", bb)
+    if not sinks or not p2_can or p1_can:
+        return False
     for it in (list(getattr(world, "items", ()) or ())
                + list(getattr(world, "held_items", ()) or ())):
-        if not isinstance(it, dict) or it.get("held_by") == P.P1_NAME:
+        if not isinstance(it, dict) or not _is_dirty_plate(it):
             continue
-        name = str(it.get("n") or "").lower()
-        if name in want and _side_of(world, near, far, it, bb) == "near":
-            available.add(name)
-    return sorted(want & available)
+        if _side_of(world, near, far, it, bb) in ("far", "transit"):
+            return True
+    return False
 
 
 def _can_supply(ctx, book, ing):

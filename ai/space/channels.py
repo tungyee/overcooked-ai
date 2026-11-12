@@ -344,16 +344,39 @@ def switch_direction(world, bb=None):
     return None
 
 
+def _bin_reachable_by(world, bb, name, gx):
+    # type: (object, object, str, int) -> Optional[bool]
+    """name 是否够得着 gx 那端的传送带桶（gz=0）。拿不到（无厨师/无桶/拓扑未知）返回 None。"""
+    try:
+        ctx = reachability.context(world, bb, name)
+    except Exception:  # noqa: BLE001 单测 fake world 没有 chefs 等字段
+        return None
+    for st in getattr(world, "stations", ()) or ():
+        if isinstance(st, dict) and st.get("t") == "bin" \
+                and st.get("gx") == gx and st.get("gz") == 0:
+            return reachability.can_interact(ctx, st)
+    return None
+
+
 def conveyor_direction_ok(world, bb=None):
     # type: (object, object) -> bool
-    """4-5 传送带方向是否「正确」（把料送向 P1 而非垃圾桶）。
+    """4-5 传送带方向是否「正确」（把料送向 P1 够得着的接收桶，而非另一头）。
 
-    TODO(实机核实)：目前按开关格方向 '>' 为正确、'<' 为错误——这是从
-    trace-20261111-233924 里按钮把 (0,0) 从 '<' 翻成 '>' 推断的，未经游戏
-    实测确认。没有开关（其它关卡）恒 True。
+    开关格 (0,0) 的 raw vx>0 = 实际向左 → 左桶(gx=-6)；raw vx<0 = 实际向右 →
+    右桶(gx=6)。正确的方向 = 把料送向 P1 够得着的那端——按 P1 可达场判，谁在
+    南谁在北都能自适应。判不出（拓扑未知/两端都够得着）回退「左端收」。没有
+    开关（其它关卡）恒 True。
     """
     d = switch_direction(world, bb)
-    return d is None or d == ">"
+    if d is None:
+        return True
+    left = _bin_reachable_by(world, bb, P.P1_NAME, -6)
+    right = _bin_reachable_by(world, bb, P.P1_NAME, 6)
+    if left is True and right is not True:
+        return d == ">"   # P1 只在左端收 → 需要 raw vx>0（实际向左）
+    if right is True and left is not True:
+        return d == "<"   # P1 只在右端收 → 需要 raw vx<0（实际向右）
+    return d == ">"       # 未知/两端都可 → 回退左端收
 
 
 def conveyor_interact_cells(world, st):

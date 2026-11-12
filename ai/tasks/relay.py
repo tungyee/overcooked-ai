@@ -316,8 +316,11 @@ class PressSwitch(Task):
             PR.Approach(target, None),
             PR.Face(target),
             # 按 WorkstationInteract 直到方向翻到对的一侧；pred（done）成立即松键。
+            # kind="spray"：开关是 grid 对象（m_gridLocation），不是 interactable
+            # （m_interactable=null），HoldCommand 的 UseMatches 门恒不中 → drifted
+            # 按不出键。spray 改走朝向句柄（同 Extinguish 喷灶，见 fire.py）。
             PR.HoldUntil("switch", self.done, timeout=SWITCH_PRESS_TICKS,
-                         target=target),
+                         target=target, kind="spray"),
         ]), TASK_TIMEOUT_TICKS)
 
 

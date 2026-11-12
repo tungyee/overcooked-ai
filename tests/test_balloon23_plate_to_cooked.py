@@ -51,10 +51,17 @@ def test_t660_only_one_marinara_jumps_ahead_per_fish_pan(frames):
 
 
 def test_t1901_pasta_plate_goes_to_marinara_with_cooked_fish(frames):
+    """完整 Marinara 盘 -16230 直接绑队首 #2，意面盘 -16228 给下一个 Marinara #4。
+
+    旧断言 `-16228 == "2"` 是缺料数用 set 减法、把完整盘的 opaque 熟料 token
+    漏减（缺料虚高 1）时的旧行为：完整盘 head_complete 判据不成立，被「能用上
+    熟鱼」的意面盘抢走队首。缺料数改交集口径后，完整盘正确拿下队首。
+    """
     w, book, bb, pm, cm = _matches(frames[1])
-    assert pm.get("-16228") == "2", pm
+    assert pm.get("-16230") == "2", pm
+    assert pm.get("-16228") == "4", pm
     fish_pan = ("RightBasket", "workstation_cooker_01 (3)")
-    assert cm.get(fish_pan) == "2", cm
+    assert cm.get(fish_pan) == "4", cm
 
 
 @pytest.mark.parametrize("idx", [0, 1])

@@ -107,9 +107,12 @@ def test_planner_keeps_rescue_feasible_under_blacklist(frames):
     _, _, _, task, rec = _plan(frames[1], bb)
     rescue = _cand(rec, "RescueCooked(%s" % (COOKER,))
     assert rescue and rescue[0][3] is True, rescue
+    # 完整折叠盘 -15532 已正确绑给 order#1（缺料数不再被 opaque token 虚高），
+    # 灶 (2) 上多煎的蘑菇是盈余料、不被任何单需要 → 不再生成 TakeCookedToPlate；
+    # 它改由 RescueCooked 端走防烧糊。
     take = [c for c in rec["candidates"]
             if c[0].TYPE == "TakeCookedToPlate" and COOKER in c[0].key[2]]
-    assert take and all(c[3] is False for c in take)
+    assert take == [], take
 
 
 def test_executor_scopes_last_resort_flag_to_task_tick():

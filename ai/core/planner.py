@@ -978,6 +978,43 @@ def _pinned_plate_order(world, bb, book):
 PLATE_REACH_GRACE_TICKS = 100
 
 
+def _chopped_supply(world, book, bb=None):
+    # type: (World, RecipeBook, object) -> Dict[str, int]
+    """切好的料（散落/砧板上、P2 够得着）的盘态 token 供给：token → 份数。
+
+    与 cooked_sources 平行：熟料用 cooked:{raw}:{cookware}，切料用
+    want_tokens(ing) 的盘态 token（如 SushiFish → sushifish）。只数
+    world.items（散落物，含 on_station 指向砧板的）；不数 workstations——
+    那是同一份料的冗余视角，会 double count。逐份查 P2 可达：切料在 P1 侧
+    不算（P2 拿不到）。只算订单要切的成分，逐 ing 去重。
+    """
+    supply = {}  # type: Dict[str, int]
+    seen = set()  # type: Set[str]
+    rctx = reachability.context(world, bb)
+    for o in getattr(world, "orders", None) or ():
+        for ing in book.requirements(o):
+            key = str(ing).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not book.needs_chopping(ing):
+                continue
+            chopped = str(book.chop_target(ing) or "").lower()
+            if not chopped:
+                continue
+            n = 0
+            for it in getattr(world, "items", None) or ():
+                if str(it.get("n") or "").lower() == chopped \
+                        and not it.get("held_by") \
+                        and it.get("flying") is not True \
+                        and reachability.can_interact(rctx, it):
+                    n += 1
+            if n:
+                for tok in book.want_tokens(ing):
+                    supply[tok] = supply.get(tok, 0) + n
+    return supply
+
+
 def _match_plates_to_orders(world, bb, book, orders=None):
     # type: (World, Blackboard, RecipeBook, Optional[List[Dict]]) -> Dict[Any, Any]
     """盘↔订单 1:1 匹配（每拍重算、不写黑板）。返回 {plate_id: order_id}。
@@ -1017,6 +1054,11 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     for src in cooked_sources(world, book):
         for tok in src["tokens"]:
             supply[tok] = supply.get(tok, 0) + 1
+    # 切好的料（散落/砧板上）也当「能立刻用上」的供给：队首鱼片单只差切好的鱼，
+    # 也该优先拿盘，别被「米饭熟了」的黄瓜单把空盘抢走
+    # （trace-20261112-234841 t=650 空盘 -21228 被绑给 order#3 而非队首 order#1）。
+    for tok, n in _chopped_supply(world, book, bb).items():
+        supply[tok] = supply.get(tok, 0) + n
 
     # 匹配「已就位」的盘（落在 counter 拼装格上）+ P2 手里正端着的盘
     # + 掉在地上且带料的半成品盘 + 干净盘堆（取盘站/沥碗架）的顶层盘。
@@ -1094,7 +1136,17 @@ def _match_plates_to_orders(world, bb, book, orders=None):
                 cover = carrier_cover.get(oid, set())
                 if cover & tokens:
                     cover = set()      # 载体的料盘里已有：这只盘用不上载体
-                edges.append((is_not_head, len(wt - tokens - cover), stack_rank,
+                # 缺料数不能直接 wt - tokens - cover：熟料的订单 want 同时带
+                # rich token（cooked:{raw}:{cookware}）和旧帧 opaque
+                # COOKED_PLATE_TOKEN，detail 帧的盘只有 rich token，set 减法
+                # 会把 opaque 误算成「还缺一样」——队首已完整的熟料盘 missing
+                # 恒 ≥1，head_complete 判据永不成立，被「能立刻用上」的非队首
+                # 单把盘抢走（trace-20261113-000718 t=3380 Sushi_Fish 盘被改绑
+                # 去 Sushi_All）。用 book.missing（交集口径，见 recipes.py）
+                # 取顶层缺料数，再扣掉载体覆盖的料。
+                missing = sum(1 for ing in book.missing(o, p)
+                              if not (cover and (book.want_tokens(ing) & cover)))
+                edges.append((is_not_head, missing, stack_rank,
                               _remaining_of(o), str(pid), str(oid), pid, oid,
                               (wt & set(supply)) - tokens, bool(cover)))
     # 钉死手持盘：P2 当前承诺绑定的盘不参与贪心重排，保持它和订单的配对。
@@ -1129,9 +1181,17 @@ def _match_plates_to_orders(world, bb, book, orders=None):
             pid, oid, usable, carrier_ready = e[6], e[7], e[8], e[9]
             if pid in used_plates or oid in used_orders:
                 continue
-            if first_pass and not carrier_ready \
-                    and not (usable and take_supply(usable)):
-                continue
+            if first_pass:
+                # 第一轮放行「能立刻用上」的边（熟锅/载体）；另加「队首且已
+                # 完整」的边——它不缺料、该立刻绑定送掉，否则会被「能马上加
+                # 熟料」的队尾半成品边抢走、绑错单（trace-20261112-230754
+                # 盘 -44018 已完整 Sushi_PlainFish 却被绑去 Sushi_Fish）。
+                # 队首半成品盘不在这里放行：它这拍用不上，仍允许熟锅等的队尾
+                # 边先拿盘（test_match_plates_cooked_order_takes_plate_head_cannot_use）。
+                head_complete = (e[0] == 0 and e[1] == 0)
+                if not head_complete and not carrier_ready \
+                        and not (usable and take_supply(usable)):
+                    continue
             matched[pid] = oid
             used_plates.add(pid)
             used_orders.add(oid)

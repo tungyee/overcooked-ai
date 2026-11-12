@@ -583,6 +583,55 @@ def test_match_plates_head_keeps_plate_when_nobody_can_use_it():
     assert got == {"plate_01": "order1"}, got
 
 
+def test_match_plates_head_complete_cooked_plate_not_rebound():
+    """队首已完整的熟料盘不该被改绑去非队首单（缺料数被 opaque token 抬高）。
+
+    实机 trace-20261113-000718 t=3380：Sushi_Fish 盘（rice+seaweed+fish）已齐，
+    却被绑去 Sushi_All（order6），随后加黄瓜成 Sushi_All 后被 combo_break 拦死。
+    缺料数用 set 减法时，订单 want 里的旧帧 opaque COOKED_PLATE_TOKEN 不会被
+    盘里的 rich cooked token 抵消，队首 missing 恒 1 → head_complete 判据不成立，
+    「能立刻用上」的黄瓜让非队首把盘抢走。
+    """
+    w = World({
+        "orders": [
+            {"id": "2", "dish": "Sushi_Fish",
+             "composition": ["Seaweed", "BoiledSushiRice", "SushiFish"],
+             "remaining": 27.8},
+            {"id": "6", "dish": "Sushi_All",
+             "composition": ["Seaweed", "BoiledSushiRice", "Cucumber",
+                             "SushiFish"],
+             "remaining": 110.7},
+        ],
+        "stations": [{"t": "counter", "n": "assembly", "gx": 1, "gz": 1,
+                      "x": 1.2, "z": 1.2}],
+        "recipes": [
+            {"name": "BoiledSushiRice", "comp": ["SushiRice"], "cook": "Pot"},
+            {"name": "SushiRice", "comp": []},
+            {"name": "Seaweed", "comp": []},
+            {"name": "SushiFish", "comp": [], "chop": "ChoppedSushiFish"},
+            {"name": "Cucumber", "comp": [], "chop": "ChoppedCucumber"},
+        ],
+        "chefs": [{"name": "Player 2", "x": 4.0, "z": 4.0, "held": None}],
+        "plates": [
+            {"n": "-44946", "name": "equipment_plate_01",
+             "x": 1.0, "z": 1.0, "count": 3,
+             "contents": ["CookedCompositeAssembledNode", "Seaweed",
+                          "SushiFish"],
+             "detail": ["CookedCompositeAssembledNode(Pot){ ing:SushiRice }",
+                        "ing:Seaweed", "ing:SushiFish"]},
+        ],
+        "workstations": [], "cookers": [],
+        "items": [
+            {"n": "ChoppedCucumber", "x": 1.2, "z": 1.2, "throwable": True,
+             "node": "Cucumber"},
+        ],
+        "extinguishers": [], "grid": {"nodeMap": None},
+    })
+    book = RecipeBook(w.recipes, w.stations, w.items)
+    got = planner._match_plates_to_orders(w, Blackboard(), book)
+    assert got == {"-44946": "2"}, got
+
+
 def test_order_needs_cooked_false_with_loose_cooked_pot():
     """散熟锅已匹配给该单 → 不再生成下锅候选（从煮的范围排出）。"""
     w = _loose_cooked_world()

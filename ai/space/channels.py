@@ -300,19 +300,18 @@ def conveyor_slots(world, bb=None):
                     out = near_segs
         else:
             # —— 4-5 静态：传送带是「竖带把料送向中点 (0,0)、开关再分左右」。
-            # P2 该放到自己这侧、朝中点流的竖带段（gx=0、gz<0），料向上到
-            # (0,0) 再由开关向左送到 P1 那端；中点横带（gz=0）是送进两边的桶、
-            # 不能当放料点（trace-20261112-122718 空盘放 gx=5 一路进右桶）。
-            # 玩家侧对称：P1 放 gx=0、gz>0 的竖带段。
+            # 竖带（gx=0、gz!=0）两半都朝中点流，P2 放自己可达的那半即可；
+            # 中点横带（gz=0）是送进两边的桶、不能当放料点（trace-20261112-122718
+            # 空盘放 gx=5 一路进右桶）。按可达场筛，P2/P1 谁在南谁在北都能自适应。
             near_segs = [
                 st for st in (getattr(world, "stations", ()) or ())
                 if is_conveyor_station(world, st)
-                and st.get("gx") == 0 and (st.get("gz") or 0) < 0
+                and st.get("gx") == 0 and (st.get("gz") or 0) != 0
                 and _reach(world, near, st, P.P2_NAME)]
             player_segs = [
                 st for st in (getattr(world, "stations", ()) or ())
                 if is_conveyor_station(world, st)
-                and st.get("gx") == 0 and (st.get("gz") or 0) > 0
+                and st.get("gx") == 0 and (st.get("gz") or 0) != 0
                 and _reach(world, far, st, P.P1_NAME)]
             if near_segs and player_segs:
                 out = near_segs

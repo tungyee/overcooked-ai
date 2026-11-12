@@ -386,12 +386,18 @@ class ThrowBatch(Task):
         dest = _dest_station(ctx, self.dest_id)
         if dest is None:
             return None
-        # 先按 split 口径找来源（分割与否看消费站可达性，不看来源）
-        probe = TS.MODE_SPLIT if not RG.reachable_by(w, dest, P.P2_NAME, bb) \
-            else TS.MODE_FAR
+        # 先按 split 口径找来源（分割与否看消费站可达性，不看来源）。
+        # CONSUMER_PLATE 的参照物是 P1 的盘（对面），不是 dest（砧板）——
+        # 砧板可能在 P2 自己这边（4-5），按砧板可达性会把 split 误判成 far，
+        # sources 再按「离砧板 <3.6m」把切好料当已就位排除（trace-20261113-013646）。
+        if self.consumer == TS.CONSUMER_PLATE:
+            probe = TS.MODE_SPLIT if RG.split(w, bb) else TS.MODE_FAR
+        else:
+            probe = TS.MODE_SPLIT if not RG.reachable_by(w, dest, P.P2_NAME, bb) \
+                else TS.MODE_FAR
         dests = TS.dest_candidates(w, ctx["book"], self.consumer, self.product)
         srcs = TS.sources(w, self.item, self.raw, dest, probe, bb, dests)
-        mode = TS.mode_for(w, dest, srcs, bb)
+        mode = TS.mode_for(w, dest, srcs, bb, consumer=self.consumer)
         if mode is None and self._carrying_this_batch(ctx, srcs, probe):
             # 本批已在进行、料拿在手上：按探测口径继续投完这份，不因单帧判据
             # 翻转就放下。far：走向出手位时人离灶近了（trace-20261029-130632）；

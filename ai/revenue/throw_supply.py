@@ -177,16 +177,21 @@ def at_dest(world, form, dest, mode, bb=None):
                if near_dest(world, it, dest, mode, bb))
 
 
-def gap(world, book, product, form, consumer, raw, dest, mode, bb=None):
-    # type: (Any, Any, str, str, str, str, Dict, str, Any) -> int
-    """还要往 dest 投几份 form（下界 0）。"""
+def gap(world, book, product, form, consumer, raw, dest, mode, bb=None,
+        require_far_plate=True):
+    # type: (Any, Any, str, str, str, str, Dict, str, Any, bool) -> int
+    """还要往 dest 投几份 form（下界 0）。
+
+    require_far_plate=False 时跳过「对面有干净盘」的门控：SendAcross 送松散
+    切好料用（放上传送带，对面有没有盘都能先送过去）。
+    """
     need = demand(world, book, product, raw)
     if need <= 0:
         return 0
     # 切好的沙拉料投给对面（split）只有在对面有干净盘能接盘装沙拉时才有意义：
     # 对面没盘就别投，料堆在对面没人接（voice-20261111-224619）。生料站（board）
     # 不受此限——生料投过去是让对面切，接盘与否不卡这一站。
-    if (mode == MODE_SPLIT and consumer == CONSUMER_PLATE
+    if (require_far_plate and mode == MODE_SPLIT and consumer == CONSUMER_PLATE
             and not _far_has_clean_plate(world, book, bb)):
         return 0
     # 已就位按「这一站的任一消费站附近」计、每份只算一次：只看本站的话，
@@ -231,11 +236,18 @@ def sources(world, form, raw, dest, mode, bb=None, dests=None):
     return out
 
 
-def mode_for(world, dest, srcs, bb=None):
-    # type: (Any, Dict, List[Dict], Any) -> Optional[str]
-    """这一投属于哪类：split（对面才够得着消费站）/ far（同侧但远）/ None。"""
+def mode_for(world, dest, srcs, bb=None, consumer=None):
+    # type: (Any, Dict, List[Dict], Any, Optional[str]) -> Optional[str]
+    """这一投属于哪类：split（对面才够得着消费站）/ far（同侧但远）/ None。
+
+    consumer == CONSUMER_PLATE 时参照物是 P1 的盘（对面），不是 dest（砧板）：
+    切好料的下一站是装盘，砧板只是作出手瞄准点——砧板可能在 P2 自己这边
+    （4-5 砧板在南侧、P1 装盘在北侧），按砧板可达性判会把 split 误判成 far。
+    """
     if not srcs:
         return None
+    if consumer == CONSUMER_PLATE:
+        return MODE_SPLIT if RG.split(world, bb) else None
     if not RG.reachable_by(world, dest, P.P2_NAME, bb):
         return MODE_SPLIT if RG.reachable_by(world, dest, P.P1_NAME, bb) else None
     if not ENABLE_FAR_THROW:

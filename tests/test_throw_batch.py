@@ -906,3 +906,53 @@ def test_launch_cells_never_in_road_or_across_it():
     assert TS._launch_ok(w, "east", (-4, 0)) is False   # 对岸
     assert TS._launch_ok(w, "west", (-4, 0)) is True
     assert TS._launch_ok(w, None, (7, 0)) is True       # 已站在路上：不额外限制
+
+
+# ---------------------------------------------------------------- 4-5 切好料投给对面装盘（trace-20261113-013646）
+
+FIXTURE_45 = os.path.join(os.path.dirname(__file__), "fixtures", "sushi",
+                          "sushi45-switch-20261112.ndjson.gz")
+
+
+def _sushi45_frame(vx=0.6):
+    """4-5 帧；vx 设开关格 (0,0) 的方向（0.6=朝 P1，-0.6=朝 P2）。"""
+    with gzip.open(FIXTURE_45, "rt", encoding="utf8") as fh:
+        f = json.loads(fh.readline())
+    for st in f["stations"]:
+        if st.get("t") == "conveyor" and st.get("gx") == 0 and st.get("gz") == 0:
+            st["vx"] = vx
+            st["vz"] = 0.0
+    return f
+
+
+def _sushi45_ctx(frame):
+    w = W.World(frame)
+    book = RecipeBook(w.recipes, w.stations, w.items)
+    bb = make_bb(100)
+    return w, book, bb, planner._make_context(w, bb, book)
+
+
+def _throw_chopped_fish_to_plate(w):
+    board = next(s for s in w.stations if s.get("t") == "chopping")
+    return T.ThrowBatch(None, (P.resource_id(board), TS.CONSUMER_PLATE,
+                               "SushiFish", "SushiFish"), "ChoppedSushiFish")
+
+
+def test_chopped_to_plate_throw_mode_is_split_in_45():
+    """4-5 砧板在 P2 自己这边：切好料投给对面装盘应判 split，不因砧板可达而 None。
+
+    旧实现按「砧板可达性」定投掷口径：砧板 P2 可达 → probe=MODE_FAR，切好的鱼
+    离砧板 <3.6m 被 sources 当「已就位」排除 → mode_for 返回 None → infeasible。
+    切好料的下一站是 P1 的盘（对面），不是砧板，应直接按 split 判。
+    """
+    w, book, bb, ctx = _sushi45_ctx(_sushi45_frame())
+    task = _throw_chopped_fish_to_plate(w)
+    st = task._state(ctx)
+    assert st is not None and st[1] == TS.MODE_SPLIT
+
+
+def test_chopped_to_plate_throw_feasible_when_far_clean_plate():
+    """方向朝 P1 + 对面有干净盘：切好的鱼投给对面装盘可行。"""
+    w, book, bb, ctx = _sushi45_ctx(_sushi45_frame())
+    task = _throw_chopped_fish_to_plate(w)
+    assert task.feasible(ctx) is True

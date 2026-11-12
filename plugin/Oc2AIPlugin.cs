@@ -2783,7 +2783,7 @@ namespace Oc2AI
 
             // 传送带方向开关（ServerSwitchStation）：面对它按 WorkstationInteract 即翻转
             // 传送带方向。只报位置（方向本身从 conveyor 段的 vx/vz 读），供 Python
-            // 在「方向不对」时走 PressSwitch 去按。
+            // 在「方向不对」时作为 SendAcross 的前置动作去按。
             foreach (MonoBehaviour mb in _all)
             {
                 if (mb == null || mb.GetType().Name != "ServerSwitchStation") continue;

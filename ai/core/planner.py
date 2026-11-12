@@ -434,15 +434,6 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         cands.append(Candidate(task, ["hands_empty"], EST_COOK_OPS,
                                branch=branch_of_task(task, book)))
 
-    # 4-5 传送带方向开关：方向不对时发 PressSwitch，先把方向调对，送料/接料
-    # 才不会进垃圾桶（否则 chopped_ingredient 的 SendAcross 会被方向闸挡掉、
-    # 又没人按开关，P2 原地卡死）。
-    if any(isinstance(st, dict) and st.get("t") == "switch"
-           for st in world.stations) \
-            and not CH.conveyor_direction_ok(world, bb):
-        cands.append(Candidate(T.PressSwitch(), [], EST_FETCH,
-                               branch=branch_of_task(T.PressSwitch(), book)))
-
     cands.extend(_gen_throw(world, bb, book))
     return cands
 

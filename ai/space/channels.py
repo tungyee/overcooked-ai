@@ -549,11 +549,9 @@ def channel_keys(world, bb=None):
     # 刚开过的传送带也在 keys 里：候选仍要生成，SendAcross 会端着东西等
     # 接缝重开。否则一帧 flash 就让所有送件候选消失，AI 直接停摆
     # （trace-20261111-001945 t=2934）。
-    #
-    # 4-5 有方向开关：方向不对时传送带通道关闭，让 PressSwitch 先把方向翻对，
-    # 否则放上去的料直接进垃圾桶（trace-20261112-122718 空盘/米饭盘全进右桶）。
-    if (conveyor_slots(world, bb) or conveyor_waitable(bb)) \
-            and conveyor_direction_ok(world, bb):
+    # 4-5 的方向开关不在这里闸：方向不对由 SendAcross 树里的 _ensure_direction_ok
+    # 前置节点去翻，不把候选掐掉。
+    if conveyor_slots(world, bb) or conveyor_waitable(bb):
         keys.append(CONVEYOR)
     if static_slots(world, bb):
         keys.append(STATIC)

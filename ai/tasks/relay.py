@@ -249,10 +249,12 @@ class SendAcross(Task):
                                            self.order_id)
             return spec.done(c, s, key)
 
-        steps = [
-            PR.EnsureHandsFree(keep=held),
-            PR.InteractWith(pickup, "pickup", held),
-        ]
+        steps = []  # type: List[Node]
+        if key == CH.CONVEYOR:
+            # 4-5 方向不对时先翻开关（前置动作），否则料放上去直接进桶。
+            steps.append(_ensure_direction_ok())
+        steps.append(PR.EnsureHandsFree(keep=held))
+        steps.append(PR.InteractWith(pickup, "pickup", held))
         if key == CH.CONVEYOR:
             # 4-2 接缝会逐帧漂开：先把东西拿在手里，等在带子旁直到有槽位，
             # 而不是让 InteractWith 拿到 None 直接 failure。
@@ -272,56 +274,38 @@ class SendAcross(Task):
 SWITCH_PRESS_TICKS = 40
 
 
-@_register
-class PressSwitch(Task):
-    """按 4-5 传送带方向开关：方向不对时翻到对的方向。
+def _switch_target(ctx):
+    # type: (Dict) -> Optional[Dict]
+    """P2 够得着的那台方向开关（两人各一台，只能按自己这侧那台）。"""
+    for st in ctx["w"].stations:
+        if isinstance(st, dict) and st.get("t") == "switch" \
+                and reachability.can_interact(ctx, st):
+            return st
+    return None
 
-    done 判「方向已正确」而非「按过一下」：开关是 toggle，若按「按了」判
-    完成会连按两次又翻回原方向。方向判断见 channels.conveyor_direction_ok。
+
+def _ensure_direction_ok():
+    # type: () -> Node
+    """方向已正确 → 直接过；否则走到开关按到正确（4-5 送料的前置动作）。
+
+    不是独立打分 task：作为 SendAcross 树里的一个前置节点，只在该送料时顺手
+    把方向翻对。
     """
+    def direction_ok(c):
+        return CH.conveyor_direction_ok(c["w"], c.get("bb"))
 
-    TYPE = "PressSwitch"
-    DESC = "按下传送带方向开关，把方向调到对的那边"
-    LABEL = "按开关"
-    HANDS = "any"
-
-    def claims(self):
-        return ()
-
-    def _switch(self, ctx):
-        # type: (Dict) -> Optional[Dict]
-        """P2 够得着的那台开关（两人各一台，P2 只能按自己这侧那台）。"""
-        for st in ctx["w"].stations:
-            if isinstance(st, dict) and st.get("t") == "switch" \
-                    and reachability.can_interact(ctx, st):
-                return st
-        return None
-
-    def done(self, ctx):
-        # type: (Dict) -> bool
-        return CH.conveyor_direction_ok(ctx["w"], ctx.get("bb"))
-
-    def feasible(self, ctx):
-        # type: (Dict) -> bool
-        if self.done(ctx):
-            return False
-        return self._switch(ctx) is not None
-
-    def build(self):
-        # type: () -> Node
-        def target(c):
-            return self._switch(c)
-
-        return PR.Timeout(Sequence([
-            PR.Approach(target, None),
-            PR.Face(target),
-            # 按 WorkstationInteract 直到方向翻到对的一侧；pred（done）成立即松键。
-            # kind="spray"：开关是 grid 对象（m_gridLocation），不是 interactable
-            # （m_interactable=null），HoldCommand 的 UseMatches 门恒不中 → drifted
-            # 按不出键。spray 改走朝向句柄（同 Extinguish 喷灶，见 fire.py）。
-            PR.HoldUntil("switch", self.done, timeout=SWITCH_PRESS_TICKS,
-                         target=target, kind="spray"),
-        ]), TASK_TIMEOUT_TICKS)
+    return Selector([
+        Condition(direction_ok),
+        Sequence([
+            PR.Approach(_switch_target, None),
+            PR.Face(_switch_target),
+            # kind="spray"：开关是 grid 对象（m_gridLocation）、m_interactable=null，
+            # HoldCommand 的 UseMatches 门恒不中 → drifted 按不出键。spray 改走
+            # 朝向句柄（HandleMatches(kind=null)），同 Extinguish 喷灶。
+            PR.HoldUntil("switch", direction_ok, timeout=SWITCH_PRESS_TICKS,
+                         target=_switch_target, kind="spray"),
+        ]),
+    ])
 
 
 def _dest_station(ctx, dest_id):

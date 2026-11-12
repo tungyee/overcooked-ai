@@ -291,9 +291,6 @@ def chopped_ingredient_sources(world, book, bb=None):
     """
     if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
         return []
-    # 4-5 有方向开关：方向不对时先按开关（PressSwitch），不送——送过去进垃圾桶。
-    if not CH.conveyor_direction_ok(world, bb):
-        return []
     near, far = CH._fields(world, bb)
     _boards, p2_can, p1_can = _station_sides(world, near, far, "chopping", bb)
     if not p2_can or p1_can:

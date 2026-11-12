@@ -38,7 +38,7 @@ FETCH_TASK_TYPES = ("FetchToBoard", "FetchToCarrier", "FillCarrier",
 OTHER_TASK_TYPES = (
     "ReturnPot", "RescueCooked", "MergePlates", "SendAcross", "ThrowBatch",
     "Discard", "RecoverLoosePot", "StashHeld", "ResetPlate", "Extinguish",
-    "FetchConveyorPlate", "PressSwitch",
+    "FetchConveyorPlate",
     # 换边：布局窗口里把自己挪到两种布局都对的格，不产生菜品、不认领，
     # 不该出现在分工枚举里。
     "Reposition",

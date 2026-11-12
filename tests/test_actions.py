@@ -13,7 +13,8 @@ def test_action_station_types_cover_all_actions():
 
 
 def test_action_partition_covers_all_task_types():
-    assert set(ACTION_TASK_TYPES) == {"切", "下锅", "拌", "装盘", "送餐", "洗盘"}
+    assert set(ACTION_TASK_TYPES) == {"切", "下锅", "拌", "装盘", "送餐", "洗盘",
+                                       "按开关"}
     covered = set()
     for types in ACTION_TASK_TYPES.values():
         covered |= set(types)

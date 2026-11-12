@@ -29,6 +29,7 @@ ACTION_LABELS = {
     "wash": "洗盘",
     "fetch": "取料",
     "prepare": "整道菜",
+    "press_switch": "按开关",
 }
 
 TICKS_PER_SECOND = 20
@@ -64,6 +65,7 @@ ACTION_TASK_TYPES = {
     "fetch": ("FetchToBoard", "FetchToCooker", "FetchToPlate",
               "FetchToCarrier", "FillCarrier", "Prefetch"),
     "prepare": None,       # 整道菜：取该菜全部 task
+    "press_switch": ("ReceiveConveyor",),
 }  # type: Dict[str, Optional[Tuple[str, ...]]]
 
 # 中文口语 → DAG 英文名。只覆盖常见料；查不到时 check 会返回 valid_targets。
@@ -153,7 +155,7 @@ def resolve_target(kitchen, action, raw):
     用户说中文时先过 TARGET_ALIASES。
     """
     action = str(action or "")
-    if action == "wash":
+    if action in ("wash", "press_switch"):
         return None, None, None, "", []
     text = str(raw or "").strip()
     if not text:
@@ -218,6 +220,8 @@ def build_scope(kitchen, action, target, mode):
         return frozenset({("WashPlate", None)} | _send_scope(action)), ""
     if action == "deliver":
         return frozenset({("DeliverPlate", None)} | _send_scope(action)), ""
+    if action == "press_switch":
+        return frozenset({("ReceiveConveyor", None)}), ""
     if not target:
         # 动作级：任意 item 的这个动作；由 planner 选具体料。
         if not task_types:
@@ -840,6 +844,9 @@ def command_done(world, book, command):
     """命令的目标状态是否已经成立（纯读）。"""
     action = command.action
     target = command.resolved_target or command.target
+    if action == "press_switch":
+        from ai.space import channels as CH
+        return CH.conveyor_direction_toward_p2(world)
     if action == "wash":
         return command.start_dirty > 0 and dirty_count(world) < command.start_dirty
     if action == "deliver":

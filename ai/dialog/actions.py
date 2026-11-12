@@ -19,7 +19,8 @@
 """
 from typing import Dict, FrozenSet, Optional, Tuple
 
-# 6 个可分工动作 → task TYPE（顺序即目录渲染顺序）。
+# 可分工动作 → task TYPE（顺序即目录渲染顺序）。送餐/洗盘/按开关不可分工，
+# 但仍在动作枚举里（谁近谁做 / 随时可命令）。
 ACTION_TASK_TYPES = {
     "切": ("Chop",),
     # 「下锅」= 把料送进灶：含 FetchToCooker（取料下锅这一步）。
@@ -28,6 +29,7 @@ ACTION_TASK_TYPES = {
     "装盘": ("FetchToPlate", "TakeCookedToPlate", "PlaceCleanPlate"),
     "送餐": ("DeliverPlate",),
     "洗盘": ("WashPlate",),
+    "按开关": ("ReceiveConveyor",),
 }  # type: Dict[str, Tuple[str, ...]]
 
 # 取料/搬运：planner 按料源可达性自动归位，不进 LLM 枚举。
@@ -38,7 +40,7 @@ FETCH_TASK_TYPES = ("FetchToBoard", "FetchToCarrier", "FillCarrier",
 OTHER_TASK_TYPES = (
     "ReturnPot", "RescueCooked", "MergePlates", "SendAcross", "ThrowBatch",
     "Discard", "RecoverLoosePot", "StashHeld", "ResetPlate", "Extinguish",
-    "FetchConveyorPlate", "ReceiveConveyor",
+    "FetchConveyorPlate",
     # 换边：布局窗口里把自己挪到两种布局都对的格，不产生菜品、不认领，
     # 不该出现在分工枚举里。
     "Reposition",
@@ -54,6 +56,7 @@ ACTION_STATION_TYPES = {
     "装盘": "plate_station",
     "送餐": "plate_station",
     "洗盘": "washing",
+    "按开关": "switch",
 }  # type: Dict[str, str]
 
 # 工具协议里的英文动作名；只用于 LLM 可见的 schema/返回值。
@@ -64,6 +67,7 @@ ACTION_TOOL_NAMES = {
     "装盘": "plate",
     "送餐": "deliver",
     "洗盘": "wash",
+    "按开关": "press_switch",
 }  # type: Dict[str, str]
 TOOL_ACTION_NAMES = {name: action for action, name in ACTION_TOOL_NAMES.items()}
 

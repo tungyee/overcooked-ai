@@ -227,6 +227,13 @@ def test_wash_and_deliver_scopes_include_relay_kinds():
     assert ("SendAcross", XS.KIND_PLATED_DISH) in deliver
 
 
+def test_press_switch_scope_is_receive_conveyor():
+    """「按开关」= 把方向调向自己 → scope 落成 ReceiveConveyor（无需 target）。"""
+    scope, reason = build_scope(None, "press_switch", None, None)
+    assert reason == ""
+    assert scope == frozenset({("ReceiveConveyor", None)})
+
+
 def test_send_across_dirty_plate_blocked_while_holding_raw_carrier(frames):
     """手里端着待进炉的披萨底时，别为了送脏盘把它放下。
 

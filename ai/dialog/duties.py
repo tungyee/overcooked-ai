@@ -260,10 +260,12 @@ _ACTION_TEXT = {
     "装盘": "盘/出餐台装盘盛盘",
     "送餐": "出餐口送餐",
     "洗盘": "洗碗池洗盘",
+    "按开关": "方向开关把传送带调向自己",
 }
 
 # 工具协议的动作枚举（英文标识，内部翻译成中文 key）。
-TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch"]
+TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch",
+                "press_switch"]
 # 可分工动作的默认枚举；实际由本关站点过滤（见 agent._division_tool_actions）。
 DIVISION_TOOL_ACTIONS = ["chop", "cook", "mix", "plate"]
 # check_action 暂时不暴露给模型：execute_actions 内部已经原子校验。

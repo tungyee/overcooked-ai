@@ -304,8 +304,22 @@ def chopped_ingredient_sources(world, book, bb=None):
             if book.needs_chopping(ing):
                 target = book.chop_target(ing)
                 if target:
-                    want.add(target)
-    return sorted(want)
+                    want.add(target.lower())
+    if not want:
+        return []
+    # 只发「P2 这侧真的有一块切好的料可送」的源——没料时发源会让
+    # SendAcross(chopped_ingredient) 在 L_UNBLOCK 层被选中、pickup 却找不到料、
+    # 每拍 failure 空转（trace-20261112-120920：P2 全程没切菜，只在这两个
+    # SendAcross 间来回失败）。
+    available = set()  # type: Set[str]
+    for it in (list(getattr(world, "items", ()) or ())
+               + list(getattr(world, "held_items", ()) or ())):
+        if not isinstance(it, dict) or it.get("held_by") == P.P1_NAME:
+            continue
+        name = str(it.get("n") or "").lower()
+        if name in want and _side_of(world, near, far, it, bb) == "near":
+            available.add(name)
+    return sorted(want & available)
 
 
 def _can_supply(ctx, book, ing):

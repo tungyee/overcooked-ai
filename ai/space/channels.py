@@ -323,18 +323,17 @@ def switch_direction(world, bb=None):
     # type: (object, object) -> Optional[str]
     """4-5 传送带方向开关当前的开关格方向：'>'（右）或 '<'（左）；拿不到返回 None。
 
-    开关格 = 与 switch 站点同格的 conveyor 段，读该段的 vx 符号。
+    开关格是传送带系统中点 (0,0) 那格 conveyor——按钮（switch 站点）挂在
+    (1,1)/(-1,-1)，但随按钮翻转的是中点格的 vx（trace-20261111-233924 按钮把
+    (0,0) 从 '<' 翻成 '>'）。读该格的 vx 符号。
     """
-    switches = [st for st in getattr(world, "stations", ()) or ()
-                if isinstance(st, dict) and st.get("t") == "switch"]
-    if not switches:
+    if not any(isinstance(st, dict) and st.get("t") == "switch"
+               for st in getattr(world, "stations", ()) or ()):
         return None
-    sw = switches[0]
-    sx, sz = sw.get("gx"), sw.get("gz")
     for st in getattr(world, "stations", ()) or ():
         if not isinstance(st, dict) or st.get("t") != "conveyor":
             continue
-        if st.get("gx") == sx and st.get("gz") == sz:
+        if st.get("gx") == 0 and st.get("gz") == 0:
             vx = st.get("vx") or 0.0
             if abs(vx) > 0.01:
                 return ">" if vx > 0 else "<"

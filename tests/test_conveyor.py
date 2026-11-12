@@ -209,9 +209,11 @@ def test_send_uses_own_belt_start_not_far_end():
 
 
 def _switch_world(vx):
+    # 按钮（switch 站点）在 (1,1)/(-1,-1)，随按钮翻转的开关格 conveyor 在 (0,0)。
     class W(object):
         stations = [
-            {"t": "switch", "n": "SwitchStation", "gx": 0, "gz": 0},
+            {"t": "switch", "n": "Switch (1)", "gx": 1, "gz": 1},
+            {"t": "switch", "n": "Switch", "gx": -1, "gz": -1},
             {"t": "conveyor", "n": "ConveyorStation (85)", "gx": 0, "gz": 0,
              "vx": vx, "vz": 0.0},
         ]

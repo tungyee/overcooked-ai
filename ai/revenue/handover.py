@@ -390,6 +390,81 @@ SEND_SPECS[XS.KIND_PLATED_DISH] = SendSpec(
 )
 
 
+# ---------------------------------------------------------------- ingredient
+
+
+def _ingredient_sources(world, book, bb):
+    # type: (Any, Any, Any) -> List[SendSource]
+    return [SendSource(XS.KIND_INGREDIENT, form, None, item)
+            for form, item in XS.ingredient_sources(world, book, bb)]
+
+
+def _ingredient_resolve(ctx, source_id, order_id):
+    # type: (Dict, Any, Any) -> Optional[SendSource]
+    for form, item in XS.ingredient_sources(ctx["w"], ctx.get("book"),
+                                            ctx.get("bb")):
+        if form == source_id:
+            return SendSource(XS.KIND_INGREDIENT, form, None, item)
+    # 已拿在手里（刚捡起来、快照里不再算散料）：仍按形态放行，让树走 placement。
+    if P.held_matches(ctx["chef"], source_id):
+        return SendSource(XS.KIND_INGREDIENT, source_id, None, None)
+    return None
+
+
+def _ingredient_pickup(ctx, source):
+    # type: (Dict, SendSource) -> Optional[Dict]
+    if source.payload is not None:
+        return _station_for_item(ctx["w"], source.payload) or source.payload
+    return None
+
+
+def _ingredient_held(ctx, source):
+    # type: (Dict, SendSource) -> bool
+    return P.held_matches(ctx["chef"], source.source_id)
+
+
+def _ingredient_on_channel(world, form, key, bb=None):
+    # type: (Any, Any, str, Any) -> bool
+    for it in getattr(world, "items", None) or ():
+        if not isinstance(it, dict) \
+                or str(it.get("n") or "").lower() != str(form).lower():
+            continue
+        st = CH.slot_of(world, it, bb)
+        if st is not None and CH.channel_of_slot(world, st, bb) == key:
+            return True
+    return False
+
+
+def _ingredient_done(ctx, source, key):
+    # type: (Dict, SendSource, str) -> bool
+    if not P.hands_free(ctx["chef"]):
+        return False
+    if _ingredient_on_channel(ctx["w"], source.source_id, key, ctx.get("bb")):
+        return True
+    return not any(f == source.source_id
+                   for f, _ in XS.ingredient_sources(ctx["w"], ctx.get("book"),
+                                                     ctx.get("bb")))
+
+
+def _ingredient_capacity(ctx, key):
+    # type: (Dict, str) -> bool
+    return XS.has_send_capacity(ctx["w"], key, ctx.get("bb"))
+
+
+SEND_SPECS[XS.KIND_INGREDIENT] = SendSpec(
+    kind=XS.KIND_INGREDIENT,
+    label="送切好料",
+    sources=_ingredient_sources,
+    claims=lambda source_id, order_id: ((source_id, "send"),),
+    pickup=_ingredient_pickup,
+    held=_ingredient_held,
+    done=_ingredient_done,
+    resolve=_ingredient_resolve,
+    channels=lambda world, bb: CH.channel_keys(world, bb),
+    capacity=_ingredient_capacity,
+)
+
+
 # ---------------------------------------------------------------- 对外入口
 
 

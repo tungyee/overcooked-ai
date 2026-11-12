@@ -38,7 +38,12 @@ KIND_CARRIER = "carrier"
 KIND_DIRTY_PLATE = "dirty_plate"
 # 成品盘：出餐口只在对面、P2 这侧有料齐的盘时，送到共享台面让 P1 送。
 KIND_PLATED_DISH = "plated_dish"
-KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH)
+# 松散切好料：对面缺（订单还要），P2 这边有切好的现成料，放上通道送过去。
+# 与 ThrowBatch 的区别：投掷要求对面有干净盘能接盘（gap 的 far-plate 门控），
+# 送件只要求「对面还缺」——料放上传送带/共享台面，P1 有盘时自己捡（4-5）。
+KIND_INGREDIENT = "ingredient"
+KINDS = (KIND_CLEAN_PLATE, KIND_CARRIER, KIND_DIRTY_PLATE, KIND_PLATED_DISH,
+         KIND_INGREDIENT)
 
 # 对面最多备几块空盘（含在途）：P1 一般同时装 1~2 单，再多就是把盘从我这边
 # 搬去对面闲着，回头我这边要用（洗好的盘也在这边）还得送回来。
@@ -385,3 +390,45 @@ def _can_supply(ctx, book, ing):
 def _cookers_side_of(world, near, far, cookers, bb=None):
     # type: (object, Dict, Dict, List[Dict], object) -> Set[str]
     return {s for s in (_side_of(world, near, far, c, bb) for c in cookers) if s}
+
+
+def ingredient_sources(world, book, bb=None):
+    # type: (object, object, object) -> List[Tuple[str, Dict]]
+    """P2 该送过通道的松散切好料：[(形态名, 可取散料)]。
+
+    与 ThrowBatch 的 CONSUMER_PLATE 同源（都读 throw_supply 的缺口与来源），
+    但跳过「对面有干净盘」门控：切好料放上传送带/共享台面，P1 有盘时自己捡
+    （4-5 内圈）。形态名作 SendAcross 身份（一次送一份）；避免跨模块反向
+    import throw_supply，改在函数内惰性导入。
+    """
+    from ai.revenue import throw_supply as TS
+    if not CH.is_split(world, bb) or not CH.channel_keys(world, bb):
+        return []
+    out = []  # type: List[Tuple[str, Dict]]
+    seen = set()
+    for order in getattr(world, "orders", None) or ():
+        for product in book.requirements(order):
+            if not book.needs_chopping(product):
+                continue
+            chopped = book.chop_target(product)
+            if not chopped or str(chopped).lower() == str(product).lower():
+                continue
+            key = str(chopped).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            board = next((s for s in getattr(world, "stations", None) or ()
+                          if isinstance(s, dict) and s.get("t") == "chopping"), None)
+            if board is None:
+                continue
+            dests = TS.dest_candidates(world, book, TS.CONSUMER_PLATE, product) \
+                or [board]
+            if TS.gap(world, book, product, chopped, TS.CONSUMER_PLATE, product,
+                      board, TS.MODE_SPLIT, bb, require_far_plate=False) <= 0:
+                continue
+            for s in TS.sources(world, chopped, product, board, TS.MODE_SPLIT,
+                                bb, dests):
+                if s["kind"] == "loose":
+                    out.append((chopped, s["entry"]))
+                    break       # 一次只送一份
+    return out

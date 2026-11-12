@@ -93,7 +93,8 @@ def test_send_specs_cover_all_kinds():
     from ai.revenue import handover as HO
     assert set(HO.SEND_SPECS) == set(XS.KINDS)
     assert set(XS.KINDS) == {XS.KIND_CLEAN_PLATE, XS.KIND_CARRIER,
-                             XS.KIND_DIRTY_PLATE, XS.KIND_PLATED_DISH}
+                             XS.KIND_DIRTY_PLATE, XS.KIND_PLATED_DISH,
+                             XS.KIND_INGREDIENT}
 
 
 def test_request_objects_expose_kind_source_and_channel(frames):
@@ -257,3 +258,40 @@ def test_send_across_dirty_plate_blocked_while_holding_raw_carrier(frames):
     task = T.SendAcross(item=XS.KIND_DIRTY_PLATE,
                         resources=("dirty_plate", CH.STATIC))
     assert task.feasible(ctx) is False
+
+
+# ---------------------------------------------------------------- 松散切好料（4-5）
+
+FIXTURE_SUSHI45 = os.path.join(os.path.dirname(__file__), "fixtures", "sushi",
+                                "sushi45-switch-20261112.ndjson.gz")
+
+
+def _sushi45_frame(vx=0.6):
+    """4-5 帧；vx 设开关格 (0,0) 的方向（0.6=朝 P1，-0.6=朝 P2）。"""
+    with gzip.open(FIXTURE_SUSHI45, "rt", encoding="utf8") as fh:
+        f = json.loads(fh.readline())
+    for st in f["stations"]:
+        if st.get("t") == "conveyor" and st.get("gx") == 0 and st.get("gz") == 0:
+            st["vx"] = vx
+            st["vz"] = 0.0
+    return f
+
+
+def _sushi45_ctx(frame):
+    w = W.World(frame)
+    book = RecipeBook(w.recipes, w.stations, w.items)
+    bb = make_bb(100)
+    return w, book, bb, planner._make_context(w, bb, book)
+
+
+def test_ingredient_sent_via_conveyor_when_far_needs_chopped():
+    """4-5：对面缺切好的鱼，P2 这边有 → 生成「松散切好料」的 SendAcross 候选。"""
+    from ai.revenue import handover as HO
+    w, book, bb, ctx = _sushi45_ctx(_sushi45_frame())
+    reqs = HO.send_requests(w, book, bb)
+    ing = [r for r in reqs if r.kind == XS.KIND_INGREDIENT]
+    assert ing and ing[0].channel == CH.CONVEYOR
+    assert ing[0].source.source_id == "ChoppedSushiFish"
+    task = T.SendAcross(item=XS.KIND_INGREDIENT,
+                        resources=(ing[0].source.source_id, CH.CONVEYOR))
+    assert task.feasible(ctx) and not task.done(ctx)

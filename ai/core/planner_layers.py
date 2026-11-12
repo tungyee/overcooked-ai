@@ -123,9 +123,6 @@ def build_rules(pressure_fn, plate_pressure_fn, placed_plates_fn,
             # 跨区送盘：只在对面缺盘时才是候选（cross_supply.send_deficit），
             # 缺盘就是拼装被卡住，同摆盘一层
             or t.TYPE == "SendAcross"
-            # 4-5 方向开关：方向不对时传送带通道关闭、送料被卡住，按开关是
-            # 「解卡」，同 L4；否则它在 L7 会被备菜永远压着、方向没人翻。
-            or t.TYPE == "PressSwitch"
             # 脏盘已经上了传送带：不洗就会被带进垃圾桶销毁，别排到 L7。
             or (t.TYPE == "WashPlate" and dirty_on_conveyor(w))
             # 传送带上的盘（非脏盘）马上进垃圾桶：同「解卡」。

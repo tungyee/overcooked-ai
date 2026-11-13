@@ -2417,6 +2417,7 @@ def test_all_spec_tasks_are_registered():
         "FillCarrier",                                        # wrap 载体（卷饼直接装熟料）
         "MergePlates",                                        # 盘合并（spec 2026-11-01-plate-merge-design）
         "Reposition",                                         # 换布局时走进安全区
+        "RideRaft",                                           # 5-1 开舢板过河
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),

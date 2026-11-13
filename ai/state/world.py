@@ -267,6 +267,20 @@ class World(object):
         self.wind_zones = occupancy.parse_wind_zones(state.get("wind_zones"))
         hazard_boxes = occupancy.hazard_boxes(self.hazards, cell=self.mapping.cell)
         occ_cells = self._occupancy_cells(state.get("occupancy"))
+        # 5-1 舢板：主网格把船底板报成占用（船是移动物体，游戏里 m_gridOccupancy
+        # 记它当前占住的格），但角色实际能站上去、骑它过河。把船底板格从运行时
+        # 占用里排除，寻路才能走上船；船中间的柜台仍由 TableBlock 层挡。
+        from ai.space import raft as _raft
+        _raft_box = _raft.raft_box(self)
+        if _raft_box is not None:
+            g0 = self.to_grid(_raft_box[0], _raft_box[2])
+            g1 = self.to_grid(_raft_box[1], _raft_box[3])
+            for gx in range(min(g0[0], g1[0]), max(g0[0], g1[0]) + 1):
+                for gz in range(min(g0[1], g1[1]), max(g0[1], g1[1]) + 1):
+                    x, z = self.to_world(gx, gz)
+                    if _raft_box[0] <= x <= _raft_box[1] \
+                            and _raft_box[2] <= z <= _raft_box[3]:
+                        occ_cells.discard((gx, gz))
         # 写死（1-6）：出餐口（plate_station）grid=None，碰撞 footprint 没进
         # occupancy；且碰撞盒北缘（maxz≈3.6）伸进北邻那排，角色半径过不去 →
         # 把出餐口北邻一排标成不可走，避免寻路北上钻墙后死路（1-6 实机两处卡死）。

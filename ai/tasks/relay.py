@@ -87,7 +87,7 @@ def _channel_slot(ctx, key, lock, allow_boards=False):
 
     own = CH._chef_grid(w, ctx.get("chef"))
     def cost(st):
-        if key in (CH.STATIC, CH.CONVEYOR):
+        if key in (CH.STATIC, CH.CONVEYOR, CH.RAFT):
             goals = reachability._interact_goals(ctx, st)
             if goals is True:
                 return (0, 0)

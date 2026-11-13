@@ -26,11 +26,13 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ai.query import predicates as P
 from ai.space import occupancy
+from ai.space import raft
 from ai.space import reachability
 from ai.space import shuttle
 
 STATIC = "@static"
 CONVEYOR = "@conveyor"
+RAFT = "@raft"
 
 # 传送带段没有 collider 字段（插件只报段位置），散落物靠 on_station 段名
 # 或与段心的距离认领。格宽 1.2，半格 0.6 留一点余量。
@@ -602,6 +604,26 @@ def shared_boards(world, bb=None):
     return out
 
 
+def raft_slots(world, bb=None):
+    # type: (object, object) -> List[Dict]
+    """舢板柜台上 P2 够得着的台面（船停在 P2 这一侧时）。
+
+    与 static（两边都够得着）不同：舢板柜台只有停靠那一侧的厨师够得着，
+    所以按 P2 可达场筛，而不是要求两边都可交互。
+    """
+    cache = getattr(world, "_raft_slots", None)
+    if cache is not None:
+        return cache
+    out = []  # type: List[Dict]
+    if is_split(world, bb):
+        near, _far = _fields(world, bb)
+        for st in raft.countertop_slots(world):
+            if _reach(world, near, st, P.P2_NAME):
+                out.append(st)
+    world._raft_slots = out
+    return out
+
+
 def _board_free(world, st):
     # type: (object, Dict) -> bool
     for ws in getattr(world, "workstations", ()) or ():
@@ -633,6 +655,8 @@ def channel_keys(world, bb=None):
         keys.append(CONVEYOR)
     if static_slots(world, bb):
         keys.append(STATIC)
+    if raft_slots(world, bb):
+        keys.append(RAFT)
     return keys
 
 
@@ -643,6 +667,8 @@ def slots(world, key, bb=None):
         return list(static_slots(world, bb))
     if key == CONVEYOR:
         return list(conveyor_slots(world, bb))
+    if key == RAFT:
+        return list(raft_slots(world, bb))
     return [st for st in shuttle.shuttle_stations(world)
             if str(st.get("grid") or "") == str(key)]
 
@@ -658,10 +684,15 @@ def slot_of(world, entry, bb=None):
     st = shuttle.station_of(world, entry)
     if st is not None:
         return st
+    from ai.space import occupancy as O
+    raft_counters = raft.countertop_slots(world)
+    if raft_counters:
+        support = O._support_station(entry, raft_counters)
+        if support is not None:
+            return support
     shared = static_slots(world, bb) + shared_boards(world, bb)
     if not shared:
         return None
-    from ai.space import occupancy as O
     support = O._support_station(entry, shared)
     if support is None:
         return None
@@ -674,6 +705,8 @@ def channel_of_slot(world, st, bb=None):
         return CONVEYOR
     if shuttle.is_shuttle_station(world, st):
         return str(st.get("grid"))
+    if raft.is_raft_counter(world, st):
+        return RAFT
     if any(s is st for s in static_slots(world, bb) + shared_boards(world, bb)):
         return STATIC
     return None

@@ -27,6 +27,7 @@ from ai.tasks.mix import *          # noqa: F401,F403
 from ai.tasks.relay import *        # noqa: F401,F403
 from ai.tasks.carrier import *      # noqa: F401,F403
 from ai.tasks.reposition import *   # noqa: F401,F403
+from ai.tasks.raft import *         # noqa: F401,F403
 from ai.tasks.assembly import delivery_baseline_from
 
 

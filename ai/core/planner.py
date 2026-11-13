@@ -352,6 +352,14 @@ def _gen_misc(world, bb, book, chef, hands_empty):
             and XS.dirty_plate_to_receive(world, bb):
         cands.append(Candidate(T.ReceiveConveyor(), [], EST_FETCH))
 
+    # 5-1 舢板：开船过河到对岸。feasible 再判「船停本侧、对岸才是目标」，
+    # 平时与切/煮等有订单紧急性分的 task 同场，只在「本侧无活、对岸有活但
+    # 够不着」时胜出——正是 trace-20261113-224047 里 P2 卡死要过的场景。
+    from ai.space import raft
+    if raft.raft_box(world) is not None:
+        for side in ("left", "right"):
+            cands.append(Candidate(T.RideRaft(item=side), [], EST_FETCH))
+
     for c in _cookers(world):
         if not c.get("n"):
             continue

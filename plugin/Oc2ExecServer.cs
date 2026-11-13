@@ -131,6 +131,9 @@ namespace Oc2AI
                 case "throw":
                     lock (_cmdLock) { _active = new ThrowCommand(obj); _activeCmdId = cmdId; _activeStartedAt = Time.unscaledTime; }
                     break;
+                case "raft":
+                    lock (_cmdLock) { _active = new RaftCommand(obj); _activeCmdId = cmdId; _activeStartedAt = Time.unscaledTime; }
+                    break;
                 case "halt":
                     Halt();
                     SendResult(cmdId, true, null);

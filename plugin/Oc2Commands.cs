@@ -564,4 +564,100 @@ namespace Oc2AI
             Why = why;
         }
     }
+
+    /// <summary>raft：触发舢板（5-1）移动到对岸——朝向可选目标、按交互键 + 按住方向，短暂保持后松键。</summary>
+    /// <remarks>
+    /// 语义到岸由 Python 判（docked_side），这里只做「触发」。按键控制的具体
+    /// 键位（交互键 + 方向）来自 Assembly-CSharp 反查 MovingPlatform /
+    /// OnSwitchPressed + 攻略「按钮 + 移动键」，实机可能需微调 hold_ms 或方向轴。
+    /// </remarks>
+    public sealed class RaftCommand : IExecCommand
+    {
+        private const float FACE_TIMEOUT = 0.6f;
+        private const float FACE_STICK = 0.25f;   // 小推杆：只转身不怎么走
+        private const float FACE_DOT = 0.97f;
+
+        private enum Phase { Face, Hold }
+        private Phase _phase = Phase.Face;
+        private readonly Vector2 _direction;
+        private readonly Dictionary<string, object> _target;
+        private readonly Vector2 _targetWorld;
+        private readonly bool _hasTargetWorld;
+        private readonly float _holdSeconds;
+        private readonly float _timeout;
+        private bool _started;
+        private float _startTime;
+        private float _phaseStart;
+
+        public bool Done { get; private set; }
+        public bool Ok { get; private set; }
+        public string Why { get; private set; }
+        public double[] BlockedCell { get { return null; } }
+
+        public RaftCommand(Dictionary<string, object> cmd)
+        {
+            _direction = PadButtons.DirVec(Req.Str(cmd, "direction"));
+            _target = Req.Obj(cmd, "target");
+            var tw = Req.List(cmd, "target_world");
+            if (tw != null && tw.Count >= 2)
+            {
+                _targetWorld = new Vector2((float)(double)tw[0], (float)(double)tw[1]);
+                _hasTargetWorld = true;
+            }
+            _holdSeconds = (float)(Req.Num(cmd, "hold_ms") ?? 800.0) / 1000f;
+            _timeout = (float)(Req.Num(cmd, "timeout_ms") ?? 5000.0) / 1000f;
+        }
+
+        public void Tick(ChefFrame f, float now)
+        {
+            if (Done) return;
+            if (!_started) { _started = true; _startTime = now; _phaseStart = now; }
+            if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
+            if (!f.Valid) { Finish(false, "no chef"); return; }
+
+            switch (_phase)
+            {
+                case Phase.Face:
+                    if (_hasTargetWorld && _target != null)
+                    {
+                        Vector2 pos = new Vector2(f.PosX, f.PosZ);
+                        Vector2 dir = (_targetWorld - pos).normalized;
+                        Vector3 fw = f.Chef.transform.forward;
+                        Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+                        bool aligned = Vector2.Dot(fwd, dir) > FACE_DOT;
+                        if (!aligned)
+                        {
+                            if (now - _phaseStart < FACE_TIMEOUT)
+                            {
+                                PadEngagement.Pad.Move(f.Chef, dir.x * FACE_STICK, dir.y * FACE_STICK);
+                                return;
+                            }
+                        }
+                    }
+                    PadEngagement.Pad.Stop();
+                    _phase = Phase.Hold;
+                    _phaseStart = now;
+                    break;
+
+                case Phase.Hold:
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+                    if (_direction != Vector2.zero) PadEngagement.Pad.Stick(_direction.x, _direction.y);
+                    if (now - _phaseStart >= _holdSeconds)
+                    {
+                        Finish(true, null);
+                        return;
+                    }
+                    break;
+            }
+        }
+
+        private void Finish(bool ok, string why)
+        {
+            PadEngagement.Pad.Stop();
+            PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, false);
+            Done = true;
+            Ok = ok;
+            Why = why;
+        }
+    }
 }

@@ -7,7 +7,7 @@ from ai.exec.commands import CMD_NAMES, build_command, parse_result
 
 def test_cmd_names_covers_all_commands():
     assert set(CMD_NAMES) == {"move", "tap", "hold", "wait", "throw", "halt",
-                              "ping"}
+                              "ping", "raft"}
 
 
 def test_build_move_roundtrip_multi_grid():

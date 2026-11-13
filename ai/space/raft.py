@@ -144,10 +144,11 @@ def countertop_slots(world):
 
 def on_my_side(world, name=P.P2_NAME):
     # type: (object, str) -> bool
-    """舢板是否停在 name（默认 P2）这一侧的岛边。
+    """舢板是否停在 name（默认 P2）这一侧（= P2 能走上船）。
 
-    几何判据：船中心 x 把左右分开，厨师在船中心哪半边就是哪侧。只在有可达场
-    不可用时作兜底；channels 层优先用 reachability.can_interact 判「够得着」。
+    判据用船边而非船中心：P2 站在船上任意位置（含开局船停右岸、P2 在船左半边）
+    都算「这一侧」——船中心会把船左半边的 P2 判成「在对岸」，开局就上不了船。
+    只在有可达场不可用时作兜底；channels 层优先用 reachability.can_interact 判。
     """
     side = docked_side(world)
     raft = raft_box(world)
@@ -157,8 +158,9 @@ def on_my_side(world, name=P.P2_NAME):
     x = (chef or {}).get("x")
     if x is None:
         return False
-    mid = (raft[0] + raft[1]) / 2.0
-    return float(x) >= mid if side == "right" else float(x) <= mid
+    if side == "right":
+        return float(x) >= raft[0] - DOCK_EPS   # 在船上或右岛
+    return float(x) <= raft[1] + DOCK_EPS       # 在船上或左岛
 
 
 def board_cell(world, name=P.P2_NAME):

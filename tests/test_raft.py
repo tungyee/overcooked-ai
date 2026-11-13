@@ -87,6 +87,11 @@ def test_on_my_side_follows_docked_side():
     assert RF.on_my_side(W.World(_state(10.17, 16.17, p2_x=0.0))) is False
 
 
+def test_on_my_side_true_when_chef_on_raft():
+    # 开局：船停右岸、P2 站在船左半边（x=11.4 在船中心 13.17 之左），仍算「这一侧」
+    assert RF.on_my_side(W.World(_state(10.17, 16.17, p2_x=11.4))) is True
+
+
 def test_channel_of_slot_maps_raft_counter_to_raft():
     w = W.World(_state(10.17, 16.17))
     raft_c = next(s for s in w.stations if s["n"] == "raft_c")

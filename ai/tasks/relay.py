@@ -177,6 +177,30 @@ class SendAcross(Task):
                 return probe
         return None
 
+    def resource_target(self, rid, ctx):
+        # type: (Any, Dict) -> Optional[Dict]
+        """route 检查（reachability.task_veto）按「P2 实际要碰的来源」解析，
+        不按名字撞同名物。
+
+        ingredient 的 source_id 是形态名，场上可能有多块同名料（P1 侧也有一块）。
+        默认 reachability.resource() 按名查会取到 P1 侧那块、误判 unreachable，
+        让送料任务在「拿起料」那一拍掉出可行集（trace-20261113-211840 末段
+        SendAcross↔FetchToPlate 抖动）。其它 kind 的 source_id 是盘 id，默认
+        解析已正确，这里不接管（返回 None 走原逻辑）。
+        """
+        if self.item != XS.KIND_INGREDIENT:
+            return None
+        source = self._source(ctx)
+        if source is None:
+            return None
+        if source.payload is not None:
+            return source.payload
+        # 手里正拿着：can_interact 对 held_by==P2 返回 True。找手持物条目。
+        for it in getattr(ctx["w"], "held_items", None) or ():
+            if str(it.get("n") or "").lower() == str(self.source_id).lower():
+                return it
+        return None
+
     def wait_targets(self, ctx):
         # type: (Dict) -> List[Dict]
         """要等篮子的目标（reachability.task_*wait_seconds 读）：放哪一格。

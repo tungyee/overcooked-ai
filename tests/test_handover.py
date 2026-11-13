@@ -295,3 +295,29 @@ def test_ingredient_sent_via_conveyor_when_far_needs_chopped():
     task = T.SendAcross(item=XS.KIND_INGREDIENT,
                         resources=(ing[0].source.source_id, CH.CONVEYOR))
     assert task.feasible(ctx) and not task.done(ctx)
+
+
+def test_ingredient_send_route_veto_ignores_far_side_duplicate():
+    """P2 手里拿着切好的黄瓜时，SendAcross(ingredient) 不该被同名料判 unreachable。
+
+    场上还有一块同名 ChoppedCucumber 在 P1 侧（P2 够不着）。旧实现按 claim 的
+    形态名用 resource() 按名查，会取到 P1 侧那块、误判 unreachable，导致送料
+    任务在「拿起料」那一拍掉出可行集（trace-20261113-211840 末段抖动）。
+    """
+    f = _sushi45_frame()
+    p1 = next(c for c in f["chefs"] if c["name"] == "Player 1")
+    f.setdefault("items", []).append({
+        "n": "ChoppedCucumber", "x": p1["x"], "z": p1["z"],
+        "held_by": None, "throwable": True, "flying": False, "on_station": None,
+    })
+    for c in f["chefs"]:
+        if c["name"] == "Player 2":
+            c["held"] = "ChoppedCucumber"
+    f.setdefault("held_items", []).append({
+        "n": "ChoppedCucumber", "x": 16.8, "z": 14.6,
+        "held_by": "Player 2", "throwable": True, "flying": False, "on_station": None,
+    })
+    w, book, bb, ctx = _sushi45_ctx(f)
+    task = T.SendAcross(item=XS.KIND_INGREDIENT,
+                        resources=("ChoppedCucumber", CH.CONVEYOR))
+    assert R.task_veto(task, ctx) == ""

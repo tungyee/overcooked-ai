@@ -56,10 +56,11 @@ def iter_probes(path):
 
 def py_walkable(m, probe):
     terrain = occupancy.parse_terrain(m.get("terrain"))
+    terrain_y = occupancy.parse_terrain_y(m.get("terrain"))
     level_bounds = occupancy.parse_level_bounds(m.get("level_bounds"))
     mapping = GridMapping(probe["cell"], 0, 0, probe["ox"], probe["oz"])
     return occupancy.make_walkable_from_terrain(
-        terrain, [], set(), mapping, level_bounds=level_bounds)
+        terrain, [], set(), mapping, level_bounds=level_bounds, terrain_y=terrain_y)
 
 
 def cells(chef, sub):

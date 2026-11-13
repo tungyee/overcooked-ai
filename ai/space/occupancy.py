@@ -371,6 +371,8 @@ LAYER_SLOPED_GROUND = 28
 SLOPE_JOIN_MARGIN = 0.3   # 楼梯并入 Ground 时的外扩（米），补台阶与地板间接缝
 LAYER_KILLPLANE = 30
 BLOCKING_LAYERS = (LAYER_WALLS, LAYER_TABLEBLOCK, LAYER_COOKINGBLOCK, LAYER_PLATEBLOCK)
+# 地板顶面高度取这两层（SlopedGround 楼梯并入 Ground 的可走面）。
+GROUND_TOP_LAYERS = (LAYER_GROUND, LAYER_SLOPED_GROUND)
 
 
 def _iter_terrain(terrain_list):
@@ -526,9 +528,66 @@ def _point_in_any_box(x, z, boxes, margin=0.0):
     return False
 
 
+def _ground_top_at(terrain_y, x, z):
+    # type: (Optional[Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]], float, float) -> Optional[float]
+    """(x,z) 处地板顶面高度（Ground/SlopedGround 盒顶取最高）。
+
+    只读带高度的 terrain_y（parse_terrain_y）；旧帧/无高度地面盒返回 None。
+    调用方对 None 的解释是「不知道地板高度」——保守按阻挡处理，保持旧行为。
+    """
+    best = None  # type: Optional[float]
+    for layer in GROUND_TOP_LAYERS:
+        for box, _miny, maxy in (terrain_y or {}).get(layer) or ():
+            if box[0] <= x <= box[1] and box[2] <= z <= box[3] \
+                    and (best is None or maxy > best):
+                best = maxy
+    return best
+
+
+def _blocking_boxes(terrain_by_layer, terrain_y):
+    # type: (Dict[int, List[Tuple[float, float, float, float]]], Optional[Dict]) -> List[Tuple[float, ...]]
+    """阻挡层盒，带高度时是 6 元素 (minx,maxx,minz,maxz,miny,maxy)。
+
+    高度从 terrain_y 反查（按 (layer, 2D box) 精确匹配）。旧 4 元素盒（无
+    高度）原样返回——调用方对无高度盒一律按阻挡处理，保持旧行为。
+    """
+    heights = {}  # type: Dict[Tuple[int, Tuple[float, float, float, float]], Tuple[float, float]]
+    for layer, entries in (terrain_y or {}).items():
+        for box, miny, maxy in entries:
+            heights[(layer, box)] = (miny, maxy)
+    out = []  # type: List[Tuple[float, ...]]
+    for layer in BLOCKING_LAYERS:
+        for box in terrain_by_layer.get(layer) or ():
+            h = heights.get((layer, box))
+            out.append(box + h if h is not None else box)
+    return out
+
+
+def _point_in_blocking(x, z, boxes, gtop, margin=0.0):
+    # type: (float, float, List[Tuple[float, ...]], Optional[float], float) -> bool
+    """点 (x,z) 是否落在阻挡盒内（带外扩）。
+
+    6 元素盒先按高度过滤：整段顶面（maxy）不超过地板顶面 gtop 的盒在脚下
+    之下（矿洞/平台底座之类），不挡路。gtop 为 None（不知道地板高度）时不
+    过滤，保持旧行为。
+    """
+    for box in boxes:
+        if len(box) == 6:
+            minx, maxx, minz, maxz, _miny, maxy = box
+            if gtop is not None and maxy <= gtop:
+                continue
+        else:
+            minx, maxx, minz, maxz = box
+        if (minx - margin - _POINT_EPS <= x <= maxx + margin + _POINT_EPS
+                and minz - margin - _POINT_EPS <= z <= maxz + margin + _POINT_EPS):
+            return True
+    return False
+
+
 def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
-                               mapping, belt_cells=None, level_bounds=None):
-    # type: (Dict[int, List[Tuple]], List[Tuple[float,float,float,float]], Set[Tuple[int,int]], GridMapping, Optional[Set[Tuple[int,int]]], Optional[List[Tuple[float,float,float,float]]]) -> Callable[[int, int], bool]
+                               mapping, belt_cells=None, level_bounds=None,
+                               terrain_y=None):
+    # type: (Dict[int, List[Tuple]], List[Tuple[float,float,float,float]], Set[Tuple[int,int]], GridMapping, Optional[Set[Tuple[int,int]]], Optional[List[Tuple[float,float,float,float]]], Optional[Dict]) -> Callable[[int, int], bool]
     """按 §5.3 判定顺序构造 is_walkable(gx,gz)。替代 `make_walkable`。
 
     判定顺序：
@@ -554,9 +613,7 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
     """
     ground = terrain_by_layer.get(LAYER_GROUND) or []
     killplane = terrain_by_layer.get(LAYER_KILLPLANE) or []
-    blocking = []  # type: List[Tuple[float, float, float, float]]
-    for layer in BLOCKING_LAYERS:
-        blocking.extend(terrain_by_layer.get(layer) or ())
+    blocking = _blocking_boxes(terrain_by_layer, terrain_y)
     hazard_boxes = list(hazard_boxes or ())
     belts = set(belt_cells or ())
     level_bounds = list(level_bounds or ())
@@ -581,7 +638,9 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
         # AABB 会朝邻格溢出一点点，若按格子区域相交判，会把贴着墙站立的
         # 可走地板整排误判成不可走（Balloon_1_5 上层地板、上左走廊被封死，
         # trace-20261017-193620）。点判只拦「格中心真的被占」的格子。
-        if _point_in_any_box(x, z, blocking, margin=CHEF_CLEARANCE):
+        # 带高度的盒先滤掉「整段在地板之下」的假墙（矿洞地板下空腔之类）。
+        if _point_in_blocking(x, z, blocking, _ground_top_at(terrain_y, x, z),
+                              margin=CHEF_CLEARANCE):
             return False
         if (gx, gz) in occupancy_cells and (gx, gz) not in belts:
             return False
@@ -590,8 +649,8 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
     return is_walkable
 
 
-def make_edge_blocker(terrain_by_layer, mapping):
-    # type: (Dict[int, List[Tuple[float, float, float, float]]], GridMapping) -> Callable[[Tuple[int, int], Tuple[int, int]], bool]
+def make_edge_blocker(terrain_by_layer, mapping, terrain_y=None):
+    # type: (Dict[int, List[Tuple[float, float, float, float]]], GridMapping, Optional[Dict]) -> Callable[[Tuple[int, int], Tuple[int, int]], bool]
     """返回 edge_blocked(cur, nxt) -> bool：两格之间是否被薄墙挡住。
 
     薄墙 = collider AABB **严格夹在两格中心之间**（比一格窄、盖不住任何格
@@ -607,24 +666,29 @@ def make_edge_blocker(terrain_by_layer, mapping):
     站点 collider 会朝邻格溢出一点点，按区域判会把贴墙站立的可走地板整排
     误杀（同 is_walkable 点判的教训）。
     """
-    blocking = []  # type: List[Tuple[float, float, float, float]]
-    for layer in BLOCKING_LAYERS:
-        blocking.extend(terrain_by_layer.get(layer) or ())
+    blocking = _blocking_boxes(terrain_by_layer, terrain_y)
 
     def edge_blocked(cur, nxt):
         # type: (Tuple[int, int], Tuple[int, int]) -> bool
         x0, z0 = mapping.to_world(cur[0], cur[1])
         x1, z1 = mapping.to_world(nxt[0], nxt[1])
+        gtop = _ground_top_at(terrain_y, x0, z0)
         if cur[0] != nxt[0]:
             # 水平移动：墙夹在左右两格中心之间，且高度盖住本行中心 z
             lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
-            for minx, maxx, minz, maxz in blocking:
+            for box in blocking:
+                minx, maxx, minz, maxz = box[:4]
+                if len(box) == 6 and gtop is not None and box[5] <= gtop:
+                    continue          # 整段在地板之下：不拦这条边
                 if lo < minx and maxx < hi and minz <= z0 <= maxz:
                     return True
         else:
             # 垂直移动：墙夹在上下两格中心之间，且横向盖住本列中心 x
             lo, hi = (z0, z1) if z0 < z1 else (z1, z0)
-            for minx, maxx, minz, maxz in blocking:
+            for box in blocking:
+                minx, maxx, minz, maxz = box[:4]
+                if len(box) == 6 and gtop is not None and box[5] <= gtop:
+                    continue          # 整段在地板之下：不拦这条边
                 if lo < minz and maxz < hi and minx <= x0 <= maxx:
                     return True
         return False

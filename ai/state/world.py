@@ -290,11 +290,13 @@ class World(object):
         # 豁免（ConveyorStation 自己占住那格，但角色能走上去）。
         self.walkable = occupancy.make_walkable_from_terrain(
             self.terrain, hazard_boxes, occ_cells, self.mapping,
-            belt_cells=self.belt_cells, level_bounds=level_bounds)
+            belt_cells=self.belt_cells, level_bounds=level_bounds,
+            terrain_y=self.terrain_y)
 
         # 薄墙拦「边」不拦「格」：凸起在网格边缘的 collider 夹在两格之间、
         # 盖不住任何格中心，点判漏掉它，交给 distance_field 的边检查。
-        self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping)
+        self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping,
+                                                       terrain_y=self.terrain_y)
 
         # 半格走廊（ai/space/lanes.py）：通道夹在两排格中心之间时的寻路跳边，
         # 与 walkable 同一套阻挡/占用口径。寻路方取用走 portals.nav_args。

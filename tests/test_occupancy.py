@@ -504,6 +504,42 @@ def test_walkable_blocks_wall_layers():
     assert is_walkable(0, 0) is False
 
 
+def test_walkable_does_not_block_wall_below_floor():
+    """带高度的墙盒整段在地板顶面之下（矿洞地板下空腔）不挡路。
+
+    Mine_4_6 右半厨房地板（Ground 顶 y=0）下方有一个 Walls(10) 盒
+    y[-4,-0.5]，2D 范围与地板完全重合；点判若忽略高度会把整片厨房判成
+    不可走，P2 从出生点只够得到 1 格、全部 task infeasible
+    （trace-20261113-215358）。
+    """
+    terrain = {
+        9: [(9.0, 10.2, -3.0, -1.8)],
+        10: [(9.0, 10.2, -3.0, -1.8)],
+    }
+    terrain_y = {
+        9: [((9.0, 10.2, -3.0, -1.8), -0.5, 0.0)],
+        10: [((9.0, 10.2, -3.0, -1.8), -4.0, -0.5)],
+    }
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, terrain_y=terrain_y)
+    assert is_walkable(0, 0) is True
+
+
+def test_walkable_blocks_wall_at_floor_level_with_height():
+    """带高度且顶面高于地板的墙盒照常挡路（高度判定不误放真墙）。"""
+    terrain = {
+        9: [(9.0, 10.2, -3.0, -1.8)],
+        10: [(9.0, 10.2, -3.0, -1.8)],
+    }
+    terrain_y = {
+        9: [((9.0, 10.2, -3.0, -1.8), -0.5, 0.0)],
+        10: [((9.0, 10.2, -3.0, -1.8), 0.0, 1.2)],
+    }
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, terrain_y=terrain_y)
+    assert is_walkable(0, 0) is False
+
+
 def test_walkable_blocks_wall_within_chef_radius():
     """阻挡 box 距格心 < CHEF_RADIUS(0.4) 时，即使格心点在 box 外也应判不可走。
 
@@ -597,6 +633,18 @@ def test_edge_blocker_ignores_thick_station_block():
         [], set(), MAPPING)
     assert is_walkable(0, 0) is False
     assert is_walkable(0, 1) is True
+
+
+def test_edge_blocker_ignores_below_floor_thin_wall():
+    """薄墙整段在地板顶面之下不拦边（与 is_walkable 同一高度口径）。"""
+    terrain = {10: [(10.1, 10.3, -3.0, -1.8)]}   # 竖薄墙：宽 0.2，跨 gx=0/1
+    terrain_y = {
+        9: [((-100.0, 100.0, -100.0, 100.0), -0.5, 0.0)],
+        10: [((10.1, 10.3, -3.0, -1.8), -4.0, -0.5)],
+    }
+    edge = O.make_edge_blocker(terrain, MAPPING, terrain_y=terrain_y)
+    assert edge((0, 0), (1, 0)) is False
+    assert edge((1, 0), (0, 0)) is False
 
 
 def test_walkable_blocks_hazard_boxes():

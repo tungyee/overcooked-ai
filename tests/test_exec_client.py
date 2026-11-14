@@ -38,7 +38,7 @@ def test_result_never_silently_dropped():
     r1 = c.poll()
     r2 = c.poll()
     assert r1 == {"cmd_id": 1, "ok": True, "why": None, "held_after": None,
-                  "blocked_cell": None}
+                  "blocked_cell": None, "blocked_box": None, "blocked_kind": None}
     assert r2["cmd_id"] == 2 and r2["ok"] is False and r2["why"] == "stuck"
     assert c.poll() is None
 

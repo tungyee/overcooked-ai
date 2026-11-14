@@ -17,7 +17,9 @@ CMD_NAMES = ("move", "tap", "hold", "wait", "throw", "halt", "ping", "raft")
 
 # 结果行里可能缺席的键：插件旧版本/异常回包不保证字段齐全，Python 侧
 # 统一补 None，调用方可以安全读（对应 spec 的「结果不丢」之外的「字段可缺」）。
-_RESULT_KEYS = ("cmd_id", "ok", "why", "held_after", "blocked_cell")
+# blocked_box / blocked_kind：碰撞探测回传（插件 0.24.9+），缺则 None。
+_RESULT_KEYS = ("cmd_id", "ok", "why", "held_after", "blocked_cell",
+                "blocked_box", "blocked_kind")
 
 
 def build_command(cmd, **fields):

@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oc2AI
 {
-    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.8")]
+    [BepInPlugin("com.oc2.aiplaymate", "OC2 AI Playmate", "0.24.9")]
     public partial class Oc2AIPlugin : BaseUnityPlugin
     {
         const int Port = 27411;
@@ -89,7 +89,7 @@ namespace Oc2AI
 
         void Awake()
         {
-            Logger.LogInfo("[OC2AI v0.24.8 exec] loaded");
+            Logger.LogInfo("[OC2AI v0.24.9 exec] loaded");
             _discoverEnabled = Config.Bind<bool>("Diagnostics", "DiscoverComponents", false, "Expensive discovery; disabled for normal play.");
             _trafficProbeEnabled = Config.Bind<bool>("Diagnostics", "TrafficProbe", true, "Log cars/traffic lights in Sushi_4_1 (diagnostic only).");
             BindWalkProbe();
@@ -1254,7 +1254,7 @@ namespace Oc2AI
             var seg = new StringBuilder();
 
             StringBuilder sb = new StringBuilder("{");
-            sb.Append("\"plugin_version\":\"0.24.8\",\"protocol_version\":10,\"session_id\":").Append(Jstr(_sessionId))
+            sb.Append("\"plugin_version\":\"0.24.9\",\"protocol_version\":10,\"session_id\":").Append(Jstr(_sessionId))
               .Append(",\"scene_epoch\":").Append(_sceneEpoch)
               .Append(",\"phase\":").Append(Jstr(Phase()))
               .Append(",\"level\":").Append(Jstr(_level))

@@ -4,6 +4,7 @@ from ai.space import navigation as N
 from ai.space.navigation import (
     BELT_REVERSE_COST,
     FAST_BELT_SPEED,
+    WITH_FLOW_COST,
     cross_grid_bridges,
     distance_field,
     interact_cells,
@@ -68,6 +69,34 @@ def test_path_blocked_by_fast_belt_detects_reverse_step():
     assert path_blocked_by_fast_belt([(0, 0), (1, 0)], belt, fast) is False
     # 无速度表时不判定（旧行为兼容）。
     assert path_blocked_by_fast_belt([(0, 0), (1, 0), (0, 0)], belt, None) is False
+
+
+def test_step_cost_blocks_against_fast_wind():
+    """4-4 逆风（6.5 m/s > 阈值）走不动 → None 硬挡；顺风记 WITH_FLOW_COST。
+
+    风走 flow 同一套 step_cost：这里用 6.5 m/s（4-4 实机值）钉住「逆风硬挡、
+    顺风默认不奖励（WITH_FLOW_COST=1）」两个口径。
+    """
+    flow = {(0, 0): (1, 0)}          # 风把格上的人向 +x 推
+    wind_speed = {(0, 0): 6.5}
+
+    assert WITH_FLOW_COST == 1       # 默认不给顺风助力奖励
+    assert step_cost(flow, (0, 0), (-1, 0), wind_speed) is None   # 逆风硬挡
+    assert step_cost(flow, (0, 0), (1, 0), wind_speed) == WITH_FLOW_COST  # 顺风
+    assert step_cost(flow, (0, 0), (0, 1), wind_speed) == 1       # 横穿风区
+
+
+def test_distance_field_blocks_against_fast_wind():
+    """逆风格不展开：只能顺风/横穿绕行，绕不过去则该格不可达。"""
+    # (0,0) 站在风区里，风把人向 +x 推；往 -x 是逆风，硬挡不可达。
+    walkable = lambda gx, gz: -1 <= gx <= 1 and gz == 0
+    flow = {(0, 0): (1, 0)}
+    wind_speed = {(0, 0): 6.5}
+
+    field = distance_field((0, 0), walkable, flow, belt_speed=wind_speed)
+
+    assert (-1, 0) not in field
+    assert field[(1, 0)] == 1
 
 
 def test_distance_field_expands_uniformly():

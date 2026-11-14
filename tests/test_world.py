@@ -259,6 +259,36 @@ def test_world_empty_state_does_not_crash():
     assert w.walkable(0, 0) is True
 
 
+def test_world_wind_zones_merge_into_flow():
+    """4-4 风区：flow_dir/flow_speed = 传送带 ∪ 风；belt_dir 仍只含带，不被风污染。"""
+    w = W.World({
+        "wind_zones": [
+            {"minx": 13.8, "maxx": 15.0, "minz": -6.6, "maxz": -5.4, "vx": -6.5, "vz": 0},
+            {"minx": 14.4, "maxx": 16.8, "minz": -5.4, "maxz": -4.2, "vx": 6.5, "vz": 0},
+        ],
+        "belts": [],
+    })
+    assert w.belt_dir == {}                    # 无传送带：belt_dir 不含风
+    assert w.flow_dir[(0, 0)] == (-1, 0)       # 下路风向左
+    assert w.flow_dir[(0, 1)] == (1, 0)        # 上路风向右
+    assert w.flow_speed[(0, 0)] == 6.5
+
+
+def test_world_belt_overrides_wind_in_flow():
+    """重叠格传送带优先：flow 取带方向/速度，不被风覆盖。"""
+    w = W.World({
+        "wind_zones": [
+            {"minx": 13.8, "maxx": 15.0, "minz": -6.6, "maxz": -5.4, "vx": -6.5, "vz": 0},
+        ],
+        "belts": [
+            {"grid": "GridManager", "gx": 0, "gz": 0, "vx": 2.5, "vz": 0.0},
+        ],
+    })
+    assert w.belt_dir[(0, 0)] == (1, 0)        # 带向 +x
+    assert w.flow_dir[(0, 0)] == (1, 0)        # 传送带优先，不取风的 -x
+    assert w.flow_speed[(0, 0)] == 2.5         # 取带速，不取风 6.5
+
+
 def test_world_empty_state_walkable_feeds_bounded_distance_field():
     """空快照（无 terrain 数据）喂给 distance_field 必须终止。
 

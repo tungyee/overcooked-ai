@@ -305,6 +305,16 @@ class World(object):
         self.belt_cells, self.belt_dir, self.belt_speed = occupancy.parse_belts(
             state.get("belts"))
 
+        # 风区 → 每格方向/速度，与传送带合并成 flow（寻路统一消费的「地板推力」）。
+        # 重叠时传送带优先：风不覆盖传送带格（4-4 无带，纯防御）。belt_dir /
+        # belt_speed 仍只含传送带，供 interact hold-key / placement 排除按带语义用。
+        wind_dir, wind_speed = occupancy.wind_flow(
+            self.wind_zones, self.to_grid, self.to_world)
+        self.flow_dir = dict(wind_dir)
+        self.flow_dir.update(self.belt_dir)
+        self.flow_speed = dict(wind_speed)
+        self.flow_speed.update(self.belt_speed)
+
         # belt_cells 必须在 walkable 之前解析好：传送带格要从运行时占用里
         # 豁免（ConveyorStation 自己占住那格，但角色能走上去）。
         self.walkable = occupancy.make_walkable_from_terrain(

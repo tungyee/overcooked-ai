@@ -60,6 +60,18 @@ def _nav_target(target):
         target.get("x"), target.get("z"))
 
 
+def _flow_dir(w):
+    # type: (Any) -> Dict
+    """寻路用流场方向（传送带 ∪ 风）；轻量测试 World 无 flow_dir 时退回 belt_dir。"""
+    return getattr(w, "flow_dir", None) or getattr(w, "belt_dir", None) or {}
+
+
+def _flow_speed(w):
+    # type: (Any) -> Optional[Dict]
+    """寻路用流场速度（传送带 ∪ 风）；无 flow_speed 时退回 belt_speed（旧帧/测试）。"""
+    return getattr(w, "flow_speed", None) or getattr(w, "belt_speed", None)
+
+
 def _nav_crossing(w, path):
     # type: (Any, Optional[List[Tuple[int, int]]]) -> str
     """4-1 过街标记：路径是否穿过马路条带（gx -3..6）。"""
@@ -167,7 +179,7 @@ def _issue_median(prim, ctx, ex, w, cur, field, spot, target, kind, timeout_ms,
     # type: (Any, Dict, Any, Any, Any, Dict, Any, Any, Optional[str], int, str, str) -> Optional[str]
     """发一条只走到中线等待点的小段 move；失败返回 None（调用方退回等待）。"""
     mpath = navigation.trace_back(
-        field, spot[0], w.belt_dir, ctx.get("soft_cost"),
+        field, spot[0], _flow_dir(w), ctx.get("soft_cost"),
         seams.nav_predicates(w, ctx.get("bb"))[1])
     if not mpath:
         return None
@@ -259,12 +271,12 @@ def _crossing_guard(prim, ctx, ex, w, cur, field, path, label, kind,
 
 def _abort_on_belt_flip(prim, ctx):
     # type: (Any, Dict) -> Optional[str]
-    """4-3 快带方向翻转：冻结路径上出现快带逆行 → 提前中止在途 move。
+    """4-3 快带 / 4-4 风区方向翻转：冻结路径上出现快带（或逆风）逆行 → 提前中止在途 move。
 
-    方向一变，发令时算好的路径就走不动了（快带逆行走不过去）。与其等插件
+    方向一变，发令时算好的路径就走不动了（快带/逆风走不过去）。与其等插件
     8s stuck 超时，不如每拍看一次，命中就 halt 交回 Planner 按新方向重算。
     只在主 move 在途时生效（curb/median 小段 move 不设 _belt_path，且 4-1
-    没有快带）。
+    没有快带）。flow_dir/flow_speed = 传送带 ∪ 风，所以风的翻转也走这条兜底。
     """
     if prim._pending_cmd is None:
         return None
@@ -273,7 +285,7 @@ def _abort_on_belt_flip(prim, ctx):
         return None
     w = ctx.get("w")
     if w is None or not navigation.path_blocked_by_fast_belt(
-            path, w.belt_dir, getattr(w, 'belt_speed', None)):
+            path, _flow_dir(w), _flow_speed(w)):
         return None
     prim._exec_halt()
     prim._belt_path = None
@@ -436,7 +448,7 @@ class Approach(Primitive):
                           goals, sorted(blocked), len(field or {})))
             return Status.FAILURE
         goal = got[0]
-        path = navigation.trace_back(field, goal, w.belt_dir, ctx.get("soft_cost"),
+        path = navigation.trace_back(field, goal, _flow_dir(w), ctx.get("soft_cost"),
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             _nav_debug("no-path t=%s target=%s kind=%s cur=%s goal=%s goals=%s"
@@ -548,7 +560,7 @@ class Approach(Primitive):
             best = options[0]
         else:
             best = min(options, key=lambda s: field[s["cell"]])
-        path = navigation.trace_back(field or {}, best["cell"], w.belt_dir,
+        path = navigation.trace_back(field or {}, best["cell"], _flow_dir(w),
                                      ctx.get("soft_cost"),
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
@@ -580,7 +592,7 @@ class Approach(Primitive):
         cell = shuttle.staging_cell(w, st, field, reachability.shuttle_clock(ctx))
         if cell is None or P.chef_cell(chef, w.to_grid) == cell:
             return Status.RUNNING
-        path = navigation.trace_back(field or {}, cell, w.belt_dir, ctx.get("soft_cost"),
+        path = navigation.trace_back(field or {}, cell, _flow_dir(w), ctx.get("soft_cost"),
                                      seams.nav_predicates(w, ctx.get("bb"))[1])
         if not path:
             return Status.RUNNING
@@ -715,7 +727,7 @@ class GoToCell(Primitive):
         path = None
         if goal is not None:
             path = navigation.trace_back(
-                field, tuple(goal), w.belt_dir, ctx.get("soft_cost"),
+                field, tuple(goal), _flow_dir(w), ctx.get("soft_cost"),
                 seams.nav_predicates(w, ctx.get("bb"))[1])
         # 4-1 过街：和 Approach 共用同一套门控（路沿判灯 / 途中去中线等）。
         if path:

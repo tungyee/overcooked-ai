@@ -770,6 +770,49 @@ def test_parse_wind_zones_skips_malformed():
          "vx": 0.0, "vz": 0.0}]
 
 
+def _wind_grid():
+    """cell=1、origin=0 的轻量 to_grid / to_world，风区格测试用。"""
+    def to_grid(x, z):
+        return (int(round(x)), int(round(z)))
+    def to_world(gx, gz):
+        return (float(gx), float(gz))
+    return to_grid, to_world
+
+
+def test_wind_flow_basic():
+    """风区 AABB → 每格方向/速度：格心落 AABB 的格记上，方向按 vx/vz 符号归一。"""
+    to_grid, to_world = _wind_grid()
+    raw = [{"minx": -0.5, "maxx": 1.5, "minz": -0.5, "maxz": 0.5,
+            "vx": 2.5, "vz": 0.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert set(dirs) == {(0, 0), (1, 0)}
+    assert dirs[(0, 0)] == (1, 0)
+    assert dirs[(1, 0)] == (1, 0)
+    assert speeds[(0, 0)] == 2.5
+    assert speeds[(1, 0)] == 2.5
+
+
+def test_wind_flow_diagonal_direction_by_sign():
+    """斜向风按符号取整（±1 分量），速度保留 |v|（同 parse_belts 斜向带口径）。"""
+    to_grid, to_world = _wind_grid()
+    raw = [{"minx": -0.5, "maxx": 0.5, "minz": -0.5, "maxz": 0.5,
+            "vx": 3.0, "vz": 4.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert dirs[(0, 0)] == (1, 1)
+    assert speeds[(0, 0)] == 5.0
+
+
+def test_wind_flow_skips_zero_and_malformed():
+    """风速 0 或缺 AABB / 非 dict 的风区不落格。"""
+    to_grid, to_world = _wind_grid()
+    raw = [None,
+           {"minx": 1.0},                                  # 缺 AABB
+           {"minx": 0.0, "maxx": 1.0, "minz": 0.0, "maxz": 1.0, "vx": 0.0, "vz": 0.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert dirs == {}
+    assert speeds == {}
+
+
 def test_parse_belts_direction_from_velocity():
     """传送带方向从 vx/vz 归一化，不信任任何枚举字段。"""
     raw = [{"grid": "GridManager", "gx": -4, "gz": 2, "vx": 2.5, "vz": 0.0},

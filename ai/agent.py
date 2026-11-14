@@ -1214,8 +1214,9 @@ class Agent:
                 goal=cell, safe=safe, until_tick=tick + REPOSITION_TICKS)
             return
         field = navigation.distance_field(
-            cell, world.walkable, world.belt_dir,
-            belt_speed=getattr(world, 'belt_speed', None))
+            cell, world.walkable,
+            getattr(world, 'flow_dir', None) or world.belt_dir,
+            belt_speed=getattr(world, 'flow_speed', None) or getattr(world, 'belt_speed', None))
         best = None  # type: Optional[Tuple[int, Tuple[int, int]]]
         for candidate in safe:
             dist = field.get(candidate)
@@ -2098,8 +2099,9 @@ class Agent:
                 field = reachability.field_for(world, self.bb, soft_cost=soft)
                 if field is None:  # 缺地形的历史测试仍使用旧距离场。
                     field = navigation.distance_field(
-                        cell, belt_dir=world.belt_dir,
-                        belt_speed=getattr(world, 'belt_speed', None),
+                        cell,
+                        belt_dir=getattr(world, 'flow_dir', None) or world.belt_dir,
+                        belt_speed=getattr(world, 'flow_speed', None) or getattr(world, 'belt_speed', None),
                         blocked=blocked, soft_cost=soft,
                         **portals.nav_args(world, self.bb, blocked))
         ctx = {

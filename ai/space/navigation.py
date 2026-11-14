@@ -15,21 +15,32 @@ BELT_REVERSE_COST = 1
 
 # 快带（4-3 的 5 m/s）逆行走不动，硬挡；1-4 的 2.5 m/s 还能逆行 + dash 顶住。
 # 阈值取两者中间。belt_speed（occupancy.parse_belts 保留的 |v|）超过它就判快带。
+# 风区（4-4 的 6.5 m/s）走同一套：flow_speed 里 |v| 超阈值即判硬挡。
 FAST_BELT_SPEED = 3.5
+
+# 顺流（顺带/顺风）一步的代价：默认 1 = 不给助力奖励，与普通步同价。设成 <1
+# （如 0.5）会让寻路偏好顺风路线——实机可能为了蹭风绕远，留作旋钮，默认不启用。
+WITH_FLOW_COST = 1
 
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
 def step_cost(belt_dir, cur, nxt, belt_speed=None):
     # type: (Dict, Tuple[int, int], Tuple[int, int], Optional[Dict[Tuple[int, int], float]]) -> Optional[int]
-    """cur → nxt 的移动代价；返回 None 表示这一步走不了（快带逆行）。
+    """cur → nxt 的移动代价；返回 None 表示这一步走不了（快带/逆风硬挡）。
 
-    逆着传送方向走要长按，慢带（1-4）记 BELT_REVERSE_COST；快带（4-3）
-    走不动，直接挡掉（None），逼寻路绕带 / 顺带，而不是顶带卡死。
+    逆着流场方向走要长按，慢流记 BELT_REVERSE_COST；快流（> FAST_BELT_SPEED）
+    走不动，直接挡掉（None），逼寻路绕流 / 顺流，而不是顶流卡死。顺流（dot>0）
+    记 WITH_FLOW_COST（默认 1，不给助力奖励）；横穿流场（dot==0）记 1。
     """
     d = (nxt[0] - cur[0], nxt[1] - cur[1])
     bd = belt_dir.get(cur)
-    if not bd or d[0] * bd[0] + d[1] * bd[1] >= 0:
+    if not bd:
+        return 1
+    dot = d[0] * bd[0] + d[1] * bd[1]
+    if dot > 0:
+        return WITH_FLOW_COST
+    if dot == 0:
         return 1
     if belt_speed and belt_speed.get(cur, 0.0) > FAST_BELT_SPEED:
         return None

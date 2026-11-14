@@ -792,6 +792,38 @@ def parse_belts(belts_list):
     return cells, dirs, speeds
 
 
+def wind_flow(wind_zones, to_grid, to_world):
+    # type: (Optional[List[Dict]], Callable, Callable) -> Tuple[Dict[Tuple[int, int], Tuple[int, int]], Dict[Tuple[int, int], float]]
+    """风区 → 每格方向/速度流场（把风当传送带处理，供寻路避开逆风）。
+
+    与 parse_belts 对齐：方向按 vx/vz 符号归一化到 (±1,0)/(0,±1)，速度 =
+    |v|。风区是 AABB（不是逐格上报），用 _box_cells 按「格心落 AABB 外扩
+    CHEF_CLEARANCE」落格（与可走性同口径）。返回 (wind_dir, wind_speed)，
+    由 World 与 belt_dir/belt_speed 合并成 flow，navigation 统一消费。
+    """
+    dirs = {}    # type: Dict[Tuple[int, int], Tuple[int, int]]
+    speeds = {}  # type: Dict[Tuple[int, int], float]
+    for wz in wind_zones or ():
+        if not isinstance(wz, dict):
+            continue
+        box = _box_of(wz)
+        if box is None:
+            continue
+        try:
+            vx, vz = float(wz.get("vx") or 0), float(wz.get("vz") or 0)
+        except (TypeError, ValueError):
+            continue
+        if vx == 0.0 and vz == 0.0:
+            continue
+        d = ((1 if vx > 0 else -1) if vx != 0 else 0,
+             (1 if vz > 0 else -1) if vz != 0 else 0)
+        speed = (vx * vx + vz * vz) ** 0.5
+        for cell in _box_cells(box, to_grid, to_world):
+            dirs[cell] = d
+            speeds[cell] = speed
+    return dirs, speeds
+
+
 def station_block_cells(station, terrain_by_layer, mapping):
     # type: (Optional[Dict], Dict[int, List[Tuple[float, float, float, float]]], GridMapping) -> Set[Tuple[int, int]]
     """站点在 terrain 阻挡层里点判覆盖的格（多格站点返回真实占地）。

@@ -77,6 +77,22 @@ def test_no_extinguish_when_p1_near_fire():
     assert not any(c[0].TYPE == "Extinguish" for c in record["candidates"])
 
 
+def test_no_extinguish_when_p1_holds_extinguisher():
+    """P1 手持灭火器 → 不发 Extinguish（别跟 P1 抢）。"""
+    w = _world(cookers=[_cooker(on_fire=True, burning=True)],
+               extinguishers=[_ext()], stations=_FIRE_STATIONS,
+               chefs=[{"name": "Player 2", "x": 5.0, "z": 5.0, "held": None},
+                      {"name": "Player 1", "x": 9.0, "z": 9.0,
+                       "held": "extinguisher"}])
+    bb = Blackboard()
+    bb.tick = 10
+    book = RecipeBook([], _FIRE_STATIONS)
+
+    _, record = planner.plan(w, bb, None, book)
+
+    assert not any(c[0].TYPE == "Extinguish" for c in record["candidates"])
+
+
 def test_no_extinguish_for_burning_only():
     """糊锅（burning）但灶没着火（onFire=False）→ 不发 Extinguish。"""
     w = _world(cookers=[_cooker(on_fire=False, burning=True)],

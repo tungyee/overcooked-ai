@@ -24,11 +24,17 @@ def _execute_actions_schema():
     action_prop = {
         "type": "string",
         "enum": list(TOOL_ACTIONS),
-        "description": "动作：chop 切 / cook 煮炸烤下锅 / mix 拌 / plate 装盘（铺/放/摆料也是 plate）/ deliver 送餐 / wash 洗盘 / fetch 取料",
+        "description": (
+            "动作标识：chop 切（会自动取料上砧板）/ cook 煮炸烤下锅（需要先切会自动切）"
+            "/ mix 拌 / plate 装盘（铺/放/摆料也是 plate，target 填该料名，例如 Seaweed；"
+            "料没准备好会失败，不会替你切/煮）/ deliver 送餐 / wash 洗盘 / "
+            "fetch 取料（把料拿到下一步要用的地方）/ press_switch 按方向开关"
+            "（把传送带方向调向自己，对方要送盘/料过来时用）"
+        ),
     }
     target_prop = {
         "type": "string",
-        "description": "物料名或菜名，使用本关目录里的英文名（Cucumber、Seaweed、BoiledSushiRice、Sushi_Cucumber）。chop / cook 必填；deliver / wash 可省略。",
+        "description": "物料名或菜名，使用本关目录里的英文名（Cucumber、Seaweed、BoiledSushiRice、Sushi_Cucumber）。chop / cook 必填；deliver / wash 可省略；省略时系统会选当前最合适的一个。",
     }
     return {
         "type": "function",
@@ -86,7 +92,7 @@ def _speak_schema():
         "type": "function",
         "function": {
             "name": "speak",
-            "description": "对玩家说话。这是唯一发言通道，不调用就不会出声。",
+            "description": "对玩家说话。这是唯一发言通道：不调用就不会出声，把台词写进 content 或套上 XML 标签都不会出声。",
             "parameters": {
                 "type": "object",
                 "properties": {

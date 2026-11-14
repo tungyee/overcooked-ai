@@ -244,7 +244,6 @@ def test_system_message_carries_rules_and_dag():
     assert "cancel_action" in text and "speak" in text
     assert "get_world_state" in text
     assert "check_action" not in text
-    assert "chop" in text and "cook" in text and "fetch" in text
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
@@ -387,8 +386,7 @@ def test_system_prompt_says_speak_is_a_tool_call():
 def test_system_prompt_lists_division_tools_when_available():
     text = system_message("", guide="本关攻略", division=True,
                           cookbook=True)["content"]
-    assert "set_division(assignments=" in text
-    assert "read_cookbook(section)" in text
+    # 工具签名已移到 tools schema（见 test_agent_dialog / test_dialog_worker）
     assert "按攻略里「玩家 / 你」的对应关系" in text
     assert "送餐和洗盘不在分工里" in text
 

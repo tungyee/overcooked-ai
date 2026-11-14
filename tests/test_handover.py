@@ -14,7 +14,7 @@ import pytest
 
 from ai import tasks as T
 from ai.core import planner
-from ai.dialog.commands import build_scope
+from ai.dialog.command_queue import build_scope
 from ai.exec.bt import Status
 from ai.query.recipes import RecipeBook
 from ai.revenue import cross_supply as XS

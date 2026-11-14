@@ -22,7 +22,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from ai.dialog.actions import DIVISION_ACTIONS
+from ai.dialog.action_defs import DIVISION_ACTIONS
 from ai.dialog.division import OWNER_PLAYER, OWNER_YOU
 from ai.query import predicates as P
 from ai.query import stations as ST
@@ -42,7 +42,7 @@ STATION_KINDS = {
     "mixing": MIXING,
 }  # type: Dict[str, str]
 
-# 可分工动作 → 需要的功能区（送餐/洗盘不落分工，见 ai/dialog/actions.py）。
+# 可分工动作 → 需要的功能区（送餐/洗盘不落分工，见 ai/dialog/action_defs.py）。
 #
 # **「装盘」故意不映射成 plate**：干净盘是会到处跑的动态物（trace-20261109-
 # 011932 t=94.8 全部干净盘都在左半边），拿它当区域判据会让「右半边没有盘」
@@ -132,6 +132,7 @@ class ZoneReport(object):
 
         开头一定是「谁守哪半边」：真机反馈（voice-20261109-124818）是玩家
         根本不知道自己该站哪，因为只在有人站错时才提一句、而且只说一边。
+        这是每帧算出来的**动态**切法（换边后会变），静态地图替代不了。
 
         玩家那句只给**目的半边**、不给来源：写成「从A换到B」时实测模型会
         抓住第一个提到的半边反着说（「从上半边换到下半边」→「你去上半边」，

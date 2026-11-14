@@ -4,7 +4,7 @@
 职责：
   每拍输出一条 JSONL，记录模式 / 候选 / 打分 / 选中 task / 执行状态 / 按键。
 
-落盘位置：仓库根目录 `trace-<时间戳>.jsonl`，每次启动一个新文件。
+落盘位置：仓库根 `runs/trace-<时间戳>.jsonl`，每次启动一个新文件。
   - 不写 /tmp：系统会清理（实机复盘时文件凭空消失过），且每次跑都覆盖上
     一局的日志，事后无法回看；
   - 文件名与 .gitignore 里的 `trace-*.jsonl` 对应，不会误提交。
@@ -24,7 +24,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 
 def default_path(root=None, now=None):
     # type: (Optional[str], Optional[time.struct_time]) -> str
-    """默认落盘路径：<root>/trace-<YYYYmmdd-HHMMSS>.jsonl。"""
+    """默认落盘路径：<root>/runs/trace-<YYYYmmdd-HHMMSS>.jsonl。"""
     root = root or REPO_ROOT
     if now is not None:
         stamp = time.strftime("%Y%m%d-%H%M%S", now)
@@ -32,10 +32,11 @@ def default_path(root=None, now=None):
         # 同一次启动的 trace / voice 日志共用一个 stamp（restart.sh 导出）。
         stamp = os.environ.get("OC2_RUN_STAMP") or time.strftime(
             "%Y%m%d-%H%M%S", time.localtime())
-    return os.path.join(root, "trace-%s.jsonl" % stamp)
+    return os.path.join(root, "runs", "trace-%s.jsonl" % stamp)
 
 
 TRACE_PATH = default_path()
+os.makedirs(os.path.dirname(TRACE_PATH), exist_ok=True)
 
 
 def _score_of(state):

@@ -182,10 +182,10 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 export OC2_RUN_STAMP="$STAMP"
 if [ "$VOICE_FLAG" != "--no-voice" ]; then
     [ -z "$VOICE_DEBUG_FLAG" ] && VOICE_DEBUG_FLAG="--voice-debug"
-    [ -z "$VOICE_LOG_PATH" ] && VOICE_LOG_PATH="voice-$STAMP.jsonl"
+    [ -z "$VOICE_LOG_PATH" ] && VOICE_LOG_PATH="runs/voice-$STAMP.jsonl"
 fi
 echo "[restart] 启动 Agent ..."
-echo "[restart] trace: trace-$STAMP.jsonl"
+echo "[restart] trace: runs/trace-$STAMP.jsonl"
 if [ -n "$VOICE_LOG_PATH" ]; then
     echo "[restart] voice: $VOICE_LOG_PATH"
 fi

@@ -17,20 +17,11 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
+from ai.dialog.action_defs import (ACTION_LABELS, COMMAND_UPSTREAM,
+                                   DIVISION_TASK_TYPES, TOOL_ACTION_NAMES)
+
 Pair = Tuple[Optional[str], Optional[str]]
 Scope = FrozenSet[Pair]
-
-ACTION_LABELS = {
-    "chop": "切",
-    "cook": "下锅",
-    "mix": "拌",
-    "plate": "装盘",
-    "deliver": "送餐",
-    "wash": "洗盘",
-    "fetch": "取料",
-    "prepare": "整道菜",
-    "press_switch": "按开关",
-}
 
 TICKS_PER_SECOND = 20
 MAX_PENDING = 3
@@ -50,23 +41,10 @@ ACTION_SEND_KINDS = {
     "deliver": ("plated_dish",),
 }  # type: Dict[str, Tuple[str, ...]]
 
-# 英文动作 → task 类型。这里只描述“做到什么状态”需要哪些 task；
+# fetch 命令的 task 集合（取料到下一步）。fetch 不在分工动作里，单独定义；
 # 具体命中哪个 item 由 build_scope 从本关 DAG 里取。
-ACTION_TASK_TYPES = {
-    "chop": ("FetchToBoard", "Chop"),
-    "cook": ("FetchToBoard", "Chop", "FetchToCooker", "FillCooker",
-             "PlaceCarrierInCooker", "TakeCookedToPlate"),
-    "mix": ("FetchToBoard", "Chop", "Mix"),
-    "plate": ("FetchToBoard", "Chop", "FetchToCooker", "FillCooker",
-              "PlaceCarrierInCooker", "TakeCookedToPlate", "FetchToPlate",
-              "PlaceCleanPlate"),
-    "deliver": ("DeliverPlate",),
-    "wash": ("WashPlate",),
-    "fetch": ("FetchToBoard", "FetchToCooker", "FetchToPlate",
-              "FetchToCarrier", "FillCarrier", "Prefetch"),
-    "prepare": None,       # 整道菜：取该菜全部 task
-    "press_switch": ("ReceiveConveyor",),
-}  # type: Dict[str, Optional[Tuple[str, ...]]]
+FETCH_COMMAND_TYPES = ("FetchToBoard", "FetchToCooker", "FetchToPlate",
+                       "FetchToCarrier", "FillCarrier", "Prefetch")  # type: Tuple[str, ...]
 
 # 中文口语 → DAG 英文名。只覆盖常见料；查不到时 check 会返回 valid_targets。
 # 中文口语 → DAG 英文名（精确别名，先查）。
@@ -211,24 +189,41 @@ def _send_scope(action):
 
 def build_scope(kitchen, action, target, mode):
     # type: (Any, str, Optional[str], Optional[str]) -> Tuple[Optional[Scope], str]
-    """动作 + target → task scope；做不到时返回 (None, reason)。"""
+    """动作 + target → task scope；做不到时返回 (None, reason)。
+
+    命令 scope 从 DAG 的 `Material.steps`（有序链）派生：
+    - 加工动作（切/下锅/拌，见 COMMAND_UPSTREAM）取「开头到目标步」的前缀，
+      自动补上游（切前取料上砧板、下锅前先切）；
+    - 收尾动作（装盘等）只取「这一步」task，不补上游（料已备好）。
+    """
     action = str(action or "")
-    task_types = ACTION_TASK_TYPES.get(action)
-    if action not in ACTION_TASK_TYPES:
-        return None, "未知动作：%s" % action
     if action == "wash":
         return frozenset({("WashPlate", None)} | _send_scope(action)), ""
     if action == "deliver":
         return frozenset({("DeliverPlate", None)} | _send_scope(action)), ""
     if action == "press_switch":
         return frozenset({("ReceiveConveyor", None)}), ""
+
+    chinese = TOOL_ACTION_NAMES.get(action)          # chop→切 / plate→装盘 / fetch→None
+    if action == "fetch":
+        goal_types = FETCH_COMMAND_TYPES
+        auto_upstream = False
+    elif action == "prepare":
+        goal_types = None                            # 整道菜：后续单独实现
+        auto_upstream = False
+    else:
+        goal_types = DIVISION_TASK_TYPES.get(chinese)
+        if not goal_types:
+            return None, "未知动作：%s" % action
+        auto_upstream = chinese in COMMAND_UPSTREAM  # 切/下锅/拌自动补上游
+
     if not target:
         # 动作级：任意 item 的这个动作；由 planner 选具体料。
-        if not task_types:
+        if not goal_types:
             return None, "这个动作需要指定目标"
-        return frozenset((t, None) for t in task_types), ""
+        return frozenset((t, None) for t in goal_types), ""
 
-    wanted = set(task_types or ())
+    wanted = set(goal_types)
     scope = set()  # type: Set[Pair]
 
     def add_material(name):
@@ -241,9 +236,21 @@ def build_scope(kitchen, action, target, mode):
                     break
         if mat is None:
             return False
-        for task_type, item in getattr(mat, "steps", ()) or ():
-            if task_type in wanted and item:
-                scope.add((task_type, _norm(item)))
+        steps = getattr(mat, "steps", ()) or ()
+        if auto_upstream:
+            # 加工动作：前缀到目标步（目标步里最后出现的 task 为止）。
+            cut = -1
+            for i, (task_type, _item) in enumerate(steps):
+                if task_type in wanted:
+                    cut = i
+            for task_type, item in steps[:cut + 1]:
+                if item:
+                    scope.add((task_type, _norm(item)))
+        else:
+            # 收尾动作：只取落在目标步集合里的 task。
+            for task_type, item in steps:
+                if task_type in wanted and item:
+                    scope.add((task_type, _norm(item)))
         if action == "fetch":
             scope.add(("Prefetch", _norm(name)))
         return True
@@ -283,12 +290,30 @@ def item_scope(kitchen, action, raw):
     item = _norm(raw)
     if not item:
         return None
-    task_types = ACTION_TASK_TYPES.get(action) or ()
+    chinese = TOOL_ACTION_NAMES.get(action)
+    if action == "fetch":
+        goal_types = FETCH_COMMAND_TYPES
+        auto_upstream = False
+    else:
+        goal_types = DIVISION_TASK_TYPES.get(chinese) or ()
+        auto_upstream = chinese in COMMAND_UPSTREAM
+    wanted = set(goal_types)
     for mat in (getattr(kitchen, "materials", {}) or {}).values():
+        steps = getattr(mat, "steps", ()) or ()
         scope = set()
-        for task_type, step_item in (getattr(mat, "steps", ()) or ()):
-            if task_type in task_types and step_item and _norm(step_item) == item:
-                scope.add((task_type, item))
+        if auto_upstream:
+            # 前缀到目标步（切前先取料上砧板），只保留该 item 的 task。
+            cut = -1
+            for i, (task_type, _step_item) in enumerate(steps):
+                if task_type in wanted:
+                    cut = i
+            for task_type, step_item in steps[:cut + 1]:
+                if step_item and _norm(step_item) == item:
+                    scope.add((task_type, item))
+        else:
+            for task_type, step_item in steps:
+                if task_type in wanted and step_item and _norm(step_item) == item:
+                    scope.add((task_type, item))
         if scope:
             return frozenset(scope), item
     return None

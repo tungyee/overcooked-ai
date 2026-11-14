@@ -120,7 +120,10 @@ def _find_frame(traces, level):
 
 def _latest_traces():
     # type: () -> List[str]
-    files = sorted(glob.glob(os.path.join(_ROOT, "trace-*.jsonl")),
+    # 新 trace 落 runs/，旧 trace 还在仓库根：两个都扫，按 mtime 取最新。
+    patterns = [os.path.join(_ROOT, "runs", "trace-*.jsonl"),
+                os.path.join(_ROOT, "trace-*.jsonl")]
+    files = sorted((p for pat in patterns for p in glob.glob(pat)),
                    key=os.path.getmtime, reverse=True)
     return files
 
@@ -164,11 +167,11 @@ def _build_messages(agent, world, show_prompt=False):
     """按 worker._run_llm 的 division 路径拼消息与工具。"""
     context = agent._build_dialog_context(world)
     tools = _tools_for_event(context.get("tools") or None, "division")
-    facts = agent._division_facts(world)
     head = [system_message(
         context.get("dag") or "", context.get("guide") or "",
         division=True, cookbook=(agent._guide is not None), actions=False)]
-    messages = head + [state_message("division", context, event_detail=facts),
+    messages = head + [state_message("division", context,
+                                     event_detail=agent._division_map(world)),
                        event_note("division")]
     if show_prompt:
         for msg in messages:

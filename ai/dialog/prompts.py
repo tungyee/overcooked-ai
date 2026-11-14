@@ -17,7 +17,7 @@ _ENV = Environment(
     lstrip_blocks=True,
 )
 
-from ai.dialog.commands import ACTION_LABELS
+from ai.dialog.command_queue import ACTION_LABELS
 
 
 def action_label(action):

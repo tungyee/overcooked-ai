@@ -9,7 +9,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from ai.dialog.actions import ACTION_STATION_TYPES, ACTION_TASK_TYPES
+from ai.dialog.action_defs import ACTION_STATION_TYPES, DIVISION_TASK_TYPES
 
 
 def node_key(task_type, item=None):
@@ -244,7 +244,7 @@ class Kitchen(object):
                      if not self._meta(task_type).shared]
             lines.append("  %s：%s" % (name, " → ".join(steps) or "直接装盘"))
         lines.append("本关动作（分工用这些名字，对应一类站点）：")
-        for action in ACTION_TASK_TYPES:
+        for action in DIVISION_TASK_TYPES:
             st = ACTION_STATION_TYPES[action]
             if st in self.stations:
                 lines.append("  %s（%s）" % (action, _ACTION_TEXT[action]))

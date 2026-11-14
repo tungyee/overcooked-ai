@@ -71,7 +71,7 @@ def test_tool_actions_excludes_deliver_wash_and_missing_stations():
         {"t": "chopping"}, {"t": "cooking"}, {"t": "plate_station"},
         {"t": "washing"},
     ]
-    assert D.tool_actions(stations) == ["chop", "cook", "plate"]
+    assert D.tool_actions(stations) == ["chop", "cook"]
 
 
 def test_station_signature_changes_only_when_stations_move():

@@ -41,7 +41,7 @@ read_cookbook(section)              读取本关攻略某一节（有攻略时�
 
 - 工具结果只以 `role=tool` 回填，不追加催 `speak` 的 system 提示；每轮都用 `tool_choice=auto`，是否发言由模型决定。`division` / `division_review` 的 content 不播（只认 `speak`），`speech` / `checkin` / `last_seconds` / `round_summary` / `batch` / `layout_review` 在没有工具调用的回合用 content 兜底播报。
 - `action` 用英文标识：`chop / cook / mix / plate / deliver / wash / fetch`（`prepare` 为后续目标级动作）。
-- `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/commands.py` 里做一次归一化。
+- `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/command_queue.py` 里做一次归一化。
 - 动作是**目标状态**：`cook(Tomato)` 会自动补取料、切；`plate(dish)` 会自动补上游。命令带 `scope` 和 `done`，不会因为第一个子任务成功就被消费。
 - 命令队列最多 3 条待执行；满了丢最后一条待执行项，新指令照收。当前命令 waiting（煎/煮/资源被占）时，下一条有可行任务的命令可以跑；依赖由 scope 可行性天然表达。
 - 命令 scope 是硬过滤，但会随时间恶化的动作允许越过 scope 抢占当前命令：`TakeCookedToPlate`（锅已熟/快熟）、`RescueCooked`（快糊/烧焦）、`Extinguish`（灭火）。端完/救完自动回到命令 scope，不取消命令。
@@ -120,7 +120,7 @@ python3 run_agent.py --voice --voice-debug
 | `OC2_VOICE_VAD_DB` | 否 | `9.0`（VAD 开口阈值，底噪之上的 dB，范围 2–20；越小越敏感） |
 | `OC2_VOICE_PTT_KEY` | 否 | 不设（VAD 自动切句）；设为 `f8` 等则按住录音、松开发送。macOS 直接按 F8 可能是媒体键，用 Fn+F8 或启用标准功能键；手柄可用 Steam Input 映射到该键 |
 | `OC2_LLM_TIMEOUT` | 否 | `10.0`（方舟请求超时秒数，范围 1–60；plan 端点容易超过 3s） |
-| `OC2_VOICE_LOG` | 否 | 不设时自动用 `voice-<trace 时间戳>.jsonl`；显式路径优先，`.gitignore` 已排除 `voice*.jsonl` |
+| `OC2_VOICE_LOG` | 否 | 不设时自动用 `runs/voice-<trace 时间戳>.jsonl`；显式路径优先，`.gitignore` 已排除 `voice*.jsonl` |
 
 控制台入口：ASR <https://console.volcengine.com/speech/service/16>，TTS <https://console.volcengine.com/speech/service/8>，方舟 <https://console.volcengine.com/ark>。
 
@@ -156,7 +156,7 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 | `--voice` | 显式启用；优先于 `OC2_VOICE=0`。任一必需 key 缺失时打印缺失项并 **退出码 2**（不会去连游戏） |
 | `--no-voice` | 恒关闭，优先于 `--voice` 和 `OC2_VOICE` |
 | `--voice-debug` | 把 `ai.dialog` logger 开到 DEBUG 并输出到 stderr（ASR 文本、LLM 回合与工具调用、命令批次/ack、播报、worker 错误；不含分段计时）。`restart.sh` 在有语音时默认开启 |
-| `--voice-log PATH` | 写逐行 JSON 对话日志；优先于 `OC2_VOICE_LOG`。不传且环境变量为空时默认 `voice-<trace 时间戳>.jsonl`，与本次 `trace-<时间戳>.jsonl` 一一对应 |
+| `--voice-log PATH` | 写逐行 JSON 对话日志；优先于 `OC2_VOICE_LOG`。不传且环境变量为空时默认 `runs/voice-<trace 时间戳>.jsonl`，与本次 `runs/trace-<时间戳>.jsonl` 一一对应 |
 
 注意 `--dry-run` 只关闭按键注入，**不关闭语音**。离线只想跑决策时用 `--dry-run --no-voice`。
 

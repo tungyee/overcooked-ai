@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ai import tasks as T
 from ai.core import arbiter, executor, planner
-from ai.dialog.actions import ACTION_STATION_TYPES
-from ai.dialog.commands import (Command, CommandQueue, build_scope,
+from ai.dialog.action_defs import ACTION_STATION_TYPES
+from ai.dialog.command_queue import (Command, CommandQueue, build_scope,
                                 command_done, command_done_undecidable,
                                 command_failed, deliveries,
                                 dirty_count, item_scope, resolve_done_item,
@@ -1087,31 +1087,21 @@ class Agent:
         self._zone_pending = 0
         self._zone_last_review_tick = 0
 
-    def _division_facts(self, world):
+    def _division_map(self, world):
         # type: (World) -> str
-        """开局/复核事件里的站位事实（不是建议）。
+        """开局分工事件里的地图：站点 + 出生点（1=玩家、2=你）。
 
-        不再列「你能做/玩家能做」：单网格寻路对 3-3 左半场/旋转桌不准，
-        会把「能装盘」误报成「够不着」。可达性以 execute_actions 返回为准。
-        但**布局一定要说**：3-3 这类关卡开局就分成两半，不说清楚模型只能按
-        出生点猜，容易定出「两人挤同一半」的分工。
+        给模型空间事实，而不是替它下「谁该守哪半边」的结论。渲染失败或
+        无站点时返回空串，分工事件仍照常发。
         """
-        parts = []  # type: List[str]
-        report = self.bb.zones
-        if report is not None:
-            if report.district and report.p2_label and report.p1_label:
-                parts.append("厨房分成%s两半：你该在%s半边，玩家该在%s半边。" % (
-                    "左右" if report.district == "LR" else "上下",
-                    report.p2_label, report.p1_label))
-            else:
-                parts.append("厨房现在还是一整块，没有分开。")
-        p1_chef = P.chef_by_name(world.chefs, P.P1_NAME)
-        p2_chef = P.chef_by_name(world.chefs, P.P2_NAME)
-        if p1_chef and p2_chef:
-            parts.append("你出生在 (%0.1f, %0.1f)，玩家在 (%0.1f, %0.1f)。" % (
-                float(p2_chef.get("x") or 0), float(p2_chef.get("z") or 0),
-                float(p1_chef.get("x") or 0), float(p1_chef.get("z") or 0)))
-        return "".join(parts)
+        try:
+            from ai.output import map_render
+            text = map_render.render_map(world)
+        except Exception:                     # noqa: BLE001
+            return ""
+        if not text:
+            return ""
+        return "【本关地图】\n" + text
 
     def _station_change_text(self, old_sig, new_sig):
         # type: (Any, Any) -> str
@@ -1156,7 +1146,7 @@ class Agent:
             report = self._zones.observe(world, self.bb.division)
             self.bb.zones = report
             self._zone_sig = _zone_key(report)
-            events.append(("division", {"facts": self._division_facts(world)}))
+            events.append(("division", {"facts": self._division_map(world)}))
             return
         # 区域复核每拍跑（实测 1.1ms）：开窗只有 2~3 秒，按 1 秒周期去查，
         # 等发现时窗口已经过了一半（trace-20261109-123544 t=118→120.18）。
@@ -1335,10 +1325,11 @@ class Agent:
 
     def _maybe_render_map(self, world):
         # type: (World) -> None
-        """进关首帧把地图画成 ASCII，落到 `map-<level>.txt` 并提示。
+        """进关首帧把地图画成 ASCII，落到 `maps/map-<level_number|level>.txt` 并提示。
 
-        独立于对话层：无语音 / 离线模式也照画。只读 World；任何失败都不
-        影响主循环（地图只是调试/复盘辅助，不是决策依赖）。
+        文件名优先用 UI 编号 `level_number`（如 "1-3"），DLC/Kevin/教学关没有
+        时才回退到内部关卡名 `level`（如 "Sushi_1_3_2P"）。独立于对话层：
+        无语音 / 离线模式也照画。只读 World；任何失败都不影响主循环。
         """
         if getattr(world, "phase", None) != "level":
             return
@@ -1353,12 +1344,15 @@ class Agent:
             text = map_render.render_map(world)
             if not text:
                 return
+            label = getattr(world, "level_number", None) or level
             safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
-                           for ch in str(level))
-            path = os.path.join(trace.REPO_ROOT, "map-%s.txt" % safe)
+                           for ch in str(label))
+            map_dir = os.path.join(trace.REPO_ROOT, "maps")
+            os.makedirs(map_dir, exist_ok=True)
+            path = os.path.join(map_dir, "map-%s.txt" % safe)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
-            print("[MAP] 已绘制 %s 地图 -> %s" % (level, path), file=sys.stderr)
+            print("[MAP] 已绘制 %s 地图 -> %s" % (label, path), file=sys.stderr)
         except Exception:                     # noqa: BLE001
             log.exception("绘制地图失败")
 

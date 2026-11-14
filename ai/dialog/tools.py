@@ -14,7 +14,8 @@ from typing import Any, List
 TOOL_ACTIONS = ["chop", "cook", "mix", "plate", "deliver", "wash", "fetch",
                 "press_switch"]
 # 可分工动作的默认枚举；实际由本关站点过滤（见 agent._division_tool_actions）。
-DIVISION_TOOL_ACTIONS = ["chop", "cook", "mix", "plate"]
+# 送餐/洗盘/装盘谁近谁做，不在分工里。
+DIVISION_TOOL_ACTIONS = ["chop", "cook", "mix"]
 COOKBOOK_SECTIONS = ["summary", "division", "mechanics", "traps", "recipes", "all"]
 
 
@@ -126,12 +127,13 @@ def _set_division_schema(actions):
                 "设置或调整长期分工：把某一类动作（可按物料细分）归给你或玩家。"
                 "只影响没有明确命令时的自主选活，不会取消正在执行的命令。"
                 "只包含本关可分工的动作；"
-                "送餐和洗盘谁近谁做，不在分工里。开局按攻略里「玩家/你」的"
-                "对应关系写，不要按出生点猜。同一动作分物料时在 item 里写物料名"
+                "送餐/洗盘/装盘谁近谁做，不在分工里。开局先看【本关地图】"
+                "（1=玩家出生、2=你出生）判断谁在砧板/灶/料箱旁，攻略只当参考。"
+                "同一动作分物料时在 item 里写物料名"
                 "（例如 chop Meat 给玩家、chop Lettuce 给你，但只是示例，必须换成本关"
                 "攻略/目录里的物料）；两人都要做、又分不清物料的动作整个不写，"
                 "不要写成一个人的动作级分工；不确定的动作不要写。"
-                "如果【本关攻略】为空，不要调用本工具。"
+                "如果【本关地图】和【本关攻略】都没有，不要调用本工具。"
             ),
             "parameters": {
                 "type": "object",

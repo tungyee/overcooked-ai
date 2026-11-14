@@ -8,7 +8,7 @@ import pytest
 
 from ai.agent import Agent
 from ai.dialog import llm
-from ai.dialog.commands import (command_done, command_done_undecidable,
+from ai.dialog.command_queue import (command_done, command_done_undecidable,
                                dirty_count)
 from ai.query.recipes import RecipeBook
 from ai.state.world import World
@@ -130,7 +130,7 @@ def test_wash_not_done_while_holding_dirty_plate(agent, world):
 
 
 def _cook_cmd(target):
-    from ai.dialog.commands import Command
+    from ai.dialog.command_queue import Command
     return Command(id="cmd1", action="cook", target=target,
                    resolved_target=target, display_target=target,
                    scope=frozenset())
@@ -192,7 +192,7 @@ def test_expired_order_fails_and_pauses_queue(agent, world):
 def test_raw_item_resolves_to_material_for_balloon_level():
     """Balloon 关的物料名是熟料名（PanFriedPrawns），玩家/模型说生料名
     （Prawn / 虾）时必须能归一到对应 material。"""
-    from ai.dialog.commands import (build_scope, resolve_done_item,
+    from ai.dialog.command_queue import (build_scope, resolve_done_item,
                                     resolve_target, valid_targets)
     from ai.dialog.catalog import Kitchen, Material
 
@@ -350,7 +350,7 @@ def test_command_without_done_signal_finishes_after_one_task(agent, world):
     `chop_target(菜名)` 是 None → command_done 永远 False，命令占着执行槽
     212/240 秒，planner 被锁在备料里，披萨组装不起来。
     """
-    from ai.dialog.commands import command_done_undecidable
+    from ai.dialog.command_queue import command_done_undecidable
 
     scope = frozenset({("Chop", None)})
     agent.commands.add("chop", None, scope, 100)
@@ -400,7 +400,7 @@ def test_running_command_expires_after_ttl(agent, world):
     实机 trace-20261109-124818：一条判不出完成条件的 `chop` 占了 212/240 秒，
     planner 被锁在备料 scope 里、两个灶全程空转。
     """
-    from ai.dialog import commands as CM
+    from ai.dialog import command_queue as CM
 
     scope = frozenset({("Chop", None)})
     agent.commands.add("chop", None, scope, 100)

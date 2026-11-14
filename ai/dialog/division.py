@@ -13,7 +13,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ai.dialog.actions import (ACTION_STATION_TYPES, ACTION_TOOL_NAMES,
+from ai.dialog.action_defs import (ACTION_STATION_TYPES, ACTION_TOOL_NAMES,
                                DIVISION_ACTIONS, TOOL_ACTION_NAMES,
                                action_scope)
 from ai.dialog.schema import Preference

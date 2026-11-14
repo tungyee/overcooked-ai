@@ -1314,7 +1314,7 @@ def test_division_turn_does_not_offer_action_tools():
     """
     llm = FakeLLM(reply("好。"))
     worker, _ = make_worker(llm=llm)
-    tools_with_division = tool_schemas(division_actions=["chop", "cook", "plate"])
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "mix"])
     worker._run_llm({"tools": tools_with_division}, "division", "")
 
     tools = llm.calls[0][1]
@@ -1349,7 +1349,7 @@ def test_division_turn_ends_naturally_when_model_stops_calling_tools():
     )
     worker, bundle = make_worker(llm=llm)
 
-    tools_with_division = tool_schemas(division_actions=["chop", "cook", "plate"])
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "mix"])
     thread = run_async(worker._run_llm, {"tools": tools_with_division},
                        "division", "")
     ack_for(bundle, [{"tool": "set_division", "ok": True,

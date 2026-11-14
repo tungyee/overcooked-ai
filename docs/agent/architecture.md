@@ -47,7 +47,7 @@ World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
 - **Executor**（`executor.py`）：把 task 换成一棵小的 `bt` 行为树，每拍 tick 产出按键。task 身份（四元组，见 `tasks-primitives.md`）不变就复用同一棵树（进度自然保留），变了就 halt 旧树重建；每棵树包一层 `Timeout` 做最后兜底，默认 `MAX_TASK_TICKS=300` 拍，task 可用类属性 `TIMEOUT_TICKS` 声明自己的上限（灭火是两趟差事，用 `FIREFIGHT_TIMEOUT_TICKS=800`）。
 - **Blackboard**（`blackboard.py`）：唯一可变状态容器，取代旧 Agent 上散落的约 20 个跨拍字段。写权受控（spec §4.5）：Planner 写 `claims`/`commitment`，P1Model 写 `p1_model`，Executor 只写 `commitment.steps_done/retries` 与 `scratch`（**不可写 claims**）。
 - **World**（`world.py`）：一帧快照的**只读**视图，构造时只做解析 + 派生数据装配；可走性与寻路分别委托 `occupancy` 与 `navigation`。
-- **Trace**（`trace.py`）：每拍写一条 JSONL 记录（模式/候选/打分/选中 task/执行状态/按键），落盘仓库根 `trace-<时间戳>.jsonl`（已 gitignore），用于复盘「为什么选这个动作」。另有 `revenue` 摘要（分数/连击/剩余时间/订单 + 送达/连击归零/订单过期三类事件），省去手工 diff 全局 state。
+- **Trace**（`trace.py`）：每拍写一条 JSONL 记录（模式/候选/打分/选中 task/执行状态/按键），落盘仓库根 `runs/trace-<时间戳>.jsonl`（已 gitignore），用于复盘「为什么选这个动作」。另有 `revenue` 摘要（分数/连击/剩余时间/订单 + 送达/连击归零/订单过期三类事件），省去手工 diff 全局 state。
 
 ### 3.1 收益模型与产能
 

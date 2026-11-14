@@ -132,7 +132,7 @@ def test_initial_division_event_and_context(agent, worker):
     assert "set_division" in tools and "read_cookbook" in tools
     assert tools["set_division"]["function"]["parameters"]["properties"][
         "assignments"]["items"]["properties"]["action"]["enum"] == [
-            "chop", "cook", "plate"]
+            "chop", "cook"]
 
 
 def test_kitchen_uses_level_dishes_for_full_menu(agent):
@@ -260,13 +260,13 @@ def test_set_division_applies_and_weights(agent, worker):
     result = agent._apply_duty_batch(world, _batch(
         ("set_division", {"assignments": [
             {"action": "cook", "owner": "you"},
-            {"action": "plate", "owner": "player"},
+            {"action": "chop", "owner": "player"},
         ]})
     ))[0]
     assert result["ok"] is True
     assert result["division_changed"] is True
     assert agent.bb.division.snapshot() == {
-        "you": ["cook"], "player": ["plate"], "both": []}
+        "you": ["cook"], "player": ["chop"], "both": []}
     # 只给玩家那边扣分；分给你的动作不加分（避免自己的活压过更值钱的事）
     kinds = {(p.kind, p.owner, p.weight) for p in agent.bb.preferences}
     assert kinds == {("claim", "P1", -6.0)}
@@ -562,26 +562,6 @@ def test_layout_review_not_repeated_by_region_jitter(agent, worker):
     jittered.walkable = lambda gx, gz: inner(gx, gz) and (gx, gz) != (0, 0)
     _settle(agent, jittered)
     assert worker.events == []
-
-
-def test_initial_division_facts_describe_layout(agent, worker):
-    """开局就要说清「分成哪两半、谁该在哪」，不然模型只能按出生点猜。"""
-    world = make_split_world("lr", p2=(7, 1), p1=(1, 1))
-    agent.book = RecipeBook(world.recipes, world.stations)
-    agent._service_dialog(world)
-    facts = worker.events[0][1]["facts"]
-    assert "分成左右两半" in facts
-    assert "你该在右半边" in facts
-    assert "玩家该在左半边" in facts
-
-
-def test_initial_division_facts_say_single_block_when_open(agent, worker):
-    world = make_split_world("open", p2=(7, 1), p1=(1, 1))
-    agent.book = RecipeBook(world.recipes, world.stations)
-    agent._service_dialog(world)
-    facts = worker.events[0][1]["facts"]
-    assert "一整块" in facts
-    assert "两半" not in facts
 
 
 def test_reposition_armed_within_one_tick(agent, worker):

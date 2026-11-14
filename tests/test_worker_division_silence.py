@@ -16,7 +16,7 @@ def _run_review(changed):
         "tick": 100,
         "dag": "本关菜：Burger",
         "guide": "",
-        "tools": tool_schemas(["cook", "plate"], with_cookbook=False),
+        "tools": tool_schemas(["cook", "mix"], with_cookbook=False),
     }
 
     def ack():

@@ -329,6 +329,23 @@ class Primitive(Node):
                             reason=reason, blocked_cell=cell)
                     except (TypeError, ValueError):
                         pass
+            # 碰撞回传 blocked：插件把挡在面前的 collider AABB 回传，投影成主网格
+            # 格集合，交给 Approach 局部重绕 / note_motion_failure 拉黑（见 stuck.py）。
+            if not r.get("ok") and r.get("why") == "blocked" \
+                    and isinstance(r.get("blocked_box"), (list, tuple)) \
+                    and len(r["blocked_box"]) >= 4:
+                w = ctx.get("w")
+                if w is not None:
+                    try:
+                        from ai.space import occupancy as O
+                        box = (float(r["blocked_box"][0]), float(r["blocked_box"][1]),
+                               float(r["blocked_box"][2]), float(r["blocked_box"][3]))
+                        cells = O._box_cells(box, w.to_grid, w.to_world)
+                        ctx.setdefault("motion_failure", {}).update(
+                            reason="blocked", blocked_cells=sorted(cells),
+                            blocked_kind=r.get("blocked_kind") or "obstacle")
+                    except (TypeError, ValueError):
+                        pass
             if not r["ok"]:
                 _note_exec_failure(ctx, getattr(self, "_pending_name", None),
                                    r.get("why"), r.get("blocked_cell"))

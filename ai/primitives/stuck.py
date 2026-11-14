@@ -19,6 +19,9 @@ from ai.primitives.base import Primitive
 # "本文档中'拍'统一指 Python 循环拍（50 ms）"。混用两套时基会让测试
 # 必须 sleep。4.0 秒 → 20 Hz 下 80 拍。
 BAD_CELL_TTL_TICKS = 80
+# 碰撞回传 blocked（硬障碍）的拉黑 TTL（拍）。比 BAD_CELL_TTL_TICKS 短：NPC 顾客
+# 会动，拉黑太久会误拦它走后空出来的路；2 秒够 AI 换条路绕过去。
+BLOCKED_BOX_TTL_TICKS = 40
 # 整体放弃的冷却（拍）。5 秒：10 秒（200 拍）会让移动木筏关卡里的送餐被锁
 # 过久——接缝/篮子停靠窗口约 10~16 秒，10 秒冷却一出窗口就错过、成品盘干放
 # 到终局（trace-20261111-220835 SendAcross -87392 三次捡盘失败后冷却还没
@@ -49,14 +52,23 @@ def _resolve_value(v, ctx):
 def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
     # type: (Any, Any, int, Dict, Any, Any) -> None
     """按位置 / 资源避让已证实的无进展；订单切换不能重置同一处故障。"""
-    if failure.get("reason") not in ("no_progress", "observation_timeout", "gate_closed"):
+    reason = failure.get("reason")
+    if reason not in ("no_progress", "observation_timeout", "gate_closed", "blocked"):
         return
     scratch = _ensure_stuck_scratch({"bb": bb})
+    if reason == "blocked":
+        # 碰撞回传：按障碍整块短暂拉黑（不是单格），重算才能绕开真实障碍身体。
+        # 类别不是 obstacle（player/pushable/travelator）可推，不拉黑。
+        if failure.get("blocked_kind") != "obstacle":
+            return
+        for cell in failure.get("blocked_cells") or ():
+            scratch.bad_cells[tuple(cell)] = tick + BLOCKED_BOX_TTL_TICKS
+        return          # 障碍挡路是暂时性的，不拉黑资源（同 gate_closed）
     cell = failure.get("blocked_cell")
     if cell is not None:
         scratch.bad_cells[tuple(cell)] = tick + BAD_CELL_TTL_TICKS
     # 门洞没开：门会再开，资源本身没问题——只绕开门洞格，不拉黑资源。
-    if failure.get("reason") == "gate_closed":
+    if reason == "gate_closed":
         return
     # 风区里被吹得动不了：不是 AI 的错，只写 bad_cells 让寻路绕开这一格，
     # **不拉黑资源**——否则一阵风就把端料/盛饭的整个资源判死刑（实机：

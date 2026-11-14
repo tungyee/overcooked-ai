@@ -181,6 +181,8 @@ namespace Oc2AI
         bool Ok { get; }
         string Why { get; }
         double[] BlockedCell { get; }
+        double[] BlockedBox { get; }
+        string BlockedKind { get; }
         void Tick(ChefFrame f, float now);
     }
 
@@ -394,6 +396,11 @@ namespace Oc2AI
         private const float SKIP_STALL = 0.3f;
         private const float SKIP_MAX_DIST = 1.2f;
         private const float SKIP_PROBE = 0.3f;
+        // 碰撞探测（Blocked）：移动方向前方扫这么远；同一个 obstacle collider 持续
+        // 挡这么多久才判 blocked。不依赖 relMoved——会动的 NPC 顾客把厨师顶来顶去时
+        // relMoved 恒非零、0.8s stuck 永不触发，只能靠这里的物理探测。
+        private const float BLOCK_PROBE = 0.4f;
+        private const float BLOCK_GRACE = 0.3f;
         // 锚定射线：从厨师头顶往下打 Ground(9) 层，找 waypoint 脚下的地板。
         private const int GROUND_LAYER_MASK = 1 << 9;
         private const float ANCHOR_RAY_UP = 5f;
@@ -450,6 +457,8 @@ namespace Oc2AI
         private float _lastRelX;
         private float _lastRelZ;
         private bool _hasRel;
+        private int _blockHitId;          // 当前持续挡在前方的 obstacle collider 实例 id
+        private float _blockHitSince = -1f;  // 该 collider 开始持续挡住的时刻
         // Python 只在路径跨地板缝时发 dash=true；没授权时遇到踩空就停下。
         // 新协议另发 dash_edges（落点下标列表）：只在真正的缝隙跳边段按 Dash，
         // 不再「整条路径任意边缘都跳」。旧 Python 不发时退回 dash 标记。
@@ -482,6 +491,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get; private set; }
+        public double[] BlockedBox { get; private set; }
+        public string BlockedKind { get; private set; }
 
         public MoveCommand(Dictionary<string, object> cmd)
         {
@@ -994,6 +1005,36 @@ namespace Oc2AI
                 return;
             }
 
+            // 碰撞探测：移动方向前方有硬障碍（obstacle）持续 BLOCK_GRACE 秒 → blocked。
+            // 不依赖 relMoved（会动的 NPC 顾客把厨师顶来顶去时 relMoved 恒非零、0.8s
+            // stuck 永不触发）。SweepTest 用厨师整个 Rigidbody（含手持物）。
+            Collider blockHit = SweepForward(f.Chef, dir, BLOCK_PROBE);
+            if (blockHit != null && BlockKind(blockHit) == "obstacle")
+            {
+                int bid = blockHit.GetInstanceID();
+                if (bid != _blockHitId)
+                {
+                    _blockHitId = bid;
+                    _blockHitSince = now;
+                }
+                else if (now - _blockHitSince > BLOCK_GRACE)
+                {
+                    UnityEngine.Debug.Log("[EXEC] move blocked t=" + now.ToString("0.00")
+                        + " pos=(" + f.PosX + "," + f.PosZ + ")"
+                        + " idx=" + _idx + "/" + _path.Count
+                        + " target=(" + target.x + "," + target.y + ")"
+                        + " blocker=" + blockHit.name + " target_id=" + TargetDesc());
+                    PadEngagement.Pad.Stop();
+                    FinishBlocked(blockHit);
+                    return;
+                }
+            }
+            else
+            {
+                _blockHitId = 0;
+                _blockHitSince = -1f;
+            }
+
             PadEngagement.Pad.Move(f.Chef, dir.x * mag, dir.y * mag);
 
             // 长距离跑动：普通地面 + 直段 + 离终点还远 + 2m 前方有地板才按 Dash。
@@ -1054,6 +1095,45 @@ namespace Oc2AI
             _lastProgress = now;
             _hasRel = false;
             return true;
+        }
+
+        // 前方障碍探测：移动方向 SweepTest，返回挡路的 collider（无则 null）。
+        private static Collider SweepForward(Component chef, Vector2 dir, float dist)
+        {
+            Rigidbody rb = chef != null ? chef.GetComponent<Rigidbody>() : null;
+            if (rb == null) return null;
+            RaycastHit hit;
+            Vector3 d = new Vector3(dir.x, 0f, dir.y);
+            if (rb.SweepTest(d, out hit, dist, QueryTriggerInteraction.Ignore))
+                return hit.collider;
+            return null;
+        }
+
+        // 挡路 collider 的类别：player（P1，可推）/ pushable（非 kinematic 刚体、
+        // 手持物）/ travelator（传送带）/ obstacle（其余硬障碍，如 NPC 顾客）。
+        private static string BlockKind(Collider c)
+        {
+            if (c == null) return null;
+            for (Transform t = c.transform; t != null; t = t.parent)
+                foreach (Component comp in t.GetComponents<Component>())
+                {
+                    if (comp == null) continue;
+                    string tn = comp.GetType().Name;
+                    if (tn == "PlayerControls") return "player";
+                    if (tn == "ServerPhysicalAttachment" || tn == "ClientPhysicalAttachment") return "pushable";
+                    if (tn == "Travelator") return "travelator";
+                }
+            if (c.attachedRigidbody != null && !c.attachedRigidbody.isKinematic) return "pushable";
+            return "obstacle";
+        }
+
+        // 命中硬障碍：回传其 AABB + 类别，交 Python 拉黑整块重绕。
+        private void FinishBlocked(Collider c)
+        {
+            Bounds b = c.bounds;
+            BlockedBox = new double[] { b.min.x, b.max.x, b.min.z, b.max.z };
+            BlockedKind = "obstacle";
+            Finish(false, "blocked", null);
         }
 
         private void Finish(bool ok, string why, double[] blockedCell = null)

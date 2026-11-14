@@ -197,7 +197,8 @@ namespace Oc2AI
             if (active.Done)
             {
                 EnsureReleased();
-                SendResult(cid, active.Ok, active.Why, null, active.BlockedCell);
+                SendResult(cid, active.Ok, active.Why, null, active.BlockedCell,
+                           active.BlockedBox, active.BlockedKind);
                 lock (_cmdLock)
                 {
                     if (ReferenceEquals(_active, active)) { _active = null; _activeCmdId = 0; _activeStartedAt = 0f; }
@@ -206,9 +207,10 @@ namespace Oc2AI
             }
         }
 
-        /// <summary>写一条结果回客户端。heldAfter / blockedCell 可空。</summary>
+        /// <summary>写一条结果回客户端。heldAfter / blockedCell / blockedBox / blockedKind 可空。</summary>
         public void SendResult(long cmdId, bool ok, string why,
-                               string heldAfter = null, double[] blockedCell = null)
+                               string heldAfter = null, double[] blockedCell = null,
+                               double[] blockedBox = null, string blockedKind = null)
         {
             UnityEngine.Debug.Log("[EXEC] result id=" + cmdId + " ok=" + (ok ? "true" : "false")
                                  + " why=" + (why ?? "null"));
@@ -230,6 +232,19 @@ namespace Oc2AI
                 {
                     sb.Append(",\"blocked_cell\":null");
                 }
+                if (blockedBox != null && blockedBox.Length == 4)
+                {
+                    sb.Append(",\"blocked_box\":[")
+                      .Append(blockedBox[0].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[1].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[2].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[3].ToString("R", CultureInfo.InvariantCulture)).Append(']');
+                }
+                else
+                {
+                    sb.Append(",\"blocked_box\":null");
+                }
+                sb.Append(",\"blocked_kind\":").Append(Json.Quote(blockedKind));
                 sb.Append('}');
                 try { _writer.WriteLine(sb.ToString()); }
                 catch (Exception) { }

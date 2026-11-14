@@ -184,6 +184,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public TapCommand(Dictionary<string, object> cmd)
         {
@@ -382,6 +384,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public HoldCommand(Dictionary<string, object> cmd)
         {
@@ -484,6 +488,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public ThrowCommand(Dictionary<string, object> cmd)
         {
@@ -593,6 +599,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public RaftCommand(Dictionary<string, object> cmd)
         {

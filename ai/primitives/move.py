@@ -16,6 +16,7 @@ from ai.exec.commands import build_command
 from ai.query.stations import PLATE_STATION, sink_place_cells
 from ai.primitives.base import (Primitive, resolve, target_cell, handle_desc,
                                 _blocked_cells, target_grid_callbacks)
+from ai.primitives.stuck import BLOCKED_BOX_TTL_TICKS, _ensure_stuck_scratch
 
 # 转向预算（委托后端下 Face 是 no-op，保留该常量仅用于接口兼容）。
 FACE_MAX_TICKS = 40
@@ -26,6 +27,8 @@ MOVE_TIMEOUT_MS = 8000
 TRAFFIC_WAIT_TICKS = 800
 # 跑动 dash 的最短路径（格）：短距离不跑，免得在台面边/交互位附近冲过头。
 RUN_MIN_CELLS = 5
+# 碰撞回传 blocked（硬障碍）后，Approach 局部重绕的重试上限；超过才升格整树 replan。
+BLOCK_RETRIES = 3
 
 
 def _nav_debug(msg):
@@ -299,6 +302,7 @@ class Approach(Primitive):
         self._median_cmd = False       # 在途的是「改道到车道中间」的小段 move
         self._median_wait = False      # 已到中线，锁存等下一轮红灯
         self._belt_path = None         # 发令时冻结的路径（方向翻转检测用）
+        self._block_retries = 0        # 碰撞回传 blocked 后的局部重绕计数
 
     def reset(self):
         # type: () -> None
@@ -310,6 +314,7 @@ class Approach(Primitive):
         self._median_cmd = False
         self._median_wait = False
         self._belt_path = None
+        self._block_retries = 0
 
     def needs_reapproach(self, ctx):
         # type: (Dict) -> bool
@@ -470,6 +475,28 @@ class Approach(Primitive):
                 self._median_cmd = False
                 # 到路沿/中线不等于到目标：回去重新判灯，不能报 SUCCESS。
                 return Status.RUNNING if status == Status.SUCCESS else status
+        if status == Status.SUCCESS:
+            self._block_retries = 0
+            return status
+        # 碰撞回传 blocked（硬障碍）：不在 Approach 里整树 FAILURE，先局部重绕——
+        # 拉黑障碍整块，下一拍用新 field 重 trace（同 GoToCell 的失败重算惯用法）。
+        mf = ctx.get("motion_failure") or {}
+        if status == Status.FAILURE and mf.get("reason") == "blocked" \
+                and mf.get("blocked_kind") == "obstacle" and mf.get("blocked_cells"):
+            tick = ctx.get("tick") or 0
+            scratch = _ensure_stuck_scratch(ctx)
+            for cell in mf["blocked_cells"]:
+                scratch.bad_cells[tuple(cell)] = tick + BLOCKED_BOX_TTL_TICKS
+            self._belt_path = None
+            self._block_retries += 1
+            if self._block_retries <= BLOCK_RETRIES:
+                _nav_debug("blocked-reroute t=%s target=%s kind=%s cells=%s retry=%d"
+                           % (_nav_time(ctx), _nav_target(self.target),
+                              mf.get("blocked_kind"), mf.get("blocked_cells"),
+                              self._block_retries))
+                return Status.RUNNING
+            self._block_retries = 0
+            return Status.FAILURE
         return status
 
     def _tick_shuttle(self, ctx, ex, st, shuttle_st):

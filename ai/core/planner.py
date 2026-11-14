@@ -122,6 +122,9 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     # 与订单无关的清理 / 回收 / 待命 task（第 2/5/6/11/12/13/14/15 号）
     candidates.extend(_gen_misc(world, bb, book, chef, hands_empty))
 
+    # 火情：发一个全局 Extinguish（L_FIRE 顶层，见 _fire_needs_ai 的三条件门）
+    candidates.extend(_gen_fire(world, bb))
+
     # 换布局：窗口打开时把自己挪进「两种布局都算对」的格。不接订单、不认领，
     # 由「马上去」闸硬选（见 _select_reposition），普通打分排在 L_PREP 里。
     if getattr(bb, "reposition", None) is not None:
@@ -472,6 +475,78 @@ def _gen_throw(world, bb, book):
                     seen.add(task.key)
                     cands.append(Candidate(task, [], EST_FETCH,
                                            branch=branch_of_task(task, book)))
+    return cands
+
+
+# P1 在灶附近多少距离算「正在处理」火情（平移自原 arbiter.HANDLING_DISTANCE）。
+HANDLING_DISTANCE = 2.0
+
+
+def _fire_needs_ai(world, bb):
+    # type: (World, Blackboard) -> bool
+    """是否该由 AI 去灭火（平移自原 arbiter._should_enter_firefighting）。
+
+    三条件合取：有 onFire 的灶 + AI 有可获得的灭火器 + 至少一口着火灶未被
+    P1 处理。只用 onFire、不用 burning——糊锅走 RescueCooked/L1，不进灭火。
+    """
+    on_fire = [c for c in world.cookers if c.get("onFire")]
+    if not on_fire:
+        return False
+    if not _extinguisher_available(world, bb):
+        return False
+    p1 = P.chef_by_name(world.chefs, "Player 1")
+    return any(_fire_unhandled(c, p1, world) for c in on_fire)
+
+
+def _extinguisher_available(world, bb):
+    # type: (World, Blackboard) -> bool
+    """AI 是否有可获得的灭火器（平移自原 arbiter._has_available_extinguisher）。
+
+    world.extinguishers 只含非手持（挂墙/地上），列表里每个都是可获得的。
+    特殊规则：P1 持唯一灭火器时不进（读 p1_model 的持有状态）。
+    """
+    total_count = 0
+    available_count = 0
+    p1_holds_extinguisher = False
+    if bb.p1_model and bb.p1_model.holding:
+        if "extinguisher" in bb.p1_model.holding.lower():
+            p1_holds_extinguisher = True
+    for _ext in world.extinguishers:
+        total_count += 1
+        available_count += 1
+    if p1_holds_extinguisher and total_count == 1:
+        return False
+    return available_count > 0
+
+
+def _fire_unhandled(cooker, p1_chef, world):
+    # type: (dict, object, World) -> bool
+    """着火灶是否未被 P1 处理（平移自原 arbiter._is_fire_unhandled）。
+
+    未被处理 = P1 不在该灶旁 且 P1 不持该灶对应的灭火器。
+    """
+    if not p1_chef:
+        return True
+    cooker_pos = (cooker.get("x"), cooker.get("z"))
+    p1_pos = (p1_chef.get("x"), p1_chef.get("z"))
+    if None not in cooker_pos and None not in p1_pos:
+        dx = cooker_pos[0] - p1_pos[0]
+        dz = cooker_pos[1] - p1_pos[1]
+        distance = (dx * dx + dz * dz) ** 0.5
+        if distance <= HANDLING_DISTANCE:
+            return False
+    p1_held = P.held_name(p1_chef)
+    if "extinguisher" in p1_held:
+        return False
+    return True
+
+
+def _gen_fire(world, bb):
+    # type: (World, Blackboard) -> List[Candidate]
+    """火情候选：发一个全局 Extinguish（树内部循环处理所有着火灶）。"""
+    cands = []  # type: List[Candidate]
+    if _fire_needs_ai(world, bb):
+        cands.append(Candidate(T.Extinguish(), [], EST_COOK_OPS))
     return cands
 
 
@@ -3019,6 +3094,16 @@ def _apply_commitment_inertia(scored, world, bb, book=None):
         return top_task
 
     current_task = bb.commitment.active_task
+
+    # 火情无条件抢占当前承诺：L0 火会蔓延，不能等承诺惯性/进度加成。分层只
+    # 决定候选池，这里若不显式放行，current_task（L6 备菜）不在 L0 的 scored
+    # 里 → current_entry is None → infeasible_streak < 8 时继续做旧活，火情
+    # 白等 8 拍。L1/L2 靠下面的 _time_pressure >= 1.0 紧急切换，但 Extinguish
+    # 的 _time_pressure 恒 0（白名单只认 TakeCookedToPlate/RescueCooked/
+    # Discard/FillCarrier），必须在这里显式放行。
+    if getattr(top_task, "TYPE", None) == "Extinguish" \
+            and not _tasks_equal(top_task, current_task):
+        return top_task
 
     # 熟/快糊/已糊的锅要第一时间去端/救，跳过承诺惯性。光靠把 pressure 加进
     # 分数不够：pressure 把 TakeCookedToPlate 拉到 ~1-2，但当前 FetchToCooker /

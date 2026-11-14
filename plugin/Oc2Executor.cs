@@ -398,13 +398,15 @@ namespace Oc2AI
         private const int GROUND_LAYER_MASK = 1 << 9;
         private const float ANCHOR_RAY_UP = 5f;
         private const float ANCHOR_RAY_LEN = 20f;
-        // 跨地板缝隙：前方探针距离、Dash 按住时长、冷却。
-        private const float DASH_PROBE = 0.55f;
+        // 跨地板缝隙：厨师胶囊半径/直径、Dash 按住时长、冷却。
+        // 半径实测 0.4（seams.py GATE_RADIUS 同源注释），窄于半径的缝胶囊能直接跨过去。
+        private const float CHEF_RADIUS = 0.4f;
+        private const float CHEF_DIAMETER = 0.8f;
         private const float DASH_HOLD = 0.08f;
         private const float DASH_COOLDOWN = 1.0f;
         // 起跳前先看落点：沿当前方向 DASH_LAND_PROBE 处必须还有地板。
         // 实测 dash 从头前冲约 2.2~2.4m；探针 2.0m 留 0.2m 余量。
-        // 光看「前方 0.55m 没地板」就跳会把平台边缘巡逻（路径下一步拐弯）
+        // 光看「胶囊前沿没地板」就跳会把平台边缘巡逻（路径下一步拐弯）
         // 和木筏漂走后的宽缝都当成可跳的缝。
         private const float DASH_LAND_PROBE = 2.0f;
         // 跳边起点前多远就允许起跳：路径在格子中心拐弯时，等走到格心才按
@@ -688,15 +690,22 @@ namespace Oc2AI
             return PadButtons.HandleMatches(f, _target, _kind);
         }
 
-        // 前方 DASH_PROBE 处往下打 Ground：没有地板 = 前面是缝/悬崖。
+        // 前方地面探针：先打胶囊前沿（半径处），再打一个胶囊直径处。
+        // 只有前沿没地板、且直径内也没地板才判「前面是悬崖」——窄缝（< 半径，
+        // 如 1-5 主地板与气球篮子之间 0.39m 接缝）胶囊能跨过去，单点探针会
+        // 误判 ledge（trace-20261114-205207 t=157/160：P2 空转）。
         private bool GroundGapAhead(ChefFrame f, Vector2 dir)
         {
             if (dir.sqrMagnitude < 1e-6f) return false;
-            Vector3 p = new Vector3(
-                f.PosX + dir.x * DASH_PROBE,
-                f.Chef.transform.position.y + ANCHOR_RAY_UP,
-                f.PosZ + dir.y * DASH_PROBE);
-            return !Physics.Raycast(p, Vector3.down, ANCHOR_RAY_LEN,
+            float y = f.Chef.transform.position.y + ANCHOR_RAY_UP;
+            Vector3 lead = new Vector3(f.PosX + dir.x * CHEF_RADIUS, y,
+                                       f.PosZ + dir.y * CHEF_RADIUS);
+            if (Physics.Raycast(lead, Vector3.down, ANCHOR_RAY_LEN,
+                                GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore))
+                return false;  // 胶囊前沿仍在板上：稳
+            Vector3 far = new Vector3(f.PosX + dir.x * CHEF_DIAMETER, y,
+                                      f.PosZ + dir.y * CHEF_DIAMETER);
+            return !Physics.Raycast(far, Vector3.down, ANCHOR_RAY_LEN,
                                     GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
         }
 

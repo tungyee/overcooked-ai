@@ -10,8 +10,6 @@
   flush 播放窗口内的块（TTS 前已排队的语音保留），再恢复 VAD。
 - 没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声；需要向玩家
   解释的抢单走 rescue 事件，由 LLM 按事实说。TTS 失败时静默。
-- `new_order` 不受主动开口 4 秒闸限制：1 秒合并窗口本身就是它的限频，
-  丢一张单比连续两条订单播报更糟。`rescue` 仍受全局 4 秒闸。
 """
 import dataclasses
 import datetime
@@ -34,7 +32,6 @@ from ai.dialog.llm import (assistant_message, event_note, speech_message,
                            state_message, system_message, tool_message)
 from ai.dialog.policy import (
     PROACTIVE_MIN_INTERVAL_TICKS,
-    merge_new_orders,
     should_checkin,
     should_trigger,
 )
@@ -85,7 +82,7 @@ class TurnTiming(object):
     `started` 的定义随来源变化：
     - PTT：按键松开（之后还有 200 ms 尾音才送 ASR）；
     - VAD：VAD 判定句尾（已含约 400 ms 静音）；
-    - 主动事件：worker 收到事件（new_order 从第一张单到达算起）。
+    - 主动事件：worker 收到事件。
     """
     source: str
     event: str
@@ -369,8 +366,7 @@ class DialogClients(object):
 # 模型没有「马上去做」的授权，但工具摆在面前它就会调：实机
 # voice-20261109-124818 的 division 回合 turn0 定完分工说完一句，turn1 又调
 # execute_actions（被拒），turn2 补一句「好，我这就去送烤箱」——玩家听到两句。
-_ACTION_TOOL_NAMES = frozenset(("execute_actions", "execute_action",
-                                "cancel_action"))
+_ACTION_TOOL_NAMES = frozenset(("execute_actions", "cancel_action"))
 
 
 def _tools_for_event(tools, event):
@@ -397,8 +393,7 @@ _TOOL_PARAM_RE = re.compile(
 # 「好，我去洗碗」可能对应根本没派发的动作，不能念出去。
 _SPEAK_TAG_EVENTS = frozenset((
     "last_seconds", "round_summary", "checkin", "batch",
-    "command_result", "new_order", "division", "division_review",
-    "layout_review",
+    "division", "division_review", "layout_review",
 ))
 # 纯闲聊/播报回合：模型忘了调 speak 时，content 直接兜底念出来。
 # 分工/复核不在此列：没调 set_division 就不能先念一个没落地的分工。
@@ -442,15 +437,6 @@ def _event_detail(name, payload):
     # type: (str, Any) -> str
     """把一个主动事件转成给 LLM 的具体说明（batch 合成用）。"""
     payload = payload or {}
-    if name == "command_result":
-        label = payload.get("label") or payload.get("action") or ""
-        target = payload.get("target") or ""
-        status = payload.get("status")
-        reason = payload.get("reason") or ""
-        if status == "failed":
-            return "你派发的命令失败了：%s %s，原因：%s" % (
-                label, target, reason or "执行失败")
-        return "你派发的命令完成了：%s %s" % (label, target)
     if name == "division":
         return payload.get("facts") or ""
     if name == "division_review":
@@ -497,9 +483,6 @@ class DialogWorker(object):
         self._pending_order_at = None
         # 下次定时 check-in 的单调时钟时间点；None 表示尚未排期。
         self._next_checkin_at = None
-        # 首次 new_order 的触发时间与已发起的 check-in 次数：首次 check-in
-        # 必须避开首次 new_order，避免开局连续发言。
-        self._first_new_order_at = None
         self._checkins_fired = 0
 
     # -------------------------------------------------------------- logging
@@ -713,7 +696,6 @@ class DialogWorker(object):
             self._pending_order_at = None
             self._level_started = None
             self._next_checkin_at = None
-            self._first_new_order_at = None
             self._checkins_fired = 0
 
     # ------------------------------------------------------------- queues
@@ -895,9 +877,6 @@ class DialogWorker(object):
                 # 玩家正在说话/录音时，主动事件让位；否则事件优先于音频。
                 if utterance is None and not vad_active and not ptt_recording:
                     self._drain_events()
-                # 单张新单只会投一次 `("new_order", [id])`，必须由 worker
-                # 周期性用空 id 再调一次，1 秒合并窗口才会关窗触发。
-                self._flush_pending_orders()
                 drain_dt = time.monotonic() - loop_start
                 if iter_dt > 0.15:
                     # 诊断：worker 主循环被拖慢时记录整轮耗时与 drain 占比，
@@ -1096,12 +1075,6 @@ class DialogWorker(object):
         if (not utterance and not vad_active and not ptt_recording
                 and should_checkin(self._next_checkin_at, now,
                                    has_orders, in_level, live)):
-            # 首次 check-in 必须和首次 new_order 保持间距，避免开局连续发言。
-            if self._checkins_fired == 0 and self._first_new_order_at is not None:
-                earliest = self._first_new_order_at + CHECKIN_MIN_S
-                if now < earliest:
-                    self._next_checkin_at = earliest
-                    return
             # 先清排期再开口：正常结束会重排，LLM 失败等早退路径则停在
             # None，下一拍 `should_checkin` 返回 False，不会空转打 LLM。
             self._next_checkin_at = None
@@ -1129,18 +1102,6 @@ class DialogWorker(object):
                 log.exception("处理对话事件失败: %r", event)
                 self._log_event("worker_error", where="event",
                                 event=event, error=str(exc))
-
-    def _flush_pending_orders(self):
-        # type: () -> None
-        """推进新单合并窗口：没有待发批次时是空操作。"""
-        if not self.state.pending_orders:
-            return
-        try:
-            self._handle_event(("new_order", []), self._latest_context())
-        except Exception as exc:
-            log.exception("刷新新单批次失败")
-            self._log_event("worker_error", where="new_order",
-                            error=str(exc))
 
     def _process_utterance(self, frames, coalesce=False, source="vad",
                            speech_end=None, audio_ms=None):
@@ -1243,18 +1204,6 @@ class DialogWorker(object):
         context = context or {}
         tick = int(context.get("tick", 0) or 0)
 
-        if name == "command_result":
-            status = (payload or {}).get("status")
-            if status != "failed":
-                # 成功默认不打扰；状态快照里能看到结果。
-                return
-            detail = _event_detail(name, payload)
-            self.last_proactive_tick = tick
-            timing = TurnTiming(source="event", event=name,
-                                started=time.monotonic())
-            self._run_llm(context, name, "", timing=timing,
-                          event_detail=detail, failed=True)
-            return
         if name == "batch":
             # 同一拍多个事件合成一段：把每个子事件的说明拼起来，一次说完。
             detail = "\n".join(_event_detail(n, p) for n, p in (payload or []))
@@ -1347,10 +1296,10 @@ class DialogWorker(object):
             except Exception:                   # noqa: BLE001
                 log.debug("PTT 打断 TTS 失败", exc_info=True)
 
-    def _run_llm(self, context, event, transcript, new_orders=None,
+    def _run_llm(self, context, event, transcript,
                  timing=None, event_detail="", failed=False,
                  silent_review=None):
-        # type: (dict, str, str, Any, Any, str, bool, Any) -> None
+        # type: (dict, str, str, Any, str, bool, Any) -> None
         """一轮对话：多轮工具调用，直到模型不再需要动作或给出 speak。
 
         新协议：
@@ -1382,10 +1331,7 @@ class DialogWorker(object):
             cookbook=_tools_include(tools, "read_cookbook"),
             actions=(event == "speech"
                      and _tools_include(tools, "execute_actions")))]
-        new_dag = ""
-        if event == "new_order":
-            new_dag = _new_dishes_dag(context, new_orders)
-        world = state_message(event, context, new_dag, event_detail,
+        world = state_message(event, context, event_detail=event_detail,
                               failed=failed)
         opener = speech_message(transcript) if event == "speech" \
             else event_note(event)
@@ -1509,14 +1455,14 @@ class DialogWorker(object):
                 continue
             if not action_calls:
                 break
-            if any(c.name in ("execute_actions", "execute_action",
-                              "cancel_action")
+            if any(c.name in ("execute_actions", "cancel_action")
                    for c in action_calls):
                 if not speak_calls:
                     # 动作已派发但没确认：不再强制 speak，下一轮由模型收尾。
                     continue
                 break
-            # 只有 check_action：继续下一轮，让模型决定 execute/speak。
+            # 其它工具（set_division / get_world_state / read_cookbook）：
+            # 继续下一轮，让模型收尾。
         if silent_review and division_changed:
             for text in buffered_speech:
                 stream.feed(text)
@@ -1888,8 +1834,7 @@ def _compact_turn(turn):
                     text = args.get("text")
                     if text:
                         spoken.append(str(text))
-                elif name in ("check_action", "execute_action",
-                              "execute_actions", "cancel_action"):
+                elif name in ("execute_actions", "cancel_action"):
                     if name == "execute_actions" and isinstance(args, dict):
                         for item in args.get("actions") or ():
                             if isinstance(item, dict):
@@ -1960,19 +1905,5 @@ class DutyBatch(object):
     calls: List[Any]
     source: str = ""
     origin: str = "speech"
-
-
-def _new_dishes_dag(context, order_ids):
-    # type: (dict, Any) -> str
-    """新单批次里各道菜的 DAG 文本（主循环在上下文里按菜名给出）。"""
-    dags = (context or {}).get("dish_dags") or {}
-    dishes = []
-    for order in (context or {}).get("orders") or ():
-        if order_ids and order.get("id") not in order_ids:
-            continue
-        dish = order.get("dish")
-        if dish and dish not in dishes:
-            dishes.append(dish)
-    return "\n".join(dags[d] for d in dishes if d in dags)
 
 

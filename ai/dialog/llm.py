@@ -223,14 +223,11 @@ def render_state(context):
     return prompts.render_state(context)
 
 
-def state_message(event, context, new_dishes_dag="", event_detail="",
-                  failed=False):
-    # type: (str, dict, str, str, bool) -> dict
+def state_message(event, context, event_detail="", failed=False):
+    # type: (str, dict, str, bool) -> dict
     """本轮末尾的 system 消息：世界状态 + 事件说明（不进历史）。"""
     parts = [prompts.render_state(context)]
-    if event == "new_order" and new_dishes_dag:
-        parts.append("【新菜】\n" + new_dishes_dag)
-    if event in ("speech", "command_result", "last_seconds", "round_summary",
+    if event in ("speech", "last_seconds", "round_summary",
                  "checkin", "batch", "division", "division_review",
                  "layout_review"):
         event_text = prompts.render_event(event, event_detail, failed=failed)

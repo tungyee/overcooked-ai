@@ -423,7 +423,7 @@ def _record_mic(max_seconds, fixed_seconds=None, threshold_db=9.0):
 def _llm_call(settings, transcript, event, timeout):
     # type: (Settings, str, str, float) -> object
     """一轮真实方舟请求（带当前工具协议），返回 LLMReply。"""
-    from ai.dialog.duties import tool_schemas
+    from ai.dialog.tools import tool_schemas
     from ai.dialog.llm import (LLMClient, speech_message, state_message,
                                system_message)
 

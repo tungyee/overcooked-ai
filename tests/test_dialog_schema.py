@@ -47,7 +47,6 @@ def test_exclude_carves_out_of_scope():
 def test_dialog_state_defaults():
     state = DialogState()
     assert state.history == []
-    assert state.pending_orders == []
     assert state.last_transcript == ""
     assert state.pending_event is None
     assert state.rescue_task_key is None

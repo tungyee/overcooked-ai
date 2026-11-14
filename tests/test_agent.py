@@ -453,7 +453,7 @@ import gzip
 import json
 import os
 
-from ai.dialog.duties import Kitchen
+from ai.dialog.catalog import Kitchen
 from ai.query.recipe_graph import _compile_node
 from ai.query.recipes import RecipeBook
 

@@ -1384,7 +1384,7 @@ def select_task(world, bb, order, book):
 
 def feasible_candidates(world, bb, book, command_scope=None):
     # type: (World, Blackboard, RecipeBook, Any) -> Tuple[List[Any], List[Any], Dict, Dict, Dict]
-    """只读地算出当前可行候选；供对话层的 check_action / 命令调度用。
+    """只读地算出当前可行候选；供对话层的命令调度用。
 
     与 `plan` 的候选生成、可行性过滤同口径，但不选任务、不写黑板、不触发
     截止闸/承诺惯性。`command_scope` 非空时只保留命中 scope 的候选。

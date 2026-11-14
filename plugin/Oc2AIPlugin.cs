@@ -25,6 +25,17 @@ namespace Oc2AI
         // 楼梯/坡道（Wizard_3_1 一楼↔二楼缺口无 Ground 盒，trace-20261101-130851）。
         int _colliderDumpEpoch = -1;
         string _staticJson;
+        // recipes 是否已成功构建过（BuildStatic 成功）。Phase() 用它区分
+        // 「关卡还在加载（配方缓存未就绪）」和「真 level」：开局上一场景残留的
+        // flow controller/厨师会让 Phase 误报 level，而这时 _staticJson 还是 null、
+        // orders 也是空的。只在 RefreshLevel 切关时清零；RescanChopIndex 重建
+        // recipes 不清它，避免 Dynamic 关卡开局食材延迟刷出时 phase 反复闪
+        // loading/level。
+        bool _recipesReady;
+        // 本关完整菜单（GetAllRecipes 的 JSON 片段）：配置资产静态不漂移，发给
+        // Python 补全分工 prompt 的物料名单——订单只刷出部分菜时 DAG 会漏掉还没
+        // 出单的料（如寿司关只出鱼单时看不到虾 SushiPrawn）。
+        string _levelDishesJson;
         string _level;
         // UI 编号（如 "4-1"），来自场景目录 SceneDirectoryEntry；只对主线
         // World.One..Six 输出，DLC/Kevin 留空由 Python 走资产名回退。
@@ -318,6 +329,8 @@ namespace Oc2AI
                     + (_levelNumber ?? "null"));
                 _flowId = flowId; _sceneEpoch++;
                 _staticJson = null;       // 下一拍 BuildState() 会重建 stations/recipes
+                _recipesReady = false;    // 新关卡：配方还没就绪，Phase 先报 loading
+                _levelDishesJson = null;  // 菜单随关卡重建
                 // 切关重启延迟刷出食材的低频重扫（上一关可能已收敛停止）。
                 _chopNoNew = 0;
                 CancelInvoke("RescanChopIndex");
@@ -1364,6 +1377,7 @@ namespace Oc2AI
             seg.Append("stations=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             if (_staticJson != null) sb.Append(',').Append(_staticJson);
+            if (_levelDishesJson != null) sb.Append(',').Append(_levelDishesJson);
             seg.Append("staticJson=").Append(segW.Elapsed.TotalMilliseconds.ToString("0.0")).Append(';'); segW.Reset(); segW.Start();
 
             sb.Append(",\"segments\":\"").Append(seg.ToString()).Append('"');
@@ -1406,7 +1420,13 @@ namespace Oc2AI
         string Phase()
         {
             if (FindServerFlowController() == null) return "menu";
-            return CountChefs() >= 1 ? "level" : "lobby";
+            if (CountChefs() < 1) return "lobby";
+            // 开局旧场景残留的 flow controller/厨师会让上面两个判据命中，但配方缓存
+            // 还没建好、orders 也是空的；此时报 level 会让 Python 主循环在关卡数据
+            // 没就绪时就发分工事件（trace-20261114-135155：ack 超时 5s、分工全程静默）。
+            // 等 recipes 建好（_recipesReady）再报 level。
+            if (!_recipesReady) return "loading";
+            return "level";
         }
 
         bool IsPaused()
@@ -2901,11 +2921,42 @@ namespace Oc2AI
                 }
 
                 _staticJson = "\"recipes\":[" + recipes + "]";
+                _recipesReady = true;
                 Logger.LogInfo("[STATIC] built recipes=" + ri);
+
+                // 本关完整菜单：GetAllRecipes 返回本关能刷出的全部菜（OrderDefinitionNode），
+                // 与运行时 m_cachedRecipeList（全局）不同源。配置资产开局就绪、切关不漂移。
+                StringBuilder levelDishes = new StringBuilder();
+                int ldi = 0;
+                try
+                {
+                    LevelConfigBase cfg = GameUtils.GetLevelConfig();
+                    object dishesList = CallMethod(cfg, "GetAllRecipes");
+                    if (dishesList is IEnumerable)
+                    {
+                        foreach (object node in (IEnumerable)dishesList)
+                        {
+                            string nm = ShortVal(node);
+                            if (nm == null || nm == "null") continue;
+                            if (ldi > 0) levelDishes.Append(',');
+                            levelDishes.Append(Jstr(nm));
+                            ldi++;
+                            if (ldi >= 200) break;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Logger.LogWarning("[STATIC] level dishes error: " + e.Message);
+                }
+                _levelDishesJson = "\"level_dishes\":[" + levelDishes + "]";
+                // 一关只成功构建一次，菜单静态不漂移：落一条日志即可，不用每帧打。
+                Logger.LogInfo("[STATIC] level_dishes=[" + levelDishes + "]");
             }
             catch (Exception e)
             {
                 _staticJson = null;
+                _recipesReady = false;
                 Logger.LogWarning("[STATIC] error: " + e.Message);
             }
         }

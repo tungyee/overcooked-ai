@@ -92,7 +92,7 @@ class Task(object):
     # 这一步决定物料的加工方式时填（切 / 煮 / 拌）：对话层据此给物料打标签，
     # 让 LLM 知道「我负责煮的」指哪些物料。
     PROCESS = ""
-    # 对话层目录的 DAG 元数据（ai/dialog/duties.py 的 Kitchen 读取，planner 不用）：
+    # 对话层目录的 DAG 元数据（ai/dialog/catalog.py 的 Kitchen 读取，planner 不用）：
     # - SHARED：不分菜的共享节点（洗盘/摆盘/送餐），作用域是 (类型, None)；
     # - STATION：本关要有这类站点（frame stations[].t）才进目录；
     SHARED = False

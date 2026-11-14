@@ -79,7 +79,7 @@ class Extinguish(Task):
     """
 
     TYPE = "Extinguish"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "用灭火器灭火"
     LABEL = "灭火"
     # 一局火情是循环树，比普通 task 长，用专属上限兜底（默认 200 拍会中途砍树）。

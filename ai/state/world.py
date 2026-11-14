@@ -169,6 +169,11 @@ class World(object):
         self.chefs = _dicts(state.get("chefs"))
         self.stations = _dicts(state.get("stations"))
         self.recipes = _dicts(state.get("recipes"))
+        # 本关完整菜单（插件 GetAllRecipes，静态不漂移）：订单只刷出部分菜时，
+        # 用它补全 DAG，避免分工 prompt 看不到还没出单的物料（如虾 SushiPrawn）。
+        self.level_dishes = [
+            str(x) for x in (state.get("level_dishes") or []) if x
+        ]
         # plates[] 混合散落/就位盘与手持盘（插件给手持盘打 held_by）。散落语义
         # （clean_plate_exists / placed_plates / _emit_plate …）读 self.plates，
         # 只含非手持；按 id 找盘（plate_by_id / 盘匹配 / 送餐）必须能看见 P2 自己

@@ -23,9 +23,9 @@
 
 ## 1.1 新工具协议（2026-11）
 
-对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型，也没有单独的两段式回合路径。`execute_action` / `check_action` 的 handler 仅为旧数据保留，旧 trace/回放同样走下面的多轮工具调用。
+对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型，也没有单独的两段式回合路径。旧 trace/回放同样走下面的多轮工具调用。
 
-模型只看到 4 个工具：
+模型看到的工具（`set_division` 恒常驻，`read_cookbook` 按是否有攻略出现）：
 
 ```text
 execute_actions(actions=[{action, target?}, ...])
@@ -35,6 +35,8 @@ cancel_action(action=None)          撤销当前命令和队列，停手约 5 �
 speak(text)                         主要发言通道；模型不调用时，语音/播报类
                                     事件允许用 content 兜底（见下）
 get_world_state()                   按需读取最新世界状态
+set_division(assignments=[...])     设置长期分工（动作级 + 可选 item）
+read_cookbook(section)              读取本关攻略某一节（有攻略时）
 ```
 
 - 工具结果只以 `role=tool` 回填，不追加催 `speak` 的 system 提示；每轮都用 `tool_choice=auto`，是否发言由模型决定。`division` / `division_review` 的 content 不播（只认 `speak`），`speech` / `checkin` / `last_seconds` / `round_summary` / `batch` / `layout_review` 在没有工具调用的回合用 content 兜底播报。
@@ -137,7 +139,7 @@ python3 run_agent.py --voice --voice-debug
 - **覆盖**：同一 target 只有一条约定，再 add 就是改写；`edit` 保留 id。不同物料共用中间产物时新条目优先（旧条目 `exclude` 掉重叠的 item）。
 - **账本影响**：世界状态里每条约定后面带「此刻」：它挡住了 P2 哪些可做的活、挡了多久、P1 手上拿着什么。挡住超过 10 秒时提示 LLM 在回话时顺带问一句要不要调整（只提议，P1 同意后才改账本）。
 - **兑现不了的认领会如实回报**：认领带救锅步骤的物料（饭链里的 `TakeCookedToPlate`，planner L1/L2 免疫认领负分）时，工具结果带 `warning`，第二段回复据此转告玩家。不绑订单的认领（洗盘、填灶、预取）在截止闸里按最紧的活单计算 cushion。
-- **事件**：新菜出现（`new_order`）由 LLM 按新菜的物料组成直接落账本并告诉 P1 分工，P1 之后可以改口；截止闸抢回（`rescue`）由 LLM 按被抢的具体步骤说明接手了哪一步。没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声。
+- **事件**：截止闸抢回（`rescue`）由 LLM 按被抢的具体步骤说明接手了哪一步。没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声。
 
 ## 5. 启动与 CLI
 
@@ -193,11 +195,11 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 
 计时口径：
 
-- 一轮的起点是 `turn_latency.started`：PTT 是**按键松开**（之后还有 200 ms 尾音才送 ASR）；VAD 是**判定句尾**（已含约 400 ms 静音）；主动事件是 worker 收到事件（`new_order` 从第一张单到达算起，含 1 秒合并窗口）。
+- 一轮的起点是 `turn_latency.started`：PTT 是**按键松开**（之后还有 200 ms 尾音才送 ASR）；VAD 是**判定句尾**（已含约 400 ms 静音）；主动事件是 worker 收到事件。
 - `*_ms` 不带前缀的字段都相对这一起点；`request_ms` / `first_token_ms` / `elapsed_ms` / `tts_first_chunk_ms` / `tts_to_audio_ms` 是相对各段自己的起点。
 - `llm_first_token_ms` 是起点到**第一次看到 content/tool_calls delta**；`llm_done_ms` 是到最终那段文字就绪（两段式包含工具落地和第二段）。
 - `tts_first_chunk_ms` 是起点到第一块 PCM；`first_audio_ms` 是起点到输出回调第一次真正写入采样，更接近耳朵听到的时间。
-- `since_level_ms` 只对主动事件（尤其开局 `new_order`）有意义，表示从 Agent 首次看到关卡到本轮开始隔了多久。
+- `since_level_ms` 只对主动事件（尤其开局分工）有意义，表示从 Agent 首次看到关卡到本轮开始隔了多久。
 
 不记录密钥、完整 prompt 或原始音频。日志写入失败只降级为 debug，不影响对话链路；日志只由 worker / 生命周期线程写。`--voice-debug` 仍只打印文本级事件，分段计时看 `turn_latency`。
 

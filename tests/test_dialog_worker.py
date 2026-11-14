@@ -14,7 +14,7 @@ import pytest
 
 from ai.dialog import worker as worker_mod
 from ai.dialog.llm import LLMReply, ToolCall
-from ai.dialog.duties import tool_schemas
+from ai.dialog.tools import tool_schemas
 from ai.dialog.schema import VoiceConfig
 from ai.dialog.worker import DialogClients, DialogWorker, DutyBatch
 
@@ -573,13 +573,11 @@ def test_start_after_stop_raises():
 def test_reset_state_clears_dialog_state():
     worker, _ = make_worker()
     worker.state.last_speech_tick = 9
-    worker.state.pending_orders = [1, 2]
     worker.last_proactive_tick = 50
 
     worker.reset_state()
 
     assert worker.state.last_speech_tick == 0
-    assert worker.state.pending_orders == []
     assert worker.last_proactive_tick == 0
 
 
@@ -1022,14 +1020,14 @@ def test_round_summary_does_not_schedule_next_checkin():
 
 def test_new_protocol_execute_and_speak_in_one_turn():
     llm = FakeLLM(
-        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"}),
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]}),
               ("speak", {"text": "好，这就去切黄瓜"})))
     worker, bundle = make_worker(llm=llm)
 
     thread = run_async(worker._handle_transcript, "把黄瓜切了",
                        {"tick": 100, "tools": TOOLS_NEW})
     batch = bundle.cmd_q.get(timeout=2)
-    assert [c[0] for c in batch.calls] == ["execute_action"]
+    assert [c[0] for c in batch.calls] == ["execute_actions"]
     bundle.ack_q.put({"batch_id": batch.batch_id,
                       "results": [{"ok": True, "status": "running"}]})
     thread.join(2)
@@ -1041,7 +1039,7 @@ def test_new_protocol_execute_and_speak_in_one_turn():
 
 def test_new_protocol_rejection_suppresses_optimistic_speak():
     llm = FakeLLM(
-        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"}),
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]}),
               ("speak", {"text": "好，这就去切黄瓜"})),
         reply("", ("speak", {"text": "砧板被占了，切不了"})))
     worker, bundle = make_worker(llm=llm)
@@ -1147,7 +1145,7 @@ def test_tts_wait_total_timeout_resumes_vad():
 def test_failed_execute_continues_without_forcing_speak():
     """execute 失败后继续一轮让模型解释，但不再强制 tool_choice=speak。"""
     llm = FakeLLM(
-        reply("", ("execute_action", {"action": "chop", "target": "BurritoMeat"})),
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "BurritoMeat"}]})),
         reply("", ("speak", {"text": "我现在够不着砧板，切不了肉。"})))
     worker, bundle = make_worker(llm=llm)
 
@@ -1220,7 +1218,7 @@ def test_speak_tag_content_is_not_spoken_for_player_command():
 def test_execute_without_speak_does_not_force_ack():
     """直接 execute 后模型没 speak：不再强制补 speak，下一轮用 content 收尾。"""
     llm = FakeLLM(
-        reply("", ("execute_action", {"action": "chop", "target": "Cucumber"})),
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]})),
         reply("好，这就去切黄瓜"))
     worker, bundle = make_worker(llm=llm)
 

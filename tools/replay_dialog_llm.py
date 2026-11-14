@@ -8,7 +8,7 @@
   DialogWorker._run_llm（真实方舟 LLM）→ DutyBatch → Agent._service_dialog
   落分工 → ack 写回历史 → planner 重新选
 
-每个场景是一串回合（玩家原话或 new_order / rescue 事件），逐轮检查：
+每个场景是一串回合（玩家原话或 rescue 事件），逐轮检查：
 
   - 有没有回复、回复长度；
   - 工具调用是否全部落地（被拒的打印原因）；
@@ -224,7 +224,7 @@ class Expect:
 @dataclass
 class Step:
     say: str = ""                 # 玩家原话；空 = 事件
-    event: str = "speech"         # speech / new_order / rescue
+    event: str = "speech"         # speech / rescue
     expect: Expect = field(default_factory=Expect)
     # 回合前改黑板（例如把某个 task 设成截止闸抢回），参数 (agent, world)
     setup: Optional[Callable[[Any, World], None]] = None
@@ -307,10 +307,6 @@ SCENARIOS = [
     Scenario("offtopic", "any", [
         Step("给我捶捶背。", expect=Expect(tools=False)),
     ], "跟游戏无关：轻松接一句，不调工具"),
-    Scenario("new_order_then_yes", "any", [
-        Step(event="new_order", expect=Expect(tools=False)),
-        Step("好，就这么办。", expect=Expect(tools=True)),
-    ], "新菜商量 → 玩家同意后落分工"),
 ]
 
 
@@ -380,7 +376,7 @@ def _make_pair(frame, llm):
 
 
 def _prime(agent, world):
-    """跑一拍对话服务 + planner：生成 new_order 记账、p2_options、承诺。"""
+    """跑一拍对话服务 + planner：生成分工记账、p2_options、承诺。"""
     agent.bb.tick = agent.tick = 1000
     agent.book = RecipeBook(world.recipes, world.stations)
     agent._service_dialog(world)
@@ -412,8 +408,7 @@ def _run_turn(agent, worker, world, step):
                 worker.state.last_transcript = ""
                 worker._run_llm(context, "speech", step.say)
             else:
-                worker._run_llm(context, step.event, "",
-                                new_orders=[o.get("id") for o in world.orders])
+                worker._run_llm(context, step.event, "")
         finally:
             done.set()
 

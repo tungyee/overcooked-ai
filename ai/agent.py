@@ -18,9 +18,9 @@ from ai.dialog.commands import (Command, CommandQueue, build_scope,
                                 command_failed, deliveries,
                                 dirty_count, item_scope, resolve_done_item,
                                 resolve_target, scope_matches_task)
+from ai.dialog.catalog import Kitchen, TaskMeta, node_key
 from ai.dialog.cookbook import default_cookbook
-from ai.dialog.duties import (Kitchen, TaskMeta, TOOL_ACTIONS, node_key,
-                              tool_schemas)
+from ai.dialog.tools import TOOL_ACTIONS, tool_schemas
 from ai.dialog.division import (DIVISION_ACTIONS, TOOL_ACTION_NAMES,
                                 TOOL_OWNER_NAMES, diff_entries,
                                 resolve_material, station_signature,
@@ -355,17 +355,6 @@ def _ready_plates(world, book, live_orders):
     return out
 
 
-def _probe_command(action, resolved, display, scope, world, mode="material",
-                   done_item=None):
-    # type: (str, Optional[str], Optional[str], Any, World, str, Optional[str]) -> Command
-    """只用于 check_action 的 done 探测，不进队列。"""
-    return Command(
-        id="probe", action=action, target=resolved, resolved_target=resolved,
-        display_target=display or resolved, scope=scope, mode=mode,
-        done_item=done_item,
-        start_deliveries=deliveries(world), start_dirty=dirty_count(world))
-
-
 def _validate_action(kitchen, action, direction, world, bb):
     # type: (Kitchen, str, str, World, Blackboard) -> Tuple[bool, str]
     """校验一个动作意图是否可行（判）。返回 (ok, reason)。
@@ -595,6 +584,7 @@ class Agent:
         self._round_summary_fired = False  # 结束总结只发一次
         self._round_started = False        # 计时器是否跑过（区分未开局/已结束）
         self._last_ranked = []         # 上一拍 planner 打分前几名（给 LLM 看）
+        self._map_rendered_level = None  # 已画过地图的关卡名；进关首帧画一次
         # 分工：只由 LLM 的 set_division 工具写入；这里只存本关攻略和复核状态。
         self._guide = None
         self._division_station_sig = None
@@ -656,9 +646,15 @@ class Agent:
         稳定，方舟上下文缓存才能命中。
         """
         book = self.book or RecipeBook(world.recipes, world.stations)
-        orders = list(self._seen_orders.values())
-        known = {o.get("dish") for o in orders}
-        orders += [o for o in world.orders or () if o.get("dish") not in known]
+        level_dishes = getattr(world, "level_dishes", None)
+        if level_dishes:
+            # 本关完整菜单（插件 GetAllRecipes，静态不漂移）：DAG 一次到位，
+            # 不依赖订单逐个刷出来，分工 prompt 能看到全部物料英文名。
+            orders = [{"dish": name} for name in level_dishes]
+        else:
+            orders = list(self._seen_orders.values())
+            known = {o.get("dish") for o in orders}
+            orders += [o for o in world.orders or () if o.get("dish") not in known]
         return Kitchen.from_orders(
             book, orders, recipe_graph._compile_node, _TASK_META,
             {st.get("t") for st in world.stations or () if st.get("t")})
@@ -675,9 +671,7 @@ class Agent:
             if args is None:
                 results.append({"ok": False, "reason": "参数不是合法 JSON"})
                 continue
-            if name == "check_action":
-                results.append(self._check_action(world, args))
-            elif name == "execute_actions":
+            if name == "execute_actions":
                 origin = getattr(batch, "origin", "") or "speech"
                 if origin != "speech":
                     # 自主干活交给 planner：分工/复核/命令结果/定时事件都不该
@@ -688,9 +682,6 @@ class Agent:
                     })
                 else:
                     results.append(self._execute_actions(world, args))
-            elif name == "execute_action":
-                # 旧工具名：handler 保留，兼容旧 trace/回放；新 prompt 不再暴露。
-                results.append(self._execute_action(world, args))
             elif name == "cancel_action":
                 results.append(self._cancel_action(world, args))
             elif name == "speak":
@@ -911,94 +902,6 @@ class Agent:
             if dest:
                 return dest
         return ""
-
-    def _check_action(self, world, args):
-        # type: (World, Any) -> Dict
-        if not isinstance(args, dict):
-            return {"ok": False, "reason": "参数必须是对象"}
-        kitchen = self._command_kitchen(world)
-        action = str(args.get("action") or "")
-        if action not in TOOL_ACTIONS:
-            return {"ok": False, "reason": "未知动作：%s" % (action,)}
-        target_raw = args.get("target")
-        if action in ("chop", "cook", "mix") and not str(target_raw or "").strip():
-            # 玩家说「你也帮我切点东西吧」是**改分工**，不是马上派活；真要派活
-            # 就得说清切/煮哪种料。不带 target 会让系统替模型挑一个，最后落成
-            # 「给这道菜备齐料」这种判不出完成的巨型命令（实机
-            # trace-20261109-124818 04:49:12 的 `chop` 占了 212/240 秒）。
-            return {"ok": False, "action": action,
-                    "reason": "要说明%s哪种料（本关目录里的英文名）。"
-                              "只是想调整分工就用 set_division。" % (
-                                  "切" if action == "chop" else "煮"),
-                    "hint": "set_division"}
-        mode, resolved, display, reason, valid = resolve_target(
-            kitchen, action, target_raw)
-        if reason and not resolved:
-            return {"ok": False, "action": action, "target": target_raw,
-                    "reason": reason, "valid_targets": valid}
-        scope, scope_reason = build_scope(kitchen, action, resolved, mode)
-        if scope is None:
-            return {"ok": False, "action": action,
-                    "target": display or resolved or target_raw,
-                    "reason": scope_reason, "valid_targets": valid}
-        if action == "wash" and dirty_count(world) == 0:
-            return {"ok": False, "action": action, "reason": "现在没有脏盘"}
-        done_item = resolve_done_item(kitchen, action, resolved,
-                                      target_raw or resolved)
-        probe = _probe_command(action, resolved, display, scope, world, mode,
-                               done_item=done_item)
-        if command_done(world, self.book, probe):
-            out = {"ok": True, "action": action,
-                   "target": display or resolved or target_raw,
-                   "resolved_target": resolved, "already_done": True}
-            return out
-        feasible, _cands, _ctx, _pm, _cm = planner.feasible_candidates(
-            world, self.bb, self.book, command_scope=scope)
-        if not feasible:
-            if action == "deliver":
-                reason = self._deliver_reason(world, self.book)
-            elif action == "wash":
-                reason = self._wash_reason(world)
-            else:
-                labels = {"fetch": "现在没有可取的料"}
-                reason = labels.get(action, "现在没有可做的这一步")
-            return {"ok": False, "action": action,
-                    "target": display or resolved or target_raw,
-                    "reason": reason, "valid_targets": valid}
-        if action == "deliver" and not resolved:
-            targets = []
-            live = planner._dialog_live_orders(world, self.bb)
-            for cand in feasible:
-                order_id = getattr(cand.task, "order_id", None)
-                for order in live:
-                    if str(order.get("id")) != str(order_id):
-                        continue
-                    dish = order.get("dish")
-                    if dish and str(dish) not in targets:
-                        targets.append(str(dish))
-            return {"ok": True, "action": action, "targets": targets[:6]}
-        if resolved:
-            out = {"ok": True, "action": action,
-                   "target": display or resolved,
-                   "resolved_target": resolved}
-        else:
-            targets = []
-            seen = set()
-            for cand in feasible:
-                item = getattr(cand.task, "item", None)
-                if not item:
-                    continue
-                key = str(item).lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                targets.append(str(item))
-            out = {"ok": True, "action": action, "targets": targets[:6]}
-        if action == "fetch":
-            dest = self._fetch_destination(feasible)
-            if dest:
-                out["destination"] = dest
-        return out
 
     def _execute_actions(self, world, args):
         # type: (World, Any) -> Dict
@@ -1430,6 +1333,35 @@ class Agent:
             # 打点失败不能影响主循环。
             log.debug("写 level_start 打点失败", exc_info=True)
 
+    def _maybe_render_map(self, world):
+        # type: (World) -> None
+        """进关首帧把地图画成 ASCII，落到 `map-<level>.txt` 并提示。
+
+        独立于对话层：无语音 / 离线模式也照画。只读 World；任何失败都不
+        影响主循环（地图只是调试/复盘辅助，不是决策依赖）。
+        """
+        if getattr(world, "phase", None) != "level":
+            return
+        level = getattr(world, "level", None)
+        if not level or level == self._map_rendered_level:
+            return
+        self._map_rendered_level = level
+        try:
+            import os
+            import sys
+            from ai.output import map_render
+            text = map_render.render_map(world)
+            if not text:
+                return
+            safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                           for ch in str(level))
+            path = os.path.join(trace.REPO_ROOT, "map-%s.txt" % safe)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+            print("[MAP] 已绘制 %s 地图 -> %s" % (level, path), file=sys.stderr)
+        except Exception:                     # noqa: BLE001
+            log.exception("绘制地图失败")
+
     def _drain_dialog_queues(self):
         # type: () -> None
         """丢弃命令/ack 队列里的旧世代消息（主循环线程调用）。"""
@@ -1773,6 +1705,7 @@ class Agent:
         # type: (World) -> None
         """执行一拍的 13 步主循环。"""
         self._observe_scene(world)
+        self._maybe_render_map(world)
         # 关卡/阶段切换要在生命周期守卫之前观察：暂停/菜单也是新世代，
         # 必须清掉上一局的对话状态与排队命令（spec §4.7 / §6.3）。
         if self.dialog_worker is not None:

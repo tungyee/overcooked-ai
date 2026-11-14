@@ -49,11 +49,7 @@ class DialogState(object):
     """对话层的跨回合状态；由主循环持有（spec §6.2）。"""
     last_speech_tick: int = 0
     last_speech_at: float = 0.0
-    last_order_tick: int = 0
     last_rescue_tick: int = 0
-    # 新单合并窗口（spec §5.1）：1 秒内到达的订单攒成一批，由
-    # `ai.dialog.policy.merge_new_orders` 维护；清批前一个都不丢。
-    pending_orders: List = field(default_factory=list)
     # 上一条已触发的 speech（规范化后），供 4 秒内同句去重用。
     last_transcript: str = ""
     # 本关对话历史：OpenAI 多轮消息 dict（user / assistant / tool / 事件占位

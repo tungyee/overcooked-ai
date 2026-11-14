@@ -41,7 +41,7 @@ class Mix(Task):
     """
 
     TYPE = "Mix"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把几种料装进拌料容器里拌"
     LABEL = "拌"
     PROCESS = "拌"

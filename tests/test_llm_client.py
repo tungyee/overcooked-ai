@@ -302,7 +302,7 @@ def test_state_message_is_system_with_world_state():
 
 
 def test_event_note_is_system():
-    assert event_note("new_order")["role"] == "system"
+    assert event_note("division")["role"] == "system"
 
 
 def test_chat_passes_tool_choice_none(monkeypatch):

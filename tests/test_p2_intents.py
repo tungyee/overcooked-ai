@@ -15,7 +15,7 @@ from ai.state.blackboard import Blackboard
 from ai.state.world import World
 
 
-# 账本作用域（与 ai/dialog/duties.py 展开结果同形）。
+# 账本作用域（与 ai/dialog/catalog.py 展开结果同形）。
 CUCUMBER_CHAIN = frozenset({("FetchToBoard", "cucumber"), ("Chop", "cucumber"),
                             ("FetchToPlate", "cucumber")})
 FISH_CHAIN = frozenset({("FetchToBoard", "sushifish"), ("Chop", "sushifish"),

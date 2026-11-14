@@ -112,7 +112,7 @@ class FetchToPlate(Task):
     """
 
     TYPE = "FetchToPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把这种料（需要切的取切好的）放进盘里"
     LABEL = "装盘"
     HANDS = "empty"       # 要空手去拿料；手里有东西时打分加腾手代价（spec §6.1(b)）
@@ -232,10 +232,10 @@ class DeliverPlate(Task):
     """
 
     TYPE = "DeliverPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把配齐的盘送到出餐口"
     LABEL = "送餐"
-    # 不分菜的共享节点（ai/dialog/duties.py）。
+    # 不分菜的共享节点（ai/dialog/catalog.py）。
     SHARED = True
     # 送餐不开放「交给 P1 / 先别做」：谁在旁边谁送，只能让 P2 马上去或优先做。
     HANDS = "empty"       # 要空手去端盘；手里有东西时打分加腾手代价（spec §6.1(b)）
@@ -343,7 +343,7 @@ class MergePlates(Task):
     """
 
     TYPE = "MergePlates"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把一块盘的内容倒进另一块盘"
     LABEL = "并盘"
     HANDS = "empty"       # 要空手去端 src 盘；手里有东西时打分加腾手代价

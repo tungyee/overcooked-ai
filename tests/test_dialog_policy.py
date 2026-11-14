@@ -1,6 +1,5 @@
-"""对话策略：事件触发、限频、新单合并窗口与固定模板（spec §5.1–5.3）。"""
+"""对话策略：事件触发、限频与固定模板（spec §5.1–5.3）。"""
 from ai.dialog.policy import (
-    merge_new_orders,
     should_checkin,
     should_trigger,
 )
@@ -57,68 +56,6 @@ def test_rescue_4s_interval():
 
 def test_help_event_no_longer_triggers():
     assert should_trigger("help", DialogState(), tick=10**6) is False
-
-
-def test_new_order_merges_within_one_second():
-    state = DialogState()
-    first, batch = merge_new_orders([1], state, tick=100)
-    assert first is False and batch == [1]
-    second, batch = merge_new_orders([2], state, tick=110)
-    assert second is False and batch == [1, 2]
-    # 窗口内（< 20 拍）空调用也不触发
-    third, batch = merge_new_orders([], state, tick=119)
-    assert third is False and batch == [1, 2]
-
-
-def test_new_order_flushes_when_window_elapses_with_empty_ids():
-    state = DialogState()
-    merge_new_orders([1], state, tick=100)
-    merge_new_orders([2], state, tick=110)
-    fired, batch = merge_new_orders([], state, tick=120)
-    assert fired is True and batch == [1, 2]
-    assert state.pending_orders == []
-    # 第二批已经交出去，不会重复触发
-    fired, batch = merge_new_orders([], state, tick=140)
-    assert fired is False and batch == []
-
-
-def test_new_order_held_batch_is_flushed_before_new_ids():
-    state = DialogState()
-    merge_new_orders([1], state, tick=100)
-    merge_new_orders([2], state, tick=110)
-    # 180 拍时 [1,2] 早已过窗：先冲出旧批，新单另起一批，谁都不丢
-    fired, batch = merge_new_orders([3], state, tick=180)
-    assert fired is True and batch == [1, 2]
-    assert state.pending_orders == [3]
-    # 下一拍把新单这批也交出去
-    fired, batch = merge_new_orders([], state, tick=200)
-    assert fired is True and batch == [3]
-
-
-def test_new_order_window_starts_at_first_order_of_batch():
-    state = DialogState()
-    merge_new_orders([1], state, tick=100)
-    merge_new_orders([2], state, tick=115)
-    # 追加不刷新窗口：从 100 起算，120 已满 20 拍
-    fired, batch = merge_new_orders([3], state, tick=120)
-    assert fired is True and batch == [1, 2]
-    assert state.pending_orders == [3]
-
-
-def test_new_order_deduplicates_ids_within_a_call():
-    state = DialogState()
-    merge_new_orders([1], state, tick=100)
-    _, batch = merge_new_orders([1, 2, 2], state, tick=105)
-    assert batch == [1, 2]
-
-
-def test_new_order_gate_reports_only_aged_batch():
-    state = DialogState()
-    merge_new_orders([1], state, tick=100)
-    assert should_trigger("new_order", state, tick=110) is False
-    assert should_trigger("new_order", state, tick=120) is True
-    # 谓词不消费批次；清批由 merge_new_orders 负责
-    assert state.pending_orders == [1]
 
 
 # ---------------------------------------------------------------- other

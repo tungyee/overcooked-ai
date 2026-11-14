@@ -1,6 +1,6 @@
 # -*- coding: utf8 -*-
 """division_review 回合硬静音：不改分工就不出声。"""
-from ai.dialog.duties import tool_schemas
+from ai.dialog.tools import tool_schemas
 from tests.test_dialog_worker import FakeLLM, make_worker, reply, run_async
 
 

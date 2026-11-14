@@ -440,7 +440,7 @@ def test_tick_once_emits_round_summary_once(dagent, world, fake_worker):
 def test_service_dialog_publishes_context_every_10_ticks(dagent, world,
                                                          fake_worker):
     dagent.tick = 8
-    dagent._service_dialog(world)          # 首拍有 new_order 事件，立刻发一份
+    dagent._service_dialog(world)          # 首拍有开局分工事件，立刻发一份
     fake_worker.contexts.clear()
 
     dagent.tick = 9

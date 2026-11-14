@@ -217,10 +217,10 @@ class PlaceCleanPlate(Task):
     """
 
     TYPE = "PlaceCleanPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "拿一个干净盘摆到拼装台上"
     LABEL = "摆盘"
-    # 不分菜的共享节点（ai/dialog/duties.py）。
+    # 不分菜的共享节点（ai/dialog/catalog.py）。
     SHARED = True
 
     @property
@@ -309,10 +309,10 @@ class WashPlate(Task):
     """
 
     TYPE = "WashPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "在洗碗池洗脏盘"
     LABEL = "洗盘"
-    # 不分菜的共享节点；需要洗碗池这类站点才进目录（ai/dialog/duties.py）。
+    # 不分菜的共享节点；需要洗碗池这类站点才进目录（ai/dialog/catalog.py）。
     SHARED = True
     STATION = "washing"
 
@@ -568,7 +568,7 @@ class ResetPlate(Task):
     """
 
     TYPE = "ResetPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把装错/无用的盘子清空复位"
     LABEL = "清盘"
 

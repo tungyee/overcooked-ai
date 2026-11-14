@@ -263,7 +263,7 @@ class FillCarrier(Task):
     """
 
     TYPE = "FillCarrier"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "端着卷饼把煮好的料装进去"
     LABEL = "装馅"
     HANDS = "empty"       # 要空手去端卷饼；手不空时打分加腾手代价（spec §6.1(b)）

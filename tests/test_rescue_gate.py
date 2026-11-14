@@ -18,7 +18,7 @@ from ai.core import planner
 from ai.core import planner_layers as PL
 from ai.dialog.schema import Preference
 
-# 账本作用域（与 ai/dialog/duties.py 展开结果同形）。
+# 账本作用域（与 ai/dialog/catalog.py 展开结果同形）。
 COOK_CLAIM = frozenset({("FetchToCooker", None), ("FillCooker", None),
                         ("TakeCookedToPlate", None)})
 WASH_SCOPE = frozenset({("WashPlate", None), ("PlaceCleanPlate", None)})

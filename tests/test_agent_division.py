@@ -135,6 +135,47 @@ def test_initial_division_event_and_context(agent, worker):
             "chop", "cook", "plate"]
 
 
+def test_kitchen_uses_level_dishes_for_full_menu(agent):
+    """level_dishes（插件 GetAllRecipes）存在时，DAG 用本关完整菜单。
+
+    订单只刷出部分菜时，没出单的料也要进 DAG，否则分工 prompt 看不到
+    （如寿司关只出鱼单时，模型不知道虾叫 SushiPrawn）。
+    """
+    world = make_world()
+    world.recipes = [
+        {"name": "Burger", "comp": ["Meat"]},
+        {"name": "Salad_Plain", "comp": ["Lettuce"]},
+        {"name": "Meat", "comp": []},
+        {"name": "Lettuce", "comp": []},
+    ]
+    world.orders = [{"id": 1, "dish": "Burger", "composition": ["Meat"],
+                     "remaining": 60, "lifetime": 130}]
+    world.level_dishes = ["Burger", "Salad_Plain"]
+    agent.book = RecipeBook(world.recipes, world.stations)
+    dag = agent._kitchen(world).render()
+    assert "Burger" in dag
+    assert "Salad_Plain" in dag
+    assert "Lettuce" in dag          # 没出单的料的物料也进来了
+
+
+def test_kitchen_falls_back_to_orders_without_level_dishes(agent):
+    """没有 level_dishes（旧插件）时退回当前订单，行为不变。"""
+    world = make_world()
+    world.recipes = [
+        {"name": "Burger", "comp": ["Meat"]},
+        {"name": "Salad_Plain", "comp": ["Lettuce"]},
+        {"name": "Meat", "comp": []},
+        {"name": "Lettuce", "comp": []},
+    ]
+    world.orders = [{"id": 1, "dish": "Burger", "composition": ["Meat"],
+                     "remaining": 60, "lifetime": 130}]
+    world.level_dishes = []
+    agent.book = RecipeBook(world.recipes, world.stations)
+    dag = agent._kitchen(world).render()
+    assert "Burger" in dag
+    assert "Salad_Plain" not in dag   # 没出单的菜不进 DAG
+
+
 def test_initial_division_waits_for_level(agent, worker):
     """关卡名没到位时不能发开局分工：否则 prompt 里没有攻略。"""
     world = make_world(level=None)

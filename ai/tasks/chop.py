@@ -127,7 +127,7 @@ class FetchToBoard(Task):
     """
 
     TYPE = "FetchToBoard"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "从箱子取这种料放上砧板"
     LABEL = "取料上砧板"
     HANDS = "empty"       # 要空手去拿生料；手里有东西时打分加腾手代价（spec §6.1(b)）
@@ -265,7 +265,7 @@ class Chop(Task):
     """
 
     TYPE = "Chop"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "在砧板上把这种料切好"
     LABEL = "切"
     PROCESS = "切"

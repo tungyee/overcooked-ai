@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""新工具协议：check_action / execute_action / cancel_action 与命令队列。"""
+"""新工具协议：execute_action / cancel_action 与命令队列。"""
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -41,28 +41,6 @@ def agent(world):
 @pytest.fixture
 def world():
     return _world()
-
-
-def test_check_action_reports_real_targets(agent, world):
-    out = agent._check_action(world, {"action": "chop", "target": "Cucumber"})
-    assert out == {"ok": True, "action": "chop", "target": "Cucumber",
-                   "resolved_target": "Cucumber"}
-
-    out = agent._check_action(world, {"action": "chop", "target": "Seaweed"})
-    assert out["ok"] is False
-    assert "不用切" in out["reason"]
-
-
-def test_check_action_chinese_alias(agent, world):
-    out = agent._check_action(world, {"action": "chop", "target": "黄瓜"})
-    assert out["ok"] is True
-    assert out["resolved_target"] == "Cucumber"
-
-
-def test_check_wash_without_dirty_plates_is_not_done(agent, world):
-    out = agent._check_action(world, {"action": "wash"})
-    assert out["ok"] is False
-    assert "没有脏盘" in out["reason"]
 
 
 def test_execute_action_creates_persistent_command(agent, world):
@@ -216,7 +194,7 @@ def test_raw_item_resolves_to_material_for_balloon_level():
     （Prawn / 虾）时必须能归一到对应 material。"""
     from ai.dialog.commands import (build_scope, resolve_done_item,
                                     resolve_target, valid_targets)
-    from ai.dialog.duties import Kitchen, Material
+    from ai.dialog.catalog import Kitchen, Material
 
     kitchen = Kitchen({}, {})
     kitchen.materials = {
@@ -339,7 +317,7 @@ def test_pizza_chop_targets_are_item_scoped(monkeypatch):
 
 
 def test_execute_actions_rejected_on_autonomous_event(agent, world):
-    """自主事件（division/review/command_result）不能自己派活。"""
+    """自主事件（division/review 等）不能自己派活。"""
     from ai.dialog.worker import DutyBatch
 
     batch = DutyBatch(

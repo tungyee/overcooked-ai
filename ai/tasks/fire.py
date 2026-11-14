@@ -89,7 +89,7 @@ class Extinguish(Task):
     NO_ABANDON = True
 
     def claims(self):
-        # 全局灭火 task 不按灶认领：火情协调靠 arbiter 的 _is_fire_unhandled
+        # 全局灭火 task 不按灶认领：火情协调靠 planner 的 _fire_needs_ai
         # （P1 是否在旁 / 持灭火器），不靠 claims（spec §5.3）。
         return ()
 

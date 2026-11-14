@@ -3,7 +3,7 @@
 
 原 Arbiter 每拍决定 Normal / Firefighting 模式；火情现已由 planner 的
 L_FIRE（Extinguish 候选）统一处理，不再有独立 Firefighting 模式。中断 task
-连续失败降级（写 blacklisted_resources 的拉黑）是只写不读的死状态，一并删除。
+连续失败降级（其拉黑目标写进一个只写不读的死字段）也一并删除。
 
 这里只保留卡住检测 `_is_stuck`：维护 `bb.scratch.same_count` 计数器，供
 `agent._stuck_info` 读走做 trace 卡住观测。真正的脱困在别处（HoldUntil 位置

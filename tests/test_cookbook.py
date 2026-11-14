@@ -68,7 +68,7 @@ def test_summary_and_sections_have_no_internal_codes():
 def test_section_aliases():
     book = default_cookbook()
     guide = book.resolve("Wizard_5_5_2P")
-    assert "玩家" in guide.section("division")
+    assert "楼上的人" in guide.section("division")
     assert "楼梯" in guide.section("mechanics")
     assert "高度差" in guide.section("traps")
     assert "汉堡" in guide.section("recipes")

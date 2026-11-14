@@ -18,8 +18,8 @@
 
 | 子目录 | 模块 |
 |---|---|
-| 根级 | `agent.py` 13 步装配（收帧→对账→推断→仲裁→规划→执行→日志）· `primitives/` 原语 · `tasks/` task（对外只认 `from ai import tasks as T`） |
-| `core/` 主循环 | `arbiter.py` 模式仲裁 · `planner.py` 候选→可行性→协作过滤→打分→承诺惯性（最大文件，约 1800 行）· `planner_layers.py` 分层过滤 · `executor.py` task 树生命周期 |
+| 根级 | `agent.py` 装配（收帧→对账→推断→卡住观测→规划→执行→日志）· `primitives/` 原语 · `tasks/` task（对外只认 `from ai import tasks as T`） |
+| `core/` 主循环 | `arbiter.py` 卡住检测（供 trace 观测） · `planner.py` 候选→可行性→协作过滤→打分→承诺惯性（最大文件）· `planner_layers.py` 分层过滤 · `executor.py` task 树生命周期 |
 | `state/` 状态 | `blackboard.py` 唯一可变状态容器 · `bb_factory.py` 其构造 · `world.py` StateClient 分帧 + World 只读视图 · `reconcile.py` 每拍认领对账 · `p1model.py` P1 事实（holding）+ 站位软代价 |
 | `query/` 查询 | `predicates.py` 纯谓词（无副作用、不依赖 World 类）· `recipes.py` RecipeBook 配方语义 · `recipe_graph.py` 配方 DAG 编译 + 候选发射 · `plate_tokens.py` 盘/锅内容 token 解析 · `stations.py` 站点检索 · `placement.py` 落点约束 |
 | `space/` 空间 | `navigation.py` Dijkstra 距离场 · `occupancy.py` 可走性 + 实体去重 · `geometry.py` 网格↔世界坐标 · `seams.py`/`seam_clock.py` 平台接缝门洞与开关时间表 · `shuttle.py` 渡运台面（隔围栏够的移动台面：格外站位 + 可交互窗口） · `channels.py` 跨区通道（渡运台面 + 两边都够得着的静态共享台面） · `portals.py` 传送门（触发格对寻路不可走 + 过门跳边 + move 过门段；寻路参数统一走 `portals.nav_args`） · `lanes.py` 半格走廊（通道夹在两排格中心之间时的寻路跳边 + move 拐点） |
@@ -33,11 +33,11 @@
 三层 + 黑板（spec §3）：
 
 ```
-World 快照 → 认领对账 → 更新 P1Model → Arbiter 选模式
-  → Normal 则 Planner 选 task，否则取中断 task → Executor tick 成按键 → 输出 trace
+World 快照 → 认领对账 → 更新 P1Model → 卡住观测
+  → Planner 选 task（火情走 L_FIRE 顶层）→ Executor tick 成按键 → 输出 trace
 ```
 
-- **Arbiter**（`arbiter.py`）：每拍先跑，只决定「谁拿控制权」，不执行动作。返回 `(mode, reason)`。优先级：卡住守卫 → 中断 task 连续失败降级 → Firefighting（灶着火且 P1 未在处理）→ Normal。Arbiter 只读黑板，模式写入由调用方（Agent）负责。**卡住守卫（同一格连续 N 拍）目前只记 `stuck detected` 日志、不触发脱困动作**——实际脱困靠两层：`HoldUntil` 的位置自愈 + Agent 连续失败计数写 `scratch.abandoned`。
+- **Arbiter**（`arbiter.py`）：只保留卡住检测 `_is_stuck`（维护 `bb.scratch.same_count` 供 trace 观测），不再决定模式。火情由 Planner 的 `L_FIRE` 层（`Extinguish` 候选）统一处理：候选生成门 `_fire_needs_ai`（有 onFire 灶 + 灭火器可得 + P1 未在处理），`Extinguish.NO_ABANDON` 让它免疫拉黑，承诺惯性里显式放行火情抢占。实际脱困靠 `HoldUntil` 位置自愈 + Agent 连续失败计数写 `scratch.abandoned` + 执行层 `motion.stalled`。
 - **Planner**（`planner.py`）：纯函数步进器。`select_task(world, bb, order, book)` 走：
   生成候选（枚举所有订单，Plan 4 多订单模式）→ 可行性过滤（`claims_available` 前置 +
   `_is_abandoned` 拉黑检查 + 各 task 的 `feasible()`）→ **分层过滤（取最高层，见

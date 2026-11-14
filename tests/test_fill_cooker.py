@@ -170,3 +170,25 @@ def test_fetch_to_cooker_pickup_locks_segment_and_waits():
     pickup = fill.children[0].children[2]
     assert isinstance(pickup, PR.InteractWith)
     assert pickup._wait is not None, "传送带取料必须带等料谓词（拦截等料）"
+
+
+def test_recover_places_loose_pot_on_nearest_empty_cooker(monkeypatch):
+    """散锅回收的放置落点是动态空灶（find_empty_cooker），不是写死的绑定灶。
+
+    清手阶段可能已把另一口锅归位到绑定灶（trace-20261115-005140 t=2845：锅B
+    被归位到 1 号灶），再往绑定灶放散锅会 no effect 卡死。锅灶可互换，
+    放哪口空灶都一样。
+    """
+    from ai.exec.bt import Sequence
+    from ai.query import placement as PL
+
+    t = T.FetchToCooker("o1", ("c1", ("SushiRice",), "pot1"), "BoiledSushiRice")
+    recover = t.build().child.children[1]
+    assert isinstance(recover, Sequence)
+    _pickup, place = recover.children
+    assert isinstance(place, PR.InteractWith)
+    assert place.kind == "placement"
+
+    sentinel = {"t": "cooking", "n": "empty_cooker"}
+    monkeypatch.setattr(PL, "find_empty_cooker", lambda w, f: sentinel)
+    assert place.target({"w": object(), "field": {}}) is sentinel

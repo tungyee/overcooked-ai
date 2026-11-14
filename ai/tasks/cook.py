@@ -10,6 +10,7 @@ from ai.revenue import cook_supply as CS
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
+from ai.query import placement
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.query.plate_tokens import parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
@@ -192,17 +193,21 @@ class FetchToCooker(Task):
         def holding_pot(c):
             return bool(lp) and P.held_matches(c["chef"], lp)
 
-        def pot_placed(c):
-            cc = cooker_state(c, cooker_id)
-            return cc is not None and P.cooker_has_pot(cc)
+        # 散锅放到**最近的空灶**（动态落点），而不是写死的绑定灶。清手阶段
+        # 可能已经把另一口锅归位到绑定灶（trace-20261115-005140 t=2845：锅B
+        # 被归位到 1 号灶），再往绑定灶放锅A 会 no effect 卡死。锅灶可互换，
+        # 放哪口空灶都一样；放置成功判「散锅离手」即可。
+        def pot_released(c):
+            return not holding_pot(c)
+
+        def empty_cooker(c):
+            return placement.find_empty_cooker(c["w"], c["field"])
 
         recover = None
         if lp:
             recover = Sequence([
                 PR.InteractWith(pot_target, "pickup", holding_pot, face=False),
-                PR.InteractWith(
-                    lambda c: cooker_station(c, cooker_id), "placement",
-                    pot_placed),
+                PR.InteractWith(empty_cooker, "placement", pot_released),
             ])
 
         timeout = FETCH_TO_COOKER_TIMEOUT_TICKS * max(len(raws), 1)

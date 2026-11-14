@@ -25,7 +25,7 @@ from ai.dialog.division import (DIVISION_ACTIONS, TOOL_ACTION_NAMES,
                                 TOOL_OWNER_NAMES, diff_entries,
                                 resolve_material, station_signature,
                                 tool_actions, validate_entry)
-from ai.dialog.help import cost_to
+from ai.dialog.help import cost_to, reachable_actions
 from ai.dialog.policy import EventQueue
 from ai.dialog.schema import DialogState
 from ai.revenue import eta as ETA
@@ -383,32 +383,6 @@ DIVISION_REVIEW_COOLDOWN_TICKS = 20 * 8
 ZONE_REVIEW_COOLDOWN_TICKS = 20 * 3
 # 换边目标的兜底寿命（拍）：实测连通窗口最长 3.4 秒，留一倍余量。
 REPOSITION_TICKS = 20 * 7
-
-
-def _min_interact_cost(world, bb, name, stations):
-    # type: (World, Blackboard, str, list) -> Optional[int]
-    """厨师到一类站点的最短交互步数；全够不着返回 None。"""
-    costs = [cost_to(world, bb, name, st) for st in stations]
-    costs = [c for c in costs if c is not None]
-    return min(costs) if costs else None
-
-
-def _reachable_actions(world, bb, name=P.P2_NAME):
-    # type: (World, Blackboard, str) -> List[str]
-    """某位厨师够得着的动作（不看分工；送餐、洗盘也在内）。
-
-    只判「站点在本关存在且够得着」，不判此刻有没有活可干——
-    有没有脏盘、有没有装好的盘，由 get_world_state 和 execute_actions 返回。
-    """
-    out = []
-    for action, station_type in ACTION_STATION_TYPES.items():
-        stations = [st for st in world.stations if st.get("t") == station_type]
-        if not stations:
-            continue
-        if _min_interact_cost(world, bb, name, stations) is None:
-            continue
-        out.append(action)
-    return out
 
 
 def _option_text(task):
@@ -1089,19 +1063,20 @@ class Agent:
 
     def _division_map(self, world):
         # type: (World) -> str
-        """开局分工事件里的地图：站点 + 出生点（1=玩家、2=你）。
+        """开局分工事件里的空间摘要：站点在哪侧 + 你和玩家出生在哪侧。
 
-        给模型空间事实，而不是替它下「谁该守哪半边」的结论。渲染失败或
-        无站点时返回空串，分工事件仍照常发。
+        用自然语言（render_spawn_summary）而不是 ASCII 网格——实测模型对
+        自然语言的空间事实能正确映射到人，对 ASCII 网格 parse 不动。
+        渲染失败或无站点时返回空串，分工事件仍照常发。
         """
         try:
             from ai.output import map_render
-            text = map_render.render_map(world)
+            text = map_render.render_spawn_summary(world)
         except Exception:                     # noqa: BLE001
             return ""
         if not text:
             return ""
-        return "【本关地图】\n" + text
+        return "【本关地图】" + text
 
     def _station_change_text(self, old_sig, new_sig):
         # type: (Any, Any) -> str
@@ -1344,6 +1319,9 @@ class Agent:
             text = map_render.render_map(world)
             if not text:
                 return
+            summary = map_render.render_spawn_summary(world)
+            p2_actions = reachable_actions(world, self.bb)
+            p1_actions = reachable_actions(world, self.bb, P.P1_NAME)
             label = getattr(world, "level_number", None) or level
             safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
                            for ch in str(label))
@@ -1351,6 +1329,10 @@ class Agent:
             os.makedirs(map_dir, exist_ok=True)
             path = os.path.join(map_dir, "map-%s.txt" % safe)
             with open(path, "w", encoding="utf-8") as fh:
+                if summary:
+                    fh.write(summary + "\n")
+                fh.write("你能做的动作：%s\n" % "、".join(p2_actions))
+                fh.write("玩家能做的动作：%s\n\n" % "、".join(p1_actions))
                 fh.write(text + "\n")
             print("[MAP] 已绘制 %s 地图 -> %s" % (label, path), file=sys.stderr)
         except Exception:                     # noqa: BLE001
@@ -1648,8 +1630,8 @@ class Agent:
                       if scope_matches_task(current_command.scope, task)]
         options = [_option_text(task) for task in ranked[:6]]
 
-        p2_reachable = _reachable_actions(world, self.bb)
-        p1_reachable = _reachable_actions(world, self.bb, P.P1_NAME)
+        p2_reachable = reachable_actions(world, self.bb)
+        p1_reachable = reachable_actions(world, self.bb, P.P1_NAME)
         tools = tool_schemas(
             self._division_tool_actions(world),
             with_cookbook=self._guide is not None)

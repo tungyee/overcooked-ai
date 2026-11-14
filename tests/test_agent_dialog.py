@@ -636,20 +636,20 @@ def _with_stations(w, *stations):
 
 def test_reachable_actions_include_deliver_and_wash(monkeypatch):
     """够得着的动作不看分工：送餐、洗盘只要站点可达就列出。"""
-    import ai.agent as A
+    import ai.dialog.help as help_mod
     w = _with_stations(
         make_world(),
         {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
         {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
     )
-    monkeypatch.setattr(A, "cost_to", lambda *a, **k: 3)
+    monkeypatch.setattr(help_mod, "cost_to", lambda *a, **k: 3)
 
-    assert A._reachable_actions(w, None) == ["切", "下锅", "装盘", "送餐", "洗盘"]
+    assert help_mod.reachable_actions(w, None) == ["切", "下锅", "装盘", "送餐", "洗盘"]
 
 
 def test_reachable_actions_skip_unreachable_station(monkeypatch):
     """站点够不着就不列；其余动作不受影响。"""
-    import ai.agent as A
+    import ai.dialog.help as help_mod
     w = _with_stations(
         make_world(),
         {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
@@ -658,8 +658,8 @@ def test_reachable_actions_skip_unreachable_station(monkeypatch):
     def fake_cost(world, bb, name, source):
         return None if source.get("t") == "plate_station" else 3
 
-    monkeypatch.setattr(A, "cost_to", fake_cost)
-    labels = A._reachable_actions(w, None)
+    monkeypatch.setattr(help_mod, "cost_to", fake_cost)
+    labels = help_mod.reachable_actions(w, None)
 
     assert "送餐" not in labels
     assert "洗盘" in labels

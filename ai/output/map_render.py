@@ -393,3 +393,158 @@ def render_layout(world):
         for ing, cells in sorted(crates.items()):
             lines.append("%s料箱 %s：%s" % (prefix, ing, side(cells)))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 自然语言摘要
+
+_TYPE_CN = {
+    "chopping": "砧板", "cooking": "灶", "washing": "洗碗池",
+    "plate_station": "出餐口", "plate_return": "盘回收",
+    "drying": "晾干架", "bin": "垃圾桶", "crate": "料箱", "counter": "柜台",
+    "mixing": "搅拌站",
+}
+
+
+_GRID_LABELS = {
+    "GridManager": "厨房",
+    "Raft_Top": "木筏",
+    "Balloon Basket": "气球篮",
+    "RightBasket": "右篮",
+    "FoodBasket": "食物篮",
+    "LeftBasket": "左篮",
+    "Server_Balloon": "气球篮",
+    "Counters": "中间台",
+}
+
+
+def render_spawn_summary(world):
+    # type: (object) -> str
+    """自然语言空间摘要，给 LLM 做分工用。
+
+    多网格关（木筏/篮子等移动网格上有分工站点，如 2-1/2-3/1-5）按
+    「谁出生在哪块 + 每块有哪些站点」描述；单网格关按「站点在哪侧 + 谁
+    出生在哪侧」描述（左/右按主网格站点 gx 的最大空隙切）。
+    """
+    main = _majority_grid(world)
+    split_types = ("chopping", "cooking", "washing", "mixing")
+
+    grid_types = {}   # type: Dict[str, Set[str]]
+    by_type = {}      # type: Dict[str, List[Tuple[int, int]]]
+    for st in getattr(world, "stations", None) or ():
+        if not isinstance(st, dict):
+            continue
+        t = str(st.get("t") or "")
+        if t not in split_types:
+            continue
+        g = _station_grid(world, st, main)
+        grid_types.setdefault(g, set()).add(t)
+        if g == main:
+            cell = _station_cell_local(world, main, st)
+            if cell is not None:
+                by_type.setdefault(t, []).append(cell)
+
+    chef_grids = {}   # type: Dict[str, str]
+    for ch in getattr(world, "chefs", None) or ():
+        if isinstance(ch, dict) and ch.get("name"):
+            chef_grids[str(ch.get("name"))] = _chef_grid(world, ch)
+    g_you = chef_grids.get(P2_NAME)
+    g_player = chef_grids.get(P1_NAME)
+    split_chefs = (g_you and g_player and g_you != g_player
+                   and grid_types.get(g_you) and grid_types.get(g_player))
+    # 主网格没有任何分工站点（都在木筏/篮子上），也走多网格描述。
+    no_main_stations = not by_type and any(grid_types.values())
+    if split_chefs or no_main_stations:
+        return _multi_grid_summary(grid_types, chef_grids)
+    return _single_grid_summary(world, by_type)
+
+
+def _multi_grid_summary(grid_types, chef_grids):
+    # type: (Dict[str, Set[str]], Dict[str, str]) -> str
+    """多网格：谁出生在哪块 + 每块有哪些分工站点。"""
+    parts = []   # type: List[str]
+    for label, want in (("你", P2_NAME), ("玩家", P1_NAME)):
+        g = chef_grids.get(want)
+        if g is None:
+            continue
+        parts.append("%s出生在%s" % (label, _GRID_LABELS.get(g, g)))
+    for g, types in sorted(grid_types.items()):
+        if not types:
+            continue
+        cn = "、".join(_TYPE_CN.get(t, t) for t in sorted(types))
+        parts.append("%s在%s" % (cn, _GRID_LABELS.get(g, g)))
+    return "；".join(parts) + "。" if parts else ""
+
+
+def _single_grid_summary(world, by_type):
+    # type: (object, Dict[str, List[Tuple[int, int]]]) -> str
+    """单网格：站点在哪侧 + 你和玩家出生在哪侧。"""
+    if not by_type:
+        return ""
+    all_cells = [c for v in by_type.values() for c in v]
+    gxs = sorted({c[0] for c in all_cells})
+    gap_lo, gap_hi, best = gxs[0], gxs[-1], -1
+    for i in range(len(gxs) - 1):
+        gap = gxs[i + 1] - gxs[i]
+        if gap > best:
+            best, gap_lo, gap_hi = gap, gxs[i], gxs[i + 1]
+    center = (gap_lo + gap_hi) / 2.0
+    half = max(1.0, (gap_hi - gap_lo) * 0.25)
+
+    def side(gx):
+        # type: (int) -> str
+        if gx < center - half:
+            return "左"
+        if gx > center + half:
+            return "右"
+        return "中"
+
+    station_parts = []   # type: List[str]
+    for t in ("chopping", "cooking", "washing", "mixing"):
+        cells = by_type.get(t)
+        if not cells:
+            continue
+        sides = {side(c[0]) for c in cells}
+        if sides == {"左", "右"}:
+            station_parts.append("%s两侧都有" % _TYPE_CN.get(t, t))
+        elif sides == {"左"}:
+            station_parts.append("%s在左侧" % _TYPE_CN.get(t, t))
+        elif sides == {"右"}:
+            station_parts.append("%s在右侧" % _TYPE_CN.get(t, t))
+        else:
+            station_parts.append("%s在中间" % _TYPE_CN.get(t, t))
+
+    # 出餐口：只报告，不参与切分。
+    main = _majority_grid(world)
+    plate_cells = []   # type: List[Tuple[int, int]]
+    for st in getattr(world, "stations", None) or ():
+        if isinstance(st, dict) and st.get("t") == "plate_station" \
+                and _station_grid(world, st, main) == main:
+            cell = _station_cell_local(world, main, st)
+            if cell is not None:
+                plate_cells.append(cell)
+    if plate_cells:
+        sides = {side(c[0]) for c in plate_cells}
+        s = ("两侧都有" if sides == {"左", "右"} else
+             "左侧" if sides == {"左"} else "右侧" if sides == {"右"} else "中间")
+        station_parts.append("出餐口在%s" % s)
+
+    chef_parts = []   # type: List[str]
+    for ch in getattr(world, "chefs", None) or ():
+        if not isinstance(ch, dict):
+            continue
+        name = str(ch.get("name") or "")
+        label = "你" if name == P2_NAME else ("玩家" if name == P1_NAME else None)
+        if label is None:
+            continue
+        x, z = ch.get("x"), ch.get("z")
+        if x is None or z is None:
+            continue
+        try:
+            cell = world.to_grid(x, z)
+        except Exception:                 # noqa: BLE001
+            continue
+        s = side(cell[0])
+        chef_parts.append("%s出生在%s" % (
+            label, "中间" if s == "中" else s + "侧"))
+
+    return "；".join(chef_parts + station_parts) + "。"

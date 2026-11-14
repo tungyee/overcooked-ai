@@ -9,7 +9,8 @@
 订单：{{ orders|length }} 个{{ '\n' }}
 你：{% if you.doing %}正在{{ you.doing }}{% else %}暂时没事做{% endif %}{{ '\n' }}
 {% if you.stuck %}你卡住的原因：{{ you.stuck }}{{ '\n' }}{% endif %}
-{% if reachable.you %}你能做的动作（单网格估计，可能漏掉移动平台/镜子；实际以 execute_actions 返回为准）：{{ reachable.you|join('、') }}{{ '\n' }}{% endif %}
+{% if reachable.you %}你能做的动作：{{ reachable.you|join('、') }}{{ '\n' }}{% endif %}
+{% if reachable.teammate %}玩家能做的动作：{{ reachable.teammate|join('、') }}{{ '\n' }}{% endif %}
 {% if division %}当前分工：{{ division }}{{ '\n' }}{% endif %}
 你的当前命令：{{ '\n' }}
 {% if command %}- {{ command.label }}{% if command.target %} {{ command.target }}{% endif %}（{{ command.status }}{% if command.wait_reason %}：{{ command.wait_reason }}{% endif %}）{{ '\n' }}

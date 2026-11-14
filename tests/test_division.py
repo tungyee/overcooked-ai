@@ -130,7 +130,6 @@ def test_validate_entry_rejects_unknown_action_and_owner():
 
 
 def test_validate_entry_rejects_non_choppable_item(monkeypatch):
-    monkeypatch.setattr(D, "_reachable", lambda *a, **k: True)
     world = SimpleNamespace(stations=[{"t": "chopping"}])
     kitchen = SimpleNamespace(materials={"Bun": SimpleNamespace(items={"Bun"})})
 
@@ -145,7 +144,8 @@ def test_validate_entry_rejects_non_choppable_item(monkeypatch):
 
 
 def test_validate_entry_warns_when_temporarily_unreachable(monkeypatch):
-    monkeypatch.setattr(D, "_reachable", lambda *a, **k: False)
+    import ai.dialog.help as help_mod
+    monkeypatch.setattr(help_mod, "reachable_actions", lambda *a, **k: [])
     world = SimpleNamespace(stations=[{"t": "cooking"}])
     ok, reason, warning = D.validate_entry(world, None, None, None,
                                            "cook", "you")
@@ -204,7 +204,8 @@ def test_validate_entry_knows_crates_outside_current_orders(monkeypatch):
     voice-20261110-221304：ChickenOnly + Salad 开局，模型写 Potato/Chicken，
     校验只看当前订单 DAG，把土豆也报成「本关没有物料」。
     """
-    monkeypatch.setattr(D, "_reachable", lambda *a, **k: True)
+    import ai.dialog.help as help_mod
+    monkeypatch.setattr(help_mod, "reachable_actions", lambda *a, **k: ["切"])
     world = SimpleNamespace(stations=[
         {"t": "chopping"},
         {"t": "crate", "ing": "Potato"},

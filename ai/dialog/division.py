@@ -249,22 +249,6 @@ def reach_signature(world, bb):
     return tuple(sorted(out))
 
 
-def _reachable(world, bb, owner, action):
-    # type: (Any, Any, str, str) -> bool
-    from ai.dialog.help import cost_to
-
-    station_type = ACTION_STATION_TYPES[action]
-    stations = [s for s in (getattr(world, "stations", None) or ())
-                if isinstance(s, dict) and s.get("t") == station_type]
-    if not stations:
-        return False
-    names = [P.P2_NAME] if owner == OWNER_YOU else [P.P1_NAME]
-    if owner == OWNER_BOTH:
-        names = [P.P1_NAME, P.P2_NAME]
-    return any(cost_to(world, bb, name, s) is not None
-               for name in names for s in stations)
-
-
 def _known_materials(kitchen, world=None):
     # type: (Any, Any) -> Dict[str, str]
     """本关可认领的物料名：{小写: 原始写法}。
@@ -358,7 +342,11 @@ def validate_entry(world, bb, kitchen, book, action_tool, owner_tool,
             if not needed:
                 return False, "%s 不需要下锅" % (item,), ""
 
-    if not _reachable(world, bb, owner, action):
+    from ai.dialog.help import reachable_actions
+    names = ([P.P2_NAME] if owner == OWNER_YOU else
+             [P.P1_NAME] if owner == OWNER_PLAYER else
+             [P.P1_NAME, P.P2_NAME])
+    if not any(action in reachable_actions(world, bb, n) for n in names):
         who = {"P2": "你", "P1": "玩家", "BOTH": "两人"}.get(owner, owner)
         return True, "", "%s现在够不着%s的站点（可能只是暂时挡路）" % (
             who, action)

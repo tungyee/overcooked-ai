@@ -325,14 +325,13 @@ def test_assistant_and_tool_messages_round_trip():
 
 
 def test_render_state_includes_reachable_division():
-    """世界状态里要有「你能做的动作」，防止 LLM 抢够不着的活。"""
+    """世界状态里要有「你能做的动作」和「玩家能做的动作」。"""
     text = render_state({
         "reachable_actions": {"p2_actions": ["切"],
                               "p1_actions": ["下锅", "装盘", "送餐"]},
     })
-    assert "你能做的动作（单网格估计" in text and "：切" in text
-    # 队友能做什么同样是快照，容易被滞后信息误导，不再进 state。
-    assert "队友能做的动作" not in text
+    assert "你能做的动作：切" in text
+    assert "玩家能做的动作：下锅、装盘、送餐" in text
 
 
 def test_render_state_prefers_reachable_actions_over_division():
@@ -341,7 +340,8 @@ def test_render_state_prefers_reachable_actions_over_division():
         "p2_reachable_actions": ["切", "装盘", "送餐", "洗盘"],
         "reachable_actions": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
     })
-    assert "你能做的动作（单网格估计" in text and "切、装盘、送餐、洗盘" in text
+    assert "你能做的动作：" in text and "切、装盘、送餐、洗盘" in text
+    assert "玩家能做的动作：" in text
 
 
 def test_render_state_does_not_fall_back_when_reachable_is_empty():
@@ -387,7 +387,7 @@ def test_system_prompt_lists_division_tools_when_available():
     text = system_message("", guide="本关攻略", division=True,
                           cookbook=True)["content"]
     # 工具签名已移到 tools schema（见 test_agent_dialog / test_dialog_worker）
-    assert "按攻略里「玩家 / 你」的对应关系" in text
+    assert "先看【本关地图】" in text
     assert "送餐和洗盘不在分工里" in text
 
 

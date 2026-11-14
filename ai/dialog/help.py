@@ -8,6 +8,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from ai.dialog.action_defs import ACTION_STATION_TYPES
 from ai.dialog.schema import RESCUE_TYPES
 from ai.query import predicates as P
 from ai.query import recipe_graph
@@ -34,6 +35,24 @@ def cost_to(world, bb, name, source):
         return 0
     vals = [field[g] for g in goals if g in field]
     return min(vals) if vals else None
+
+
+def reachable_actions(world, bb, name=P.P2_NAME):
+    # type: (Any, Any, str) -> List[str]
+    """`name`（"Player 1"/"Player 2"）厨师够得着的动作名，按动作枚举顺序。
+
+    只判「本关存在该动作的站点、且至少一个站点够得着」，不判此刻有没有活
+    可干。分工校验（validate_entry）与 LLM 展示共用本函数，口径一致。
+    """
+    out = []  # type: List[str]
+    for action, station_type in ACTION_STATION_TYPES.items():
+        stations = [s for s in (getattr(world, "stations", None) or ())
+                    if isinstance(s, dict) and s.get("t") == station_type]
+        if not stations:
+            continue
+        if any(cost_to(world, bb, name, s) is not None for s in stations):
+            out.append(action)
+    return out
 
 
 def p1_saves_enough(p1_cost, p2_cost):

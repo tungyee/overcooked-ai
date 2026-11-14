@@ -19,11 +19,12 @@ from ai.state.world import World
 
 # ---------------------------------------------------------------- fixtures
 
-def make_world(level="Sushi_1_4_2P", orders=None, chefs=None,
-               session_id=None, scene_epoch=None):
+def make_world(level="Sushi_1_4_2P", level_number=None, orders=None,
+               chefs=None, session_id=None, scene_epoch=None):
     return World({
         "phase": "level",
         "level": level,
+        "level_number": level_number,
         "session_id": session_id,
         "scene_epoch": scene_epoch,
         "orders": orders if orders is not None else [
@@ -202,13 +203,24 @@ def test_service_dialog_prunes_abandoned_orders(dagent, world):
 
 def test_level_start_is_logged_on_first_observation_and_change(
         dagent, fake_worker):
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P"))
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P"))
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P"))
+    # 主线记 UI 编号；同一关不重复记，换关记一次。
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P", "1-4"))
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P", "1-4"))
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P", "1-5"))
 
     assert fake_worker.level_events == [
-        ("level_start", "Sushi_1_4_2P"),
-        ("level_start", "Sushi_1_5_2P"),
+        ("level_start", "1-4"),
+        ("level_start", "1-5"),
+    ]
+
+
+def test_level_start_falls_back_to_internal_name_without_number(
+        dagent, fake_worker):
+    # DLC / Kevin / 教学关没有 level_number，回退内部关卡名。
+    dagent._maybe_reset_dialog_level(make_world("Mine_5_3_2P"))
+
+    assert fake_worker.level_events == [
+        ("level_start", "Mine_5_3_2P"),
     ]
 
 

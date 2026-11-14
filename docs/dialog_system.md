@@ -180,7 +180,7 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 | `worker_dead` | `stage`、`event`（worker 线程已退出；看前面的 `worker_error`） |
 | `ptt` / `ptt_cb` | `event`（down/up）、`vad_paused`、`recording`、`utterance`、`stage`、`active_stream` |
 | `barge_in` | `ptt`、`stage`（PTT 按下打断 TTS 时写） |
-| `level_start` | `level`（Agent 第一次看到关卡 / 换关时写；`since_level_ms` 的分母） |
+| `level_start` | `level`（Agent 第一次看到关卡 / 换关时写；`since_level_ms` 的分母。值为 UI 关卡编号如 `4-4`，DLC/Kevin/教学关无编号时回退内部关卡名） |
 | `asr` | `text`、`tick`、`source`（`ptt` / `vad` / `direct`）、`audio_ms`、`asr_ms`、`end_to_asr_ms` |
 | `llm_reply` | `event`、`stage`（`first` / `final`）、`content`、`tool_calls`、`request_ms`、`first_token_ms`、`elapsed_ms`、`end_to_first_token_ms`、`end_to_done_ms` |
 | `duty_batch` | `event`、`batch_id`、`calls`（工具名 + 参数） |

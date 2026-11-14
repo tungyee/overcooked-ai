@@ -1260,12 +1260,12 @@ class Agent:
             self._dialog_scene_key = key
             self._load_guide(level, level_number)
             self._reset_division_state()
-            self._log_dialog_level_start(level)
+            self._log_dialog_level_start(level, level_number)
             return
         if key == self._dialog_scene_key:
             return
         self._dialog_scene_key = key
-        self._log_dialog_level_start(level)
+        self._log_dialog_level_start(level, level_number)
         self._load_guide(level, level_number)
         self._reset_division_state()
         self.commands.clear()
@@ -1286,14 +1286,18 @@ class Agent:
         if callable(reset):
             reset()
 
-    def _log_dialog_level_start(self, level):
-        # type: (Any) -> None
-        """把关卡开始时间写进对话日志，供 since_level_ms 打点。"""
+    def _log_dialog_level_start(self, level, level_number=None):
+        # type: (Any, Any) -> None
+        """把关卡开始时间写进对话日志，供 since_level_ms 打点。
+
+        打点只记 UI 关卡编号（level_number，如 "4-4"）；DLC / Kevin / 教学关
+        没有编号时才回退到内部关卡名（level，如 "Mine_5_3_2P"）。
+        """
         log_event = getattr(self.dialog_worker, "log_event", None)
         if not callable(log_event):
             return
         try:
-            log_event("level_start", level=level)
+            log_event("level_start", level=level_number or level)
         except Exception:                       # noqa: BLE001
             # 打点失败不能影响主循环。
             log.debug("写 level_start 打点失败", exc_info=True)

@@ -49,8 +49,7 @@ def _resolve_value(v, ctx):
 def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
     # type: (Any, Any, int, Dict, Any, Any) -> None
     """按位置 / 资源避让已证实的无进展；订单切换不能重置同一处故障。"""
-    if failure.get("reason") not in ("no_progress", "observation_timeout", "gate_closed") \
-            or bb.mode != "Normal":
+    if failure.get("reason") not in ("no_progress", "observation_timeout", "gate_closed"):
         return
     scratch = _ensure_stuck_scratch({"bb": bb})
     cell = failure.get("blocked_cell")

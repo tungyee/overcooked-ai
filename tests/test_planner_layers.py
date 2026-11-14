@@ -544,7 +544,7 @@ def test_rescue_layers_ignore_completion_ratio():
 
 
 def test_fire_layer_scores_zero():
-    """L0 不打分（plan_firefighting 只发一个全局候选）。"""
+    """L0 不打分（L_FIRE 层只有一个全局 Extinguish 候选）。"""
     score, kept = PL.filter_terms({"pressure": 2.0, "urgency": 3.0}, PL.L_FIRE)
     assert score == 0.0
     assert kept == {}

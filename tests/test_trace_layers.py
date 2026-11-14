@@ -32,7 +32,7 @@ def test_candidate_carries_layer_and_in_top_layer():
 
 
 def test_six_tuple_still_formats():
-    """plan_firefighting 仍发 6 元组（它不分层，只有一个全局候选）。"""
+    """测试场景仍会造 6 元组，格式化要兼容。"""
     cands = [(_Task("Extinguish"), 0.0, {}, True, "", True)]
     out = trace._format_candidates(cands)
     assert out[0]["layer"] is None

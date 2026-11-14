@@ -270,7 +270,6 @@ def test_gate_closed_result_marks_gate_cell_bad_without_abandoning():
     task = SimpleNamespace(key="k", claims=lambda: [("res", "use")])
     note_motion_failure(bb, task, 10, ctx["motion_failure"], world=w)
     assert (4, 1) in bb.scratch.bad_cells
-    assert not bb.blacklisted_resources
 
 
 # ---------- 门关着时对面那格按开门时的篮子位置算（trace-20261030-125344）----------

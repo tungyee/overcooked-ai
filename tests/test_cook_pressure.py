@@ -33,21 +33,30 @@ def _cooker(name="cooker_01", cooked=None, is_cooking=None, burning=None,
 
 # ---------- 火情不受 L3 拉黑（spec §7.2 的例外）----------
 
-def test_plan_firefighting_ignores_abandon_blacklist():
+def test_fire_ignores_abandon_blacklist():
     """着火的那口灶被别的 task 拉黑了，也照样要去灭。
 
     拉黑是按资源 id 记的：Normal 里 ReturnPot / RescueCooked 在同一口灶上
     反复失败，会把**着火的那口灶**写进 scratch.abandoned。火不能因此没人
-    管——plan_firefighting 忽略这条否决。
+    管——Extinguish.NO_ABANDON 让它在正常可行性过滤里也免疫拉黑。
     """
     stations = [{"t": "cooking", "n": "cooker_01", "gx": 1, "gz": 1}]
-    w = _world(cookers=[_cooker(burning=True)], stations=stations)
+    w = World({
+        "orders": [], "stations": stations, "recipes": [],
+        "chefs": [{"name": "Player 2", "x": 5.0, "z": 5.0, "held": None},
+                  {"name": "Player 1", "x": 9.0, "z": 9.0, "held": None}],
+        "plates": [], "workstations": [],
+        "cookers": [_cooker(burning=True)],
+        "items": [],
+        "extinguishers": [{"n": "ext", "x": 3.0, "z": 3.0}],
+        "grid": {"nodeMap": None},
+    })
     bb = Blackboard()
     bb.scratch = StuckScratch()
     bb.scratch.abandoned["cooker_01"] = bb.tick + 200
     book = RecipeBook([], stations)
 
-    chosen, record = planner.plan_firefighting(w, bb, book)
+    chosen, record = planner.plan(w, bb, None, book)
 
     assert chosen is not None, "火不能被拉黑挡住"
     assert chosen.TYPE == "Extinguish"

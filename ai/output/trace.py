@@ -251,7 +251,7 @@ def _format_candidates(candidates):
     for cand in candidates:
         layer, in_top_layer = None, False
         # 解构候选元组。分层后尾部多两项（spec §6）；旧的 6 元组与 3 元组
-        # 仍要能格式化——测试与 plan_firefighting 都还在用短元组。
+        # 仍要能格式化——测试场景会造短元组，这里兼容保留。
         if len(cand) >= 8:
             task, score, terms, ok, veto, chosen, layer, in_top_layer = cand[:8]
         elif len(cand) >= 6:

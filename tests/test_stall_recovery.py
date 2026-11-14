@@ -2,11 +2,10 @@
 from unittest.mock import patch
 
 from ai import tasks as T
-from ai.core import planner, arbiter
+from ai.core import planner
 from ai.state.blackboard import StuckScratch
 from ai.state.world import World
 from tests.test_agent_lifecycle import _agent, _snapshot
-from tests.test_arbiter import _make_world, _make_bb, _make_chef, _make_cooker, _make_extinguisher
 
 
 def test_alternating_failures_eventually_back_off_each_operation():
@@ -69,22 +68,6 @@ def test_motion_failure_does_not_blacklist_other_actions_on_same_hob():
     agent._note_motion_failure(fill, {'motion_failure': {'reason': 'no_progress'}})
     assert planner._is_abandoned(fill, agent.bb)
     assert not planner._is_abandoned(restore, agent.bb)
-
-
-def test_stationary_work_does_not_suppress_new_fire():
-    w = _make_world(cookers=[_make_cooker('hob', on_fire=True)],
-        extinguishers=[_make_extinguisher('ext')],
-        chefs=[_make_chef('Player 2', 3, 3), _make_chef('Player 1', 10, 10)])
-    bb = _make_bb(scratch=StuckScratch(last_cell=w.to_grid(3, 3), same_count=10))
-    assert arbiter.select_mode(w, bb)[0] == 'Firefighting'
-
-
-def test_stationary_firefighter_exits_when_fire_is_gone():
-    w = _make_world(cookers=[_make_cooker('hob', on_fire=False)],
-                   chefs=[_make_chef('Player 2', 3, 3)])
-    bb = _make_bb(mode='Firefighting',
-                 scratch=StuckScratch(last_cell=w.to_grid(3, 3), same_count=10))
-    assert arbiter.select_mode(w, bb)[0] == 'Normal'
 
 
 def test_new_level_discards_old_resource_cooldowns_and_orders():

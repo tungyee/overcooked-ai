@@ -10,7 +10,7 @@
 熟饭——而取熟饭恰恰是最有价值的接力。
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ai.dialog.division import DivisionState
 from ai.dialog.schema import DialogState, Preference
@@ -45,8 +45,6 @@ class Commitment:
     steps_done: int = 0
     infeasible_streak: int = 0
     retries: int = 0
-    interrupt_failure_count: int = 0  # 中断 task 连续失败计数（Arbiter 用）
-    target_resource_id: Any = None    # 当前目标资源 ID（用于失败降级拉黑）
 
 
 @dataclass
@@ -88,14 +86,6 @@ class StuckScratch:
 
 
 @dataclass
-class FireScratch:
-    """灭火模式局部状态。模式进入时构造、退出即丢弃。"""
-    ext_target: Any = None
-    bad_ext: Set[Any] = field(default_factory=set)
-    tries: int = 0
-
-
-@dataclass
 class Blackboard:
     claims: Dict[Tuple[Any, str], Claim] = field(default_factory=dict)
     waiters: Dict[Any, List[Tuple[Any, int]]] = field(default_factory=dict)
@@ -103,11 +93,9 @@ class Blackboard:
     p1_model: P1Model = field(default_factory=P1Model)
     scratch: Any = None
     tick: int = 0
-    mode: str = "Normal"  # 当前模式（Arbiter 写入）
     # 移动平台（气球篮）是否正在移动。Agent 每拍更新，planner 可行性过滤
     # 读它：篮子动时「目标在篮子上的 task」判不可行，避免选到必失败的候选。
     balloon_moving: bool = False
-    blacklisted_resources: Dict[Any, int] = field(default_factory=dict)  # 拉黑资源 → 失效拍号
     # 投锅冷却：灶资源 id → 失效拍号。ThrowOntoStation 投偏/没对准后写，期间
     # 这口灶只走过去放、不再投。不进 scratch：scratch 随模式整体替换会丢。
     pot_throw_cooldown: Dict[Any, int] = field(default_factory=dict)

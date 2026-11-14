@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""火情候选进 planner 正常路径（移除 Firefighting 模式前的回归钉）。
+"""火情候选进 planner 正常路径（L_FIRE 顶层）的回归钉。
 
 覆盖：
   1. 着火 → plan() 选 Extinguish（L_FIRE=0 顶层）。

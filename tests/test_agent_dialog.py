@@ -365,9 +365,7 @@ def test_context_p2_options_come_from_planner_ranking(dagent, world):
         (t1, 5.0, {}, True, "", True, 6, True),
         (T.Chop(1, ("board_01",), "Cucumber"), None, {}, False, "x", False, 6, False),
     ]}
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit"):
         dagent._tick_once(world)
 
@@ -383,9 +381,7 @@ def test_tick_once_includes_dialog_record(dagent, world):
         {"action": "chop", "owner": "player"}]})))
 
     from unittest.mock import patch
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan",
+    with patch("ai.agent.planner.plan",
                return_value=(None, {"candidates": []})), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
@@ -491,9 +487,7 @@ def test_tick_once_forwards_branches_and_rescue_override(dagent, world):
         "branches": {"key-1": "Cucumber"},
         "rescue_override": "order-1",
     }
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
 
@@ -537,8 +531,7 @@ def test_tick_once_emits_stuck_event(dagent, world):
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 2)
     dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=n)
 
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "stuck detected")), \
+    with patch("ai.agent.arbiter._is_stuck", return_value=False), \
          patch("ai.agent.planner.plan",
                return_value=(None, {"candidates": []})), \
          patch("ai.agent.trace.emit") as emit:
@@ -557,9 +550,7 @@ def test_tick_once_emits_stuck_event(dagent, world):
 def test_tick_once_forwards_imperative(dagent, world):
     from unittest.mock import patch
     plan_record = {"candidates": [], "imperative": "WashPlate"}
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
 

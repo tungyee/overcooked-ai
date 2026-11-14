@@ -77,40 +77,14 @@ def test_reconcile_claims_called(agent, mock_state_client):
         assert mock_reconcile.called
 
 
-def test_mode_transition_halts_executor(agent, mock_state_client):
-    """步骤 ⑦ 模式变化时 halt 并丢弃树。"""
-    agent.bb.mode = "Normal"
-
-    # Mock arbiter 返回新模式
-    with patch("ai.core.arbiter.select_mode") as mock_select:
-        mock_select.return_value = ("Firefighting", "fire detected")
-
-        # Mock executor
-        agent.executor_inst = MagicMock()
-
-        snapshot = mock_state_client.receive.return_value
-        agent._tick_once(World(snapshot))
-
-        # 验证 halt_and_discard 被调用。模式切换（⑦）会 halt 一次；
-        # Firefighting 下 chosen_task 为 None，⑫ 也会再 halt 一次（幂等）。
-        agent.executor_inst.halt_and_discard.assert_called()
-
-        # 验证模式更新
-        assert agent.bb.mode == "Firefighting"
-
-
 def test_no_task_halts_executor(agent, mock_state_client):
     """步骤 ⑫ 无任务可选时也要 halt 旧树松键。
 
     实机复现：RecoverLoosePot 因锅被 P1 端走变不可行，planner 选不到任务，
     但上一次 Approach 的移动键还按着，角色一直按 right 顶墙。
     """
-    agent.bb.mode = "Normal"
-
-    with patch("ai.core.arbiter.select_mode") as mock_mode, \
-         patch("ai.core.planner.select_task") as mock_plan:
-        mock_mode.return_value = ("Normal", "default")
-        mock_plan.return_value = None  # 无可行任务
+    with patch("ai.core.planner.plan") as mock_plan:
+        mock_plan.return_value = (None, {"candidates": []})  # 无可行任务
 
         agent.executor_inst = MagicMock()
 
@@ -122,7 +96,6 @@ def test_no_task_halts_executor(agent, mock_state_client):
 
 def test_claims_written_back_to_blackboard(agent, mock_state_client):
     """步骤 ⑨ 写回 claims 到黑板。"""
-    agent.bb.mode = "Normal"
 
     # Mock planner：plan 返回 (task, record)
     with patch("ai.core.planner.plan") as mock_plan:
@@ -148,7 +121,6 @@ def test_claims_written_back_to_blackboard(agent, mock_state_client):
 
 def test_commitment_registered(agent, mock_state_client):
     """步骤 ⑩ 登记 commitment。"""
-    agent.bb.mode = "Normal"
 
     # Mock planner：plan 返回 (task, record)
     with patch("ai.core.planner.plan") as mock_plan:
@@ -175,7 +147,6 @@ def test_commitment_registered(agent, mock_state_client):
 
 def test_task_success_releases_claims(agent, mock_state_client):
     """task SUCCESS → 释放该 task 的认领。"""
-    agent.bb.mode = "Normal"
 
     # 预先设置认领
     agent.bb.claims[("board_01", "chop")] = Claim("P2", "order1", 0)
@@ -257,7 +228,6 @@ def test_done_active_task_settles_instead_of_ticking(agent, mock_state_client):
     """
     from ai.core.executor import Executor
 
-    agent.bb.mode = "Normal"
     agent.executor_inst = Executor()
     fill = _FakeTask("cooker_01")
     other = _FakeTask("cooker_02")
@@ -322,7 +292,6 @@ def test_order_switch_when_current_gone(agent, mock_state_client):
 
 def test_trace_emit_called(agent, mock_state_client):
     """步骤 ⑭ 决策日志被调用。"""
-    agent.bb.mode = "Normal"
 
     with patch("ai.agent.trace") as mock_trace:
         with patch("ai.agent.planner") as mock_planner:

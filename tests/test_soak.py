@@ -259,55 +259,6 @@ def test_soak_multi_order_600ticks(clean_trace):
         _verify_soak_metrics(metrics)
 
 
-def test_soak_with_fire_interrupt(clean_trace):
-    """浸泡测试：灭火事件打断承诺。
-
-    验证：
-      - 灭火时切换到 Firefighting 模式
-      - 承诺被中断（灭火模式抢占）
-      - 火灭后恢复 Normal 模式
-
-    注意：此测试依赖灭火器和灶台的正确配置，可能因模拟状态不完整而失败。
-    """
-    pytest.skip("Firefighting mode detection requires more complex state setup")
-    scenario = {
-        "orders": [
-            {"arrive_tick": 0, "id": "order1", "recipe": "Tomato-Chopped", "comp": ["Tomato-Chopped"], "duration": 300}
-        ],
-        "fire_events": [100],
-        "p1_behavior": {"enabled": False}
-    }
-
-    mock_client = SoakMockStateClient(scenario)
-
-    with patch("ai.agent.StateClient", return_value=mock_client):
-        agent = Agent()
-        agent.client = mock_client
-
-        modes_seen = []
-
-        # 执行 150 拍（覆盖灭火事件）
-        for _ in range(150):
-            try:
-                snapshot = agent.client.read()
-                world = World(snapshot)
-                # Workaround: p1model.update() expects world.tick
-                world.tick = snapshot.get("tick", agent.tick)
-                agent._tick_once(world)
-                modes_seen.append(agent.bb.mode)
-                agent.tick += 1
-            except EOFError:
-                break
-
-        # 验证模式切换
-        assert "Normal" in modes_seen, "应该有 Normal 模式"
-        assert "Firefighting" in modes_seen, "应该切换到 Firefighting 模式"
-
-        # 验证切换到 Firefighting 后又切回 Normal
-        ff_index = modes_seen.index("Firefighting")
-        assert "Normal" in modes_seen[ff_index+1:], "火灭后应切回 Normal"
-
-
 def test_soak_p1_conflict_handling(clean_trace):
     """浸泡测试：P1 冲突处理（waiters 队列）。
 

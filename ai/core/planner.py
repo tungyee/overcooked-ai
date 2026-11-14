@@ -715,8 +715,8 @@ def _head_plate_ready(world, head_order):
     return False
 
 
-def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
-    # type: (Candidate, Dict, Blackboard, bool, Optional[float]) -> Tuple[bool, str]
+def _feasibility_of(cand, ctx, bb, time_left=None):
+    # type: (Candidate, Dict, Blackboard, Optional[float]) -> Tuple[bool, str]
     """判断单个候选是否可行，返回 (ok, 否决原因)。
 
     否决原因供 trace 排查：abandoned（L3 拉黑）/ p2_suppressed（账本 stop：
@@ -725,9 +725,9 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     单 agent（只有 P2 写认领）下不再检查 `claims_available`：所有认领都是
     P2 自己的，`is_claimed_by_other` 恒假，只会让同一 task 隔拍被压掉。
 
-    ignore_abandon=True 给火情用：拉黑是按资源 id 记的，别的 task 在同一
-    口灶上反复失败也会把着火的那口灶写进 scratch.abandoned（比如 Normal
-    模式里 ReturnPot 卡在灶边），但火不能不管。
+    火情不受 L3 拉黑约束：`Extinguish.NO_ABANDON` 让 `_is_abandoned` 直接
+    放行——着火的那口灶被别的 task 反复失败写进 scratch.abandoned 也不能
+    不管。
     """
     task = cand.task
     # 方案 B（篮子移动时否决目标在篮子上的候选 task）已禁用。
@@ -735,7 +735,7 @@ def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
     #     return False, "platform_moving"
     if _is_stopped(task, bb):
         return False, "p2_suppressed"
-    if not ignore_abandon and _is_abandoned(task, bb):
+    if _is_abandoned(task, bb):
         return False, "abandoned"
     if _breaks_combo(task, ctx["w"]):
         return False, "combo_break"
@@ -1526,7 +1526,6 @@ def plan(world, bb, order, book):
     尾部两项由分层添加：layer 是该候选所在层，in_top_layer 标记它是否进了打分
     （spec §6）。`top_layer` 是**实际选中**的层；分工认领只影响该层内评分。
     截止闸打开且抢到的候选还会写 `rescue_override`（订单 id）。
-    plan_firefighting 不分层，仍发 6 元组。
 
     candidates 含**全部**生成候选：被可行性过滤掉的（ok=False）也保留，
     并用 veto 标注被否决原因，方便复盘「为什么没选拿熟饭」。
@@ -1740,63 +1739,6 @@ def plan(world, bb, order, book):
     # 本拍没再选抢回的那个 task（做完 / 不可行 / 被更高层抢走）→ 保护期结束。
     _finalize_rescue_hold(bb, chosen_task)
     return chosen_task, record
-
-
-def plan_firefighting(world, bb, book):
-    # type: (World, Blackboard, RecipeBook) -> Tuple[Optional[Any], Dict]
-    """Firefighting 模式专用规划：生成一个全局 Extinguish 候选。
-
-    返回 (chosen_task, decision_record)，格式与 plan() 一致。
-
-    实机复现：拍 596-727 Firefighting 触发但 P2 完全 idle，原因是 Agent
-    主循环在非 Normal 模式下跳过了 Planner 调用 → candidates=0 → 无任务可选。
-    旧实现按灶逐个生成 Extinguish 候选、每拍选列表里第一个着火的灶，既没有
-    承诺惯性、又会在火复燃时反复换灶（换灶＝重建树＝丢灭火器，实机复现）。
-    现在灭火是一个全局 task：树内部循环处理所有着火灶，这里只发一个候选。
-    """
-    ctx = _make_context(world, bb, book)
-    cands = []  # type: List[Candidate]
-
-    # 有任一着火/烧焦的灶 → 发一个全局 Extinguish（树内部循环处理所有灶）
-    if any(c.get("onFire") or c.get("burning") for c in world.cookers):
-        cands.append(Candidate(T.Extinguish(), [], EST_COOK_OPS))
-
-    if not cands:
-        # 无灶着火（Arbiter 误判 or 火已被 P1 扑灭）→ 返回空
-        return None, {"candidates": []}
-
-    # 可行性过滤
-    feasible_cands = []  # type: List[Candidate]
-    ok_map = {}          # type: Dict[Any, Tuple[bool, str]]
-    for cand in cands:
-        # 火情不受 L3 拉黑约束：着火的那口灶必须一直可攻击（拉黑按资源
-        # id 记，别的 task 在同一口灶上反复失败也会把它写进去）。
-        ok, veto = _feasibility_of(cand, ctx, bb, ignore_abandon=True)
-        ok_map[cand.task.key] = (ok, veto)
-        if ok:
-            feasible_cands.append(cand)
-
-    if not feasible_cands:
-        # 候选不可行（灭火器被 P1 拿走 / 无法到达）
-        record_cands = [(c.task, 0.0, {}, False, ok_map[c.task.key][1], False)
-                        for c in cands]
-        return None, {"candidates": record_cands, "plate_match": {}, "cooker_match": {}}
-
-    chosen = feasible_cands[0].task
-    chosen_key = chosen.key
-
-    # 组装 decision_record（格式同 plan()，方便 trace 记录）
-    record_cands = []
-    for cand in cands:
-        key = cand.task.key
-        ok, veto = ok_map[key]
-        # Firefighting 不打分，统一给 0 分
-        # 火情路径**不分层**（单候选，且 L_FIRE 的白名单为空、分层等于恒等变换），
-        # 所以仍发 6 元组。trace 渲染出的 `chosen=True, in_top_layer=False` 不是
-        # 矛盾：in_top_layer 只对分层路径有意义（spec §6）。
-        record_cands.append((cand.task, 0.0, {}, ok, veto, key == chosen_key))
-
-    return chosen, {"candidates": record_cands, "plate_match": {}, "cooker_match": {}}
 
 
 def _record(candidates, plate_match, cooker_match):

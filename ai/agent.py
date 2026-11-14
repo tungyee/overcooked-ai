@@ -1726,7 +1726,7 @@ class Agent:
                           else "paused" if world.paused
                           else "phase=%s" % world.phase)
                 trace.emit({"mode_reason": reason, "p1": {}, "candidates": []},
-                           self.bb.mode, self.bb.commitment,
+                           "Normal", self.bb.commitment,
                            {"status": "skipped"}, [], self.tick)
             # 结束总结：round_finished 首次成立时发一次，并立刻发布上下文让
             # worker 读到最终战绩。其余等待原因（暂停/失焦等）按 2 Hz 发布
@@ -1779,78 +1779,52 @@ class Agent:
         # ④ P1 推断（Plan 4 Task 2）
         p1model.update(world, self.bb)
 
-        # ⑥ 模式仲裁
-        new_mode, mode_reason = arbiter.select_mode(world, self.bb)
-
-        # ⑦ 模式变化 → halt
-        if new_mode != self.bb.mode:
-            self.executor_inst.halt_and_discard()
-            arbiter.on_mode_transition(self.bb.mode, new_mode, self.bb)
-            self.bb.mode = new_mode
+        # ⑥ 卡住观测：推进 bb.scratch.same_count（供 trace 卡住事实用）
+        arbiter._is_stuck(world, self.bb)
 
         # ⑨ 规划（多订单模式：不再选择单个订单）
         ctx = self._exec_context(world)
         planner_choice = None  # type: Optional[Any]
         settle_active = False  # ⑨.5 接回的旧 task 后置条件已成立：⑫ 直接收尾
-        if new_mode == "Normal":
-            chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
-            if plan_record.get("command_scope_empty"):
-                chosen_task, plan_record = self._scope_empty_fallback(
-                    world, plan_record)
-            # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
-            # 两者永远相等，那条可观测性就是假的。
-            planner_choice = chosen_task
-            # ⑨.5 正在跑的那棵树：如果它的后置条件**已经成立**，这一拍先让
-            # 它把 SUCCESS 报完，别被 planner 抢走。
-            #
-            # 为什么需要：planner 每拍重选，而任务一旦自己做成了，就对自己
-            # 不可行了（倒完米饭 plate_lacks 为假、下完锅 cooker_started 为
-            # 真）→ 换任务 → executor 见身份变化就 halt 掉旧树 → ⑬ 的成功
-            # 记账（释放认领）连带被吞掉。实机后果：倒完米饭那一拍被换成
-            # ReturnPot，认领没释放 → 下一拍又去取熟料。
-            #
-            # 只在 Normal 分支里做：模式切换（火情等）已经 halt_and_discard
-            # 过了，此时 active_task 是 None，不会把任务"复活"。
-            #
-            # 接回来之后**不再 tick 旧树**，直接按成功收尾（⑫ settle_active）：
-            # 后置条件可能是别人替我们达成的，树只认自己的 expect，接着 tick
-            # 会把整段流程重走一遍（trace-20261030-214824 t=1743~1795：P1 先把
-            # 面下进锅，P2 的 FillCooker 已 done，树照样走去面箱又拿一份，52 拍）。
-            active = self.executor_inst.active_task
-            if active is not None and active != chosen_task \
-                    and self._task_done(active, world, ctx):
-                chosen_task = active
-                settle_active = True
-            claims_new = {}
-            if chosen_task and hasattr(chosen_task, "claims"):
-                # 认领绑定到任务的 order_id（而非全局 current_order_id）
-                for res_id, action in chosen_task.claims():
-                    # 记下 item：recipe_graph 的在途烹饪抑制按熟料区分作用域，
-                    # 一单要两份熟料时第一份下锅不该压掉第二份（第 1 组 1.3）。
-                    claims_new[(res_id, action)] = Claim(
-                        "P2", chosen_task.order_id, self.tick,
-                        item=getattr(chosen_task, "item", None))
-        elif new_mode == "Firefighting":
-            # Firefighting 模式：只生成 RescueCooked 候选，优先灭火。
-            # 实机复现 trace-20261009-130459 拍 596-727: Firefighting 触发但
-            # P2 完全 idle (candidates=0)，原因是旧分支直接跳过了 Planner 调用。
-            chosen_task, plan_record = planner.plan_firefighting(world, self.bb, self.book)
-            claims_new = {}
-            if chosen_task and hasattr(chosen_task, "claims"):
-                for res_id, action in chosen_task.claims():
-                    # Firefighting task 不绑订单（灭火与订单无关）
-                    claims_new[(res_id, action)] = Claim("P2", None, self.tick)
-        else:
-            # Arbiter 目前只产出 Normal / Firefighting，此分支为防御性兜底。
-            chosen_task = None
-            claims_new = {}
-            plan_record = {"candidates": []}
+        chosen_task, plan_record = planner.plan(world, self.bb, None, self.book)
+        if plan_record.get("command_scope_empty"):
+            chosen_task, plan_record = self._scope_empty_fallback(
+                world, plan_record)
+        # planner 的**原始**选择要在 ⑨.5 覆盖之前抓一份给 trace：覆盖之后
+        # 两者永远相等，那条可观测性就是假的。
+        planner_choice = chosen_task
+        # ⑨.5 正在跑的那棵树：如果它的后置条件**已经成立**，这一拍先让
+        # 它把 SUCCESS 报完，别被 planner 抢走。
+        #
+        # 为什么需要：planner 每拍重选，而任务一旦自己做成了，就对自己
+        # 不可行了（倒完米饭 plate_lacks 为假、下完锅 cooker_started 为
+        # 真）→ 换任务 → executor 见身份变化就 halt 掉旧树 → ⑬ 的成功
+        # 记账（释放认领）连带被吞掉。实机后果：倒完米饭那一拍被换成
+        # ReturnPot，认领没释放 → 下一拍又去取熟料。
+        #
+        # 接回来之后**不再 tick 旧树**，直接按成功收尾（⑫ settle_active）：
+        # 后置条件可能是别人替我们达成的，树只认自己的 expect，接着 tick
+        # 会把整段流程重走一遍（trace-20261030-214824 t=1743~1795：P1 先把
+        # 面下进锅，P2 的 FillCooker 已 done，树照样走去面箱又拿一份，52 拍）。
+        active = self.executor_inst.active_task
+        if active is not None and active != chosen_task \
+                and self._task_done(active, world, ctx):
+            chosen_task = active
+            settle_active = True
+        claims_new = {}
+        if chosen_task and hasattr(chosen_task, "claims"):
+            # 认领绑定到任务的 order_id（而非全局 current_order_id）
+            for res_id, action in chosen_task.claims():
+                # 记下 item：recipe_graph 的在途烹饪抑制按熟料区分作用域，
+                # 一单要两份熟料时第一份下锅不该压掉第二份（第 1 组 1.3）。
+                claims_new[(res_id, action)] = Claim(
+                    "P2", chosen_task.order_id, self.tick,
+                    item=getattr(chosen_task, "item", None))
 
         # 给 LLM 看的「接下来可做的」：本拍可行候选按分数排序。
         self._last_ranked = _ranked_tasks(plan_record)
 
         record = {
-            "mode_reason": mode_reason,
             "p1": _p1_record(self.bb.p1_model),
             "candidates": plan_record.get("candidates", []),
             "dialog": dialog_record,
@@ -1924,6 +1898,7 @@ class Agent:
             self.executor_inst.halt_and_discard()
             status = "idle"
             record['waiting'] = waiting_reason(plan_record.get('candidates', []), world.orders)
+            # 无模式后，mode_reason 复用作「为什么在等」（trace 观测用）。
             record['mode_reason'] = record['waiting']['reason']
 
         # Approach 在 exec 里才写 ctx["traffic_wait"]，这里回填给 trace。
@@ -1959,8 +1934,6 @@ class Agent:
                     }
                     self.bb.command_scope = None
                     self.bb.command_id = None
-            if self.bb.commitment:
-                self.bb.commitment.interrupt_failure_count += 1
             self.bb.commitment = None
 
         # ⑭ 日志
@@ -1974,7 +1947,7 @@ class Agent:
         exec_state = trace.execution_record(
             status, success_task if status == "success" else chosen_task, ctx,
             self._frame_seq, self._frame_received_at)
-        trace.emit(record, new_mode, self.bb.commitment, exec_state, keys,
+        trace.emit(record, "Normal", self.bb.commitment, exec_state, keys,
                    self.tick, state_dump.snapshot(world))
 
     def _task_done(self, task, world, ctx):

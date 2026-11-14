@@ -93,6 +93,23 @@ def test_no_extinguish_when_p1_holds_extinguisher():
     assert not any(c[0].TYPE == "Extinguish" for c in record["candidates"])
 
 
+def test_extinguish_generated_when_p2_already_holds_extinguisher():
+    """P2 已手持灭火器（灭火进行中）→ 仍发 Extinguish，别误判成「无灭火器」。"""
+    w = _world(cookers=[_cooker(on_fire=True, burning=True)],
+               extinguishers=[],  # 唯一的灭火器正被 P2 拿在手里，非手持列表为空
+               stations=_FIRE_STATIONS,
+               chefs=[{"name": "Player 2", "x": 5.0, "z": 5.0,
+                       "held": "utensil_fire_extinguisher_01"},
+                      {"name": "Player 1", "x": 9.0, "z": 9.0, "held": None}])
+    bb = Blackboard()
+    bb.tick = 10
+    book = RecipeBook([], _FIRE_STATIONS)
+
+    chosen, record = planner.plan(w, bb, None, book)
+
+    assert chosen is not None and chosen.TYPE == "Extinguish"
+
+
 def test_no_extinguish_for_burning_only():
     """糊锅（burning）但灶没着火（onFire=False）→ 不发 Extinguish。"""
     w = _world(cookers=[_cooker(on_fire=False, burning=True)],

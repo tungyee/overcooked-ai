@@ -500,11 +500,17 @@ def _fire_needs_ai(world, bb):
 
 def _extinguisher_available(world, bb):
     # type: (World, Blackboard) -> bool
-    """AI 是否有可获得的灭火器（平移自原 arbiter._has_available_extinguisher）。
+    """AI 是否有可用的灭火器（平移自原 arbiter._has_available_extinguisher）。
 
     world.extinguishers 只含非手持（挂墙/地上），列表里每个都是可获得的。
+    但「P2 已经手持灭火器」也算可用——灭火进行中，手上的那瓶从非手持列表消失，
+    不能据此把灭火任务判成「无灭火器」而改去做别的（trace-20261115-002229
+    灭火器反复拿起放下、灭一下又去切菜的 flap 根因）。
     特殊规则：P1 持唯一灭火器时不进（读 p1_model 的持有状态）。
     """
+    p2 = P.chef_by_name(world.chefs, P.P2_NAME)
+    if p2 and "extinguisher" in P.held_name(p2):
+        return True
     total_count = 0
     available_count = 0
     p1_holds_extinguisher = False

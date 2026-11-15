@@ -23,6 +23,17 @@ FAST_BELT_SPEED = 3.5
 WITH_FLOW_COST = 1
 
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+# 四邻全不可走时兜底的对角格：角落柜台（corner counter）四邻被墙/柜台堵死、
+# 交互位在斜对角（trace-20261115-223025 Mine_2_4_2P counter_corner(1)@(-1,4)）。
+_DIAGONALS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
+
+
+def is_corner_counter(entry):
+    # type: (object) -> bool
+    """角落柜台（corner counter）：四邻全被墙/柜台堵死、交互位在斜对角。"""
+    return (isinstance(entry, dict)
+            and entry.get("t") == "counter"
+            and "corner" in str(entry.get("n") or "").lower())
 
 
 def step_cost(belt_dir, cur, nxt, belt_speed=None):
@@ -226,8 +237,9 @@ def interact_cells_with_belts(gx, gz, is_walkable, belt_cells=None):
     return fallback
 
 
-def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=False):
-    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], bool) -> List[Tuple[int, int]]
+def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=False,
+                         allow_diagonal=False):
+    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], bool, bool) -> List[Tuple[int, int]]
     """多格站点（出餐口 1×2）的可站立交互位：各占地格的四邻并集。
 
     出餐口这类多格站点，游戏接受站在它任一占地格的邻侧交互（placement
@@ -235,7 +247,12 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
     交互位，角色已站在能送餐的位置却还要多挪一格。并集去重；传送带规则
     与 interact_cells / interact_cells_with_belts 一致（include_belts=True
     放行传送带位，供「非传送带位全不可达」时兜底）。
+
+    allow_diagonal：角落柜台（corner counter）四邻全被墙/柜台堵死、交互位在
+    斜对角。只有显式传 True 且四邻全空时才补对角可走格；普通站点四邻总有
+    可走格，不受影响。
     """
+    cells = list(cells)
     preferred = set()  # type: Set[Tuple[int, int]]
     fallback = set()   # type: Set[Tuple[int, int]]
     belts = set(belt_cells or ())
@@ -243,6 +260,15 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
         p, f = _interact_cells(gx, gz, is_walkable, belts)
         preferred.update(p)
         fallback.update(f)
+    if allow_diagonal and not fallback:
+        for gx, gz in cells:
+            for dx, dz in _DIAGONALS:
+                cell = (gx + dx, gz + dz)
+                if not is_walkable(cell[0], cell[1]):
+                    continue
+                fallback.add(cell)
+                if cell not in belts:
+                    preferred.add(cell)
     if include_belts:
         return list(fallback)
     return list(preferred) if preferred else list(fallback)

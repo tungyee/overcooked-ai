@@ -155,7 +155,8 @@ def _station_interact_cells(st, cell, w, kind, include_belts=False, field=None):
         cells = O.interaction_footprint(st, cell, getattr(w, "stations", ()),
                                         w.to_grid, w.to_world, w.walkable)
     return navigation.interact_cells_multi(
-        cells, w.walkable, w.belt_cells, include_belts=include_belts)
+        cells, w.walkable, w.belt_cells, include_belts=include_belts,
+        allow_diagonal=navigation.is_corner_counter(st))
 
 
 def _wait_for_light(prim, ctx, label, kind, cur, info):

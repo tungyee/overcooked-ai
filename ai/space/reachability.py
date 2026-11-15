@@ -220,7 +220,8 @@ def _interact_goals(ctx, entry):
                                                 world.to_grid, world.to_world,
                                                 world.walkable)
         goals = set(navigation.interact_cells_multi(
-            cells, world.walkable, world.belt_cells, include_belts=True))
+            cells, world.walkable, world.belt_cells, include_belts=True,
+            allow_diagonal=navigation.is_corner_counter(entry)))
     goals |= extra
     if world.walkable(*cell):
         goals.add(cell)

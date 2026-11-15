@@ -381,7 +381,7 @@ class WashPlate(Task):
             # 续洗只在「P2 真的有活可干」时成立：脏盘摞在换帧的瞬间会从
             # items[] 里消失一下（进传送带/被 P1 端走），这时树会空跑
             # 三次失败 → 被 abandoned → recovery_cooldown 冻结整局
-            # （trace-20261111-010521 t=3486~3488）。没活就让承诺自然切换。
+            # （t=3486~3488）。没活就让承诺自然切换。
             return dirty_stack_entry(ctx) is not None \
                 or sink_plate_count(ctx, self.sink_id) > 0
         # 不在续洗态 → 只判物理可行性：有 P2 能处理的活就可行。「要不要洗」
@@ -390,7 +390,7 @@ class WashPlate(Task):
         # WashPlate 候选，因为 _select_imperative 只在 feasible 过滤后的候选里选。
         # 注意不能用 dirty_plate_exists：它会算上 P1 手里端着的那摞，P2 够不着，
         # 于是候选可行但树首找不到目标 → 空跑失败 → recovery_cooldown 冻结
-        # （trace-20261111-010521 t=3486）。
+        # （t=3486）。
         return dirty_stack_entry(ctx) is not None \
             or sink_plate_count(ctx, self.sink_id) > 0
 
@@ -474,7 +474,7 @@ class FetchConveyorPlate(Task):
     LABEL = "抢救传送带上的盘"
     HANDS = "any"
     # 抢救的是马上会被销毁的东西；别让连续失败把它 abandoned 进 recovery_cooldown，
-    # 否则这摞盘一路进桶、AI 还整局冻结（trace-20261111-010521）。
+    # 否则这摞盘一路进桶、AI 还整局冻结。
     NO_ABANDON = True
 
     @property

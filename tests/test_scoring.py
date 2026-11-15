@@ -302,7 +302,7 @@ def test_send_across_plated_dish_gets_delivery_combo_score():
 def test_deadline_penalty_when_cooker_will_burn():
     """截止前瞻：启动任务后会导致锅烧糊，惩罚。
 
-    字段语义按真实帧（trace-20261014-011202 实测）：
+    字段语义按真实帧实测：
       - `cooking_time` 是**常量容量**（这关恒为 12），不是已耗时；
       - `cooking_progress` 是进度，单位≈秒（实测 1.07/秒）；
       - 熟点 = progress 达到 cooking_time，糊点 = 2×cooking_time。
@@ -347,7 +347,7 @@ def test_burn_eta_reads_progress_not_cooking_time():
 
     但真实帧里 `cooking_time` 是常量容量（这关恒 12），于是它算出的
     "距烧糊时间" 恒为常数，与锅的真实进度无关——这条前瞻实际从未按进度
-    触发过（trace-20261014-011202：锅从 progress 16.9 一路烧到 24 着火，
+    触发过（锅从 progress 16.9 一路烧到 24 着火，
     期间 planner 没给出任何烧糊惩罚）。
     """
     # 刚熟（progress≈ctime）→ 还有满额 12 秒 = 240 拍

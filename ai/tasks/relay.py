@@ -413,7 +413,7 @@ class ThrowBatch(Task):
         # 先按 split 口径找来源（分割与否看消费站可达性，不看来源）。
         # CONSUMER_PLATE 的参照物是 P1 的盘（对面），不是 dest（砧板）——
         # 砧板可能在 P2 自己这边（4-5），按砧板可达性会把 split 误判成 far，
-        # sources 再按「离砧板 <3.6m」把切好料当已就位排除（trace-20261113-013646）。
+        # sources 再按「离砧板 <3.6m」把切好料当已就位排除。
         if self.consumer == TS.CONSUMER_PLATE:
             probe = TS.MODE_SPLIT if RG.split(w, bb) else TS.MODE_FAR
         else:

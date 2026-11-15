@@ -319,7 +319,7 @@ def test_cooked_pizza_in_hand_is_not_put_back_in_oven(frames):
 def test_cooked_pizza_in_hand_yields_to_raw_carrier_on_counter(frames):
     """手里是熟饼、台面上还有一张同单的生饼时，不能把熟饼当成进炉载体。
 
-    trace-20261109-011315 t=3156~3307：RescueCooked 把熟饼端到手里后，
+    t=3156~3307：RescueCooked 把熟饼端到手里后，
     `_holding` 只比形态名仍返回真；行为树 keep 住熟饼、拿生饼那步短路，
     最后又把熟饼塞回烤箱 → 与 RescueCooked 来回 12 次。
     """

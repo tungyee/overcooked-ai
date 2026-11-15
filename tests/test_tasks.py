@@ -706,7 +706,7 @@ def cooker(name, **kw):
 def test_extinguish_target_sticks_to_nearest_not_list_order():
     """灭火目标按**就近**选，且新灶着火不许把人从眼前那口灶拖走。
 
-    实机（trace-20261014-011202 t=2404~2478）：P2 端着灭火器走到灶 (2)
+    实机（t=2404~2478）：P2 端着灭火器走到灶 (2)
     跟前（目标 (7,1)、已到 goal (6,1)），这时灶 (3) 也着了火——`fire_station`
     取 `burning(c)[0]`，即 `world.cookers` 的**列表序**第一个，于是目标
     瞬间翻转到 (7,-2)，人被拖去灶 (3)。喷了 50 拍两口灶的火都还在，直到
@@ -1171,7 +1171,7 @@ def test_deliver_plate_feasible_when_plate_still_on_counter():
 def test_rescue_cooked_feasible_when_too_late_to_fetch_plate():
     """来不及端盘来盛 → 先端锅离灶止损，别等到着火。
 
-    实机（trace-20261014-011202 t=2056~2184）：灶 (2) 的饭 progress 16.9
+    实机（t=2056~2184）：灶 (2) 的饭 progress 16.9
     已熟，P2 去取盘再走回来要 ~130 拍，锅 ~140 拍后烧糊着火。旧
     `_about_to_burn` 要求 `progress >= 2*ctime`——**那一刻已经着火了**，
     于是 P2 一路端着盘往锅跑，到 t=2184 才选中 RescueCooked，下一拍
@@ -1489,7 +1489,7 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     这里曾是「RepeatUntil 批量取+投 N 份，再捡散落下锅」。树结构决定了
     必须投满 N 份才轮到 drop()，而一轮取+投实测约 80 拍、整树裹在
     TASK_TIMEOUT_TICKS=200 里——第二轮没结束就被砍，drop() 一次都没执行
-    过，米全堆在地上、灶始终空着（trace-20261014-011202，2527 拍 0 送达）。
+    过，米全堆在地上、灶始终空着（2527 拍 0 送达）。
 
     钉住：① 没有 RepeatUntil；② 不往地上投——投掷只出现在「投进锅」
     （ThrowOntoStation，投完等锅收下）里；③ 每个分支都以下锅收尾：先试投进锅，

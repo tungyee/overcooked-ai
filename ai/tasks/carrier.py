@@ -206,7 +206,7 @@ class PlaceCarrierInCooker(Task):
         只比名字会把 RescueCooked 刚端出炉的熟披萨当成待进炉载体：熟饼名字
         仍是 Pizza_Base_Raw、cookable.prep 仍为真。于是树首 keep 住它、拿生饼
         那步 expect 短路，最后整份塞回烤箱；RescueCooked 再端出来——无限拿进
-        拿出（trace-20261109-011315 t=3156~3307、trace-20261109-010647
+        拿出（t=3156~3307、
         t=3928~4440，最后烧着）。料也要对：别把另一道菜的饼塞进这单的炉子。
         """
         if not P.held_matches(ctx["chef"], self.base_form):

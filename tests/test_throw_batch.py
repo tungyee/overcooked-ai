@@ -908,7 +908,7 @@ def test_launch_cells_never_in_road_or_across_it():
     assert TS._launch_ok(w, None, (7, 0)) is True       # 已站在路上：不额外限制
 
 
-# ---------------------------------------------------------------- 4-5 切好料投给对面装盘（trace-20261113-013646）
+# ---------------------------------------------------------------- 4-5 切好料投给对面装盘
 
 FIXTURE_45 = os.path.join(os.path.dirname(__file__), "fixtures", "sushi",
                           "sushi45-switch-20261112.ndjson.gz")

@@ -327,7 +327,7 @@ def _gen_misc(world, bb, book, chef, hands_empty):
     # 传送带上的盘/脏盘摞快到末端垃圾桶：先抢救下来。脏盘摞和盘是同一类
     # 东西（都在 `attach:ConveyorStation` 上走），WashPlate 够不着传送带上的
     # 散落物，所以这里也要给它发 FetchConveyorPlate，别让 P2 看着它进桶
-    # （trace-20261111-010521 t=3510）。
+    # （t=3510）。
     from ai.space import channels as CH
     entries = []  # type: List[Dict]
     for p in P.all_plates(world):
@@ -1321,7 +1321,7 @@ def _burn_eta_ticks(c):
     # type: (Dict) -> Optional[float]
     """这口灶还有多少**拍**烧糊；没在煮则 None（无烧糊截止）。
 
-    字段语义按真实帧实测（trace-20261014-011202）：
+    字段语义按真实帧实测：
 
       - `cooking_time` 是**常量容量**（Sushi_1_4_2P 恒为 12），不是已耗时；
       - `cooking_progress` 是进度，单位≈秒（实测 1.07/秒）；

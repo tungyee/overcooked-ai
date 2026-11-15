@@ -370,11 +370,21 @@ namespace Oc2AI
     {
         private const float REAIM_TIME = 0.6f;
 
+        // 扫射（灭火器 spray）：左右摆动朝向的默认参数。喷流是窄流，覆盖靠转头
+        // 扫出的扇面——单点喷灭不掉（实机确认）。Python 可传 sweep_deg/sweep_period/
+        // sweep_stick 覆盖，避免每次调参都重编插件。
+        private const float SWEEP_DEG = 20f;      // 单侧摆动角（度），总摆约 40°
+        private const float SWEEP_PERIOD = 1.2f;  // 一个完整来回的秒数
+        private const float SWEEP_STICK = 0.3f;   // 摇杆幅度（主要转身、少走动）
+
         private readonly Dictionary<string, object> _target;
         private readonly string _kind;
         private readonly Vector2 _targetWorld;
         private readonly bool _hasTargetWorld;
         private readonly float _timeout;
+        private readonly float _sweepDeg;
+        private readonly float _sweepPeriod;
+        private readonly float _sweepStick;
         private bool _started;
         private float _startTime;
         private float _phaseStart;
@@ -398,6 +408,9 @@ namespace Oc2AI
                 _hasTargetWorld = true;
             }
             _timeout = (float)(Req.Num(cmd, "timeout_ms") ?? 5000.0) / 1000f;
+            _sweepDeg = (float)(Req.Num(cmd, "sweep_deg") ?? SWEEP_DEG);
+            _sweepPeriod = (float)(Req.Num(cmd, "sweep_period") ?? SWEEP_PERIOD);
+            _sweepStick = (float)(Req.Num(cmd, "sweep_stick") ?? SWEEP_STICK);
         }
 
         public void Tick(ChefFrame f, float now)
@@ -407,10 +420,17 @@ namespace Oc2AI
             if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
             if (!f.Valid) { Finish(false, "no chef"); return; }
             f.RefreshInteraction();
+
+            // spray（灭火器）：不是「正对目标才按键」，而是按住喷的同时左右摆面向
+            // （扫射）。use 句柄是手持灭火器本身而非灶，所以不比对 use 句柄。
+            if (_kind == "spray")
+            {
+                TickSpray(f, now);
+                return;
+            }
+
             // 句柄没命中（没正对目标）→ 有 target_world 就先 re-aim 转向，
             // 转正后下一拍命中再按键；无世界坐标则 drifted 交 Python。
-            // spray（灭火器）：use 句柄是手持灭火器本身而非灶，改比朝向句柄
-            // （m_gridLocation，HandleMatches(kind=null)）——正对灶才算命中。
             if (_target != null && !MatchesTarget(f))
             {
                 if (!_hasTargetWorld)
@@ -433,10 +453,37 @@ namespace Oc2AI
             PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
         }
 
+        /// <summary>灭火器扫射：baseDir 指向目标，左右摆一个角度边喷边扫。</summary>
+        private void TickSpray(ChefFrame f, float now)
+        {
+            if (!_hasTargetWorld)
+            {
+                Finish(false, "drifted");
+                return;
+            }
+            Vector2 pos = new Vector2(f.PosX, f.PosZ);
+            Vector2 baseDir = _targetWorld - pos;
+            if (baseDir.sqrMagnitude < 1e-6f) baseDir = Vector2.up;
+            baseDir.Normalize();
+            float t = now - _startTime;
+            float period = _sweepPeriod > 1e-3f ? _sweepPeriod : 1e-3f;
+            float ang = _sweepDeg * Mathf.Deg2Rad * Mathf.Sin(t * 2f * Mathf.PI / period);
+            Vector2 dir = Rotate(baseDir, ang);
+            // 小摇杆幅度：主要转身、尽量少走动（照 ThrowCommand FACE_STICK）。
+            PadEngagement.Pad.Move(f.Chef, dir.x * _sweepStick, dir.y * _sweepStick);
+            PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+        }
+
+        private static Vector2 Rotate(Vector2 v, float rad)
+        {
+            float c = Mathf.Cos(rad), s = Mathf.Sin(rad);
+            return new Vector2(v.x * c - v.y * s, v.x * s + v.y * c);
+        }
+
         private bool MatchesTarget(ChefFrame f)
         {
-            // spray 比朝向句柄（m_gridLocation），其余比 use 句柄（m_interactable）。
-            if (_kind == "spray") return PadButtons.HandleMatches(f, _target, null);
+            // 非 spray 比对 use 句柄（m_interactable）。spray 已单独走 TickSpray
+            // 扫射、不进这里——灭火器喷流朝向是手持灭火器自身，比 use 句柄恒不中。
             return PadButtons.UseMatches(f, _target);
         }
 

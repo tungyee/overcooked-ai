@@ -873,6 +873,32 @@ namespace Oc2AI
             return false;
         }
 
+        // 非灶站点的着火读取：灶（ServerCookingStation）直接有 m_flammable 字段，
+        // 柜台/工作台/砧板的 Flammable 组件挂在别的 MonoBehaviour 上——逐级在
+        // GameObject 上找 Flammable 类型组件再读 m_onFire。找不到返回 null
+        // （Python 侧当「没火」）。字段/组件名待实机探明（见方案 C 数据缺口）。
+        object ReadStationFlammable(MonoBehaviour mb)
+        {
+            object fl = GetField(mb, "m_flammable");
+            if (fl != null) return fl;
+            Type flammableType = FindType("Flammable");
+            if (flammableType == null) return null;
+            Component[] comps = mb.GetComponentsInChildren<Component>(true);
+            foreach (Component c in comps)
+            {
+                if (c != null && flammableType.IsAssignableFrom(c.GetType())) return c;
+            }
+            return null;
+        }
+
+        string StationOnFire(MonoBehaviour mb)
+        {
+            object fl = ReadStationFlammable(mb);
+            if (fl == null) return "null";
+            object f = GetField(fl, "m_onFire");
+            return f is bool fb ? (fb ? "true" : "false") : "null";
+        }
+
         // 可投掷 = GameObject 上挂了 ThrowableItem 组件（食材有，锅/盘没有）。
         bool IsThrowable(object o)
         {
@@ -2715,6 +2741,10 @@ namespace Oc2AI
                     .Append(",\"x\":").Append(p.x.ToString("0.0"))
                     .Append(",\"z\":").Append(p.z.ToString("0.0"));
                 AppendColliderBounds(sb, mb);
+                if (type == "counter" || type == "chopping" || type == "workstation")
+                {
+                    sb.Append(",\"onFire\":").Append(StationOnFire(mb));
+                }
                 if (type == "crate")
                 {
                     sb.Append(",\"ing\":").Append(Jstr(CrateIngredient(mb)));

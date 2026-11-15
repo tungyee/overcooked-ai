@@ -23,8 +23,9 @@ class HoldUntil(Primitive):
     位置重验 + timeout FAILURE，所以语义完成由 Python 侧判 pred 后发 halt。
     """
 
-    def __init__(self, key, pred, timeout, target=None, kind=None, guard=None):
-        # type: (str, Callable[[Dict], bool], int, Any, Optional[str], Optional[Callable[[Dict], bool]]) -> None
+    def __init__(self, key, pred, timeout, target=None, kind=None, guard=None,
+                 sweep_deg=None, sweep_period=None, sweep_stick=None):
+        # type: (str, Callable[[Dict], bool], int, Any, Optional[str], Optional[Callable[[Dict], bool]], Optional[float], Optional[float], Optional[float]) -> None
         Primitive.__init__(self)
         self.key = key
         self.pred = pred
@@ -35,6 +36,10 @@ class HoldUntil(Primitive):
         # 在新树 EnsureHandsFree 之后才落地；守卫在 HoldUntil 每拍复检，
         # 手不空就 FAILURE，Sequence 回到树首重新清手。
         self.guard = guard
+        # 扫射（灭火器 spray）参数：None 走插件默认，实机标定后由 fire.py 传值。
+        self.sweep_deg = sweep_deg
+        self.sweep_period = sweep_period
+        self.sweep_stick = sweep_stick
 
     def reset(self):
         # type: () -> None
@@ -63,13 +68,19 @@ class HoldUntil(Primitive):
             st = resolve(self.target, ctx) if self.target is not None else None
             if self.target is not None and st is None:
                 return Status.FAILURE
-            cmd = build_command(
-                "hold",
-                target=handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
-                kind=self.kind,
-                target_world=target_world(st),
-                timeout_ms=self.timeout * 50,
-            )
+            fields = {
+                "target": handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
+                "kind": self.kind,
+                "target_world": target_world(st),
+                "timeout_ms": self.timeout * 50,
+            }
+            if self.sweep_deg is not None:
+                fields["sweep_deg"] = self.sweep_deg
+            if self.sweep_period is not None:
+                fields["sweep_period"] = self.sweep_period
+            if self.sweep_stick is not None:
+                fields["sweep_stick"] = self.sweep_stick
+            cmd = build_command("hold", **fields)
             return self._begin_exec(ctx, ex, cmd)
         return self._poll_exec(ctx, ex)
 

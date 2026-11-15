@@ -486,10 +486,13 @@ def _fire_needs_ai(world, bb):
     # type: (World, Blackboard) -> bool
     """是否该由 AI 去灭火（平移自原 arbiter._should_enter_firefighting）。
 
-    三条件合取：有 onFire 的灶 + AI 有可获得的灭火器 + 至少一口着火灶未被
-    P1 处理。只用 onFire、不用 burning——糊锅走 RescueCooked/L1，不进灭火。
+    三条件合取：有 onFire 的灶/柜台 + AI 有可获得的灭火器 + 至少一口着火目标
+    未被 P1 处理。只用 onFire、不用 burning——糊锅走 RescueCooked/L1，不进灭火。
+    柜台/砧板/工作台也会着火（实机确认），只有 onFire 信号，没有锅要端。
     """
     on_fire = [c for c in world.cookers if c.get("onFire")]
+    on_fire += [s for s in world.stations
+                if s.get("t") not in ("cooking",) and s.get("onFire") is True]
     if not on_fire:
         return False
     if not _extinguisher_available(world, bb):

@@ -398,6 +398,18 @@ def cooker_burning(cooker):
     return cooker.get("burning") is True or cooker.get("onFire") is True
 
 
+def station_burning(station):
+    # type: (Optional[Dict]) -> bool
+    """非灶站点（柜台/砧板/工作台）的着火判据：只看 onFire。
+
+    灶的着火走 cooker_burning（有 burning/onFire 两个信号）；柜台没有锅、没有
+    burning，只有插件报的 onFire（见插件 AppendStations 的 StationOnFire）。
+    """
+    if not station:
+        return False
+    return station.get("onFire") is True
+
+
 def cooker_started(cooker):
     # type: (Optional[Dict]) -> bool
     """已下锅在煮，或已经煮熟（熟了也说明启动过）。"""

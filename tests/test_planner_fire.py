@@ -62,6 +62,21 @@ def test_plan_chooses_extinguish_when_fire():
     assert record["top_layer"] == 0
 
 
+def test_extinguish_for_counter_fire():
+    """柜台（t="counter"）着火 → 也发 Extinguish（火点不止灶）。"""
+    stations = [{"t": "counter", "n": "countertop_01", "gx": 1, "gz": 1,
+                 "x": 1.0, "z": 1.0, "onFire": True}]
+    w = _world(cookers=[], extinguishers=[_ext()], stations=stations)
+    bb = Blackboard()
+    bb.tick = 10
+    book = RecipeBook([], stations)
+
+    chosen, record = planner.plan(w, bb, None, book)
+
+    assert chosen is not None and chosen.TYPE == "Extinguish"
+    assert record["top_layer"] == 0
+
+
 def test_no_extinguish_when_p1_near_fire():
     """P1 已经站在着火灶旁 → 不发 Extinguish（别跟 P1 抢）。"""
     w = _world(cookers=[_cooker(on_fire=True, burning=True)],

@@ -5,7 +5,7 @@
 实机确认）。外部不直接 import 本模块，一律 `from ai import tasks as T`
 （分组边界是实现细节，见 ai/tasks/__init__.py）。
 """
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ai.query import predicates as P
 from ai import primitives as PR
@@ -47,15 +47,44 @@ def _available_extinguisher(ctx):
     return best
 
 
+def _burning_targets(world):
+    # type: (Any) -> List[Dict]
+    """所有在烧目标：烧灶（cookers 里 onFire/burning）+ 烧柜台/砧板/工作台。
+
+    灶的着火走 cooker_burning（burning=糊锅 / onFire=灶火两个信号）；柜台没有锅，
+    只有插件报的 onFire（见 station_burning）。灶在 stations[] 里也有 t="cooking"
+    的条目，这里排除掉避免和 cookers 重复计数。
+    """
+    pts = [cc for cc in world.cookers if P.cooker_burning(cc)]
+    pts += [s for s in world.stations
+            if s.get("t") not in ("cooking",) and P.station_burning(s)]
+    return pts
+
+
+def _fire_centroid(points):
+    # type: (List[Dict]) -> Optional[Tuple[float, float]]
+    """起火点集合的团重心（x,z 均值）。空或全部缺坐标返回 None。"""
+    xs = [p.get("x") for p in points if p.get("x") is not None]
+    zs = [p.get("z") for p in points if p.get("z") is not None]
+    if not xs or not zs:
+        return None
+    return (sum(xs) / len(xs), sum(zs) / len(zs))
+
+
 @_register
 class Extinguish(Task):
-    """第 6.5 号：灭火——全局 task，一棵树循环处理所有着火灶。
+    """第 6.5 号：灭火——全局 task，一棵树循环处理所有着火目标（灶 + 柜台）。
 
     一局火情 = 一个 task = 一棵树，不再按灶拆分：换灶不重建树、不丢灭火器
     （旧实现「一灶一 task」换目标就重建树，树首 EnsureHandsFree 会把端着的
     灭火器放下，实机复现）。
 
-    顺序（用户实机确认的机制）：**先端所有带锅的着火灶，再逐灶喷**——
+    着火目标两种：灶（cookers 的 onFire/burning，带锅才要端）和普通柜台/砧板/
+    工作台（stations 的 onFire，没有锅、直接喷）。`_burning_targets` 把它们合到
+    一起；`burning()` 按「离团重心最近」排序，让 P2 站到整团火的中心旁喷，
+    而不是站到最靠边那口。
+
+    顺序（用户实机确认的机制）：**先端所有带锅的着火灶，再逐个起火目标喷**——
     锅留在灶上会一直烧、火不断复燃，只喷不端灭不掉。喷的过程中用 Guard
     每拍盯「有没有新着火的锅」，出现就中断喷、转去端锅。
 
@@ -71,8 +100,9 @@ class Extinguish(Task):
     HoldCommand 的 UseMatches 门恒不中、按不出键；spray 改走朝向句柄
     （m_gridLocation，HandleMatches(kind=null)），正对灶才按键。
 
-    换下一灶由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定最近
-    那口灶的名字，`spray_done` 判「这口灶还在不在燃烧列表里」。这口一灭 →
+    换下一目标由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定离团
+    重心最近的起火目标的名字，`spray_done` 判「这个目标还在不在燃烧列表里」。
+    这口一灭 →
     提前 SUCCESS（不再等「全灭」）→ RepeatUntil 重新评估 Selector，走到
     下一口着火灶。否则 pred 若仍是「not any_fire」，多口火时会一直喷已经
     灭掉的那口、不换目标（实机 trace 里火反复蔓延、灭火器喷半天灭不完）。
@@ -95,33 +125,37 @@ class Extinguish(Task):
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        return not any(P.cooker_burning(c) for c in ctx["w"].cookers)
+        return not _burning_targets(ctx["w"])
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
-        return any(P.cooker_burning(c) for c in ctx["w"].cookers)
+        return bool(_burning_targets(ctx["w"]))
 
     def build(self):
         # type: () -> Node
         def burning(c):
-            # 所有着火 / 烧焦的灶，**按离 P2 的距离排序**。
+            # 所有在烧目标（烧灶 + 烧柜台），**按离起火团重心的距离排序**。
             #
-            # 排序是必须的，不是优化：下面 pot_station / fire_station 都取
-            # 第 0 个，若用 world.cookers 的列表序，新灶着火就会把目标瞬间
-            # 翻转到别处——实机 trace-20261014-011202 t=2404~2478：P2 端着
-            # 灭火器已经走到灶 (2) 跟前（goal 已到 (6,1)），灶 (3) 跟着着火，
-            # 目标立刻跳成 (7,-2)，人被拖去灶 (3)，喷了 50 拍两口火都没灭。
-            # 按距离排序后「已经站在跟前的那口」天然最近，不会被抢走。
-            out = [cc for cc in c["w"].cookers if P.cooker_burning(cc)]
-            cx, cz = c["chef"].get("x"), c["chef"].get("z")
+            # 排序是必须的，不是优化：下面 pot_station / fire_station /
+            # spray_target 都取第 0 个，若用 world 的列表序，新火点出现就会把
+            # 目标瞬间翻转到别处（旧实机 trace-20261014-011202 t=2404~2478：
+            # 新灶一着火目标就跳走、喷半天没灭）。按「团重心」排序后，第 0 个
+            # 是整团火的中心，P2 站到团中心旁、朝团中心扫射，一记扫射尽量盖住
+            # 整团（而不是旧实现按离 P2 距离排、站到最靠边那口）。
+            pts = _burning_targets(c["w"])
+            if not pts:
+                return pts
+            cen = _fire_centroid(pts)
+            cx, cz = cen if cen is not None else (
+                c["chef"].get("x"), c["chef"].get("z"))
             if cx is None or cz is None:
-                return out
-            def d2(cc):
-                x, z = cc.get("x"), cc.get("z")
+                return pts
+            def d2(pt):
+                x, z = pt.get("x"), pt.get("z")
                 if x is None or z is None:
                     return float("inf")
                 return (x - cx) ** 2 + (z - cz) ** 2
-            return sorted(out, key=d2)
+            return sorted(pts, key=d2)
 
         def with_pot(c):
             # 只有「糊锅」（锅里的食物烧糊、pot.IsBurning()=True）才需要先端走；
@@ -139,28 +173,36 @@ class Extinguish(Task):
             cc = with_pot(c)
             return cooker_station(c, cc[0]["n"]) if cc else None
 
-        # 「当前正在喷哪口灶」的可变标记（build 闭包共享）。喷完一口后
+        def station_of(c, pt):
+            # 起火点 → 站点 dict：柜台/砧板等带 t 的站点直接用；灶（无 t）经
+            # cooker_station 从 stations 里反查。Approach/HoldUntil 都要 gx/gz
+            # （交互位）和 x/z（朝向/重瞄）。
+            if pt.get("t"):
+                return pt
+            return cooker_station(c, pt["n"])
+
+        # 「当前正在喷哪口」的可变标记（build 闭包共享）。喷完一口后
         # spray_done 用它判「这口灭了没」，让 HoldUntil 提前 SUCCESS、
         # RepeatUntil 重新评估去喷下一口。否则 pred 只能等「全灭」（not
         # any_fire），多口火时会一直喷已经灭掉的那口、不换目标（实机复现）。
         spray = {"n": None}
 
         def fire_station(c):
-            # 供 Approach 走位用：解析最近的着火灶。顺便把上一口的喷标记
-            # 清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
+            # 供 Approach 走位用：解析离团重心最近的起火目标。顺便把上一口的
+            # 喷标记清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
             # 从零开始，否则 spray_done 会拿上一口的旧名提前判 True。
             cc = burning(c)
             spray["n"] = None
-            return cooker_station(c, cc[0]["n"]) if cc else None
+            return station_of(c, cc[0]) if cc else None
 
         def spray_target(c):
-            # 供 HoldUntil 喷用：锁定当前最近的着火灶，并记下它的名字。
+            # 供 HoldUntil 喷用：锁定当前离团重心最近的起火目标，并记下名字。
             cc = burning(c)
             if not cc:
                 spray["n"] = None
                 return None
             spray["n"] = cc[0]["n"]
-            return cooker_station(c, cc[0]["n"])
+            return station_of(c, cc[0])
 
         def spray_done(c):
             # 当前锁定的这口灶灭了（或全灭）→ 本轮喷完，交 RepeatUntil 换下一口。

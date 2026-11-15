@@ -47,6 +47,33 @@ def _available_extinguisher(ctx):
     return best
 
 
+def _extinguisher_target(w, ext):
+    # type: (Any, Optional[Dict]) -> Optional[Dict]
+    """灭火器的 pick 目标：挂/放在台面上时用台面站点，否则用灭火器自己。
+
+    灭火器挂在气球篮的 countertop 上时，游戏的 pickup 句柄是承载它的台面、
+    不是灭火器自己（trace-20261115-213622 Balloon_2_3_2P：pickup=countertop(3)
+    而非 extinguisher）。按位置就近解析到台面站点，pick 的目标名才跟句柄对得上；
+    挂墙/放地上（没有同位置站点）就原样返回灭火器。
+    """
+    if not ext:
+        return None
+    x, z = ext.get("x"), ext.get("z")
+    if x is None or z is None:
+        return ext
+    best = None
+    best_d = 0.6 * 0.6  # 半格以内才算「挂在这台面上」
+    for st in w.stations:
+        sx, sz = st.get("x"), st.get("z")
+        if sx is None or sz is None:
+            continue
+        d = (sx - x) ** 2 + (sz - z) ** 2
+        if d < best_d:
+            best_d = d
+            best = st
+    return best if best is not None else ext
+
+
 def _burning_targets(world):
     # type: (Any) -> List[Dict]
     """所有在烧目标：烧灶（cookers 里 onFire/burning）+ 烧柜台/砧板/工作台。
@@ -215,7 +242,8 @@ class Extinguish(Task):
             return not any(cc0.get("n") == n for cc0 in cc)
 
         def ext(c):
-            return _available_extinguisher(c)
+            e = _available_extinguisher(c)
+            return _extinguisher_target(c["w"], e) if e else None
 
         def holding_ext(c):
             return "extinguish" in P.held_name(c["chef"])

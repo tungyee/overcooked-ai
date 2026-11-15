@@ -5,7 +5,7 @@
 实机确认）。外部不直接 import 本模块，一律 `from ai import tasks as T`
 （分组边界是实现细节，见 ai/tasks/__init__.py）。
 """
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from ai.query import predicates as P
 from ai import primitives as PR
@@ -88,16 +88,6 @@ def _burning_targets(world):
     return pts
 
 
-def _fire_centroid(points):
-    # type: (List[Dict]) -> Optional[Tuple[float, float]]
-    """起火点集合的团重心（x,z 均值）。空或全部缺坐标返回 None。"""
-    xs = [p.get("x") for p in points if p.get("x") is not None]
-    zs = [p.get("z") for p in points if p.get("z") is not None]
-    if not xs or not zs:
-        return None
-    return (sum(xs) / len(xs), sum(zs) / len(zs))
-
-
 @_register
 class Extinguish(Task):
     """第 6.5 号：灭火——全局 task，一棵树循环处理所有着火目标（灶 + 柜台）。
@@ -108,8 +98,7 @@ class Extinguish(Task):
 
     着火目标两种：灶（cookers 的 onFire/burning，带锅才要端）和普通柜台/砧板/
     工作台（stations 的 onFire，没有锅、直接喷）。`_burning_targets` 把它们合到
-    一起；`burning()` 按「离团重心最近」排序，让 P2 站到整团火的中心旁喷，
-    而不是站到最靠边那口。
+    一起；`burning()` 按「离 P2 最近」排序，先喷身边的起火点。
 
     顺序（用户实机确认的机制）：**先端所有带锅的着火灶，再逐个起火目标喷**——
     锅留在灶上会一直烧、火不断复燃，只喷不端灭不掉。喷的过程中用 Guard
@@ -127,8 +116,8 @@ class Extinguish(Task):
     HoldCommand 的 UseMatches 门恒不中、按不出键；spray 改走朝向句柄
     （m_gridLocation，HandleMatches(kind=null)），正对灶才按键。
 
-    换下一目标由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定离团
-    重心最近的起火目标的名字，`spray_done` 判「这个目标还在不在燃烧列表里」。
+    换下一目标由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定离 P2
+    最近的起火目标的名字，`spray_done` 判「这个目标还在不在燃烧列表里」。
     这口一灭 →
     提前 SUCCESS（不再等「全灭」）→ RepeatUntil 重新评估 Selector，走到
     下一口着火灶。否则 pred 若仍是「not any_fire」，多口火时会一直喷已经
@@ -161,20 +150,15 @@ class Extinguish(Task):
     def build(self):
         # type: () -> Node
         def burning(c):
-            # 所有在烧目标（烧灶 + 烧柜台），**按离起火团重心的距离排序**。
+            # 所有在烧目标（烧灶 + 烧柜台），**按离 P2 的距离排序**。
             #
             # 排序是必须的，不是优化：下面 pot_station / fire_station /
             # spray_target 都取第 0 个，若用 world 的列表序，新火点出现就会把
             # 目标瞬间翻转到别处（旧实机 trace-20261014-011202 t=2404~2478：
-            # 新灶一着火目标就跳走、喷半天没灭）。按「团重心」排序后，第 0 个
-            # 是整团火的中心，P2 站到团中心旁、朝团中心扫射，一记扫射尽量盖住
-            # 整团（而不是旧实现按离 P2 距离排、站到最靠边那口）。
+            # 新灶一着火目标就跳走、喷半天没灭）。按离 P2 距离排序后，第 0 个
+            # 是最近的起火点，先就近喷，喷完再换下一个最近的。
             pts = _burning_targets(c["w"])
-            if not pts:
-                return pts
-            cen = _fire_centroid(pts)
-            cx, cz = cen if cen is not None else (
-                c["chef"].get("x"), c["chef"].get("z"))
+            cx, cz = c["chef"].get("x"), c["chef"].get("z")
             if cx is None or cz is None:
                 return pts
             def d2(pt):
@@ -215,7 +199,7 @@ class Extinguish(Task):
         spray = {"n": None}
 
         def fire_station(c):
-            # 供 Approach 走位用：解析离团重心最近的起火目标。顺便把上一口的
+            # 供 Approach 走位用：解析最近的起火目标。顺便把上一口的
             # 喷标记清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
             # 从零开始，否则 spray_done 会拿上一口的旧名提前判 True。
             cc = burning(c)
@@ -223,7 +207,7 @@ class Extinguish(Task):
             return station_of(c, cc[0]) if cc else None
 
         def spray_target(c):
-            # 供 HoldUntil 喷用：锁定当前离团重心最近的起火目标，并记下名字。
+            # 供 HoldUntil 喷用：锁定当前最近的起火目标，并记下名字。
             cc = burning(c)
             if not cc:
                 spray["n"] = None

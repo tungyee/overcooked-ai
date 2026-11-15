@@ -149,6 +149,8 @@ class Extinguish(Task):
 
     def build(self):
         # type: () -> Node
+        from ai.space import reachability
+
         def burning(c):
             # 所有在烧目标（烧灶 + 烧柜台），**按离 P2 的距离排序**。
             #
@@ -192,6 +194,17 @@ class Extinguish(Task):
                 return pt
             return cooker_station(c, pt["n"])
 
+        def reachable_fire(c):
+            # 最近的**可达**起火点：跳过交互位不可达的死角（如角落柜台四邻全被
+            # 墙/柜台堵死），否则 fire_station 一直对着这个死角、Approach 第一拍
+            # 就失败、树反复重建，P2 卡住不去喷旁边可达的火点
+            # （trace-20261115-223025 Mine_2_4_2P：counter_corner(1)@(-1,4) 死角）。
+            for pt in burning(c):
+                st = station_of(c, pt)
+                if st is not None and reachability.can_interact(c, st):
+                    return pt, st
+            return None, None
+
         # 「当前正在喷哪口」的可变标记（build 闭包共享）。喷完一口后
         # spray_done 用它判「这口灭了没」，让 HoldUntil 提前 SUCCESS、
         # RepeatUntil 重新评估去喷下一口。否则 pred 只能等「全灭」（not
@@ -199,21 +212,21 @@ class Extinguish(Task):
         spray = {"n": None}
 
         def fire_station(c):
-            # 供 Approach 走位用：解析最近的起火目标。顺便把上一口的
-            # 喷标记清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
-            # 从零开始，否则 spray_done 会拿上一口的旧名提前判 True。
-            cc = burning(c)
+            # 供 Approach 走位用：解析最近的可达起火目标。顺便把上一口的喷标记
+            # 清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应从零开始，
+            # 否则 spray_done 会拿上一口的旧名提前判 True。
             spray["n"] = None
-            return station_of(c, cc[0]) if cc else None
+            _, st = reachable_fire(c)
+            return st
 
         def spray_target(c):
-            # 供 HoldUntil 喷用：锁定当前最近的起火目标，并记下名字。
-            cc = burning(c)
-            if not cc:
+            # 供 HoldUntil 喷用：锁定最近的可达起火目标，并记下名字。
+            pt, st = reachable_fire(c)
+            if pt is None:
                 spray["n"] = None
                 return None
-            spray["n"] = cc[0]["n"]
-            return station_of(c, cc[0])
+            spray["n"] = pt["n"]
+            return st
 
         def spray_done(c):
             # 当前锁定的这口灶灭了（或全灭）→ 本轮喷完，交 RepeatUntil 换下一口。

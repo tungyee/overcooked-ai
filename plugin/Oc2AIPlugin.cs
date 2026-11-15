@@ -873,22 +873,27 @@ namespace Oc2AI
             return false;
         }
 
-        // 非灶站点的着火读取：灶（ServerCookingStation）直接有 m_flammable 字段，
-        // 柜台/工作台/砧板的 Flammable 组件挂在别的 MonoBehaviour 上——逐级在
-        // GameObject 上找 Flammable 类型组件再读 m_onFire。找不到返回 null
-        // （Python 侧当「没火」）。字段/组件名待实机探明（见方案 C 数据缺口）。
+        // 非灶站点的着火读取：灶（ServerCookingStation）直接有 m_flammable 字段；
+        // 柜台/工作台/砧板的 Flammable 组件（Flammable / ServerFlammable /
+        // ClientFlammable）挂在同一个 GameObject 上，类型带命名空间、FindType
+        // 精确名匹配不到。按简单类名找，优先 ServerFlammable（服务端权威 onFire）。
+        // 找不到返回 null（Python 侧当「没火」）。
         object ReadStationFlammable(MonoBehaviour mb)
         {
             object fl = GetField(mb, "m_flammable");
             if (fl != null) return fl;
-            Type flammableType = FindType("Flammable");
-            if (flammableType == null) return null;
             Component[] comps = mb.GetComponentsInChildren<Component>(true);
+            Component fallback = null;
             foreach (Component c in comps)
             {
-                if (c != null && flammableType.IsAssignableFrom(c.GetType())) return c;
+                if (c == null) continue;
+                string tn = c.GetType().Name;
+                if (tn == "ServerFlammable") return c;
+                if (fallback == null
+                        && tn.IndexOf("Flammable", StringComparison.OrdinalIgnoreCase) >= 0)
+                    fallback = c;
             }
-            return null;
+            return fallback;
         }
 
         string StationOnFire(MonoBehaviour mb)

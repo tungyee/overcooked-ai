@@ -314,7 +314,10 @@ class FillCarrier(Task):
                 continue
             if token and token not in src["tokens"]:
                 continue
-            return {"kind": "loose", "target": src["item"]}
+            # 散熟源挂在台面上时句柄是台面、不是源物品本身（与
+            # TakeCookedToPlate._source 同理由）；散在地上才对 item 盛。
+            station = _station_for_item(ctx["w"], src["item"])
+            return {"kind": "loose", "target": station or src["item"]}
         return None
 
     def _holding_wrapper(self, ctx):

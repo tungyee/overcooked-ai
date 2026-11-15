@@ -384,8 +384,9 @@ def test_take_cooked_pizza_skips_same_named_raw_base(frames):
     pid = w.plates[0]["n"]
     task = T.TakeCookedToPlate("1", (BASE, pid), "MargheritaPizza")
     src = task._source(ctx)
-    assert src is not None and src["target"]["cooked"] == "Cooked"
-    assert src["target"]["on_station"] == "attach:" + COUNTER
+    assert src is not None and src["kind"] == "loose"
+    # 找到的是熟饼所在的台面，不是生饼的 raw_spot（散熟源挂在台面上对台面盛）
+    assert src["target"]["n"] == COUNTER
 
 
 def test_burnt_pizza_is_not_cooked_source(frames):

@@ -555,13 +555,13 @@ class TakeCookedToPlate(Task):
             if token and token not in src["tokens"]:
                 continue
             item = src["item"]
-            # 锅具（煮锅/炸篮）散在台面上时，游戏的句柄是台面、不是锅具本身，
-            # 要对着承载它的站点盛（与灶上锅对着灶站盛是同一个道理），否则目标名
-            # 对不上 → handle mismatch（4-2 散炸篮 trace-20261111-130956 t=3260+）。
+            # 散熟源（锅具/炸篮/出炉熟载体）挂在台面上时，游戏的句柄是台面、
+            # 不是源物品本身，要对着承载它的站点盛（与灶上锅对着灶站盛同理），
+            # 否则目标名对不上 → handle mismatch（4-2 散炸篮 trace-20261111-130956
+            # t=3260+；3-2 台面熟披萨 trace-20261115-133954 t=8348）。
             # 散在地上（on_station=null）的散物句柄就是它自己，照旧对 item 盛。
-            # 熟载体（整份披萨）不是锅具，句柄是载体本身，保持对 item 盛。
             station = _station_for_item(ctx["w"], item)
-            if P.item_is_cookware(item, ctx["w"].recipes) and station is not None:
+            if station is not None:
                 return {"kind": "loose", "target": station}
             return {"kind": "loose", "target": item}
         return None

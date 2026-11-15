@@ -13,6 +13,7 @@ import os
 
 import pytest
 
+from ai import tasks as T
 from ai.core import planner
 from ai.query.recipes import RecipeBook
 from ai.space import reachability as R
@@ -56,3 +57,18 @@ def test_p2_plates_the_loose_pizza_instead_of_idling(frame):
     assert task is not None
     assert task.TYPE == "TakeCookedToPlate"
     assert task.cooker_id == "Pizza_Base_Raw"
+
+
+def test_loose_cooked_pizza_source_targets_counter(frame):
+    """散熟披萨挂在台面上时，_source 应对着台面盛，而非披萨 item。
+
+    trace-20261115-133954 t=8348：TakeCookedToPlate 端盘去盛台面上的熟披萨，
+    _source 返回披萨 item（Pizza_Base_Raw），插件按 name 校验 use 句柄对不上
+    台面 → handle mismatch。
+    """
+    w, book, bb, _ = _plan(frame)
+    ctx = planner._make_context(w, bb, book)
+    task = T.TakeCookedToPlate("1", ("Pizza_Base_Raw", "-59512"), "MargheritaPizza")
+    src = task._source(ctx)
+    assert src is not None and src["kind"] == "loose"
+    assert src["target"].get("n") == "countertop_01_standard_gold_alt (3)"

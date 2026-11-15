@@ -2106,8 +2106,18 @@ namespace Oc2AI
                 string lname = mb.name.ToLowerInvariant();
                 if (ln.IndexOf("extinguish") < 0 && lname.IndexOf("extinguish") < 0) continue;
                 Vector3 p = mb.transform.position;
+                // 灭火器挂墙/放地上，可能挂在气球篮这类非主网格上。补报 grid/gx/gz，
+                // 否则 Python 只能拿 x/z 做主网格投影，移动篮关里站位算错、拿不起来
+                // （trace-20261115-162024 Balloon_2_3_2P）。gx/gz 用 GridIndexOn
+                // 按灭火器自己网格的本地索引反解，与 AppendStations 同口径。
+                object gm = GridManagerObj(mb);
+                string[] gidx = GridIndexOn(gm, p).Split(',');
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"n\":").Append(Jstr(mb.name))
+                  .Append(",\"grid\":").Append(
+                      gm is UnityEngine.Object ugm && ugm != null ? Jstr(ugm.name) : "null")
+                  .Append(",\"gx\":").Append(gidx[0])
+                  .Append(",\"gz\":").Append(gidx[1])
                   .Append(",\"x\":").Append(p.x.ToString("0.0"))
                   .Append(",\"z\":").Append(p.z.ToString("0.0"))
                   .Append(",\"held_by\":").Append(

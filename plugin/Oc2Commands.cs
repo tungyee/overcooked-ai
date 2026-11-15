@@ -31,16 +31,15 @@ namespace Oc2AI
             string tname = Req.Str(target, "name");
             if (kind == "use")
             {
-                // 盛料/盛容器（TakeCookedToPlate / FillCarrier）：要按的是
-                // “面对目标”的 use/grid 句柄，不能让 pickup/placement 的
-                // 坐标兜底把旁边柜台的句柄当成目标。4-2 散炸篮与柜台在各自
-                // 网格里都可能是 (1,2)，只比局部坐标会误按，把盘子放到柜台
-                // （trace-20261111-001945 t=600~690）。
-                if (NameMatchesStrict(f.UseName, tname)) return true;
-                if (NameMatchesStrict(f.GridName, tname)) return true;
-                if (NameMatchesStrict(f.PickupName, tname)) return true;
-                if (NameMatchesStrict(f.PlacementName, tname)) return true;
-                return false;
+                // 盛料/盛容器（TakeCookedToPlate / FillCarrier）：按键走
+                // PickupAndDrop，游戏按 pickup 句柄决定盛到哪——只有 pickup
+                // 指向目标才算命中。散料/散米抢走 pickup 时（pickup=SushiRice
+                // 而非锅）判不中，交给 Python 重站/清散料，不能再靠 GridName
+                // （面朝格）兜底误按（trace-20261115-162024：端盘被脚边散
+                // Pasta 抢 pickup，按下去盘掉地上）。
+                // 名字匹配、不做坐标兜底：保留 4-2 散炸篮/柜台局部坐标同名
+                // 的修复（trace-20261111-001945 t=600~690）。
+                return NameMatchesStrict(f.PickupName, tname);
             }
             if (kind == "pickup")
             {

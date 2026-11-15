@@ -401,8 +401,18 @@ namespace Oc2AI
         // relMoved 恒非零、0.8s stuck 永不触发，只能靠这里的物理探测。
         private const float BLOCK_PROBE = 0.4f;
         private const float BLOCK_GRACE = 0.3f;
-        // 锚定射线：从厨师头顶往下打 Ground(9) 层，找 waypoint 脚下的地板。
-        private const int GROUND_LAYER_MASK = 1 << 9;
+        // 锚定射线：从厨师头顶往下打 Ground(9) + SlopedGround(28) 层，找 waypoint
+        // 脚下的地板。SlopedGround 是楼梯/坡道（Wizard_3_1「Left Side Stairs」）；
+        // 探地只认 Ground 会把上楼梯误判成悬崖（ledge），P2 端着成品盘上不了楼。
+        private static readonly int GROUND_LAYER_MASK = BuildGroundMask();
+
+        private static int BuildGroundMask()
+        {
+            int mask = 1 << 9;  // Ground
+            int sloped = LayerMask.NameToLayer("SlopedGround");
+            if (sloped >= 0) mask |= 1 << sloped;
+            return mask;
+        }
         private const float ANCHOR_RAY_UP = 5f;
         private const float ANCHOR_RAY_LEN = 20f;
         // 跨地板缝隙：厨师胶囊半径/直径、Dash 按住时长、冷却。

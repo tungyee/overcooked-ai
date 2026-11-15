@@ -2756,13 +2756,13 @@ namespace Oc2AI
                     .Append(",\"x\":").Append(p.x.ToString("0.0"))
                     .Append(",\"z\":").Append(p.z.ToString("0.0"));
                 AppendColliderBounds(sb, mb);
-                // 可着火的非灶站点（counter/chopping/workstation/crate）都报 onFire：
-                // 火按 ServerFlammable.m_fireSpreadRadius 蔓延，料箱（米/肉箱 = crate）
-                // 也会被点着，不能漏（trace 实机：柜台火灭了、米箱肉箱还在烧）。
-                if (type == "counter" || type == "chopping" || type == "workstation"
-                        || type == "crate")
+                // 任何挂了 ServerFlammable 的站点都能着火（灶/柜台/砧板/工作台/
+                // 料箱/搅拌站…由场景预制体决定，不做类型白名单）。反编译确认火状态
+                // 在 ServerFlammable.m_onFire 上；读不到 ServerFlammable 就报 null。
+                string onFire = StationOnFire(mb);
+                if (onFire != "null")
                 {
-                    sb.Append(",\"onFire\":").Append(StationOnFire(mb));
+                    sb.Append(",\"onFire\":").Append(onFire);
                 }
                 if (type == "crate")
                 {

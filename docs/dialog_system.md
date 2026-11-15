@@ -80,10 +80,10 @@ read_cookbook(section)              读取本关攻略某一节（有攻略时�
 
 - **历史 trace 回放 LLM**：`python3 tools/replay_dialog_llm.py --trace trace-<时间戳>.jsonl` 从 trace 的 `state` 快照重建 World，按局面选帧，走线上同一条路径（worker 两段式 LLM → 主循环落账本 → planner 重选），逐轮打印回复、工具调用、账本和 P2 的实际选择，并按期望检查（闲聊不调工具、一句两处分工都落、改口用 edit、叫停/恢复、截止抢回的话术与节点一致等）。`--dry-run` 只选帧打印 prompt；`--show-prompt` 每轮打印完整消息；`--scenario NAME` 只跑指定场景。
 
-- **PTT（推荐）**：设置 `OC2_VOICE_PTT_KEY=f8` 后，按住 F8 录音、松开发送，完全绕过 VAD 的起止判断。一次按住 = 一轮对话：录音会带约 300 ms pre-roll 和 200 ms 尾音，ASR 返回的多个 definite 片段会先合并再送 LLM，避免一句话被拆成多次回复。
+- **PTT（推荐）**：按住 `OC2_VOICE_PTT_KEY`（未设置时默认 `f8`）录音、松开发送。一次按住 = 一轮对话：录音会带约 300 ms pre-roll 和 200 ms 尾音，ASR 返回的多个 definite 片段会先合并再送 LLM，避免一句话被拆成多次回复。
   - macOS 默认把 F8 当媒体键：需要 **Fn+F8**，或在「系统设置 → 键盘 → 键盘快捷键 → 功能键」里启用「使用 F1、F2 等键作为标准功能键」。
   - 当前只监听键盘事件。手柄需要通过 Steam Input 映射成 F8；如果游戏不是由 Steam 启动（本项目用 `run_game.sh` 直接启动），Steam 的**游戏布局**可能不生效，需要试 **Desktop Layout**，或另行实现原生手柄监听。
-  - 监听建立失败（缺「辅助功能/输入监控」权限）时，worker 会记录 `worker_error where=ptt` 并自动退回 VAD。
+  - 监听建立失败（缺「辅助功能/输入监控」权限）时，worker 会记录 `worker_error where=ptt`，语音输入不可用。
 - **半双工限制**：TTS 播放期间 VAD 暂停、PTT 按键事件被忽略，播完只 flush 播放窗口内的采集块（TTS 前已排队的语音保留），避免把自己的声音送进 ASR。因此 AI 说话时你插话会被忽略，等它说完再说。主动回合（新单/截止抢回）在 worker 里是串行的：LLM 请求在飞时新的人声要等这一回合结束才处理；v1 不做抢占（第二版再支持 barge-in）。游戏音效和扬声器外放也会干扰识别，建议戴耳机或把游戏音量调低。
 - **默认值验证状态**：TTS 2.0（`seed-tts-2.0` + `zh_female_vv_uranus_bigtts`）、ASR 2.0（`volc.seedasr.sauc.duration`）、方舟 plan 端点（`/api/plan/v3`）与键盘 PTT（Fn+F8）均已用真实 key/设备验证；手柄经 Steam Input 直接触发 F8 尚未验证。普通方舟 key 仍用 `/api/v3`；首次换账号请按 §6 排障确认。`tests/test_live_voice.py` 在 `OC2_LIVE_VOICE=1` 时做真实冒烟，CI/常规测试不会执行。
 - 还需要游戏侧正常：插件把状态推到 `127.0.0.1:27411`（见 `AGENTS.md`）。语音不改这条链路。
@@ -117,8 +117,8 @@ python3 run_agent.py --voice --voice-debug
 | `OC2_VOICE` | 否 | 不设；`0` 强制关，其他值表示希望开（缺 key 时仍告警退回） |
 | `OC2_VOICE_RATE` | 否 | `1.05`（允许 0.5–2.0，超出收敛；**当前仅保留、未接到 TTS 参数**） |
 | `OC2_VOICE_VOLUME` | 否 | `0.7`（允许 0.3–1.2，超出收敛） |
-| `OC2_VOICE_VAD_DB` | 否 | `9.0`（VAD 开口阈值，底噪之上的 dB，范围 2–20；越小越敏感） |
-| `OC2_VOICE_PTT_KEY` | 否 | 不设（VAD 自动切句）；设为 `f8` 等则按住录音、松开发送。macOS 直接按 F8 可能是媒体键，用 Fn+F8 或启用标准功能键；手柄可用 Steam Input 映射到该键 |
+| `OC2_VOICE_VAD_DB` | 否 | `9.0`（已弃用：VAD 自动切句停用后无实际作用） |
+| `OC2_VOICE_PTT_KEY` | 否 | 默认 `f8`（未设置时兜底为 `f8`）；按住该键录音、松开发送。macOS 直接按 F8 可能是媒体键，用 Fn+F8 或启用标准功能键；手柄可用 Steam Input 映射到该键 |
 | `OC2_LLM_TIMEOUT` | 否 | `10.0`（方舟请求超时秒数，范围 1–60；plan 端点容易超过 3s） |
 | `OC2_VOICE_LOG` | 否 | 不设时自动用 `runs/voice-<trace 时间戳>.jsonl`；显式路径优先，`.gitignore` 已排除 `voice*.jsonl` |
 
@@ -212,16 +212,16 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 - 如果说话太轻：靠近麦克风、提高系统输入音量；如果回声/键盘声频繁触发：降低输入增益或换指向性麦克风。
 - 阈值可用 `OC2_VOICE_VAD_DB` 调（默认 9）：不触发时先试 4–6；误触发/游戏声频繁打断时调回 8–12。
 - 更底层的阈值改动在 `VAD(threshold_db=...)`，改完跑 `python3 -m pytest tests/test_audio_vad.py -q`。
-- 环境噪声大、说话偏轻时优先用 PTT（见下），不要继续硬调 VAD。
+- 环境噪声大、说话偏轻时用 PTT 会更稳（见下）。
 
 ### PTT 没反应 / 重复回复
 
-- 日志先看 `PTT 已启用：按键 ...`；没有这行说明 `OC2_VOICE_PTT_KEY` 没生效或 `PushToTalk.start()` 失败（会同时出现 `worker_error where=ptt`，并退回 VAD）。
+- 日志先看 `PTT 已启用：按键 ...`；没有这行说明 `PushToTalk.start()` 失败（会同时出现 `worker_error where=ptt`，语音输入不可用）。
 - 按下时应有 `PTT 事件: down`，松开有 `up`，随后是 `处理一段人声`。只有 `up` 没有 `down`，或完全没有事件，说明按键事件没到进程：
   - macOS 笔记本默认 F8 是媒体键，直接按不会产生标准 F8 的 keycode；用 **Fn+F8**，或在系统设置里启用「使用 F1、F2 等键作为标准功能键」。
   - 手柄通过 Steam Input 映射时，游戏若不是由 Steam 启动（本项目用 `run_game.sh`），Steam 的游戏布局可能不生效；试 `Steam → 设置 → 控制器 → 桌面布局`，或改用键盘/原生手柄监听。
   - 全局监听需要「辅助功能」权限；listen-only event tap 在部分系统上还需要「输入监控」权限，授权后重启进程。
-- 一次按住只应回复一次。若同一句话被拆成多次回复，看 `ASR 合并文本`：PTT 模式已把多个 definite 片段合并；VAD 模式仍按片段处理，建议切 PTT。
+- 一次按住只应回复一次。若同一句话被拆成多次回复，看 `ASR 合并文本`：PTT 已把多个 definite 片段合并。
 
 ### 自己的 TTS 被当成用户说话（回声）
 

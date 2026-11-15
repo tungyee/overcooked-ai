@@ -59,7 +59,8 @@ VOICE_DEFAULTS = {
     "OC2_VOICE_VOLUME": 0.7,
     "OC2_VOICE_VAD_DB": 9.0,
     "OC2_LLM_TIMEOUT": 10.0,
-    "OC2_VOICE_PTT_KEY": "",
+    # PTT 未配置时的默认键；f8 在 macOS/Windows 都有效（macOS 笔记本需 Fn+F8）。
+    "OC2_VOICE_PTT_KEY": "f8",
 }
 
 
@@ -246,9 +247,9 @@ def _build_voice_config(args, env):
         llm_timeout=_env_float(
             env, "OC2_LLM_TIMEOUT", VOICE_DEFAULTS["OC2_LLM_TIMEOUT"],
             min_value=1.0, max_value=60.0),
-        ptt_key=(_env_text(
+        ptt_key=_env_text(
             env, "OC2_VOICE_PTT_KEY",
-            VOICE_DEFAULTS["OC2_VOICE_PTT_KEY"]) or None),
+            VOICE_DEFAULTS["OC2_VOICE_PTT_KEY"]),
         log_path=(args.voice_log
                   or _env_text(env, "OC2_VOICE_LOG", "")
                   or _default_voice_log()

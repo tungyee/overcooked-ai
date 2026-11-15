@@ -61,12 +61,12 @@ python3 run_agent.py --nav-debug            # 打印 [NAV] 走位诊断（stderr
 python3 tools/voice_smoke.py doctor         # 独立冒烟：依赖/配置/音频设备（不连游戏）
 python3 tools/voice_smoke.py all            # TTS→ASR 回环 + 方舟 LLM + 扬声器
 python3 tools/replay_dialog_llm.py --trace runs/trace-<时间戳>.jsonl  # 历史 trace 回放 LLM 对话 case
-# PTT：.env 设 OC2_VOICE_PTT_KEY=f8；笔记本按 Fn+F8，按住说话、松开发送
+# PTT：.env 设 OC2_VOICE_PTT_KEY=f8（未设默认 f8）；笔记本按 Fn+F8，按住说话、松开发送
 ```
 
 - 语音 CLI：`--voice` 显式启用（缺必需 key 时报错退出 2；优先于 `OC2_VOICE=0`）；`--no-voice` 恒关闭；无 flag 时有 key 才启用、缺 key 告警后退回无语音。`--voice-debug` 把 `ai.dialog` 日志开到 DEBUG（ASR 文本、LLM 原文/回合、命令/ack、播报、错误；不含分段计时），`--voice-log PATH` 写逐行 JSON 对话日志（`ts`/`kind` + 事件字段；每轮 `turn_latency` 含 ASR/LLM 首 token/TTS 首包/首帧出声/`since_level_ms` 分段耗时；另有 `turn_start`/`turn_stall`/`ptt_cb`/`barge_in` 诊断事件；不传路径时默认 `runs/voice-<trace 时间戳>.jsonl`，与 trace 一一对应；`restart.sh` 有语音时默认开 `--voice-debug` 并写该日志）；`--env-file PATH` / `--no-env-file` 控制启动时 `.env` 的自动加载（默认仓库根 `.env`）。
 - 走位诊断：`--nav-debug`（或 `OC2_NAV_DEBUG=1`）把 `[NAV] plan/move/no-goal/no-path` 打到 stderr，含目标身份/位置、当前格、交互位、路径和 4-1 过街标记；插件侧 `[EXEC] move start/stuck/ledge/skip/finish` 写到 `~/Library/Logs/Unity/Player.log`，带 `t=` 和 `target_id=`，可与 `[TRAFFIC-ROOT]` 的 `t=` 对照。`--nav-debug` 与 `--voice-debug` 独立，可同时开。
-- 语音环境变量：`VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID`、`VOLC_TTS_API_KEY`、`VOLC_TTS_VOICE`、`VOLC_TTS_RESOURCE_ID`、`ARK_API_KEY`、`ARK_MODEL`、`ARK_BASE_URL`、`OC2_VOICE`、`OC2_VOICE_RATE`（0.5–2.0，当前仅保留、未接到 TTS 参数）、`OC2_VOICE_VOLUME`（0.3–1.2）、`OC2_VOICE_VAD_DB`（2–20，底噪之上的 dB，越小越敏感）、`OC2_VOICE_PTT_KEY`（如 `f8`；设置后按住录音、松开发送，手柄可用 Steam Input 映射）、`OC2_LLM_TIMEOUT`（1–60 秒，默认 10）、`OC2_VOICE_LOG`（示例见 `.env.example`，说明见 `docs/dialog_system.md`）。非有限值回退默认，超范围收敛到边界。
+- 语音环境变量：`VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID`、`VOLC_TTS_API_KEY`、`VOLC_TTS_VOICE`、`VOLC_TTS_RESOURCE_ID`、`ARK_API_KEY`、`ARK_MODEL`、`ARK_BASE_URL`、`OC2_VOICE`、`OC2_VOICE_RATE`（0.5–2.0，当前仅保留、未接到 TTS 参数）、`OC2_VOICE_VOLUME`（0.3–1.2）、`OC2_VOICE_VAD_DB`（已弃用：VAD 自动切句停用）、`OC2_VOICE_PTT_KEY`（默认 `f8`；按住录音、松开发送，手柄可用 Steam Input 映射）、`OC2_LLM_TIMEOUT`（1–60 秒，默认 10）、`OC2_VOICE_LOG`（示例见 `.env.example`，说明见 `docs/dialog_system.md`）。非有限值回退默认，超范围收敛到边界。
 - Agent 连不上 27411 直接退出（退出码 1）；收到 `level` 帧才真正决策。27412 exec 通道启动时发 `ping` 握手，无回包也退出 1——通常是卡死的旧游戏进程占着端口（`tools/exec_ping.py` / `lsof -nP -iTCP:27412 -sTCP:LISTEN` 排查，结束占用者再重启游戏）。
 - **执行后端**：唯一执行后端是插件逐帧闭环 + InControl 虚拟手柄（走 27412 exec 通道，**无需辅助功能**）。要求 agent 启动时游戏在主菜单（虚拟手柄只在主菜单能 engage 成 P2），已进关卡则报 not engaged、AI 空转。
 - **退出顺序：先停 Agent 再退游戏**（插件有 watchdog 兜底松键，但习惯仍保留）。
@@ -92,7 +92,7 @@ python3 tools/exec_ping.py              # 探测 27412 exec 通道是否活着�
 - `docs/agent/architecture.md` —— 技术栈、目录结构、核心架构（三层+黑板）、收益模型与产能。
 - `docs/agent/tasks-primitives.md` —— task 契约与类型表、执行原语表、资源 id/认领、代码风格。
 - `docs/agent/status-backlog.md` —— 已知限制/技术债务、当前状态、待办、改权重前必读。
-- `docs/dialog_system.md` —— 语音对话：依赖、环境变量、`--voice` 用法、排障（VAD/TTS 回声/延迟/音频设备）。
+- `docs/dialog_system.md` —— 语音对话：依赖、环境变量、`--voice` 用法、排障（TTS 回声/延迟/音频设备）。
 - `docs/map/` —— 各关卡网格/站点/配方数据。
 - `docs/superpowers/specs/2026-10-04-ai-behavior-architecture-design.md` —— 架构设计（「spec §N」出处）。
 - `docs/superpowers/specs/2026-10-18-voice-dialog-interaction-design.md` —— 语音对话设计（对话层 spec §N 出处）。

@@ -147,7 +147,7 @@ macOS：
 
 在本机 `.env` 填写 `VOLC_ASR_API_KEY`、`VOLC_TTS_API_KEY`、`ARK_API_KEY`、`ARK_MODEL`；按账户使用的产品设置 `ARK_BASE_URL`。模型名或推理接入点必须在该端点可用。音色须与 TTS 资源版本匹配，具体变量见 [.env.example](.env.example)。**不要把真实密钥写入 README、示例文件或提交记录**；`.env` 已被 Git 忽略。
 
-`run_agent.py` 自动读取仓库根 `.env`，已有环境变量优先，无需手动导出。Windows 支持 PowerShell 保存的 UTF-8 BOM 文件。Windows 建议配置 `OC2_VOICE_PTT_KEY=caps_lock`，按住录音、松开发送；避免 Alt/Ctrl/Shift 快捷键冲突及笔记本 F8 媒体功能。macOS 可用 `f8`（必要时 Fn+F8）；留空为 VAD 自动切句。
+`run_agent.py` 自动读取仓库根 `.env`，已有环境变量优先，无需手动导出。Windows 支持 PowerShell 保存的 UTF-8 BOM 文件。Windows 建议配置 `OC2_VOICE_PTT_KEY=caps_lock`，按住录音、松开发送；避免 Alt/Ctrl/Shift 快捷键冲突及笔记本 F8 媒体功能。macOS 可用 `f8`（必要时 Fn+F8）；未设置时默认 `f8`。
 
 ```powershell
 # Windows：可见语音控制台，Ctrl+C 停止，输入 oc2 回车再次启动

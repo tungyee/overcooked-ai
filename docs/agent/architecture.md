@@ -69,7 +69,7 @@ World 快照 → 认领对账 → 更新 P1Model → 卡住观测
 
 - 主循环固定 **20 Hz**，仍是唯一碰 `World` / `Blackboard` 的地方；每 10 拍（**2 Hz**）把压缩后的上下文 `publish_context()` 给 worker，新快照覆盖旧快照。
 - `DialogWorker` 跑独立 **daemon 线程**（内部可用 asyncio），只消费 context / 事件、产出 `DialogCommand` + ack；**不读 World、不写 Blackboard**。
-- 输入切句支持两种模式：默认 RMS VAD（自适应噪声底）；设置 `OC2_VOICE_PTT_KEY` 后改用全局按键 PTT（`ai/dialog/ptt.py` 的 Quartz listen-only event tap），按住录音、松开发送，一次按住只触发一轮对话。PTT 监听失败会记录 `worker_error where=ptt` 并退回 VAD。
+- 输入切句只支持全局按键 PTT（`OC2_VOICE_PTT_KEY`，未设置时默认 `f8`；`ai/dialog/ptt.py` 的 Quartz listen-only event tap），按住录音、松开发送，一次按住只触发一轮对话。PTT 监听失败会记录 `worker_error where=ptt`，语音输入不可用。
 - 命令回到主循环做权威校验后才写 `bb.preferences` / 硬否决；worker 等到 ack 再决定播不播 LLM 的回复（`rejected` 静默）。
 - 主循环用非阻塞队列与服务衔接，语音网络抖动或播放阻塞不会把 20 Hz 拖慢；关闭顺序是 Agent → worker → 游戏。
 - 语音整个链路可缺席：缺 key（无 `--voice`）时 `voice=None`，主循环没有 worker，行为与纯按键版一致。

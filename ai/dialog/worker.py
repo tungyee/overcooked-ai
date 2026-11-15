@@ -866,7 +866,7 @@ class DialogWorker(object):
                 log.info("PTT 已启用：按键 %s",
                          getattr(self.config, "ptt_key", "?"))
             except Exception as exc:            # noqa: BLE001
-                log.exception("PTT 启动失败，退回 VAD")
+                log.exception("PTT 启动失败，语音输入不可用")
                 self._log_event("worker_error", where="ptt", error=str(exc))
         last_loop_at = time.monotonic()
         try:
@@ -1785,7 +1785,7 @@ class DialogWorker(object):
                 ptt = PushToTalk(keycode_for(config.ptt_key),
                                  on_event=self._on_ptt_event)
             except ValueError:
-                log.exception("PTT 键名无效: %r，退回 VAD", config.ptt_key)
+                log.exception("PTT 键名无效: %r，语音输入不可用", config.ptt_key)
 
         return DialogClients(
             capture=AudioCapture(),

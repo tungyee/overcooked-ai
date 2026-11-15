@@ -162,7 +162,7 @@ def test_env_defaults():
     assert cfg.volume == pytest.approx(0.7)
     assert cfg.vad_threshold_db == pytest.approx(9.0)
     assert cfg.llm_timeout == pytest.approx(10.0)
-    assert cfg.ptt_key is None
+    assert cfg.ptt_key == "f8"
     assert cfg.log_path is None
     assert cfg.debug is False
 

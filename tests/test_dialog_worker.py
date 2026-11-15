@@ -647,25 +647,26 @@ def test_put_event_drops_oldest_when_full():
     assert bundle.event_q.empty()
 
 
-def test_thread_transcribes_utterance_as_int16_pcm():
-    asr = FakeASR(["我来切"])
-    worker, bundle = make_worker(
-        llm=FakeLLM(reply("行，你切。")), asr=asr)
-    bundle.vad.events = ["start", "end"]
-    worker.publish_context({"tick": 1000})
-    worker.start()
-
-    loud = np.full(160, 0.5, dtype=np.float32)
-    bundle.capture.push(loud)
-    assert wait_until(lambda: bundle.vad.fed >= 1)
-    bundle.capture.push(loud)
-
-    assert wait_until(lambda: bundle.tts.spoken == ["行，你切。"])
-    assert len(asr.calls) == 1
-    # 两帧 × 160 个 float32 样本 → 320 个 int16 样本 = 640 字节
-    assert len(asr.calls[0]) == 640
-    assert np.frombuffer(asr.calls[0], dtype="<i2")[0] == 16383
-    worker.stop()
+# VAD 自动切句已停用，此用例依赖 VAD 检测循环，暂时注释。
+# def test_thread_transcribes_utterance_as_int16_pcm():
+#     asr = FakeASR(["我来切"])
+#     worker, bundle = make_worker(
+#         llm=FakeLLM(reply("行，你切。")), asr=asr)
+#     bundle.vad.events = ["start", "end"]
+#     worker.publish_context({"tick": 1000})
+#     worker.start()
+#
+#     loud = np.full(160, 0.5, dtype=np.float32)
+#     bundle.capture.push(loud)
+#     assert wait_until(lambda: bundle.vad.fed >= 1)
+#     bundle.capture.push(loud)
+#
+#     assert wait_until(lambda: bundle.tts.spoken == ["行，你切。"])
+#     assert len(asr.calls) == 1
+#     # 两帧 × 160 个 float32 样本 → 320 个 int16 样本 = 640 字节
+#     assert len(asr.calls[0]) == 640
+#     assert np.frombuffer(asr.calls[0], dtype="<i2")[0] == 16383
+#     worker.stop()
 
 
 def test_ptt_records_while_held_and_sends_on_release():

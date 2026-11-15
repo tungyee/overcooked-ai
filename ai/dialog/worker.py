@@ -1001,45 +1001,46 @@ class DialogWorker(object):
                         utterance = None
                     continue
 
-                try:
-                    event = self.clients.vad.feed(frame)
-                except Exception as exc:
-                    log.exception("VAD 处理失败")
-                    self._log_event("worker_error", where="vad",
-                                    error=str(exc))
-                    event = None
-                if event:
-                    log.debug(
-                        "VAD 事件 %s（帧 #%d level=%s floor=%s）",
-                        event, frame_count,
-                        "?" if level is None else "%.1f" % level,
-                        "?" if floor is None else "%.1f" % floor)
-                if event == "start":
-                    if utterance is None:
-                        utterance = self._new_utterance("vad")
-                        for preroll_frame in preroll:
-                            self._feed_utterance(
-                                utterance, preroll_frame)
-                        self._feed_utterance(utterance, frame)
-                        vad_active = True
-                    else:
-                        vad_active = False
-                elif event == "end":
-                    # VAD 的 end 已经包含约 400 ms 静音判定；started 从这里算。
-                    speech_end = time.monotonic()
-                    if vad_active and utterance is not None:
-                        self._feed_utterance(utterance, frame)
-                        utterance.timing.started = speech_end
-                        self._await_utterance(utterance)
-                        utterance = None
-                    vad_active = False
-                elif vad_active and utterance is not None:
-                    self._feed_utterance(utterance, frame)
-                if utterance is not None and self._poll_utterance(utterance):
-                    utterance = None
-                preroll.append(frame)
-                if len(preroll) > PREROLL_FRAMES:
-                    preroll = preroll[-PREROLL_FRAMES:]
+                # VAD 自动切句逻辑已停用：语音输入只走 PTT。原实现保留在注释里。
+                # try:
+                #     event = self.clients.vad.feed(frame)
+                # except Exception as exc:
+                #     log.exception("VAD 处理失败")
+                #     self._log_event("worker_error", where="vad",
+                #                     error=str(exc))
+                #     event = None
+                # if event:
+                #     log.debug(
+                #         "VAD 事件 %s（帧 #%d level=%s floor=%s）",
+                #         event, frame_count,
+                #         "?" if level is None else "%.1f" % level,
+                #         "?" if floor is None else "%.1f" % floor)
+                # if event == "start":
+                #     if utterance is None:
+                #         utterance = self._new_utterance("vad")
+                #         for preroll_frame in preroll:
+                #             self._feed_utterance(
+                #                 utterance, preroll_frame)
+                #         self._feed_utterance(utterance, frame)
+                #         vad_active = True
+                #     else:
+                #         vad_active = False
+                # elif event == "end":
+                #     # VAD 的 end 已经包含约 400 ms 静音判定；started 从这里算。
+                #     speech_end = time.monotonic()
+                #     if vad_active and utterance is not None:
+                #         self._feed_utterance(utterance, frame)
+                #         utterance.timing.started = speech_end
+                #         self._await_utterance(utterance)
+                #         utterance = None
+                #     vad_active = False
+                # elif vad_active and utterance is not None:
+                #     self._feed_utterance(utterance, frame)
+                # if utterance is not None and self._poll_utterance(utterance):
+                #     utterance = None
+                # preroll.append(frame)
+                # if len(preroll) > PREROLL_FRAMES:
+                #     preroll = preroll[-PREROLL_FRAMES:]
         finally:
             if utterance is not None:
                 utterance.session.cancel()

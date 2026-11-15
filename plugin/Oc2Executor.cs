@@ -715,19 +715,30 @@ namespace Oc2AI
         // 只有前沿没地板、且直径内也没地板才判「前面是悬崖」——窄缝（< 半径，
         // 如 1-5 主地板与气球篮子之间 0.39m 接缝）胶囊能跨过去，单点探针会
         // 误判 ledge（trace-20261114-205207 t=157/160：P2 空转）。
+        // 前沿中心悬空时再探垂直两侧（±半径）：楼梯顶阶↔二楼地板的纵向缝
+        // 胶囊能骑在缝上（两侧都有地板），单点探针落缝里会误判 ledge
+        // （trace-20261115-132817 t=2223：P2 端着脏盘下楼被拦）。两侧都得有
+        // 地板才算「骑在缝上」——真悬崖两侧同样悬空，仍会判 ledge。
         private bool GroundGapAhead(ChefFrame f, Vector2 dir)
         {
             if (dir.sqrMagnitude < 1e-6f) return false;
             float y = f.Chef.transform.position.y + ANCHOR_RAY_UP;
             Vector3 lead = new Vector3(f.PosX + dir.x * CHEF_RADIUS, y,
                                        f.PosZ + dir.y * CHEF_RADIUS);
-            if (Physics.Raycast(lead, Vector3.down, ANCHOR_RAY_LEN,
-                                GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore))
-                return false;  // 胶囊前沿仍在板上：稳
+            if (FloorAt(lead)) return false;  // 胶囊前沿仍在板上：稳
+            float nx = -dir.y, nz = dir.x;    // 垂直方向
+            Vector3 sideA = new Vector3(lead.x + nx * CHEF_RADIUS, y, lead.z + nz * CHEF_RADIUS);
+            Vector3 sideB = new Vector3(lead.x - nx * CHEF_RADIUS, y, lead.z - nz * CHEF_RADIUS);
+            if (FloorAt(sideA) && FloorAt(sideB)) return false;  // 骑在纵向窄缝上
             Vector3 far = new Vector3(f.PosX + dir.x * CHEF_DIAMETER, y,
                                       f.PosZ + dir.y * CHEF_DIAMETER);
-            return !Physics.Raycast(far, Vector3.down, ANCHOR_RAY_LEN,
-                                    GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
+            return !FloorAt(far);
+        }
+
+        private bool FloorAt(Vector3 origin)
+        {
+            return Physics.Raycast(origin, Vector3.down, ANCHOR_RAY_LEN,
+                                   GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
         }
 
         // 当前段是否授权 dash。新协议（dash_edges）只看真正的缝隙跳边段；

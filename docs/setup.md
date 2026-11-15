@@ -9,7 +9,7 @@
 - Steam 已安装，且已安装 **Overcooked! 2**（macOS 版）。
 - 可用的 `python3`（macOS 默认不带；用 Xcode Command Line Tools 或 Homebrew 装一个）。
 - 安装 .NET SDK（不是仅有运行时）：`plugin/build.sh` 从 `dotnet --list-sdks` 探测 Roslyn，或用 `CSC_DLL` / `DOTNET` 环境变量指定；脚本不自动下载 SDK。
-- 在仓库根创建 Python 环境：`python3 -m venv .venv`。可选语音依赖见 [README](../README.md#可选语音与大模型)。
+- 在仓库根创建 Python 环境：`python3 -m venv .venv`。可选语音依赖见 [README](../README.md#语音对话)。
 
 ## 1. 安装 BepInEx + doorstop
 
@@ -75,6 +75,6 @@ cp plugin/build/Oc2AIPlugin.dll "$G/BepInEx/plugins/Oc2AIPlugin.dll"
 
 ## 参考
 
-- 插件协议版本：`0.24.4 / protocol 8`，需同时开放本机状态端口 27411 与执行端口 27412（见 `README.md`）。
+- 插件协议版本：`0.24.9 / protocol 10`，需同时开放本机状态端口 27411 与执行端口 27412（见 `README.md`）。
 - 架构与约定：`docs/agent/architecture.md`、`AGENTS.md`。
 - 语音排障：`docs/dialog_system.md`。

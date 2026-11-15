@@ -52,7 +52,7 @@
 - **队首单的盘漂到对面，整局静止**（`trace-20261110-233159` t=1600~1726）：`plate_match` 把队首 All 单绑到 Raft One 的 -19556，P2 够不着；P2 这侧唯一能用的 -19560 被 ChipsOnly 单占住。`TakeCookedToPlate` 恒 unreachable，其他订单又没盘/没空灶，候选 31 个 infeasible、1 个 unreachable，P2 一直站着。修：`_match_plates_to_orders` 先排除 P2 够不着的盘（手持的除外），队首 All 单改绑 -19560，AI 恢复端盘盛薯条。fixture `tests/fixtures/rapids/rapids42-static.ndjson.gz`，测试 `tests/test_plate_conflict.py::test_unreachable_plate_is_not_matched_to_the_head_order`。
 - **端着盘盛熟料输给救锅**：`TakeCookedToPlate` 已拿着目标盘时，`RescueCooked` 的 pressure 分可能更高，锅被端离灶台、盘还空着。端盘盛饭同样能停烧糊计时、还完成订单，应优先。修：`_score_candidate` 给 `TakeCookedToPlate` 在「手持目标盘」时加 `held_plate=+2.0`（L1/L2/L6 白名单），压过同锅的救锅兜底，但压不过真正的火情/快糊更高压。测试 `tests/test_score_ordering.py::test_holding_plate_beats_rescuing_pot`。
 
-**已知限制**：插件 0.24.8 的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「带子开头」的固定排序放；两筏漂开、只够得着自己这条带时**不送**（等漂近到能碰到玩家那侧的带子），不会再放到自己这侧进桶。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
+**已知限制**：插件的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「带子开头」的固定排序放；两筏漂开、只够得着自己这条带时**不送**（等漂近到能碰到玩家那侧的带子），不会再放到自己这侧进桶。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
 
 ## 半格走廊（2026-11-01，3_6_Dynamic_Lvl_02，未实机验证）
 

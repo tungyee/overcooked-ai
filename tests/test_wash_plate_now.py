@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
-"""洗盘「要不要洗」软闸从 feasible 拆进 L4 层谓词（Task 3，spec §A.3）。
-
-Task 2 加了 `now` 硬指令闸（_select_imperative），但它只在 `feasible()` 过滤后
-的候选里选——而 WashPlate.feasible 仍把「场上还有干净盘 / 装配盘」判成不可行，
-于是 `now 洗盘` 在有干净盘时根本够不到 WashPlate 候选。本任务把这条「要不要洗」
-策略从 feasible 拆出来，移到 L4 层谓词：
+"""洗盘「要不要洗」软闸从 feasible 拆进 L4 层谓词（spec §A.3）。
 
   - feasible 只保留物理约束（有脏盘 / 续洗态）；
-  - L4 层谓词改成 `plate_pressure >= 2.0 and not placed_plates`（clean==0 且
-    无装配盘才进解卡层）。
+  - L4 层谓词：`plate_pressure >= 2.0 and not placed_plates`（clean==0 且
+    无装配盘），**或** 场上总共 2 块盘且至少 1 块不干净（3-5 这类 2 盘关，
+    有脏盘就直接进解卡层，不等两块都用光）。
 
-代价是「有干净盘就别洗」从硬闸降级成层优先级：WashPlate 掉到 L7，但 `now 洗盘`
-能通过硬指令闸选到它。
+代价是「有干净盘就别洗」从硬闸降级成层优先级：3 块盘以上、只剩 1 块干净盘时
+WashPlate 仍掉到 L7，但 `now 洗盘` 能通过硬指令闸选到它。
 """
 from ai import tasks as T
 from ai.core import planner
@@ -103,35 +99,51 @@ def test_wash_infeasible_no_dirty():
 
 # ---------- L4 层谓词收紧 ----------
 
-def test_wash_layer_only_when_plate_blocked():
-    """layer_of_task(WashPlate) 只在 clean==0 and not placed 时为 L4，否则 L7。"""
+def test_wash_layer_two_plate_level_or_blocked():
+    """2 盘关有脏盘就 L4；3 块盘以上仍只在 clean==0 且无装配盘时 L4。"""
     wash = T.WashPlate(resources=("sink_01",))
 
     # clean==0 且无装配盘 → L4 解卡
     w0 = _wash_world(plates=[], items=[_dirty()])
     assert PL.layer_of_task(wash, w0) == PL.L_UNBLOCK
 
-    # 干净盘有剩（1 块，非拼装格）→ 不是 L4，掉 L7
+    # 2 盘关：1 块干净 + 1 块脏 → 也在 L4
     w1 = _wash_world(plates=[("p1", 2, 3, ())], items=[_dirty()])
-    assert PL.layer_of_task(wash, w1) == PL.L_CLEANUP
+    assert PL.layer_of_task(wash, w1) == PL.L_UNBLOCK
 
-    # 干净盘充足（2 块）→ 仍 L7
+    # 干净盘充足（2 块）+ 脏盘 = 3 块 → 仍 L7
     w2 = _wash_world(plates=[("p1", 2, 3, ()), ("p2", 3, 3, ())],
                      items=[_dirty()])
     assert PL.layer_of_task(wash, w2) == PL.L_CLEANUP
 
 
-def test_wash_not_l4_when_placed_plate():
-    """clean==0 但台上已有装配盘 → 不 L4（回归 guard：装配中却去洗盘）。
+def test_wash_l4_when_two_plates_and_dirty_even_if_placed():
+    """2 盘关：装配盘 + 脏盘也是 L4（用户确认的规则）。
 
-    实机复现的根因：盘已摆在拼装格上（装配盘=1），旧规则却因 clean <
-    PLATE_BUFFER 跑去洗盘。现在软闸在层谓词里：placed 为 True 时即便
-    clean==0 也不进 L4。
+    旧规则把 placed 当硬闸；2 盘关里另一块已经脏了，再等装配盘送完就断供，
+    所以有脏盘就直接进 L4。
     """
     w = _wash_world(plates=[("p1", 5, 5, ("Seaweed",))], items=[_dirty()])
     wash = T.WashPlate(resources=("sink_01",))
     assert planner._placed_plates(w) is True          # 装配盘确实被算作就位
+    assert PL.layer_of_task(wash, w) == PL.L_UNBLOCK
+
+
+def test_wash_not_l4_when_three_plates_and_placed():
+    """3 块盘以上仍保留 placed 守卫：没有断供风险，先别抢装配。"""
+    w = _wash_world(plates=[("p1", 5, 5, ("Seaweed",)),
+                            ("p2", 2, 3, ())],
+                    items=[_dirty()])
+    wash = T.WashPlate(resources=("sink_01",))
     assert PL.layer_of_task(wash, w) == PL.L_CLEANUP
+
+
+def test_plate_total_counts_clean_dirty_and_sink():
+    w = _wash_world(plates=[("p1", 2, 3, ())], items=[_dirty()])
+    assert planner._plate_total(w) == 2
+    w.stations[0]["plate_count"] = 1
+    w.items.clear()
+    assert planner._plate_total(w) == 2   # 1 干净盘 + 1 池里的盘
 
 
 def test_place_clean_plate_keeps_unblock_layer():
@@ -172,3 +184,27 @@ def test_now_wash_selects_when_clean_remain():
         [Candidate(wash, [], 15)], w, bb)
     assert chosen is not None
     assert chosen.task == wash
+
+
+def test_wash_infeasible_when_dirty_stack_unreachable(monkeypatch):
+    """脏盘摞在对面木筏、field 够不着时，不要选 WashPlate 空跑。"""
+    from ai.space import reachability
+    w = _wash_world(plates=[], items=[_dirty()])
+    ctx = _ctx(w)
+    ctx["field"] = {}
+    monkeypatch.setattr(
+        reachability, "can_interact",
+        lambda c, entry: entry.get("t") == "washing")
+    assert T.WashPlate(resources=("sink_01",)).feasible(ctx) is False
+
+
+def test_two_plate_rule_only_for_known_two_plate_levels():
+    """帧里看到 2 块盘不等于关卡只有 2 块盘：3+ 盘关的脏盘摞可能是一摞。"""
+    w = _wash_world(plates=[("p1", 5, 5, ("Seaweed",))], items=[_dirty()])
+    wash = T.WashPlate(resources=("sink_01",))
+
+    w.level = "Mine_2_4_2P"
+    assert PL.layer_of_task(wash, w) == PL.L_CLEANUP
+
+    w.level = "Rapids_3_5_2P"
+    assert PL.layer_of_task(wash, w) == PL.L_UNBLOCK

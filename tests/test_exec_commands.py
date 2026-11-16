@@ -5,8 +5,9 @@ import pytest
 from ai.exec.commands import CMD_NAMES, build_command, parse_result
 
 
-def test_cmd_names_covers_six():
-    assert set(CMD_NAMES) == {"move", "tap", "hold", "wait", "throw", "halt"}
+def test_cmd_names_covers_all_commands():
+    assert set(CMD_NAMES) == {"move", "tap", "hold", "wait", "throw", "halt",
+                              "ping", "raft"}
 
 
 def test_build_move_roundtrip_multi_grid():
@@ -47,13 +48,23 @@ def test_parse_result_full():
     r = parse_result('{"cmd_id": 7, "ok": true, "why": "stuck", '
                      '"held_after": null, "blocked_cell": [1.2, 3.4]}')
     assert r == {"cmd_id": 7, "ok": True, "why": "stuck",
-                 "held_after": None, "blocked_cell": [1.2, 3.4]}
+                 "held_after": None, "blocked_cell": [1.2, 3.4],
+                 "blocked_box": None, "blocked_kind": None}
+
+
+def test_parse_result_blocked_passes_box_and_kind():
+    r = parse_result('{"cmd_id": 7, "ok": false, "why": "blocked", '
+                     '"held_after": null, "blocked_cell": null, '
+                     '"blocked_box": [1.0, 2.0, 3.0, 4.0], "blocked_kind": "obstacle"}')
+    assert r["blocked_box"] == [1.0, 2.0, 3.0, 4.0]
+    assert r["blocked_kind"] == "obstacle"
 
 
 def test_parse_result_missing_keys_default_none():
     r = parse_result('{"cmd_id": 7, "ok": true}')
     assert r["cmd_id"] == 7 and r["ok"] is True
     assert r["why"] is None and r["held_after"] is None and r["blocked_cell"] is None
+    assert r["blocked_box"] is None and r["blocked_kind"] is None
 
 
 def test_parse_result_bad_json_raises():

@@ -2,8 +2,8 @@
 """熟料供需计数（第 1 组 1.2）。
 
 **为什么需要这一层**：本局 3 个 miss 的根因不是权重而是结构。
-`FetchToCooker` 只能由 `recipe_graph.emit` 按单发射，`_in_flight_cook_claim`
-压掉同一单的第二个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 ——
+`FetchToCooker` 只能由 `recipe_graph.emit` 按单发射，一份熟料在一单里只发
+一个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 ——
 于是「5 单要米」永远不等于「3 口灶在烧」。实测 trace-20261014-120406 的
 1700~3270 窗口（正是 order#3/4/5 三单过期的窗口）**59% 的拍里三口灶一个都
 没在煮**，峰值也只有 2 口。灶空转的机会成本是 12 秒不可压缩的时钟。
@@ -94,8 +94,7 @@ def cooked_supply(world, book, item):
 
     # ③ 台面/地上的散熟锅
     for it in (getattr(world, "items", None) or ()):
-        if not P.held_is_cookware({"held": it.get("n")},
-                                  getattr(world, "recipes", None)):
+        if not P.item_is_cookware(it, getattr(world, "recipes", None)):
             continue
         detail = it.get("detail") or []
         toks = parse_plate_detail(detail)
@@ -105,10 +104,39 @@ def cooked_supply(world, book, item):
         elif cooked_flag and _pot_matches(book, item, parse_pot_contents(detail)):
             n += 1
 
-    # ④ 已装盘未送
-    for p in (getattr(world, "plates", None) or ()):
-        if book.plate_has(p, item):
+    # ④ 已装盘未送：台面上的 + 手里端着的。World.plates 已排除手持盘，
+    # 只看它会在端盘/送餐途中把供给判成 0（重复下锅；断供看门狗抖动）。
+    seen_plates = set()
+    for pool in (getattr(world, "plates", None) or (),
+                 getattr(world, "held_plates", None) or ()):
+        for p in pool:
+            pid = p.get("n")
+            if pid is not None:
+                if pid in seen_plates:
+                    continue
+                seen_plates.add(pid)
+            if book.plate_has(p, item):
+                n += 1
+
+    # ⑤ 已装料载体里的（包了熟肉的卷饼等，散落或任一方手持）：放进盘就是
+    # 一份装盘熟料。不算的话 P1 包好肉卷，填灶还按缺一份再煎一锅。
+    from ai.query.carriers import carriers
+    want = book.want_tokens(item)
+    for c in carriers(world, include_held=True):
+        if want & c["contents"]:
             n += 1
+
+    # ⑥ 出炉的熟载体（整份披萨，散落或手持）：已经是一份熟料，端盘取就行。
+    # 在烤箱里的那份由 ① 灶上计数，这里跳过免得重复。
+    if token:
+        from ai.query.carriers import cooked_carrier_tokens
+        for pool in (getattr(world, "items", None) or (),
+                     getattr(world, "held_items", None) or ()):
+            for it in pool:
+                if P.item_on_cooker(it):
+                    continue
+                if token in cooked_carrier_tokens(it, book):
+                    n += 1
 
     return n
 
@@ -159,8 +187,7 @@ def recoverable_cookers(world, book):
     for it in (getattr(world, "items", None) or ()):
         if not isinstance(it, dict):
             continue
-        if not P.held_is_cookware({"held": it.get("n")},
-                                  getattr(world, "recipes", None)):
+        if not P.item_is_cookware(it, getattr(world, "recipes", None)):
             continue
         if P.item_on_cooker(it):
             continue
@@ -204,6 +231,9 @@ def cooked_items_wanted(world, book):
     for o in (getattr(world, "orders", None) or ()):
         for ing in book.requirements(o):
             if not book.needs_cooking(ing):
+                continue
+            # 整份进炉的菜（披萨）不是往灶上的锅里倒料：走载体链，不填灶
+            if book.carrier_base(ing) is not None:
                 continue
             key = str(ing).lower()
             if key not in lower:

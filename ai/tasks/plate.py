@@ -9,9 +9,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
+from ai.query.placement import counter_cell_now, counter_occupied
 from ai.exec.bt import Condition, Node, Selector, Sequence
-from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register, plate_by_id,
-                           plate_cell, station_at_cell)
+from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup, plate_by_id,
+                           plate_cell, plate_on_counter, station_at_cell)
 
 # 洗盘按住交互键的上限（拍）。done() 现在是「一池子全洗完」（见 WashPlate.done），
 # 每块实测约 2.8 秒（~56 拍），一整摞 3~4 块要 168~224 拍，故给 240 拍（12 秒）。
@@ -101,15 +103,104 @@ def clean_plate_at_source(ctx):
     return False
 
 
+def holding_plated_dish(ctx):
+    # type: (Dict) -> bool
+    """手里端着有料的盘（成品盘 / 待装盘的盘）。
+
+    这类盘该走 DeliverPlate / SendAcross，不该为了清手放下——放下就会被
+    下一个选中的任务再捡起来。实机 trace-20261109-124818 t=140~150 与
+    t=216~220 就是这样循环：WashPlate 要空手 → EnsureHandsFree 把成品盘放
+    到台面 → SendAcross 又把它拾起 → 再放下，10 秒里 wash 和 send 都没做成。
+    """
+    chef = ctx.get("chef") or {}
+    for item in getattr(ctx["w"], "held_plates", ()) or ():
+        if P.holds_plate(chef, item) and P.plate_count(item) > 0:
+            return True
+    return False
+
+
+def holding_raw_carrier(ctx):
+    # type: (Dict) -> bool
+    """手里端着生的载体（待进炉的披萨底）。
+
+    和 holding_plated_dish 同类：别的要空手的任务会把它放到台面、下一个任务
+    再捡起来。实机 trace-20261109-212622 t=94~99：SendAcross(dirty_plate) 为了
+    清手把待进炉的披萨底放下，PlaceCarrierInCooker 又捡起来，0.4 秒一次来回。
+    """
+    from ai.query import carriers as CR
+    held = CR.held_item(ctx["w"], P.P2_NAME)
+    if held is None:
+        return False
+    # 先确认是「可上灶的载体」（披萨底），再看它还是生的：普通料（番茄等）
+    # cooked 也是 None，会被 is_raw_carrier 误判成生载体。
+    return CR.is_prep_carrier(held, ctx.get("book"))         and CR.is_raw_carrier({"item": held})
+
+
+def holding_valuable(ctx):
+    # type: (Dict) -> bool
+    """手里端着不该为清手而放下的东西（成品盘 / 生载体）。"""
+    return holding_plated_dish(ctx) or holding_raw_carrier(ctx)
+
+
+def dirty_stack_entry(ctx):
+    # type: (Dict) -> Optional[Dict]
+    """脏盘摞的执行目标：优先同位置的 plate_return 站点，否则脏盘 item。
+
+    items[] 的 DirtyPlateStack 只有世界坐标，没有 gx/gz；同位置的
+    stations 条目（实测 {'t':'plate_return','n':'workstation_plate_return',
+    'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
+    都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
+    """
+    # 手里已经端着脏盘时，它就是本次 WashPlate 的目标。旧逻辑只看 items[]，
+    # 手持物在 held_items 里，于是会去用场上另一摞（常常是 Raft One 够不着
+    # 的那摞）做可达性检查，WashPlate 当场翻成 infeasible，树被 Chop 抢走，
+    # 手里的脏盘被 EnsureHandsFree 放到旁边柜台
+    # （trace-20261110-234204 t=3363~3371）。
+    for it in getattr(ctx["w"], "held_items", ()) or ():
+        if "dirtyplate" in str(it.get("n") or "").lower() \
+                and str(it.get("held_by") or "") == P.P2_NAME:
+            return it
+    stacks = [it for it in (getattr(ctx["w"], "items", ()) or ())
+              if "dirtyplate" in str(it.get("n") or "").lower()]
+    if not stacks:
+        return None
+    # 4-2 两边竹筏各有一摞脏盘时，items[] 顺序不保证先给 P2 这侧；
+    # 取第一个会把 Raft One 上够不着的那摞当成目标，WashPlate 恒 infeasible，
+    # 而 P2 这侧传送带上的脏盘一路被送进垃圾桶（trace-20261110-230514
+    # t=900：Raft One 的 workstation_plate_return 排在 Raft Two 的
+    # ConveyorStation 前面）。有可达场时优先可达的那摞。
+    field = ctx.get("field")
+    if field:
+        from ai.space import reachability
+        reachable = [it for it in stacks if reachability.can_interact(ctx, it)]
+        if reachable:
+            stacks = reachable
+    stack = stacks[0]
+    sx, sz = stack.get("x"), stack.get("z")
+    if sx is None or sz is None:
+        return stack
+    for st in getattr(ctx["w"], "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != "plate_return":
+            continue
+        if "drying" in str(st.get("n") or "").lower():
+            continue        # 晾干架是取干净盘的，不是脏盘摞
+        if st.get("gx") is None or st.get("gz") is None:
+            continue
+        # 同位置（回盘台与脏盘摞重合）才认
+        if abs(float(st.get("x", 1e9)) - float(sx)) < 0.7 and \
+                abs(float(st.get("z", 1e9)) - float(sz)) < 0.7:
+            return st
+    return stack
+
+
 def dirty_plate_exists(ctx, sink_id=None):
     # type: (Dict, Any) -> bool
-    """有要洗的盘：场上的 DirtyPlateStack，或洗碗池里待洗的盘（plate_count>0）。
+    """有要洗的盘：场上的 DirtyPlateStack、手里的脏盘、或洗碗池里待洗的盘。
 
-    后者是「盘已放进池子、正在洗」的进行态：盘一入池就离开 items[]，
-    若只认 items[]，feasible 会在入池那一拍翻脸，承诺惯性 3 拍后把正在
-    洗的树抢走（实机 trace-20261017-182700 t=1678~1680）。
+    手持的也要算：P2 捡起脏盘摞后它离开 items[]，只认 items[] 会让
+    feasible 在捡起那一拍翻脸，树被抢走后 wash 命令挂在那里没人接。
     """
-    for it in ctx["w"].items:
+    for it in (list(ctx["w"].items) + list(getattr(ctx["w"], "held_items", ()))):
         if "dirtyplate" in str(it.get("n") or "").lower():
             return True
     return sink_plate_count(ctx, sink_id) > 0
@@ -119,16 +210,17 @@ def dirty_plate_exists(ctx, sink_id=None):
 class PlaceCleanPlate(Task):
     """第 1 号：拿一块干净盘摆到拼装格。
 
-    resources = (plate_id, counter_cell)。counter_cell 是 (gx, gz)，由
-    Planner 的候选生成绑定——spec §9 记 PLATE_COUNTERS 的替代品是
+    resources = (plate_id, counter_cell)。counter_cell 是拼装位 id：主网格
+    台面为 (gx, gz)，移动网格台面为 (grid, 站名)（placement.counter_key），
+    由 Planner 的候选生成绑定——spec §9 记 PLATE_COUNTERS 的替代品是
     "Planner 的多拼装位候选生成 + 认领，不是一个 find 函数"（归 Plan 3）。
     """
 
     TYPE = "PlaceCleanPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "拿一个干净盘摆到拼装台上"
     LABEL = "摆盘"
-    # 不分菜的共享节点（ai/dialog/duties.py）。
+    # 不分菜的共享节点（ai/dialog/catalog.py）。
     SHARED = True
 
     @property
@@ -151,7 +243,7 @@ class PlaceCleanPlate(Task):
         手空是"真的放下去了"的必要信号——盘还攥在手里就绝不能算完成。
         """
         p = plate_by_id(ctx, self.plate_id)
-        return (plate_cell(ctx, p) == tuple(self.counter_cell)
+        return (plate_on_counter(ctx, p, self.counter_cell)
                 and P.hands_free(ctx["chef"]))
 
     def feasible(self, ctx):
@@ -161,23 +253,45 @@ class PlaceCleanPlate(Task):
         p = plate_by_id(ctx, self.plate_id)
         if p is None:
             return False                   # 盘被端走/消失
+        if station_at_cell(ctx, self.counter_cell) is None:
+            return False                   # 移动台面不在快照里
+        if counter_occupied(ctx["w"], self.counter_cell, self.plate_id):
+            return False                   # 台面上已有锅/料/别的盘
+        # 盘已经在通道上（正在送给对面）：别抢回来摆盘，否则和 SendAcross 反复
+        # 「放上去 → 抢下来」振荡（trace-20261112-222007 末段空盘 -40680）。
+        from ai.space import channels as CH
+        if CH.slot_of(ctx["w"], p, ctx.get("bb")) is not None:
+            return False
         return P.plate_count(p) == 0       # 必须是干净空盘
 
     def build(self):
         # type: () -> Node
         plate_id, cell = self.plate_id, self.counter_cell
+
+        def holding_bound(c):
+            # 必须是绑定的那块盘：只看「手里是盘」会把上一单端着的装料盘当成
+            # 这块空盘，直接拿去摆（trace-20261031-002224 t=2752：端着装虾的
+            # -34858 去摆 -34158）。
+            return P.holds_plate(c["chef"], plate_by_id(c, plate_id))
+
+        def excluded(c):
+            # 清手落点排除本 task 的目标拼装格：手里端着别的料（如 Pasta）时，
+            # EnsureHandsFree 就近落点正好是这块台面，把料丢回去 → 台面被占 →
+            # 本 task 不可行 → 与 ThrowBatch 振荡（trace-20261103-221421
+            # t=4287~4354）。移动台面每帧按站点重投影，取本帧格。
+            cur = counter_cell_now(c["w"], cell)
+            return {tuple(cur)} if cur is not None else set()
+
         return PR.Timeout(Sequence([
             # 树首清手：被抢占时手里可能端着上一 task 的东西（spec §7.4）；
-            # keep：手里已经是盘就别放下再捡
-            PR.EnsureHandsFree(keep=lambda c: P.held_is_plate(c["chef"])),
+            # keep：手里已经是这块盘就别放下再捡；exclude：别丢回目标拼装格。
+            PR.EnsureHandsFree(keep=holding_bound, exclude=excluded),
             PR.InteractWith(
-                lambda c: plate_by_id(c, plate_id), "pickup",
-                lambda c: P.held_is_plate(c["chef"])),
+                lambda c: plate_by_id(c, plate_id), "pickup", holding_bound),
             PR.InteractWith(
                 lambda c: station_at_cell(c, cell), "placement",
-                lambda c: (plate_cell(
-                    c, plate_by_id(c, plate_id)) == tuple(cell)
-                    and P.hands_free(c["chef"]))),
+                lambda c: (plate_on_counter(c, plate_by_id(c, plate_id), cell)
+                           and P.hands_free(c["chef"]))),
         ]), TASK_TIMEOUT_TICKS)
 
 
@@ -195,10 +309,10 @@ class WashPlate(Task):
     """
 
     TYPE = "WashPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "在洗碗池洗脏盘"
     LABEL = "洗盘"
-    # 不分菜的共享节点；需要洗碗池这类站点才进目录（ai/dialog/duties.py）。
+    # 不分菜的共享节点；需要洗碗池这类站点才进目录（ai/dialog/catalog.py）。
     SHARED = True
     STATION = "washing"
 
@@ -217,6 +331,14 @@ class WashPlate(Task):
         # 叠加「已经洗出干净盘在取盘位」。
         if sink_plate_count(ctx, self.sink_id) > 0:
             return False
+        # 手里还端着脏盘也不算完：只看池子+干净盘会在「刚捡起脏盘、还没
+        # 放进池子」时误判完成（trace-20261108-164955 t=1932：wash 命令在
+        # 捡起 DirtyPlateStack 的那一拍被标 succeeded）。场上别的脏盘摞不算
+        # ——那由 L4 层决定要不要洗，不能让它把 done 永久压成 False
+        # （test_wash_plate_infeasible_when_already_done）。
+        for it in getattr(ctx["w"], "held_items", ()) or ():
+            if "dirtyplate" in str(it.get("n") or "").lower():
+                return False
         return clean_plate_at_source(ctx)
 
     def feasible(self, ctx):
@@ -228,6 +350,25 @@ class WashPlate(Task):
         # t=6117~6193 与 7228~7370 共 220 拍选 WashPlate、0 拍按键。
         if self.done(ctx):
             return False
+        # 手里端着有料的盘 / 生载体：先把东西送出去，别为了清手把它放下
+        # （放下就会被送餐/送盘任务再捡起来，两个任务互相拆台）。
+        if holding_valuable(ctx):
+            return False
+        # 这个池子在对面时 P2 走不过去；让 SendAcross(dirty_plate) 先送过去。
+        # 拓扑未知（无 field）保持旧行为。
+        sink = sink_station(ctx, self.sink_id)
+        if sink is not None and ctx.get("field"):
+            from ai.space import reachability
+            if not reachability.can_interact(ctx, sink):
+                return False
+        # 池里已经有盘时，直接洗池子即可，不需要够得着脏盘摞；只有「要去捡
+        # 脏盘」这条路才要求脏盘摞可达，否则会选一个空跑的 WashPlate。
+        dirty = dirty_stack_entry(ctx)
+        if (dirty is not None and sink_plate_count(ctx, self.sink_id) <= 0
+                and ctx.get("field") is not None):
+            from ai.space import reachability
+            if not reachability.can_interact(ctx, dirty):
+                return False
         # 当前承诺就是洗这个池子 → 继续洗完，别中断。这里必须看「承诺」而
         # 不是只看「池子里有盘」：池子里有盘也可能是 P1 刚放进去的脏盘，那时
         # 场上还有干净盘/装配盘的话就不该去洗。只有 P2 自己已承诺在洗（含
@@ -237,12 +378,21 @@ class WashPlate(Task):
         active = getattr(commitment, "active_task", None) \
             if commitment is not None else None
         if active is not None and active == self:
-            return True
-        # 不在续洗态 → 只判物理可行性：有要洗的盘就可行。「要不要洗」的软闸
-        # （场上还有干净盘 / 装配盘就别洗）已拆到 L4 层谓词（spec §A.3）——
-        # feasible 这里若再拦，`now 洗盘` 这种硬指令就够不到 WashPlate 候选，
-        # 因为 _select_imperative 只在 feasible 过滤后的候选里选。
-        return dirty_plate_exists(ctx, self.sink_id)
+            # 续洗只在「P2 真的有活可干」时成立：脏盘摞在换帧的瞬间会从
+            # items[] 里消失一下（进传送带/被 P1 端走），这时树会空跑
+            # 三次失败 → 被 abandoned → recovery_cooldown 冻结整局
+            # （t=3486~3488）。没活就让承诺自然切换。
+            return dirty_stack_entry(ctx) is not None \
+                or sink_plate_count(ctx, self.sink_id) > 0
+        # 不在续洗态 → 只判物理可行性：有 P2 能处理的活就可行。「要不要洗」
+        # 的软闸（场上还有干净盘 / 装配盘就别洗）已拆到 L4 层谓词
+        # （spec §A.3）——feasible 这里若再拦，`now 洗盘` 这种硬指令就够不到
+        # WashPlate 候选，因为 _select_imperative 只在 feasible 过滤后的候选里选。
+        # 注意不能用 dirty_plate_exists：它会算上 P1 手里端着的那摞，P2 够不着，
+        # 于是候选可行但树首找不到目标 → 空跑失败 → recovery_cooldown 冻结
+        # （t=3486）。
+        return dirty_stack_entry(ctx) is not None \
+            or sink_plate_count(ctx, self.sink_id) > 0
 
     def build(self):
         # type: () -> Node
@@ -256,38 +406,24 @@ class WashPlate(Task):
             return sink_plate_count(c, sink_id) > 0
 
         def dirty(c):
-            """脏盘摞的取用目标：优先 stations 里的回盘台（有 gx/gz）。
+            return dirty_stack_entry(c)
 
-            items[] 的 DirtyPlateStack 只有世界坐标，没有 gx/gz；同位置的
-            stations 条目（实测 {'t':'plate_return','n':'workstation_plate_return',
-            'gx':-1,'gz':-5}）才是带网格的权威目标，Approach / interact_ready
-            都按它判。先确认脏盘摞真的存在（items），再把坐标换成站点那条。
-            """
-            stack = None
-            for it in c["w"].items:
-                if "dirtyplate" in str(it.get("n") or "").lower():
-                    stack = it
-                    break
-            if stack is None:
-                return None
-            sx, sz = stack.get("x"), stack.get("z")
-            if sx is None or sz is None:
-                return stack
-            for st in c["w"].stations:
-                if not isinstance(st, dict) or st.get("t") != "plate_return":
-                    continue
-                if "drying" in str(st.get("n") or "").lower():
-                    continue        # 晾干架是取干净盘的，不是脏盘摞
-                if st.get("gx") is None or st.get("gz") is None:
-                    continue
-                # 同位置（回盘台与脏盘摞重合）才认
-                if abs(float(st.get("x", 1e9)) - float(sx)) < 0.7 and \
-                        abs(float(st.get("z", 1e9)) - float(sz)) < 0.7:
-                    return st
-            return stack
+        def holding_dirty(c):
+            """手里已经端着脏盘（捡起后、还没放进池子）。"""
+            return "dirtyplate" in P.held_name(c.get("chef"))
 
         return PR.Timeout(Sequence([
+            # 树首清手：手里拿的是脏盘就保留（直接去池子放），否则先放回合法
+            # 落点。WashPlate 候选不再要求空手生成，端干净盘时也会接到洗碗任务。
+            PR.EnsureHandsFree(keep=holding_dirty),
             Selector([
+                # 起点 C：手里已经端着脏盘（上一步刚捡起 / 被救锅打断后重建树）
+                # → 直接去池子放下，不再找脏盘摞。
+                Sequence([
+                    Condition(holding_dirty),
+                    PR.InteractWith(sink, "placement",
+                                    lambda c: P.hands_free(c["chef"])),
+                ]),
                 Sequence([
                     # face=True：脏盘摞是**固定站点**，站对位置但朝向不对时
                     # `interactions.pickup` 为 null，不转身就永远按不到（实机
@@ -314,6 +450,110 @@ class WashPlate(Task):
 
 
 @_register
+class FetchConveyorPlate(Task):
+    """传送带上的盘快到末端垃圾桶时，先去把它拿起来。
+
+    4-2 的台面传送带末端就是 Bin 1：玩家送过来的盘/成品如果不接，会一路
+    进桶销毁。旧逻辑只给脏盘 `WashPlate` 提优先级，干净盘/成品盘没有任
+    务，`DeliverPlate` 又可能被 combo_break 挡住，盘就没了
+    （trace-20261110-234204 t=340~421：装生菜的 -19528 在传送带上，P2
+    在忙别的，t=421 进 Bin 1）。
+
+    这是**抢救**，不是「就地使用」：拿起来就完成，后面由 planner 按当前
+    局面重新决定送餐/装盘/放台面。HANDS="any"：手里有别的盘也先清手去接，
+    因为传送带上的盘马上会被销毁。
+
+    只抢玩家那侧够不着的带子（`channels.plate_on_player_side_conveyor` 为假）。
+    玩家站得到的带子就是他取货的通道，P2 每拍抢回来会变成
+    「SendAcross 放上去 → 抢救拿下来 → 再放上去」（trace-20261110-235726
+    t=491~528）。
+    """
+
+    TYPE = "FetchConveyorPlate"
+    DESC = "把传送带上快进垃圾桶的盘拿起来"
+    LABEL = "抢救传送带上的盘"
+    HANDS = "any"
+    # 抢救的是马上会被销毁的东西；别让连续失败把它 abandoned 进 recovery_cooldown，
+    # 否则这摞盘一路进桶、AI 还整局冻结。
+    NO_ABANDON = True
+
+    @property
+    def plate_id(self):
+        return self._resources[0]
+
+    def claims(self):
+        return ((self.plate_id, "rescue"),)
+
+    def _entry(self, ctx):
+        # type: (Dict) -> Optional[Dict]
+        """资源可能是 `plates[]` 里的盘，也可能是 `items[]` 里的脏盘摞。"""
+        rid = self.plate_id
+        p = plate_by_id(ctx, rid)
+        if p is not None:
+            return p
+        for it in (list(ctx["w"].items)
+                   + list(getattr(ctx["w"], "held_items", ()) or ())):
+            if str(it.get("n") or "") == str(rid):
+                return it
+        return None
+
+    def _held(self, ctx):
+        # type: (Dict) -> bool
+        e = self._entry(ctx)
+        if e is None:
+            return False
+        if e.get("held_by") == P.P2_NAME:
+            return True
+        return P.held_matches(ctx["chef"], e.get("name") or e.get("n"))
+
+    def done(self, ctx):
+        # type: (Dict) -> bool
+        return self._entry(ctx) is None or self._held(ctx)
+
+    def feasible(self, ctx):
+        # type: (Dict) -> bool
+        e = self._entry(ctx)
+        if e is None or self.done(ctx):
+            return False
+        if e.get("held_by") == P.P1_NAME:
+            return False
+        from ai.space import channels as CH
+        if not CH.plate_on_conveyor(ctx["w"], e):
+            return False
+        # 玩家那侧的带子（多半还是 P2 刚放上去的成品盘）交给他自己取，
+        # 抢下来再放回去会无限循环；只抢救玩家够不着、马上进桶的盘。
+        return not CH.plate_on_player_side_conveyor(ctx["w"], e, ctx.get("bb"))
+
+    def build(self):
+        # type: () -> Node
+        held = self._held
+
+        def resolve(c):
+            # 抢救要站到贴 Bin 的末端段等盘过来，而不是追盘当前段（盘单向走）。
+            from ai.space import channels as CH
+            e = self._entry(c)
+            if e is None:
+                return None
+            cur = CH.plate_conveyor_station(c["w"], e)
+            if cur is None:
+                return None
+            return CH.terminal_conveyor_segment(c["w"], str(cur.get("grid") or ""))
+
+        def arrived(c, seg):
+            from ai.space import channels as CH
+            cur = CH.plate_conveyor_station(c["w"], self._entry(c))
+            return cur is not None and str(cur.get("n") or "") == str(
+                seg.get("n") or "")
+
+        return PR.Timeout(Sequence([
+            # 手里有别的盘也先放下（就近台面）：不接的话传送带上的盘直接进桶。
+            PR.EnsureHandsFree(keep=held),
+            conveyor_pickup(resolve=resolve, held=held, arrived=arrived,
+                            face=True),
+        ]), TASK_TIMEOUT_TICKS)
+
+
+@_register
 class ResetPlate(Task):
     """第 14 号：清掉内容与任何现存订单都不匹配的盘。
 
@@ -328,7 +568,7 @@ class ResetPlate(Task):
     """
 
     TYPE = "ResetPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把装错/无用的盘子清空复位"
     LABEL = "清盘"
 
@@ -350,7 +590,7 @@ class ResetPlate(Task):
             return True       # 盘不见了，楔死也解除了
         if P.plate_count(p) == 0:
             return True
-        return plate_cell(ctx, p) != tuple(self.counter_cell)
+        return not plate_on_counter(ctx, p, self.counter_cell)
 
     def feasible(self, ctx):
         # type: (Dict) -> bool

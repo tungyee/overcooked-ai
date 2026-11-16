@@ -119,29 +119,27 @@ def test_endgame_veto_skipped_without_timer_info():
 
 
 def test_firefighting_is_never_endgame_vetoed():
-    """灭火不走 plan() 的终局闸：火会一直烧，最后几秒也得灭。
-
-    `plan_firefighting` 自己调 `_feasibility_of` 且不传 time_left，所以终局
-    否决对它天然不生效。这条断言把这个性质钉住——真实帧 108 个着火采样点
-    全部仍能发出 Extinguish。
-    """
+    """灭火不走终局闸：火会一直烧，最后几秒也得灭（真实帧 108 个着火采样点
+    全部仍能发出 Extinguish）。"""
     from ai.state.world import World
     st = {
         "orders": [], "stations": list(STATIONS), "recipes": list(RECIPES),
-        "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
+        "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None},
+                  {"name": "Player 1", "x": 9.0, "z": 9.0, "held": None}],
         "plates": [], "workstations": [],
         "cookers": [{"n": "c1", "x": 5.0, "z": 5.0, "cooked": True,
                      "isCooking": False, "burning": True, "onFire": True,
                      "pot_contents": []}],
-        "items": [], "extinguishers": [], "grid": {"nodeMap": None},
+        "items": [],
+        "extinguishers": [{"n": "ext", "x": 7.0, "z": 7.0}],
+        "grid": {"nodeMap": None},
         "timer": {"server": {"left": 1, "limit": 210},
                   "client": {"left": 1, "limit": 210}},
     }
     w = World(st)
     bb, book = _bb(), RecipeBook(w.recipes, w.stations)
-    task, record = planner.plan_firefighting(w, bb, book)
-    vetoes = [v for _t, _s, _tm, ok, v, _c in record["candidates"] if not ok]
-    assert "endgame" not in vetoes
+    task, record = planner.plan(w, bb, None, book)
+    assert task is not None and task.TYPE == "Extinguish"
 
 
 # 终局否决已临时禁用（见 ai/planner.py `_feasibility_of`），恢复时把下面这个

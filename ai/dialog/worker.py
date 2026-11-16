@@ -10,8 +10,6 @@
   flush 播放窗口内的块（TTS 前已排队的语音保留），再恢复 VAD。
 - 没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声；需要向玩家
   解释的抢单走 rescue 事件，由 LLM 按事实说。TTS 失败时静默。
-- `new_order` 不受主动开口 4 秒闸限制：1 秒合并窗口本身就是它的限频，
-  丢一张单比连续两条订单播报更糟。`rescue` 仍受全局 4 秒闸。
 """
 import dataclasses
 import datetime
@@ -34,7 +32,6 @@ from ai.dialog.llm import (assistant_message, event_note, speech_message,
                            state_message, system_message, tool_message)
 from ai.dialog.policy import (
     PROACTIVE_MIN_INTERVAL_TICKS,
-    merge_new_orders,
     should_checkin,
     should_trigger,
 )
@@ -43,11 +40,16 @@ from ai.dialog.schema import DialogState
 
 log = logging.getLogger(__name__)
 
-# 一批工具调用等 ack 的上限；主循环每拍开头 drain，正常远小于这个值。
-ACK_TIMEOUT_S = 2.0
+# 一批工具调用等 ack 的上限；主循环每拍开头 drain，正常只要几十毫秒。
+# 不能压到 2 秒：关卡加载时主循环会连吃几秒 `phase=None` 的帧，生命周期守卫
+# 直接跳过对话服务，ack 就迟迟不来（voice-20261109-122611 实测 4.1 秒），
+# 模型只能回一句「刚才没说上话，重来一遍」。
+ACK_TIMEOUT_S = 5.0
+# 一次玩家/事件回合内最多几轮工具调用（check → execute → speak → 修正）。
+MAX_AGENT_TURNS = 4
 # 轮询播放状态的间隔与最长等待（兜底防止设备卡死拖住 worker 线程）。
 SPEAK_POLL_S = 0.02
-SPEAK_TIMEOUT_S = 30.0
+SPEAK_TIMEOUT_S = 10.0
 # 超时后给 producer 线程的收尾时间：不能跟着卡住的网络流一起等。
 TTS_JOIN_S = 0.1
 # 本关对话历史上限（消息条数，含 tool 结果）。
@@ -60,6 +62,8 @@ PREROLL_FRAMES = 2
 PTT_PREROLL_FRAMES = 6
 PTT_TAIL_FRAMES = 4
 PTT_MIN_FRAMES = 4
+# 音频电平调试日志的间隔（秒）：2s 一条在语音调试时太吵，改成 10s。
+LEVEL_LOG_INTERVAL_S = 10.0
 # 流式 ASR：录音结束后等最终文本的上限（服务端可能还在收尾）。
 ASR_FINISH_TIMEOUT_S = 15.0
 # LLM 文本按句号/问号/感叹号/分号/换行切句，逐句交给 TTS。
@@ -78,12 +82,13 @@ class TurnTiming(object):
     `started` 的定义随来源变化：
     - PTT：按键松开（之后还有 200 ms 尾音才送 ASR）；
     - VAD：VAD 判定句尾（已含约 400 ms 静音）；
-    - 主动事件：worker 收到事件（new_order 从第一张单到达算起）。
+    - 主动事件：worker 收到事件。
     """
     source: str
     event: str
     started: float
     audio_ms: float = 0.0
+    peak_db: float = None
     asr_started: float = None
     asr_done: float = None
     first_token_at: float = None
@@ -217,28 +222,61 @@ class StreamingTTS(object):
         self.worker._shutdown(self.worker.clients.player, ("stop",))
         self._resume_capture()
 
+    def stop(self):
+        # type: () -> None
+        """用户按下 PTT / 外部打断：立即停播。
+
+        只停播放器和生产队列；VAD 恢复留给 worker 线程的 `wait()`，避免
+        从 PTT 监听线程碰音频采集状态。
+        """
+        self._cancelled = True
+        self.sentences.put(None)
+        self.worker._shutdown(self.worker.clients.player, ("stop",))
+
     def wait(self, timeout=SPEAK_TIMEOUT_S):
         # type: (float) -> None
-        self._producer_done.wait(timeout)
-        if self.error is not None:
-            self.worker._log_event("worker_error", where="tts",
-                                   error=str(self.error))
-        self._play_thread.join(timeout)
+        """等本轮播完；总时长硬上限 timeout，绝不无限拖住 worker。
+
+        以前三段各自 wait(timeout)，最坏会卡 3×timeout；而且中途异常会跳过
+        `_resume_capture`，把 VAD 永久留在 paused，后续语音全部收不到。
+        """
         deadline = time.monotonic() + timeout
-        while (self.worker.clients.player.is_playing
-               and not self.worker._stop.is_set()):
-            self.worker._poll_first_audio(self.timing, self._snippet())
-            if not self.worker._context_live():
-                # 游戏暂停/退出时立刻停播，别把过期的播报念完。
+        try:
+            self._producer_done.wait(
+                max(0.0, deadline - time.monotonic()))
+            if self.error is not None:
+                self.worker._log_event("worker_error", where="tts",
+                                       error=str(self.error))
+            if not self._producer_done.is_set():
+                # TTS 网络/生成卡住：主动取消，别让播放线程继续等。
+                self._cancelled = True
+                self.sentences.put(None)
+                self.pcm.put(None)
                 self.worker._shutdown(self.worker.clients.player, ("stop",))
-                break
-            if time.monotonic() >= deadline:
+                self.worker._log_event("worker_error", where="tts",
+                                       error="TTS 超时（未在 %.1fs 内结束）"
+                                             % timeout)
+            self._play_thread.join(
+                max(0.0, deadline - time.monotonic()))
+            while (self.worker.clients.player.is_playing
+                   and not self.worker._stop.is_set()
+                   and time.monotonic() < deadline):
+                self.worker._poll_first_audio(self.timing, self._snippet())
+                if not self.worker._context_live():
+                    # 游戏暂停/退出时立刻停播，别把过期的播报念完。
+                    self.worker._shutdown(self.worker.clients.player, ("stop",))
+                    break
+                time.sleep(SPEAK_POLL_S)
+            if (self.worker.clients.player.is_playing
+                    and time.monotonic() >= deadline):
                 self.worker._shutdown(self.worker.clients.player, ("stop",))
-                break
-            time.sleep(SPEAK_POLL_S)
-        self.worker._poll_first_audio(self.timing, self._snippet())
-        self._resume_capture()
-        self.timing.playback_done = time.monotonic()
+        finally:
+            try:
+                self.worker._poll_first_audio(self.timing, self._snippet())
+            except Exception:                   # noqa: BLE001
+                log.debug("poll_first_audio 失败", exc_info=True)
+            self._resume_capture()
+            self.timing.playback_done = time.monotonic()
 
     def _snippet(self):
         # type: () -> str
@@ -324,6 +362,92 @@ class DialogClients(object):
     ptt: Any = None
 
 
+# 只有玩家语音回合才开放派活工具。分工 / 换布局 / 例行 checkin 这些事件里
+# 模型没有「马上去做」的授权，但工具摆在面前它就会调：实机
+# voice-20261109-124818 的 division 回合 turn0 定完分工说完一句，turn1 又调
+# execute_actions（被拒），turn2 补一句「好，我这就去送烤箱」——玩家听到两句。
+_ACTION_TOOL_NAMES = frozenset(("execute_actions", "cancel_action"))
+
+
+def _tools_for_event(tools, event):
+    # type: (Any, Any) -> Any
+    """按事件裁剪工具表：非语音回合不摆派活工具。"""
+    if not tools or event == "speech":
+        return tools
+    kept = [tool for tool in tools
+            if (tool.get("function") or {}).get("name")
+            not in _ACTION_TOOL_NAMES]
+    return kept or tools
+
+
+# 模型偶尔把台词写成 <speak>...</speak>，而不是调用 speak 工具。
+_SPEAK_TAG_RE = re.compile(r"<speak>\s*(.*?)\s*</speak>", re.S)
+# 兼容端点不认 tools 时，模型会把工具调用写成
+# <tool_call><function=speak><parameter=text>...</parameter></function></tool_call>。
+# 至少不要把这段 XML 原样念出来。
+_TOOL_XML_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\s]+)>(.*?)</function>\s*</tool_call>", re.S)
+_TOOL_PARAM_RE = re.compile(
+    r"<parameter=([^>\s]+)>(.*?)</parameter>", re.S)
+# 只有纯播报类事件才兜底播放标签内容；speech 回合仍只告警——那里
+# 「好，我去洗碗」可能对应根本没派发的动作，不能念出去。
+_SPEAK_TAG_EVENTS = frozenset((
+    "last_seconds", "round_summary", "checkin", "batch",
+    "division", "division_review", "layout_review",
+))
+# 纯闲聊/播报回合：模型忘了调 speak 时，content 直接兜底念出来。
+# 分工/复核不在此列：没调 set_division 就不能先念一个没落地的分工。
+_CONTENT_FALLBACK_EVENTS = frozenset((
+    "speech", "checkin", "last_seconds", "round_summary", "batch",
+    # 换布局只在有人站错半边时才发，本来就是「必须说一句」的事件。
+    "layout_review",
+))
+
+
+def _speak_tag_text(content):
+    # type: (str) -> str
+    """取出 content 里 <speak> 标签内的台词；没有返回空串。"""
+    return " ".join(m.strip() for m in _SPEAK_TAG_RE.findall(str(content or ""))
+                    if m.strip())
+
+
+def _xml_speak_text(content):
+    # type: (str) -> str
+    """从模型误输出的 XML 工具调用里取 speak 的 text；没有返回空串。"""
+    texts = []
+    for name, body in _TOOL_XML_RE.findall(str(content or "")):
+        if name.strip() != "speak":
+            continue
+        for key, value in _TOOL_PARAM_RE.findall(body):
+            if key.strip() == "text" and value.strip():
+                texts.append(value.strip())
+    return " ".join(texts)
+
+
+def _tools_include(tools, name):
+    # type: (Any, str) -> bool
+    for tool in tools or ():
+        fn = (tool or {}).get("function") or {}
+        if fn.get("name") == name:
+            return True
+    return False
+
+
+def _event_detail(name, payload):
+    # type: (str, Any) -> str
+    """把一个主动事件转成给 LLM 的具体说明（batch 合成用）。"""
+    payload = payload or {}
+    if name == "division":
+        return payload.get("facts") or ""
+    if name == "division_review":
+        facts = payload.get("facts") or ""
+        current = payload.get("current") or ""
+        return "变化：%s 当前分工：%s" % (facts, current or "（空）")
+    if name == "layout_review":
+        return payload.get("facts") or ""
+    return ""
+
+
 class DialogWorker(object):
     """语音对话后台 worker（spec §6.2）。"""
 
@@ -338,6 +462,14 @@ class DialogWorker(object):
         self.state = DialogState()
         self.last_proactive_tick = 0
         self._stop = threading.Event()
+        # 当前正在播放的流式 TTS；PTT 按下时用它做最小 barge-in。
+        self._active_stream = None
+        # 当前回合的看门狗状态：卡住时定期写 turn_stall，定位卡在 ASR/LLM/TTS。
+        self._turn_started_at = None
+        self._turn_stage = "idle"
+        self._turn_event = ""
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = None
         self._thread = None  # type: Any
         self._closed = False
         self._context = {}  # type: dict
@@ -351,9 +483,6 @@ class DialogWorker(object):
         self._pending_order_at = None
         # 下次定时 check-in 的单调时钟时间点；None 表示尚未排期。
         self._next_checkin_at = None
-        # 首次 new_order 的触发时间与已发起的 check-in 次数：首次 check-in
-        # 必须避开首次 new_order，避免开局连续发言。
-        self._first_new_order_at = None
         self._checkins_fired = 0
 
     # -------------------------------------------------------------- logging
@@ -400,10 +529,14 @@ class DialogWorker(object):
     def _latency_fields(self, timing, outcome=None):
         # type: (TurnTiming, Any) -> dict
         """把 TurnTiming 压成一行可读的毫秒字段。"""
+        floor = getattr(self.clients.vad, "floor_db", None)
         fields = {
             "event": timing.event,
             "source": timing.source,
             "audio_ms": int(round(timing.audio_ms or 0)),
+            "peak_db": (round(timing.peak_db, 1)
+                        if timing.peak_db is not None else None),
+            "floor_db": (round(floor, 1) if floor is not None else None),
             "asr_ms": self._ms_since(timing.asr_started, timing.asr_done),
             "end_to_asr_ms": self._ms_since(timing.started, timing.asr_done),
             "llm_first_token_ms": self._ms_since(timing.started,
@@ -473,7 +606,9 @@ class DialogWorker(object):
         if self.config.log_path and self._log_fh is None:
             self._open_log()
         self._log_event("start", debug=bool(self.config.debug),
-                        log_path=self.config.log_path)
+                        log_path=self.config.log_path,
+                        model=getattr(self.config, "ark_model", ""),
+                        base_url=getattr(self.config, "ark_base_url", ""))
         # 预连 TTS：后台建好 WebSocket/StartConnection，等第一句文本一好就少一次握手。
         warmup = getattr(self.clients.tts, "warmup", None)
         if callable(warmup):
@@ -481,7 +616,19 @@ class DialogWorker(object):
                 warmup()
             except Exception:               # noqa: BLE001
                 log.debug("TTS 预连失败（不影响后续逐句建连）", exc_info=True)
+        # LLM 也预热一次，吸收服务端冷启动（实测首 token 可到 7–8s）。
+        llm_warmup = getattr(self.clients.llm, "warmup", None)
+        if callable(llm_warmup):
+            try:
+                llm_warmup()
+            except Exception:               # noqa: BLE001
+                log.debug("LLM 预热失败（不影响正常请求）", exc_info=True)
         self._stop.clear()
+        self._watchdog_stop.clear()
+        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name="dialog-watchdog", daemon=True)
+            self._watchdog_thread.start()
         self._thread = threading.Thread(
             target=self._run, name="dialog-worker", daemon=True
         )
@@ -496,6 +643,7 @@ class DialogWorker(object):
         开头检查 stop。
         """
         self._stop.set()
+        self._watchdog_stop.set()
         self._closed = True
         self._log_event("stop")
         # 先停客户端再 join：AudioCapture.frames() 阻塞在队列上，close()
@@ -504,6 +652,9 @@ class DialogWorker(object):
         self._shutdown(self.clients.ptt, ("stop",))
         self._shutdown(self.clients.capture, ("stop", "close"))
         self._shutdown(self.clients.tts, ("close",))
+        watchdog = self._watchdog_thread
+        if watchdog is not None:
+            watchdog.join(timeout=1.0)
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
@@ -545,7 +696,6 @@ class DialogWorker(object):
             self._pending_order_at = None
             self._level_started = None
             self._next_checkin_at = None
-            self._first_new_order_at = None
             self._checkins_fired = 0
 
     # ------------------------------------------------------------- queues
@@ -613,6 +763,13 @@ class DialogWorker(object):
         pcm = _pcm16([frame])
         utterance.session.feed(pcm)
         utterance.timing.audio_ms += getattr(self.clients.vad, "frame_ms", 50)
+        # 诊断：跟踪这段录音的最大 RMS 电平，区分「静音」和「有声音但太短」。
+        samples = np.asarray(frame, dtype=np.float32).reshape(-1)
+        if samples.size:
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+            level = float(20.0 * np.log10(max(rms, 1e-10)))
+            if utterance.timing.peak_db is None or level > utterance.timing.peak_db:
+                utterance.timing.peak_db = level
 
     def _poll_utterance(self, utterance):
         # type: (_Utterance) -> bool
@@ -640,8 +797,24 @@ class DialogWorker(object):
             return True
         merged = _merge_asr_texts(utterance.texts)
         if merged:
-            self._handle_transcript(
-                merged, self._latest_context(), timing=utterance.timing)
+            try:
+                self._handle_transcript(
+                    merged, self._latest_context(), timing=utterance.timing)
+            except Exception as exc:            # noqa: BLE001
+                # 单轮异常不能杀死 worker，否则后续语音全部收不到。
+                log.exception("处理 ASR 文本失败")
+                self._log_event("worker_error", where="transcript",
+                                error=str(exc))
+                stream = self._active_stream
+                if stream is not None:
+                    try:
+                        stream.cancel()
+                    except Exception:           # noqa: BLE001
+                        pass
+                self._active_stream = None
+                self._turn_started_at = None
+                self._turn_stage = "idle"
+                self._turn_event = ""
         else:
             self._log_event(
                 "turn_latency",
@@ -693,15 +866,27 @@ class DialogWorker(object):
                 log.info("PTT 已启用：按键 %s",
                          getattr(self.config, "ptt_key", "?"))
             except Exception as exc:            # noqa: BLE001
-                log.exception("PTT 启动失败，退回 VAD")
+                log.exception("PTT 启动失败，语音输入不可用")
                 self._log_event("worker_error", where="ptt", error=str(exc))
+        last_loop_at = time.monotonic()
         try:
             while not self._stop.is_set():
-                # 事件优先于音频：主动开口不能被采集阻塞。
-                self._drain_events()
-                # 单张新单只会投一次 `("new_order", [id])`，必须由 worker
-                # 周期性用空 id 再调一次，1 秒合并窗口才会关窗触发。
-                self._flush_pending_orders()
+                loop_start = time.monotonic()
+                iter_dt = loop_start - last_loop_at
+                last_loop_at = loop_start
+                # 玩家正在说话/录音时，主动事件让位；否则事件优先于音频。
+                if utterance is None and not vad_active and not ptt_recording:
+                    self._drain_events()
+                drain_dt = time.monotonic() - loop_start
+                if iter_dt > 0.15:
+                    # 诊断：worker 主循环被拖慢时记录整轮耗时与 drain 占比，
+                    # 区分「事件/LLM/TTS 阻塞」与「采集帧变慢」。
+                    self._log_event(
+                        "loop_slow", iter_ms=int(round(iter_dt * 1000.0)),
+                        drain_ms=int(round(drain_dt * 1000.0)),
+                        ptt_recording=ptt_recording,
+                        vad_paused=self.clients.vad.paused,
+                        frame_count=frame_count)
                 if utterance is not None and self._poll_utterance(utterance):
                     utterance = None
                 if self.clients.vad.paused:
@@ -754,7 +939,7 @@ class DialogWorker(object):
                     level = level_fn(frame) if callable(level_fn) else None
                     floor = getattr(self.clients.vad, "floor_db", None)
                     now = time.monotonic()
-                    if now - last_level_log >= 2.0:
+                    if now - last_level_log >= LEVEL_LOG_INTERVAL_S:
                         last_level_log = now
                         log.debug(
                             "音频帧 #%d level=%s floor=%s paused=%s",
@@ -766,6 +951,11 @@ class DialogWorker(object):
                 if ptt_ok:
                     for event in ptt.poll():
                         log.debug("PTT 事件: %s（帧 #%d）", event, frame_count)
+                        self._log_event(
+                            "ptt", event=event, vad_paused=bool(
+                                getattr(self.clients.vad, "paused", False)),
+                            recording=ptt_recording,
+                            utterance=utterance is not None)
                         if event == "down":
                             if not ptt_recording and utterance is None:
                                 ptt_recording = True
@@ -811,45 +1001,46 @@ class DialogWorker(object):
                         utterance = None
                     continue
 
-                try:
-                    event = self.clients.vad.feed(frame)
-                except Exception as exc:
-                    log.exception("VAD 处理失败")
-                    self._log_event("worker_error", where="vad",
-                                    error=str(exc))
-                    event = None
-                if event:
-                    log.debug(
-                        "VAD 事件 %s（帧 #%d level=%s floor=%s）",
-                        event, frame_count,
-                        "?" if level is None else "%.1f" % level,
-                        "?" if floor is None else "%.1f" % floor)
-                if event == "start":
-                    if utterance is None:
-                        utterance = self._new_utterance("vad")
-                        for preroll_frame in preroll:
-                            self._feed_utterance(
-                                utterance, preroll_frame)
-                        self._feed_utterance(utterance, frame)
-                        vad_active = True
-                    else:
-                        vad_active = False
-                elif event == "end":
-                    # VAD 的 end 已经包含约 400 ms 静音判定；started 从这里算。
-                    speech_end = time.monotonic()
-                    if vad_active and utterance is not None:
-                        self._feed_utterance(utterance, frame)
-                        utterance.timing.started = speech_end
-                        self._await_utterance(utterance)
-                        utterance = None
-                    vad_active = False
-                elif vad_active and utterance is not None:
-                    self._feed_utterance(utterance, frame)
-                if utterance is not None and self._poll_utterance(utterance):
-                    utterance = None
-                preroll.append(frame)
-                if len(preroll) > PREROLL_FRAMES:
-                    preroll = preroll[-PREROLL_FRAMES:]
+                # VAD 自动切句逻辑已停用：语音输入只走 PTT。原实现保留在注释里。
+                # try:
+                #     event = self.clients.vad.feed(frame)
+                # except Exception as exc:
+                #     log.exception("VAD 处理失败")
+                #     self._log_event("worker_error", where="vad",
+                #                     error=str(exc))
+                #     event = None
+                # if event:
+                #     log.debug(
+                #         "VAD 事件 %s（帧 #%d level=%s floor=%s）",
+                #         event, frame_count,
+                #         "?" if level is None else "%.1f" % level,
+                #         "?" if floor is None else "%.1f" % floor)
+                # if event == "start":
+                #     if utterance is None:
+                #         utterance = self._new_utterance("vad")
+                #         for preroll_frame in preroll:
+                #             self._feed_utterance(
+                #                 utterance, preroll_frame)
+                #         self._feed_utterance(utterance, frame)
+                #         vad_active = True
+                #     else:
+                #         vad_active = False
+                # elif event == "end":
+                #     # VAD 的 end 已经包含约 400 ms 静音判定；started 从这里算。
+                #     speech_end = time.monotonic()
+                #     if vad_active and utterance is not None:
+                #         self._feed_utterance(utterance, frame)
+                #         utterance.timing.started = speech_end
+                #         self._await_utterance(utterance)
+                #         utterance = None
+                #     vad_active = False
+                # elif vad_active and utterance is not None:
+                #     self._feed_utterance(utterance, frame)
+                # if utterance is not None and self._poll_utterance(utterance):
+                #     utterance = None
+                # preroll.append(frame)
+                # if len(preroll) > PREROLL_FRAMES:
+                #     preroll = preroll[-PREROLL_FRAMES:]
         finally:
             if utterance is not None:
                 utterance.session.cancel()
@@ -885,12 +1076,6 @@ class DialogWorker(object):
         if (not utterance and not vad_active and not ptt_recording
                 and should_checkin(self._next_checkin_at, now,
                                    has_orders, in_level, live)):
-            # 首次 check-in 必须和首次 new_order 保持间距，避免开局连续发言。
-            if self._checkins_fired == 0 and self._first_new_order_at is not None:
-                earliest = self._first_new_order_at + CHECKIN_MIN_S
-                if now < earliest:
-                    self._next_checkin_at = earliest
-                    return
             # 先清排期再开口：正常结束会重排，LLM 失败等早退路径则停在
             # None，下一拍 `should_checkin` 返回 False，不会空转打 LLM。
             self._next_checkin_at = None
@@ -919,18 +1104,6 @@ class DialogWorker(object):
                 self._log_event("worker_error", where="event",
                                 event=event, error=str(exc))
 
-    def _flush_pending_orders(self):
-        # type: () -> None
-        """推进新单合并窗口：没有待发批次时是空操作。"""
-        if not self.state.pending_orders:
-            return
-        try:
-            self._handle_event(("new_order", []), self._latest_context())
-        except Exception as exc:
-            log.exception("刷新新单批次失败")
-            self._log_event("worker_error", where="new_order",
-                            error=str(exc))
-
     def _process_utterance(self, frames, coalesce=False, source="vad",
                            speech_end=None, audio_ms=None):
         # type: (list, bool, str, Any, Any) -> None
@@ -946,6 +1119,9 @@ class DialogWorker(object):
             started=speech_end if speech_end is not None else time.monotonic(),
             audio_ms=audio_ms or 0.0,
         )
+        self._turn_started_at = time.monotonic()
+        self._turn_stage = "asr"
+        self._turn_event = "speech"
         try:
             pcm = _pcm16(frames)
             if not pcm:
@@ -975,6 +1151,10 @@ class DialogWorker(object):
         except Exception as exc:
             log.exception("ASR / 对话回合失败")
             self._log_event("worker_error", where="asr", error=str(exc))
+        finally:
+            self._turn_started_at = None
+            self._turn_stage = "idle"
+            self._turn_event = ""
 
     # ------------------------------------------------------------ commands
 
@@ -995,10 +1175,16 @@ class DialogWorker(object):
         self._log_event(
             "asr", text=text, tick=tick, source=timing.source,
             audio_ms=int(round(timing.audio_ms or 0)),
+            peak_db=(round(timing.peak_db, 1)
+                     if timing.peak_db is not None else None),
+            floor_db=(round(getattr(self.clients.vad, "floor_db", None), 1)
+                      if getattr(self.clients.vad, "floor_db", None) is not None
+                      else None),
             asr_ms=self._ms_since(timing.asr_started, timing.asr_done),
             end_to_asr_ms=self._ms_since(timing.started, timing.asr_done))
         log.debug("ASR 文本: %r（tick=%s）", text, tick)
-        if not should_trigger("speech", self.state, tick, text):
+        if not should_trigger("speech", self.state, tick, text,
+                              now=time.monotonic()):
             self._log_event("turn_latency",
                             **self._latency_fields(timing, outcome="suppressed"))
             return
@@ -1008,10 +1194,7 @@ class DialogWorker(object):
 
     def _handle_event(self, event, context):
         # type: (Any, dict) -> None
-        """主循环投递的主动事件。
-
-        当前只有 `("new_order", ids)`：新菜出现时由 LLM 定新物料分工。
-        """
+        """主循环投递的主动事件。"""
         if not isinstance(event, (tuple, list)):
             log.debug("忽略未知事件: %r", event)
             return
@@ -1022,30 +1205,32 @@ class DialogWorker(object):
         context = context or {}
         tick = int(context.get("tick", 0) or 0)
 
-        if name == "new_order":
-            ids = payload or []
-            if ids and self._pending_order_at is None:
-                # 从第一张新单到达开始算，包含 1 秒合并窗口。
-                self._pending_order_at = time.monotonic()
-            trigger, batch = merge_new_orders(ids, self.state, tick)
-            if not trigger:
-                return
-            # 首次 new_order 记下时间点，供首次 check-in 避让。
-            if self._first_new_order_at is None:
-                self._first_new_order_at = time.monotonic()
-            # 1 秒合并窗口就是 new_order 的限频，不再套全局 4 秒闸。
+        if name == "batch":
+            # 同一拍多个事件合成一段：把每个子事件的说明拼起来，一次说完。
+            detail = "\n".join(_event_detail(n, p) for n, p in (payload or []))
+            failed = any(isinstance(p, dict) and p.get("status") == "failed"
+                         for _n, p in (payload or []))
+            # 只有「改分工」类的事件才需要压着声音等落地；和换布局复核
+            # 合在一批时不压——换布局本来就是让人开口的。
+            names = {n for n, _p in (payload or [])}
+            silent = ("division_review" in names
+                      and "layout_review" not in names)
             self.last_proactive_tick = tick
-            timing = TurnTiming(
-                source="event", event=name,
-                started=(self._pending_order_at
-                         if self._pending_order_at is not None
-                         else time.monotonic()))
-            self._pending_order_at = None
-            self._run_llm(context, name, "", new_orders=batch,
-                          timing=timing)
+            timing = TurnTiming(source="event", event=name,
+                                started=time.monotonic())
+            self._run_llm(context, name, "", timing=timing,
+                          event_detail=detail, failed=failed,
+                          silent_review=silent)
+            return
+        if name in ("division", "division_review", "layout_review"):
+            detail = _event_detail(name, payload)
+            self.last_proactive_tick = tick
+            timing = TurnTiming(source="event", event=name,
+                                started=time.monotonic())
+            self._run_llm(context, name, "", timing=timing, event_detail=detail)
             return
         if name in ("last_seconds", "round_summary"):
-            # 主循环一次性触发（各只发一次），直接说，不调工具、不再套限频闸。
+            # 主循环一次性触发（各只发一次），直接说（用 speak），不再套限频闸。
             self.last_proactive_tick = tick
             timing = TurnTiming(source="event", event=name,
                                 started=time.monotonic())
@@ -1053,25 +1238,85 @@ class DialogWorker(object):
             return
         log.debug("忽略未知事件: %r", name)
 
-    def _run_llm(self, context, event, transcript, new_orders=None,
-                 timing=None):
-        # type: (dict, str, str, Any, Any) -> None
-        """一次对话回合（标准两段式 function calling）。
+    def _watchdog_loop(self):
+        # type: () -> None
+        """回合卡住时每 2 秒写一条 turn_stall，定位卡在 ASR/LLM/TTS。"""
+        last_log = 0.0
+        while not self._watchdog_stop.wait(2.0):
+            thread = self._thread
+            if thread is not None and not thread.is_alive():
+                self._log_event("worker_dead", stage=self._turn_stage,
+                                event=self._turn_event)
+                self._turn_started_at = None
+                return
+            started = self._turn_started_at
+            if started is None:
+                continue
+            elapsed = time.monotonic() - started
+            if elapsed < 5.0:
+                continue
+            now = time.monotonic()
+            if now - last_log < 2.0:
+                continue
+            last_log = now
+            stream = self._active_stream
+            try:
+                playing = bool(self.clients.player.is_playing)
+            except Exception:                   # noqa: BLE001
+                playing = None
+            producer_done = None
+            if stream is not None:
+                try:
+                    producer_done = bool(stream._producer_done.is_set())
+                except Exception:               # noqa: BLE001
+                    producer_done = None
+            try:
+                vad_paused = bool(self.clients.vad.paused)
+            except Exception:                   # noqa: BLE001
+                vad_paused = None
+            self._log_event(
+                "turn_stall", stage=self._turn_stage,
+                event=self._turn_event, elapsed_ms=int(elapsed * 1000),
+                vad_paused=vad_paused, player_playing=playing,
+                producer_done=producer_done,
+                stream_cancelled=(bool(getattr(stream, "_cancelled", False))
+                                  if stream is not None else None))
 
-        1. 第一段：speech / new_order 回合 `tool_choice="auto"`，模型决定调不调用
-           工具；rescue 回合 `tool_choice="none"`（只说话）。两种都带 tools：
-           历史里有 tool_calls，兼容端点要求 tools 有定义；
-        2. 有调用 → 打包交主循环落地，等逐条结果，回填 tool 消息；
-        3. 第二段 `tool_choice="none"`：模型看到真实结果**和落地后的账本**
-           再说最终那句话。
+    def _on_ptt_event(self, event):
+        # type: (str) -> None
+        """PTT 按下：立刻停掉正在播的 TTS（最小 barge-in）。"""
+        self._log_event("ptt_cb", event=event, stage=self._turn_stage,
+                        active_stream=self._active_stream is not None)
+        if event != "down":
+            return
+        stream = self._active_stream
+        if stream is not None:
+            self._log_event("barge_in", ptt=event, stage=self._turn_stage)
+            try:
+                stream.stop()
+            except Exception:                   # noqa: BLE001
+                log.debug("PTT 打断 TTS 失败", exc_info=True)
 
-        第一段 / 第二段的 text 都经 `StreamingTTS` 按句流式播放；没有 text
-        的阶段不发声。第一段 text 直接播（换取更快体感，接受「先出口、
-        随后第二段再确认/修正」的少量重复）。
+    def _run_llm(self, context, event, transcript,
+                 timing=None, event_detail="", failed=False,
+                 silent_review=None):
+        # type: (dict, str, str, Any, str, bool, Any) -> None
+        """一轮对话：多轮工具调用，直到模型不再需要动作或给出 speak。
 
-        回合开始时钉住 `self.state`：回合中途若换关（`reset_state` 换了新
-        对象），本轮结果作废，不把旧关历史写进新关。
+        新协议：
+        - execute_actions / cancel_action 交主循环落地；
+        - speak 在 worker 本地播放，是唯一出声通道；
+        - execute_actions 与 speak 同轮时，先落地动作：成功才播 speak，
+          失败则不播乐观台词，继续一轮让模型用真实原因说话；
+        - 成功动作没有 speak 就安静结束（不做固定兜底）；
+        - 命令结果事件会作为新的 event 再进来，由模型决定是否汇报。
         """
+        self._turn_started_at = time.monotonic()
+        self._turn_stage = "llm"
+        self._turn_event = event
+        self._log_event("turn_start", event=event, stage="llm",
+                        source=(timing.source if timing is not None else "?"),
+                        text=(str(transcript or "")[:120]))
         state_obj = self.state
         context = context or {}
         if timing is None:
@@ -1079,71 +1324,160 @@ class DialogWorker(object):
                                 started=time.monotonic())
         else:
             timing.event = event
-        head = [system_message(context.get("dag") or "")]
-        new_dag = ""
-        if event == "new_order":
-            new_dag = _new_dishes_dag(context, new_orders)
-        world = state_message(event, context, new_dag)
+        tools = context.get("tools") or None
+        head = [system_message(
+            context.get("dag") or "",
+            context.get("guide") or "",
+            division=_tools_include(tools, "set_division"),
+            cookbook=_tools_include(tools, "read_cookbook"),
+            actions=(event == "speech"
+                     and _tools_include(tools, "execute_actions")))]
+        world = state_message(event, context, event_detail=event_detail,
+                              failed=failed)
         opener = speech_message(transcript) if event == "speech" \
             else event_note(event)
-        # 世界状态放在本轮开口之前：它描述「此刻」，模型读完状态再看 P1 的话。
-        turn = [opener]
-        history = list(state_obj.history)
-        tools = context.get("tools") or None
-        choice = "auto" if event in ("speech", "new_order") else "none"
+        messages = head + list(state_obj.history) + [world, opener]
+        if failed:
+            messages.append({
+                "role": "system",
+                "content": "本轮是失败事件：必须调用 speak 说明原因；content 不会播出去。",
+            })
+        tools = _tools_for_event(context.get("tools") or None, event)
 
-        # 一整轮的流式 TTS：第一段 / 第二段的 text 都按句喂进去，按序播放。
         stream = StreamingTTS(self, timing)
-        first = self._chat(head + history + [world] + turn,
-                           tools, event, "first", tool_choice=choice,
-                           timing=timing, on_text=stream.feed)
-        if first is None or self.state is not state_obj:
-            stream.cancel()
-            if first is None:
-                self._log_event(
-                    "turn_latency",
-                    **self._latency_fields(timing, outcome="llm_error"))
-                # 漏听主动提示：第一段 LLM 失败时回一句，而不是静默（spec §G.2）。
-                if event == "speech":
-                    self._speak(MISSED_SPEECH_TEXT, timing=timing)
-            return
-        final = first
-        if first.tool_calls:
-            results, duties = self._submit_tools(
-                first.tool_calls, event, transcript, timing=timing)
-            if self.state is not state_obj:
+        self._active_stream = stream
+        turn_messages = [opener]
+        last_results = []
+        # 动态分工复核：模型不改分工就不该出声。台词先缓冲，只有
+        # set_division 真的改了分工才交给 TTS。batch 里含 review 也一样。
+        if silent_review is None:
+            silent_review = event == "division_review"
+        silent_review = bool(silent_review)
+        buffered_speech = []  # type: list
+        division_changed = False
+        for turn_index in range(MAX_AGENT_TURNS):
+            reply = self._chat(messages, tools, event,
+                               "turn%d" % turn_index,
+                               tool_choice="auto", timing=timing)
+            if reply is None or self.state is not state_obj:
                 stream.cancel()
+                self._active_stream = None
+                self._turn_started_at = None
+                self._turn_stage = "idle"
+                if reply is None:
+                    self._log_event(
+                        "turn_latency",
+                        **self._latency_fields(timing, outcome="llm_error"))
+                    # 漏听主动提示：LLM 失败时回一句，而不是静默（spec §G.2）。
+                    if event == "speech":
+                        self._speak(MISSED_SPEECH_TEXT, timing=timing)
                 return
-            # 不改 LLM 返回的对象：只取它的调用，content 置空另建一份。
-            calls = list(first.tool_calls)
-            turn.append(assistant_message(
-                dataclasses.replace(first, content="", tool_calls=calls)))
-            for call, result in zip(calls, results):
-                turn.append(tool_message(call.id, result))
-            if duties is not None:
-                # 第二段要看落地后的账本，否则世界状态与 tool 结果自相矛盾
-                world = state_message(event, dict(context, duties=duties),
-                                      new_dag)
-            second = self._chat(head + history + [world] + turn,
-                                tools, event, "final", tool_choice="none",
-                                timing=timing, on_text=stream.feed)
-            if self.state is not state_obj:
-                stream.cancel()
-                return
-            if second is None:
-                # 第二段失败：流式没喂进最终文本，用兜底模板播并收尾。
-                stream.cancel()
-                self._speak(_fallback_text(results), timing=timing)
-                return
-            content = second.content
-            final = dataclasses.replace(first, content=content, tool_calls=[])
-        turn.append(assistant_message(final))
+            calls = list(reply.tool_calls)
+            if not calls:
+                # 闲聊/播报不强制工具：模型漏调 speak 时用 content 兜底，
+                # 避免玩家完全听不到反馈；分工/复核不兜底。
+                raw_content = reply.content or ""
+                xml_calls = bool(_TOOL_XML_RE.search(raw_content))
+                tag_any = (_speak_tag_text(raw_content)
+                           or _xml_speak_text(raw_content))
+                tag_text = tag_any if event in _SPEAK_TAG_EVENTS else ""
+                # 玩家命令回合把台词写成 <speak> 标签时仍不播（防止绕过
+                # execute_actions 先答应）；只有纯 content 的闲聊才兜底。
+                # content 里是 <tool_call> XML（端点没解析）时也绝不念。
+                plain = raw_content.strip() \
+                    if (event in _CONTENT_FALLBACK_EVENTS and not tag_any
+                        and not xml_calls) else ""
+                if xml_calls and not tag_any:
+                    log.warning("模型把工具调用写成了 XML（event=%s stage=turn%d）"
+                                "：%r", event, turn_index, raw_content)
+                text = tag_text or plain
+                if text:
+                    if tag_text:
+                        log.warning("模型把发言写成了 <speak> 标签"
+                                    "（event=%s stage=turn%d）：%r",
+                                    event, turn_index, reply.content)
+                    else:
+                        log.debug("模型没调 speak，按 content 兜底播报"
+                                  "（event=%s stage=turn%d）",
+                                  event, turn_index)
+                    if silent_review:
+                        buffered_speech.append(text)
+                    else:
+                        stream.feed(text)
+                else:
+                    log.warning("本轮没有调用任何工具"
+                                "（event=%s stage=turn%d）：%r",
+                                event, turn_index, reply.content)
+                # 历史里记下这一拍说的话（XML 标签已换成纯文本/空）。
+                turn_messages.append(assistant_message(dataclasses.replace(
+                    reply, content=text or "", tool_calls=[])))
+                break
+            speak_calls = [c for c in calls if c.name == "speak"]
+            action_calls = [c for c in calls if c.name != "speak"]
+            assistant_msg = assistant_message(reply)
+            messages.append(assistant_msg)
+            turn_messages.append(assistant_msg)
+            action_results = []  # type: list
+            if action_calls:
+                self._turn_stage = "tools"
+                action_results, _commands = self._submit_tools(
+                    action_calls, event, transcript, timing=timing)
+                self._turn_stage = "llm"
+                for call, result in zip(action_calls, action_results):
+                    tool_msg = tool_message(call.id, result)
+                    messages.append(tool_msg)
+                    turn_messages.append(tool_msg)
+                last_results = action_results
+                for result in action_results:
+                    if isinstance(result, dict) and result.get("division_changed"):
+                        division_changed = True
+            for call in speak_calls:
+                tool_msg = tool_message(call.id, {"ok": True})
+                messages.append(tool_msg)
+                turn_messages.append(tool_msg)
+            texts = []
+            for call in speak_calls:
+                args = call.args()
+                text = args.get("text") if isinstance(args, dict) else None
+                if text:
+                    texts.append(str(text))
+            rejected = any(
+                isinstance(result, dict) and result.get("ok") is False
+                and not result.get("silent")
+                for result in action_results)
+            if texts and not rejected:
+                if silent_review:
+                    buffered_speech.extend(texts)
+                else:
+                    for text in texts:
+                        stream.feed(text)
+            if rejected:
+                # 不播“好，这就去”这类乐观台词；继续一轮让模型自己解释。
+                continue
+            if not action_calls:
+                break
+            if any(c.name in ("execute_actions", "cancel_action")
+                   for c in action_calls):
+                if not speak_calls:
+                    # 动作已派发但没确认：不再强制 speak，下一轮由模型收尾。
+                    continue
+                break
+            # 其它工具（set_division / get_world_state / read_cookbook）：
+            # 继续下一轮，让模型收尾。
+        if silent_review and division_changed:
+            for text in buffered_speech:
+                stream.feed(text)
+        turn = turn_messages
         self._remember(state_obj, turn)
         timing.llm_done_at = time.monotonic()
+        # 播放期间保持 _active_stream，PTT 按下才能真正打断 TTS。
+        self._turn_stage = "tts"
         stream.finish()
         stream.wait()
-        # 每轮正常结束后随机排下一次定时 check-in（失败早退不重排，沿用旧排期）。
-        # 结束总结是本局最后一句，之后不再排 check-in，避免退出关卡还在说话。
+        self._active_stream = None
+        self._turn_started_at = None
+        self._turn_stage = "idle"
+        self._turn_event = ""
         if event != "round_summary":
             self._next_checkin_at = (time.monotonic()
                                      + random.uniform(CHECKIN_MIN_S, CHECKIN_MAX_S))
@@ -1151,6 +1485,12 @@ class DialogWorker(object):
             outcome = "tts_error"
         elif stream.text_seen.strip():
             outcome = "ok"
+        elif silent_review and buffered_speech and not division_changed:
+            outcome = "silent"
+        elif last_results and any(
+                isinstance(result, dict) and result.get("ok") is False
+                for result in last_results):
+            outcome = "rejected"
         else:
             outcome = "empty_reply"
         self._log_event(
@@ -1198,14 +1538,24 @@ class DialogWorker(object):
                             if timing is not None else None))
         log.debug("LLM 回复（event=%s stage=%s）: %r tools=%s",
                   event, stage, reply.content, reply.tool_calls)
+        if reply.tool_calls:
+            log.debug("LLM 工具调用: %s",
+                      [(c.name, c.args()) for c in reply.tool_calls])
         return reply
 
-    def _remember(self, state_obj, turn):
-        # type: (Any, list) -> None
-        """本轮消息并入历史并截断；不能以孤立的 tool / assistant 开头。"""
+    def _remember(self, state_obj, turn, compact=True):
+        # type: (Any, list, bool) -> None
+        """本轮消息并入历史并截断；不能以孤立的 tool / assistant 开头。
+
+        含工具调用的回合做一次压缩：只留用户/事件输入、说出口的话和一条
+        工具摘要，避免 tool 结果把上下文撑满。
+        """
         with self._state_lock:
             if self.state is not state_obj:
                 return
+            if compact and any(isinstance(m, dict) and m.get("tool_calls")
+                               for m in turn):
+                turn = _compact_turn(turn)
             history = (list(state_obj.history) + turn)[-HISTORY_MAX:]
             while history and history[0].get("role") in ("tool", "assistant"):
                 history.pop(0)
@@ -1215,7 +1565,7 @@ class DialogWorker(object):
         # type: (list, str, str, Any) -> tuple
         """把一轮的工具调用打包投给主循环，等一个 ack。
 
-        返回 `(逐条结果, 落地后的账本快照或 None)`；超时时快照为 None。
+        返回 `(逐条结果, 落地后的命令快照或 None)`；超时时快照为 None。
         """
         batch = DutyBatch(
             batch_id=uuid.uuid4().hex,
@@ -1225,6 +1575,8 @@ class DialogWorker(object):
         )
         self.cmd_q.put(batch)
         tool_started = time.monotonic()
+        log.debug("工具批次: %s",
+                  [(name, args) for name, args in batch.calls])
         self._log_event("duty_batch", event=event, batch_id=batch.batch_id,
                         calls=batch.calls)
         deadline = tool_started + ACK_TIMEOUT_S
@@ -1248,10 +1600,14 @@ class DialogWorker(object):
             if len(results) < len(calls):
                 results += [{"ok": False, "reason": "主循环未处理"}] * (
                     len(calls) - len(results))
-            return results[:len(calls)], ack.get("duties")
+            log.debug("工具结果: %s commands=%s",
+                      results, ack.get("commands"))
+            return results[:len(calls)], ack.get("commands")
         ack_ms = self._ms_since(tool_started, time.monotonic())
         if timing is not None:
             timing.tool_ack_ms = ack_ms
+        log.debug("工具结果超时（%.0fms）: %s", ack_ms,
+                  [(name, args) for name, args in batch.calls])
         self._log_event("duty_ack", batch_id=batch.batch_id, results=None,
                         ack_ms=ack_ms)
         return [{"ok": False, "reason": "主循环超时未确认"}] * len(calls), None
@@ -1426,9 +1782,10 @@ class DialogWorker(object):
         if config.ptt_key:
             from ai.dialog.ptt import PushToTalk, keycode_for
             try:
-                ptt = PushToTalk(keycode_for(config.ptt_key))
+                ptt = PushToTalk(keycode_for(config.ptt_key),
+                                 on_event=self._on_ptt_event)
             except ValueError:
-                log.exception("PTT 键名无效: %r，退回 VAD", config.ptt_key)
+                log.exception("PTT 键名无效: %r，语音输入不可用", config.ptt_key)
 
         return DialogClients(
             capture=AudioCapture(),
@@ -1451,6 +1808,51 @@ def _json_default(value):
     if dataclasses.is_dataclass(value):
         return dataclasses.asdict(value)
     return str(value)
+
+
+def _compact_turn(turn):
+    # type: (list) -> list
+    """含工具调用的回合 → 紧凑历史：输入 + 说过的话 + 一条工具摘要。"""
+    if not turn:
+        return []
+    out = [turn[0]]
+    spoken = []
+    actions = []
+    for msg in turn:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            if not msg.get("tool_calls") and msg.get("content"):
+                spoken.append(str(msg.get("content")))
+            for call in msg.get("tool_calls") or ():
+                fn = call.get("function") or {}
+                name = fn.get("name")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except ValueError:
+                    args = {}
+                if name == "speak" and isinstance(args, dict):
+                    text = args.get("text")
+                    if text:
+                        spoken.append(str(text))
+                elif name in ("execute_actions", "cancel_action"):
+                    if name == "execute_actions" and isinstance(args, dict):
+                        for item in args.get("actions") or ():
+                            if isinstance(item, dict):
+                                actions.append(("execute_actions", item))
+                    else:
+                        actions.append((name, args if isinstance(args, dict) else {}))
+    for text in spoken:
+        out.append({"role": "assistant", "content": text})
+    if actions:
+        parts = []
+        for name, args in actions:
+            action = args.get("action") or ""
+            target = args.get("target") or ""
+            parts.append(("%s %s" % (action, target)).strip() or name)
+        out.append({"role": "system",
+                    "content": "（本轮工具：%s）" % "；".join(parts)})
+    return out
 
 
 def _merge_asr_texts(texts):
@@ -1506,23 +1908,3 @@ class DutyBatch(object):
     origin: str = "speech"
 
 
-def _new_dishes_dag(context, order_ids):
-    # type: (dict, Any) -> str
-    """新单批次里各道菜的 DAG 文本（主循环在上下文里按菜名给出）。"""
-    dags = (context or {}).get("dish_dags") or {}
-    dishes = []
-    for order in (context or {}).get("orders") or ():
-        if order_ids and order.get("id") not in order_ids:
-            continue
-        dish = order.get("dish")
-        if dish and dish not in dishes:
-            dishes.append(dish)
-    return "\n".join(dags[d] for d in dishes if d in dags)
-
-
-def _fallback_text(results):
-    # type: (list) -> str
-    """第二段 LLM 失败时的兜底句：只按结果说，不编内容。"""
-    if results and all((r or {}).get("ok") for r in results):
-        return "好，记下了。"
-    return "没弄成，再说一次？"

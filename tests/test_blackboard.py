@@ -4,7 +4,6 @@ from ai.dialog.schema import Preference
 from ai.state.blackboard import (
     DEFAULT_TTL,
     Blackboard,
-    FireScratch,
     StuckScratch,
     prune_expired_preferences,
 )
@@ -123,29 +122,12 @@ def test_drop_waiter_removes_entry():
     assert bb.next_waiter("cooker1") is None
 
 
-def test_scratch_types_are_independent():
-    """spec §4 行 154：禁止跨模式复用字段。"""
-    stuck = StuckScratch()
-    fire = FireScratch()
-
-    assert not hasattr(stuck, "ext_target")
-    assert not hasattr(fire, "nudge_dir")
-
-
 def test_scratch_defaults_are_not_shared_between_instances():
     a = StuckScratch()
     b = StuckScratch()
     a.bad_cells[(1, 1)] = 5
 
     assert b.bad_cells == {}
-
-
-def test_fire_scratch_defaults_are_not_shared():
-    a = FireScratch()
-    b = FireScratch()
-    a.bad_ext.add("ext1")
-
-    assert b.bad_ext == set()
 
 
 def test_blackboard_fresh_has_empty_state():

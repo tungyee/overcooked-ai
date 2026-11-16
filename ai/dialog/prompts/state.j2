@@ -1,0 +1,21 @@
+【世界状态】（最近快照，可能滞后；订单/灶/盘里有什么等明细用 get_world_state 查询，动作是否可行以 execute_actions 返回为准）{{ '\n' }}
+{% if live is sameas false %}注意：游戏当前已暂停或不在关卡，你不能行动；只回话，不要调用动作工具。{{ '\n' }}{% endif %}
+{% if round_finished %}注意：本关已经结束。{{ '\n' }}{% endif %}
+{% if time_left is not none %}本关剩余 {{ time_left }} 秒。{{ '\n' }}{% endif %}
+{% if total is not none %}总分 {{ total }}。{{ '\n' }}{% endif %}
+{% if deliveries is not none %}已送 {{ deliveries }} 单。{{ '\n' }}{% endif %}
+{% if tips is not none %}小费 {{ tips }}。{{ '\n' }}{% endif %}
+{% if deductions %}漏单扣 {{ deductions }} 分。{{ '\n' }}{% endif %}
+订单：{{ orders|length }} 个{{ '\n' }}
+你：{% if you.doing %}正在{{ you.doing }}{% else %}暂时没事做{% endif %}{{ '\n' }}
+{% if you.stuck %}你卡住的原因：{{ you.stuck }}{{ '\n' }}{% endif %}
+{% if reachable.you %}你能做的动作：{{ reachable.you|join('、') }}{{ '\n' }}{% endif %}
+{% if reachable.teammate %}玩家能做的动作：{{ reachable.teammate|join('、') }}{{ '\n' }}{% endif %}
+{% if division %}当前分工：{{ division }}{{ '\n' }}{% endif %}
+你的当前命令：{{ '\n' }}
+{% if command %}- {{ command.label }}{% if command.target %} {{ command.target }}{% endif %}（{{ command.status }}{% if command.wait_reason %}：{{ command.wait_reason }}{% endif %}）{{ '\n' }}
+{% else %}- 无{{ '\n' }}{% endif %}
+排队中的命令：{{ '\n' }}
+{% if queue %}{% for c in queue %}- {{ c.label }}{% if c.target %} {{ c.target }}{% endif %}{{ '\n' }}
+{% endfor %}{% else %}- 无{{ '\n' }}{% endif %}
+{% if last_result %}上一条命令结果：{{ last_result.label }}{% if last_result.target %} {{ last_result.target }}{% endif %} -> {{ last_result.status }}{% if last_result.reason %}（{{ last_result.reason }}）{% endif %}{{ '\n' }}{% endif %}

@@ -15,6 +15,8 @@ RECIPES = [
         ["Seaweed", "BoiledSushiRice", "SushiFish"], "cook": "null"},
     {"name": "Sushi_Cucumber", "t": "CompositeOrderNode", "comp":
         ["Seaweed", "BoiledSushiRice", "Cucumber"], "cook": "null"},
+    {"name": "Sushi_PlainFish", "t": "CompositeOrderNode", "comp":
+        ["SushiFish"], "cook": "null"},
     {"name": "BoiledSushiRice", "t": "CookedCompositeOrderNode",
      "comp": ["SushiRice"], "cook": "Pot", "plate": "CompositeSushi"},
     {"name": "Seaweed", "t": "IngredientOrderNode", "comp": [],
@@ -40,6 +42,8 @@ STATIONS = [
 
 ORDER_FISH = {"id": "1", "dish": "Sushi_Fish",
               "composition": ["Seaweed", "BoiledSushiRice", "SushiFish"]}
+ORDER_PLAIN_FISH = {"id": "2", "dish": "Sushi_PlainFish",
+                    "composition": ["SushiFish"]}
 
 
 def book():
@@ -192,6 +196,29 @@ def test_missing_ignores_extra_contents():
         "BoiledSushiRice", "SushiFish")
 
 
+def test_matches_requires_exact_contents():
+    """missing 空 ≠ 能送：多一份料游戏不结算。
+
+    4-1 实机 trace-20261109-231509 t≈61.5：鱼+米饭的盘被当成
+    Sushi_PlainFish（只缺 SushiFish 之外的都算多余）送进餐口，
+    deliveries/base 都没涨。
+    """
+    b = book()
+    extra = {"contents": ["SushiFish", "CookedCompositeAssembledNode"]}
+    exact = {"contents": ["SushiFish"]}
+    assert b.missing(ORDER_PLAIN_FISH, extra) == ()
+    assert b.matches(ORDER_PLAIN_FISH, extra) is False
+    assert b.matches(ORDER_PLAIN_FISH, exact) is True
+
+
+def test_matches_allows_optional_ingredient():
+    """订单 optional 里的料是允许项，不算多余。"""
+    order = dict(ORDER_PLAIN_FISH, optional=["Seaweed"])
+    plate = {"contents": ["SushiFish", "Seaweed"]}
+    assert book().matches(order, plate) is True
+    assert book().matches(ORDER_PLAIN_FISH, plate) is False
+
+
 @pytest.fixture(scope="module")
 def real_frames():
     """真实录制帧。缺夹具时跳过——没录帧的环境仍能跑完其余测试。
@@ -281,6 +308,8 @@ def test_case_insensitive_lookups():
 RECIPES_WITH_CHOP = [
     {"name": "Sushi_Fish", "t": "CompositeOrderNode",
      "comp": ["Seaweed", "BoiledSushiRice", "SushiFish"], "cook": "null"},
+    {"name": "Sushi_PlainFish", "t": "CompositeOrderNode", "comp":
+        ["SushiFish"], "cook": "null"},
     {"name": "BoiledSushiRice", "t": "CookedCompositeOrderNode",
      "comp": ["SushiRice"], "cook": "Pot", "plate": "CompositeSushi"},
     {"name": "Seaweed", "t": "IngredientOrderNode", "comp": [],

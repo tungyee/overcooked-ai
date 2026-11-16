@@ -2,8 +2,7 @@
 """FillCooker（订单无关的填灶 task）回归（第 1 组 1.1）。
 
 为什么要一个新 task 而不是调权重：`FetchToCooker` 绑订单，只能由
-recipe_graph 按单发射，`_in_flight_cook_claim` 压掉同单第二个下锅候选，
-`_match_cookers_to_orders` 又是严格 1:1。结构上「5 单要米」就不可能变成
+recipe_graph 按单发射，`_match_cookers_to_orders` 又是严格 1:1。结构上「5 单要米」就不可能变成
 「3 口灶在烧」——实测 trace-20261014-120406 的 1700~3270 窗口 59% 的拍里
 三口灶一个都没在煮，order#3/4/5 三单全在这窗口过期。
 
@@ -171,3 +170,25 @@ def test_fetch_to_cooker_pickup_locks_segment_and_waits():
     pickup = fill.children[0].children[2]
     assert isinstance(pickup, PR.InteractWith)
     assert pickup._wait is not None, "传送带取料必须带等料谓词（拦截等料）"
+
+
+def test_recover_places_loose_pot_on_nearest_empty_cooker(monkeypatch):
+    """散锅回收的放置落点是动态空灶（find_empty_cooker），不是写死的绑定灶。
+
+    清手阶段可能已把另一口锅归位到绑定灶（trace-20261115-005140 t=2845：锅B
+    被归位到 1 号灶），再往绑定灶放散锅会 no effect 卡死。锅灶可互换，
+    放哪口空灶都一样。
+    """
+    from ai.exec.bt import Sequence
+    from ai.query import placement as PL
+
+    t = T.FetchToCooker("o1", ("c1", ("SushiRice",), "pot1"), "BoiledSushiRice")
+    recover = t.build().child.children[1]
+    assert isinstance(recover, Sequence)
+    _pickup, place = recover.children
+    assert isinstance(place, PR.InteractWith)
+    assert place.kind == "placement"
+
+    sentinel = {"t": "cooking", "n": "empty_cooker"}
+    monkeypatch.setattr(PL, "find_empty_cooker", lambda w, f: sentinel)
+    assert place.target({"w": object(), "field": {}}) is sentinel

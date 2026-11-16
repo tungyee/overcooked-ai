@@ -12,8 +12,9 @@ from ai.query import stations as S
 from ai.exec.bt import Condition, Node, Selector, Sequence
 from ai.query.recipes import find_ingredient
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup,
                            ingredient_available, ingredient_source,
-                           loose_count)
+                           loose_count, loose_on_station)
 
 # ---------- 切菜常量 ----------
 
@@ -45,16 +46,88 @@ def board_station(ctx, board_id):
     return None
 
 
+def _workstation(world, board_name):
+    # type: (Any, str) -> Optional[Dict]
+    for ws in getattr(world, "workstations", None) or ():
+        if P.station_name_matches(str(ws.get("n") or ""), board_name):
+            return ws
+    return None
+
+
+def board_clearable(world, book, bb, board_id):
+    # type: (Any, Any, Any, Any) -> bool
+    """砧板上的东西能不能先挪走、腾出板来切别的。
+
+    通用判据，不按物料特判：板上有东西、没人在切、且它**不再需要在这块板上
+    切**（book.needs_chopping 为假：切好的料、切出来的饼等产物）。还没切的
+    生料是 Chop 的输入，不动。
+
+    不腾：P2 够不着的板（拿不起来）、分割地图两边共享的砧板（上面的东西
+    可能是送给对面的，挪到 P2 这边等于截走，且会与 SendAcross 来回拉扯）。
+
+    实机：Wizard_3_2 两块板一块被切好的饼（在上面放了番茄）占着、一块被切好
+    的意式香肠占着，芝士再没有板可切，饼也补不齐料（trace-20261101-173006）。
+    """
+    from ai.space import channels as CH
+    from ai.space import reachability
+    from ai.tasks.base import _unpack_resource_id
+    name = str(_unpack_resource_id(board_id)[1])
+    ws = _workstation(world, name)
+    item = (ws or {}).get("item")
+    if not item or (ws or {}).get("interacting"):
+        return False
+    if book is None or book.needs_chopping(item):
+        return False
+    ctx = reachability.context(world, bb)
+    st = board_station(ctx, board_id)
+    if st is None or not reachability.can_interact(ctx, st):
+        return False
+    return not any(P.station_name_matches(str(s.get("n") or ""), name)
+                   for s in CH.shared_boards(world, bb))
+
+
+def board_drop_station(ctx):
+    # type: (Dict) -> Optional[Dict]
+    """板上挪下来的东西放哪：P2 就近的合法空台面；无可达场（旧合成帧）不腾。"""
+    from ai.query import placement
+    field = ctx.get("field")
+    if not field:
+        return None
+    return placement.find_drop_station(ctx["w"], field)
+
+
+def _held_for_throw(ctx, item):
+    # type: (Dict, Any) -> bool
+    """手里这份料正由一个进行中的 ThrowBatch 搬运。
+
+    ThrowBatch 取到料后还要走到出手位再投；这一拍板恰好变空，FetchToBoard
+    的 done 由 True 翻成 False、feasible 由 False 翻成 True，又带着
+    async_resource / combo_head 的高分，会把刚拿起的料抢去放回同一块板
+    （trace-20261108-233353 t=742~1382：ThrowBatch ↔ FetchToBoard 来回
+    20+ 次，番茄始终没投出去）。投掷树自带 timeout，失败后承诺清空，
+    这里自然放开。
+    """
+    if not P.held_matches(ctx.get("chef"), item):
+        return False
+    bb = ctx.get("bb")
+    active = getattr(getattr(bb, "commitment", None), "active_task", None)
+    return getattr(active, "TYPE", None) == "ThrowBatch" \
+        and str(getattr(active, "item", "") or "").lower() == str(item).lower()
+
+
 @_register
 class FetchToBoard(Task):
     """第 7 号：把生料放到切菜板上。
 
     item 是**生料名**（Cucumber），与 Chop 同口径——本 task 的 done
     （板上是生料）正是 Chop 的 feasible（spec §6.1 上下游咬合）。
+
+    板上已有可挪走的东西（board_clearable）时先腾板：空手拿起板上的东西放到
+    就近空台面，再去取料。腾板必须在取料之前——手里拿着生料腾不了板。
     """
 
     TYPE = "FetchToBoard"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "从箱子取这种料放上砧板"
     LABEL = "取料上砧板"
     HANDS = "empty"       # 要空手去拿生料；手里有东西时打分加腾手代价（spec §6.1(b)）
@@ -78,8 +151,14 @@ class FetchToBoard(Task):
             return False       # 不可切的料没理由放板上
         if self.done(ctx):
             return False
+        if _held_for_throw(ctx, self.item):
+            return False
         if P.board_item(ctx["w"].workstations, str(self.board_id)):
-            return False       # 板上已有东西，放不下
+            # 板上已有东西：能挪走、且有地方放才行（先腾板，见 build）
+            if not board_clearable(ctx["w"], ctx["book"], ctx.get("bb"), self.board_id):
+                return False
+            if board_drop_station(ctx) is None:
+                return False
         return ingredient_available(ctx, self.item)
 
     def build(self):
@@ -109,17 +188,40 @@ class FetchToBoard(Task):
                                 str(board_id)) == str(raw).lower()
 
         def pickup():
-            # ingredient_source 现在对「挂在站点上的散落料」返回站点（带朝向
-            # 信号），故 face=True 让 Face 转身面向站点；裸散落料（无站点）
-            # 时 interact_ready 走名字兜底，Face 仍能到位。
-            return PR.InteractWith(
-                lambda x: ingredient_source(x, raw), "pickup", holding,
+            # 传送带上的料锁段等料；箱子/台面/散落行为与普通 pickup 一致。
+            return conveyor_pickup(
+                resolve=lambda x: ingredient_source(x, raw),
+                held=holding,
+                arrived=lambda c, seg: loose_on_station(c["w"], raw, seg),
                 face=True)
 
+        # 不投上板：投掷射程固定 ≈7.5m，而砧板是普通台面（ServerAttachStation，
+        # 只接非飞行物），从 3~5m 的投锅带扔过去必然飞过头落地上——实机
+        # trace-20261108-200713 t=659/1414 两次都从板上空 ~1m 飞过、落在板外 ~3m。
+        # 跨区/远距送料由 ThrowBatch 自己投到对面地上，不经过这里。
         def drop():
             return PR.InteractWith(board, "placement", placed)
 
-        return PR.Timeout(Selector([
+        def board_empty(c):
+            return not P.board_item(c["w"].workstations, str(board_id))
+
+        def took_board_item(c):
+            # 手里拿到了板上的东西、板空了
+            return not P.hands_free(c["chef"]) and board_empty(c)
+
+        # 腾板：板空直接过；否则空手 → 拿起板上的东西 → 放到就近空台面。
+        # 第一步的 EnsureHandsFree 不 keep 生料：手里有生料时对着有东西的板
+        # 交互是「放上去」而不是「拿起来」，必须先放下。
+        clear = Selector([
+            Condition(board_empty),
+            Sequence([
+                PR.EnsureHandsFree(),
+                PR.InteractWith(board, "pickup", took_board_item),
+                PR.EnsureHandsFree(pick=board_drop_station),
+            ]),
+        ])
+
+        return PR.Timeout(Sequence([clear, Selector([
             # 分支1：地上有散落生料 → 直接捡散落放上砧板（不投、不碰箱子）
             Sequence([
                 Condition(has_loose),
@@ -146,7 +248,7 @@ class FetchToBoard(Task):
                 pickup(),
                 drop(),
             ]),
-        ]), TASK_TIMEOUT_TICKS)
+        ])]), TASK_TIMEOUT_TICKS)
 
 
 @_register
@@ -163,7 +265,7 @@ class Chop(Task):
     """
 
     TYPE = "Chop"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "在砧板上把这种料切好"
     LABEL = "切"
     PROCESS = "切"
@@ -213,5 +315,6 @@ class Chop(Task):
             PR.Face(board_target),
             # target 让 HoldUntil 每拍校验还在砧板前：被传送带推走时松键 FAILURE，
             # Sequence 重置重新 Approach，而不是空按 chop 卡死（实机复现）。
-            PR.HoldUntil("chop", done, timeout=timeout, target=board_target),
+            PR.HoldUntil("chop", done, timeout=timeout, target=board_target,
+                         guard=lambda c: P.hands_free(c["chef"])),
         ]), TASK_TIMEOUT_TICKS)

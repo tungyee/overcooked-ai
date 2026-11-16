@@ -16,7 +16,8 @@ from ai.query import stations as S
 from ai.exec.bt import Node, Sequence
 from ai.query.plate_tokens import parse_plate_detail
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
-                           ingredient_source)
+                           conveyor_pickup, ingredient_source,
+                           loose_on_station)
 
 # 垃圾桶的资源 id。站点实例名随关卡变（实测 "Bin 1"），但认领只需要一个
 # 稳定的标识符——同一关卡内只有一个垃圾桶被认领就够了。
@@ -49,7 +50,7 @@ def loose_cookware(ctx):
     out = []
     recipes = ctx["w"].recipes
     for it in ctx["w"].items:
-        if not P.held_is_cookware({"held": it.get("n")}, recipes):
+        if not P.item_is_cookware(it, recipes):
             continue
         if P.item_on_cooker(it):
             continue                       # 在灶台上 → 在用，不是"散落"
@@ -103,29 +104,22 @@ def _has_free_chopping_board(world):
     return False
 
 
-def _chopped_form_available(world, book, raw):
-    # type: (Any, Any, Optional[str]) -> bool
-    """该生料的切好形态是否已可用（砧板 / 手上 / 散落）。
+def _chopped_form_available(world, book, raw, plate_match=None, cooker_match=None):
+    # type: (Any, Any, Optional[str], Any, Any) -> bool
+    """手里这份生料是否已多余：切好的份数已够所有还在等它的单。
 
-    与 ai.query.recipe_graph._chopped_available 同源：recipe_graph 用它判
-    Chop 链 done、不再发 FetchToBoard/Chop 候选，这里用它判「手里这份生料
-    是否已经多余」。两者口径必须一致，否则手持生料 + 场上已有切好料时，
-    一边说不用切、一边说不放下，死锁（1-6 trace-20261021-125032 t=8559）。
+    与 ai.query.recipe_graph 的 Chop done 同源（chop_waiters / chopped_count）：
+    recipe_graph 据此不再发 FetchToBoard/Chop，这里据此判可以放下。两者口径
+    必须一致，否则一边说不用切、一边说不放下，死锁（1-6 trace-20261021-125032
+    t=8559）。曾经两边都按「有一份切好的就算够」判，两单要薯条时第二单的土豆
+    没人切（trace-20261029-125348 t=434~584）。
     """
-    form = book.chop_target(raw)
-    if not form:
+    from ai.query import recipe_graph
+    if not raw or not book.chop_target(raw):
         return False
-    low = str(form).lower()
-    for ws in world.workstations or ():
-        if str(ws.get("item") or "").lower() == low:
-            return True
-    for c in world.chefs or ():
-        if P.held_name(c) == low:
-            return True
-    for it in world.items or ():
-        if str(it.get("n") or "").lower() == low:
-            return True
-    return False
+    waiters = recipe_graph.chop_waiters(world, book, raw, plate_match, cooker_match)
+    have = recipe_graph.chopped_count(world, book, raw)
+    return have > 0 and have >= len(waiters)
 
 
 @_register
@@ -141,7 +135,7 @@ class Discard(Task):
     """
 
     TYPE = "Discard"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把没用的东西扔进垃圾桶"
     LABEL = "扔垃圾"
 
@@ -207,7 +201,7 @@ class RecoverLoosePot(Task):
     """
 
     TYPE = "RecoverLoosePot"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把放在台面/地上的锅拿回灶上"
     LABEL = "捡锅"
 
@@ -291,6 +285,52 @@ class RecoverLoosePot(Task):
         ]), TASK_TIMEOUT_TICKS)
 
 
+def _held_plate_orphan(ctx, chef):
+    # type: (Dict, Optional[Dict]) -> bool
+    """手里是「孤儿半成品盘」时允许 StashHeld 放下。
+
+    成品盘不算（走 SendAcross/DeliverPlate）、空盘也不算（走 PlaceCleanPlate /
+    ResetPlate）。只有「有内容、但没有任何存活订单还想要这些内容」的盘才算
+    孤儿——内容对不上任何单（订单被放弃 / 料配错）。「内容还是某单的子集、
+    只是没做满」的盘不是孤儿：它该继续 FillCooker/Chop 补料，不该被放下
+    （否则就是拿起来又放下，浪费一块半成品）。
+    """
+    if chef is None or not P.held_is_plate(chef):
+        return False
+    name = P.held_name(chef)
+    plate = None
+    fallback = None
+    for p in P.all_plates(ctx["w"]):
+        if str(p.get("name") or "").lower() != name:
+            continue
+        if p.get("held_by") == P.P2_NAME:
+            plate = p
+            break
+        if p.get("held_by") is None and fallback is None:
+            fallback = p
+    plate = plate or fallback
+    if plate is None or P.plate_count(plate) == 0:
+        return False
+    book = ctx.get("book")
+    if book is None:
+        return False
+    tokens = book.plate_tokens(plate)
+    if not tokens:
+        return False
+    bb = ctx.get("bb")
+    abandoned = getattr(bb, "abandoned_orders", None) or {}
+    tick = getattr(bb, "tick", 0)
+    for o in ctx["w"].orders:
+        if abandoned.get(o.get("id"), 0) > tick:
+            continue
+        allowed = book.order_want_tokens(o)
+        for ing in o.get("optional") or ():
+            allowed |= book.want_tokens(ing)
+        if tokens <= allowed:
+            return False       # 还有单想要这些内容，别放
+    return True
+
+
 @_register
 class StashHeld(Task):
     """第 13 号：手里莫名拿着无用物时清空手。
@@ -308,7 +348,7 @@ class StashHeld(Task):
     """
 
     TYPE = "StashHeld"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把手里暂时用不上的东西放到台面"
     LABEL = "放下手里的东西"
 
@@ -331,7 +371,11 @@ class StashHeld(Task):
             if state != P.COOKWARE_BURNT:
                 return False
         if P.held_is_plate(chef):
-            return False       # 盘走 PlaceCleanPlate / DeliverPlate / ResetPlate
+            # 盘默认走 PlaceCleanPlate / DeliverPlate / ResetPlate。唯一例外是
+            # 「孤儿半成品盘」：有内容、但没有任何存活订单还想要这些内容（订单
+            # 被放弃 / 料配错），攥着它只会占手、让 AI 静止
+            # （trace-20261111-124037 t=1260）。这时允许放下。
+            return _held_plate_orphan(ctx, chef)
         held = P.held_name(chef)
 
         # 手持生食材 + 有空灶可用 → 不该 stash，应该走 FetchToCooker。
@@ -350,7 +394,9 @@ class StashHeld(Task):
         if item_wanted_by_orders(ctx, held) > 0:
             if book.needs_chopping(held) and (
                     not _has_free_chopping_board(ctx["w"])
-                    or _chopped_form_available(ctx["w"], book, held)):
+                    or _chopped_form_available(ctx["w"], book, held,
+                                               ctx.get("plate_match"),
+                                               ctx.get("cooker_match"))):
                 return True
             return False
         return True
@@ -374,7 +420,7 @@ class Prefetch(Task):
     """
 
     TYPE = "Prefetch"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "提前取一份多单都要的料放台面"
     LABEL = "预取"
 
@@ -402,8 +448,11 @@ class Prefetch(Task):
         # type: () -> Node
         item = self.item
         return PR.Timeout(Sequence([
-            PR.InteractWith(lambda c: ingredient_source(c, item), "pickup",
-                            lambda c: P.held_matches(c["chef"], item)),
+            conveyor_pickup(
+                resolve=lambda c: ingredient_source(c, item),
+                held=lambda c: P.held_matches(c["chef"], item),
+                arrived=lambda c, seg: loose_on_station(c["w"], item, seg),
+                face=True),
             PR.EnsureHandsFree(),
         ]), TASK_TIMEOUT_TICKS)
 

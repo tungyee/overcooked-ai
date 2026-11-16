@@ -11,20 +11,45 @@
 - `done(ctx)` → 完成判定（即下游 task 的 `feasible`，上下游咬合）
 - `build()` → 构建行为树（由 Executor 持有，不进黑板）
 
-`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay）。`T.TASK_TYPES` 登记全部 19 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
+`ai/tasks/__init__.py` 是对外唯一入口：一律 `from ai import tasks as T`，**不要直接 import 子模块**。子模块按 spec 的「单文件 ≤ 400 行」硬指标分组（plate / cook / fire / chop / assembly / cleanup / mix / relay / carrier / reposition）。`T.TASK_TYPES` 登记全部 26 个类型，靠 `__init__.py` 的 `import *` 触发 `@_register` 才能完整；`tests/test_tasks.py::test_task_types_registry_covers_all_subclasses` 用计数钉住完整性。
 
-主线 17 个 task 类型（另两个见表后）：
+主线 21 个 task 类型（另两个 `ThrowBatch` / `FillCooker` 见表后）：
 
 | 模块 | task |
 |---|---|
 | `chop.py` | `FetchToBoard`、`Chop` |
 | `cook.py` | `FetchToCooker`、`TakeCookedToPlate`、`ReturnPot`、`RescueCooked` |
 | `fire.py` | `Extinguish` |
-| `plate.py` | `PlaceCleanPlate`、`WashPlate`、`ResetPlate` |
+| `plate.py` | `PlaceCleanPlate`、`WashPlate`、`FetchConveyorPlate`、`ResetPlate` |
 | `assembly.py` | `FetchToPlate`、`DeliverPlate` |
 | `cleanup.py` | `Discard`、`RecoverLoosePot`、`StashHeld`、`Prefetch` |
 | `mix.py` | `Mix` |
-| `relay.py` | `PlaceToRelay` |
+| `relay.py` | `SendAcross`、`ThrowBatch` |
+| `carrier.py` | `FetchToCarrier`、`PlaceCarrierInCooker` |
+| `reposition.py` | `Reposition` |
+
+`SendAcross`（`relay.py`）：分割地图上把东西放到**通道**台面交给对面（`ai/space/channels.py`）。通道三种：渡运篮子（key = 渡运网格名）、台面传送带（key = `channels.CONVEYOR`，Rapids_4_2 双竹筏）与静态共享台面（key = `channels.STATIC`，两个可达场都能交互的普通台面，每帧现算，如 Wizard_3_1 中间列）。传送带段用段名/段心认领（移动网格上不好按格子认），放料固定在带子**开头**（`channels.conveyor_start_rank`：先大 `gz`、再大 `gx`），不要放到远端死胡同；**只放玩家够得着的那条带子**（`channels.conveyor_slots` 会滤掉自己这侧、末端通本侧垃圾桶的带子——放上去必进桶，还会被 `FetchConveyorPlate` 抢回来）；`on_station` 挂在带上的料/盘算「已送出」。渡运通道留 1 格回程，静态/传送带不留。任务本身只做「拿起来 → 放到通道格」；四种 kind 的来源/触发/取放/完成/落点策略集中在 `ai/revenue/handover.py` 的规格表（`SEND_SPECS`），加新 kind 不再改任务树和 planner：
+
+- `clean_plate`：对面缺干净盘（`cross_supply.send_deficit` / `far_plate_need`）；盘只放普通台面。
+- `carrier`：料齐的生载体，对应站型的灶只在对面、缺的料 P2 补不出来（`cross_supply.stuck_carriers`）；可退到两边都够得着的空砧板（`channels.free_carrier_slots`，砧板只给载体用）。
+- `dirty_plate`：洗碗池只在对面、P2 这侧有脏盘；一次一摞，P1 取走后才送下一摞。
+- `plated_dish`：出餐口只在对面、P2 这侧有料齐的成品盘；绑定对得上的订单。
+
+**传送带只给「不能扔」的东西**（成品盘、盘、载体）；生料和切好的料仍走 `ThrowBatch`。4-2 实测：`ChoppedLettuce`/`ChoppedTomato` 的 `throwable=true`，盘子 `throwable=false`。
+
+`planner.generate_candidates` 只遍历 `handover.send_requests()`；`wash` / `deliver` 命令的 scope 分别带上 `dirty_plate` / `plated_dish` 的送件。原 1-3 中转台 `PlaceToRelay` / `relay_cells_for` 已删，由它取代。
+
+`FetchConveyorPlate`（`plate.py`）：4-2 的台面传送带末端是垃圾桶。非脏盘（干净盘 / 成品盘）在传送带上时，`channels.plate_on_conveyor` 判它真的在带上（按同名 item 的 `on_station`，不是段心距离——旁边柜台上的盘不能误抢），生成 L4 抢救候选：`HANDS="any"`，树首 `EnsureHandsFree` 后 `pickup`，拿起即完成，后续送餐/装盘由 Planner 按当前局面重选。**只抢救玩家那侧够不着的带子**：`channels.plate_on_player_side_conveyor`（整条带只要有一段 P1 站得到）为真时不生成，否则会和 `SendAcross` 变成「放上去 → 抢下来 → 再放上去」的死循环（`trace-20261110-235726` t=491~528）。脏盘仍由 `WashPlate` 处理，避免两个任务抢同一摞。
+
+`FetchToCarrier` / `PlaceCarrierInCooker`（`carrier.py`）：**可烹饪载体**（披萨饼 = 反编译 `CookablePreparationContainer`：可放料 + 自带 CookingHandler）。链 = 底料切成饼 → 配料放到饼上 → 料齐的饼整份放进站型对得上的空灶（烤箱）→ `TakeCookedToPlate` 端盘取 → 出餐。判据只读插件协议 8 的能力字段（`crate.chop_cookable` / `items[].cookable` / `cookers[].station_type`），旧帧没有就不发这条链。载体实例每拍按 `carriers.match_prep_carriers` 配给订单（P2 够得着的优先，其次料多的），task 身份只带载体形态名。
+
+`Reposition`（`reposition.py`）：**订单无关**的换边，只在布局换向的连通窗口里出现。3-3（帧里报 `Wizard_3_2_2P`）的中央料箱每 34 秒在竖列/横排之间切换，把厨房切成左右或上下两半，**全图只连通 2.0~3.4 秒**（实测）。目标由 `ai/space/zoning.py` 的 `ZoneTracker` 算好放进 `bb.reposition`：`safe` = 见过的所有布局里都属于你的格（两种切法都对），`goal` = 其中离你最近、且当前可达的一格。树只有 `GoToCell(goal, arrived=进 safe)`；`claims()` 为空、不认领、`NO_ABANDON`。它**不是按层竞争**的：planner 的「马上去」闸（`_select_reposition`）在 `bb.reposition` 非空时硬选它，但让位给 L0/L1/L2（火 / 快糊 / 刚熟救锅）。窗口一关主循环就清 `bb.reposition`，任务随之不可行，不反复重试。
+
+`ThrowBatch`（`relay.py`）：**订单无关**的投掷备料，把一种可投掷料投向下一站消费站（砧板/灶/装盘）。**当前一次只投一份**（`relay.MAX_BATCH_UNITS = 1`，暂不做批量）。两类触发：分割地图（消费站只有 P1 够得着，Rapids_2_1 木筏↔厨房）与连通但远（料到消费站 > `throw_supply.THROW_MIN_DIST`，开关 `ENABLE_FAR_THROW`，**当前关闭**：单份远投没有摊销、料落在锅旁还要再捡）。缺口 = 可见订单需求 + `THROW_EXTRA_UNITS` − 已越过这一站的 − 已在这一站任一消费站附近（含飞行中）的，再封顶到 `MAX_BATCH_UNITS`；每拍重算。树 = `Timeout(取 → WaitUntil(有出手位) → GoToCell(出手位) → ThrowTo(消费站), 单轮)`，投完 SUCCESS 交还 Planner，要不要投下一份每拍重新决定。拿着本批料、承诺中时不因单帧判据翻转放下（far/split 都适用，`_carrying_this_batch`）。`throw_supply.stages` 对「不烹饪、但可切」的料生成两站：生料投砧板（`CONSUMER_BOARD`，扔过去让对面切），切好的投「装盘」（`CONSUMER_PLATE`，没有固定站点、复用对面砧板作出手瞄准点）。切好的沙拉料只在**对面有干净盘**时才投（`gap` 里 `far_plate_need` 门控），对面没盘时留在本侧装盘、成品走传送带（`voice-20261111-224619`）。飞行路径上的垃圾桶也当障碍（`walls_of` 加 `bin` 的 AABB）：4-2 往对面砧板投生菜时直线会穿过 `Bin 1`，不拦就会被垃圾桶接住（`trace-20261110-224136`）。打分 = 等价取料 task（FetchToBoard/FetchToCooker，绑最急的单）的分 + `_batch_bonus(N)`（N=1 时为 0）+ `held_batch`（手里正拿着这一批 +1.0，避免被「要空手」的 FetchToBoard 抢走而把料放下），L6 备菜层。供需与出手位在 `ai/revenue/throw_supply.py`，落点几何在 `ai/space/throw.py`，分区在 `ai/space/regions.py`。
+
+`FetchToBoard` 腾板（`chop.py`）：砧板上是**产物**（`book.needs_chopping` 为假：切好的料、切出来的饼……不按物料特判）、没人在切、P2 够得着、不是分割地图的共享砧板（`T.board_clearable`）时，树首先空手拿起板上的东西放到就近空台面，再取料上板。候选生成（`recipe_graph._inst_fetch_board`）只在 P2 够得着的空板一块都没有时才给可腾的板发候选。还没切的生料不腾（那是 `Chop` 的输入）。
+
+连通地图的「投进锅」不走 ThrowBatch：`FetchToCooker` / `FillCooker` 单料路径的下锅一步是 `Selector[ThrowOntoStation, 走过去 placement]`，见下表 `ThrowOntoStation`。
 
 另有第 18 号 `FillCooker`（`cook.py`，继承 `FetchToCooker`）：**订单无关**的填灶，
 `order_id` 恒为 None，谓词是纯世界谓词（空灶 + 熟料缺口 > 0）。它存在的理由是
@@ -35,11 +60,11 @@
 
 树的叶子是带强制前后校验的原语（spec §7.2）。ctx 契约（`primitives/base.py`）为 `{w, chef, exec, bb, field, book, tick}`；target 优先传「可调用」以便每拍重算（树跨拍复用，构造时抓的 dict 第二拍就过期）。halt 只发 halt 命令、不碰物品（优雅退出由抢占方树首的 `EnsureHandsFree` 负责）。
 
-15 个原语（`primitives.__all__` 另含 `Primitive` 基类与 `resolve` 辅助）：
+16 个原语（`primitives.__all__` 另含 `Primitive` 基类与 `resolve` 辅助）：
 
 | 原语 | 作用（括号内是容易踩的坑） |
 |---|---|
-| `Approach` | 走到目标相邻交互位（委托后端：本地算 goal/path 后发 `move` 命令给插件逐帧跟随）。（**只保证站位、不保证朝向**，定向交互的重瞄由插件 move/tap 完成；目标格就是脚下格时直接 SUCCESS） |
+| `Approach` | 走到目标相邻交互位（委托后端：本地算 goal/path 后发 `move` 命令给插件逐帧跟随）。（**只保证站位、不保证朝向**，定向交互的重瞄由插件 move/tap 完成；目标格就是脚下格时直接 SUCCESS）。路径穿平台接缝时 `move` 带 `gates`（`ai/space/seams.py`），插件每帧跟门洞中线、门洞没开在缝口等；`GoToCell` 同 |
 | `Face` | 转向 target。委托后端下转向已并入 move/tap 的重瞄，是 no-op。（`max_ticks` 保留仅用于接口兼容） |
 | `AlignToCell` | 委托后端下对齐已并入 move/tap 的重瞄，是 no-op。保留 `_blacklist_pair`：交互恢复在换位重试时按 (资源,格) 写短期拉黑 |
 | `Tap` | 单击一次，**边沿触发**（同一激活期内只按一次，否则 toggle 会反复拿起放下） |
@@ -48,9 +73,11 @@
 | `WaitUntil` | **不发任何命令**等到 `pred` 成立（端盘在锅前等饭熟）。（`timeout` 必须显式传） |
 | `HoldUntil` | 发 `hold` 命令直到 `pred` 成立（切菜/喷灭火器/洗盘）。语义早停：`pred` 成立即 SUCCESS（插件只负责按住 + 位置重验 + timeout） |
 | `TapWhileHolding` | 单击的同时把反向顶带键并入 `tap` 命令的 `hold_dir`（传送带顶位专用，防被推走） |
-| `EnsureHandsFree` | 手里有东西就放到就近合法落点，**幂等**。落点物料感知：空锅回灶、熟锅/糊锅不上灶；`home_cooker=False` 关掉归位（灭火端下来的锅只去台面/地上，否则会被当空灶放回去继续烧） |
+| `EnsureHandsFree` | 手里有东西就放到就近合法落点，**幂等**。落点物料感知：空锅回灶、熟锅/糊锅不上灶；`home_cooker=False` 关掉归位（灭火端下来的锅只去台面/地上，否则会被当空灶放回去继续烧）；`exclude(ctx)->Set[(gx,gz)]` 追加禁区格（摆盘 task 用它排除自己的目标拼装格，避免把端着的料丢回目标台面再振荡） |
 | `InteractWith` | 复合 = Approach + (Face) + Tap + Confirm。（`expect` 必传，漏给即 TypeError） |
-| `ThrowTo` | `throw` 命令投掷手持可投掷物，只校验离手。（落点不可控，米曾落到地图边界行够不到） |
+| `GoToCell` | 走到指定格（投掷出手位），首拍定格、move 回 ok 即成功。（不是「目标旁交互位」，与 `Approach` 区分；站在漂流平台上不追每拍新格） |
+| `ThrowTo` | `throw` 命令投掷手持可投掷物，只校验离手。插件 0.21 起朝向闭环（`dot>0.97` 才按、0.6s 内确认手空）。射程固定 ≈7.5m，落点由出手站位决定（`ai/space/throw.py`），不由原语控制。可选 `aim_dot` / `strict` / `face_timeout_ms`（插件 0.23.2+）：更严的朝向门槛、没对准就失败不投、转向时限 |
+| `ThrowOntoStation` | 下锅最后几步改成投：拿着料、离锅远时走到 3~5m（`space.throw.POT_THROW_MIN/MAX`）外一个直线无遮挡（只过可走地板、无别的厨师）的格，`ThrowTo(aim_dot=0.996≈5°, strict)` 投出，`WaitUntil` 锅收下。锅接料靠触发器（飞行中穿过、能收这种料就收），不必落进锅。**只用于锅，不用于砧板**：砧板是 `ServerAttachStation`，只接非飞行物，投掷射程又固定 ≈7.5m，3~5m 投过去会从板上空飞过落在地上（`trace-20261108-200713` t=659/1414）；`FetchToBoard` 一律走到板旁放下，跨区/远距送料由 `ThrowBatch` 自己投到对面地上。门槛：不在冷却、手上有料且锅还没收、比走到锅旁至少省 `POT_THROW_SAVE_CELLS` 格。投偏/没对准 → 写 `bb.pot_throw_cooldown[锅]`（20s）并 FAILURE，调用方先捡回地上那份再走过去放 |
 | `Timeout` | task 级超时装饰，超时 halt 子树转 FAILURE 交还 Planner |
 | `MarkBlocked` / `AbandonTarget` | 三级脱困的 L1/L3，**这两个节点本身仍预留未接线**（但 L1 的拉黑机制已有消费方：`AlignToCell` 写 `scratch.bad_pairs`、`Approach` 读它，是第一条真正接线的脱困路径）。实际脱困靠两处：`HoldUntil` 的位置自愈，以及 Agent 的连续失败计数（同一 task 连败 `ABANDON_FAIL_STREAK=3` → 写 `scratch.abandoned`，`filter_feasible` 跳过该候选，TTL 200 拍）。**灭火是例外**：`Extinguish` 声明 `NO_ABANDON`、`plan_firefighting` 传 `ignore_abandon=True`——拉黑按资源 id 记，别的 task 在同一口灶上反复失败会把着火的那口灶也写进去 |
 
@@ -61,8 +88,16 @@
 资源 id 规则（spec §4.4）：
 - 灶 / 板 / 洗碗池 → `(网格名, 站点实例名)`（spec 2026-10-15 地图重构后；
   同名站点可能分属不同网格）
-- **拼装格 → 网格坐标 `(gx, gz)`（坐标即身份）**
+- **拼装格 → 主网格坐标 `(gx, gz)`（坐标即身份）**；移动网格（气球篮/木筏）
+  上的台面例外，用 `(网格名, 站点实例名)`——主网格投影随篮子漂，存下的格过几秒
+  就指向空地（trace-20261030-224658）。见 `ai/query/placement.counter_key`，
+  每拍用 `counter_cell_now` 重投影
+
 - 盘 → 实例名 `n` 为主
+- 已装料载体（包了熟肉的卷饼、夹了生菜的汉堡胚等，`ai/query/carriers.py`）→
+  **(物品名, 内容签名)**，不用位置：物品无实例 id，拾取后坐标/`on_station` 都会变。
+  `FetchToPlate` 的 resources 为 `(plate_id, 签名)` 时取的是载体，`find_ingredient(..., contents=签名)`
+  按名字 + detail 内容精确匹配（缺省空集 = 普通料，不会把包肉卷饼当空卷饼拿）
 
 认领是 **`(resource_id, action)` 动作级**粒度（不是按资源整锁）：P1 往 1 号锅放生饭只锁 `(cooker1, "fetch_to")`，`(cooker1, "take_cooked")` 仍开放——取熟饭是最有价值的接力。认领的 owner 常量是 `OWNER = "P2"`（AI 控制的是 P2）。
 

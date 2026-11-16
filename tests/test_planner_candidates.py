@@ -194,39 +194,6 @@ def test_raw_on_board_does_not_generate_fetch_to_board():
     assert "Chop" in types
 
 
-def test_move_fetch_to_board_scores_below_chop():
-    """打分兜底：FetchToBoard 来源是"另一块板"（搬料）被打低，Chop 分数更高。"""
-    from ai import tasks as T
-    from ai.core.planner import _score_candidate
-
-    order = _make_order("Sushi_Cucumber", ["Cucumber"])
-    w = _make_world(
-        orders=[order],
-        stations=[
-            {"t": "crate", "n": "crate_cucumber", "ing": "Cucumber",
-             "chop": "ChoppedCucumber", "chop_stages": 8, "gx": 1, "gz": 1},
-        ],
-        workstations=[
-            {"n": "board_full", "item": "Cucumber"},
-            {"n": "board_empty", "item": None},
-        ],
-        chefs=[{"name": "Player 2", "held": None, "x": 0.0, "z": 0.0}],
-    )
-    bb = _make_bb()
-    book = RecipeBook([{"name": "Cucumber", "comp": []}], w.stations)
-
-    move_task = T.FetchToBoard("order1", ("board_empty",), "Cucumber")
-    move_cand = Candidate(move_task, ["hands_empty"], 10)
-    chop_task = T.Chop("order1", ("board_full",), "Cucumber")
-    chop_cand = Candidate(chop_task, ["chopping_station_free"], 20)
-
-    move_score, move_terms = _score_candidate(w, bb, move_cand, book)
-    chop_score, chop_terms = _score_candidate(w, bb, chop_cand, book)
-
-    assert move_terms["move_penalty"] < 0
-    assert chop_score > move_score
-
-
 def test_claimed_station_filtered():
     """已认领的站点不生成对应任务。"""
     order = _make_order("TomatoSalad", ["Tomato", "Plate"])
@@ -289,3 +256,47 @@ def test_complex_order_with_cooked_meat():
     assert len(types) >= 4
     # 检查有烹饪相关任务
     assert any("Cooker" in t or "Cook" in t for t in types)
+
+
+def test_wash_plate_candidate_generated_with_hands_full():
+    """有脏盘就发 WashPlate 候选，与手里拿没拿东西无关。
+
+    树首 EnsureHandsFree 负责把非脏盘手持物放回合法落点，所以端干净盘时
+    也该能接「去洗碗」（实机 trace-20261108-181823：池里有脏盘、手里拿着
+    干净盘 → 候选被手部门挡掉，LLM 只能说「现在没有脏盘」）。
+    """
+    from ai import tasks as T
+
+    w = _make_world(
+        stations=[{"t": "washing", "n": "WashingPart", "gx": 0, "gz": 0,
+                   "x": 0.5, "z": 0.5}],
+        chefs=[{"name": "Player 2", "held": "equipment_plate_01",
+                "x": 1.0, "z": 1.0}],
+    )
+    w.items = [{"n": "DirtyPlateStack", "x": 3.0, "z": -12.0}]
+    w.held_items = []
+    bb = _make_bb()
+    book = RecipeBook(w.recipes, w.stations)
+
+    candidates = generate_candidates(w, bb, None, book)
+
+    assert any(isinstance(c.task, T.WashPlate) for c in candidates)
+
+
+def test_no_wash_plate_candidate_without_dirty_plate():
+    """没有脏盘时不发 WashPlate（ack 才能如实回 pending）。"""
+    from ai import tasks as T
+
+    w = _make_world(
+        stations=[{"t": "washing", "n": "WashingPart", "gx": 0, "gz": 0,
+                   "x": 0.5, "z": 0.5}],
+        chefs=[{"name": "Player 2", "held": "", "x": 1.0, "z": 1.0}],
+    )
+    w.items = []
+    w.held_items = []
+    bb = _make_bb()
+    book = RecipeBook(w.recipes, w.stations)
+
+    candidates = generate_candidates(w, bb, None, book)
+
+    assert not any(isinstance(c.task, T.WashPlate) for c in candidates)

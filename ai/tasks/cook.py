@@ -10,13 +10,15 @@ from ai.revenue import cook_supply as CS
 from ai.query import predicates as P
 from ai import primitives as PR
 from ai.query import stations as S
+from ai.query import placement
 from ai.exec.bt import Condition, Node, Selector, Sequence
-from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
+from ai.query.plate_tokens import parse_pot_contents
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _register,
+                           conveyor_pickup,
                            cooker_state, cooker_station, cooked_sources,
                            ingredient_available, ingredient_source,
                            loose_count, loose_on_station, plate_by_id,
-                           plate_matches_order)
+                           plate_matches_order, _station_for_item)
 
 # 端盘在锅前等熟的最长拍数（15s）。煮一锅饭实测约 11s，取盘+走到锅前再
 # 留足余量；超时交还 Planner，避免无限等一个可能永远不成立的状态。
@@ -26,10 +28,10 @@ WAIT_COOKED_TIMEOUT_TICKS = 300
 # task 长，超时上限单独放宽（20s，比默认 TASK_TIMEOUT_TICKS=200 的 10s 翻倍）。
 TAKE_COOKED_TIMEOUT_TICKS = 400
 
-# 传送带拦截等料的最长拍数（15s）。米/鱼/海苔在传送带上循环移动，走到锁定
-# 段旁等它经过；一轮循环实测约 30~40 秒但场上同时有多份料，等到下一份的
-# 间隔远短于此。超时交还 Planner，而不是无限等一份可能永远不来的料。
-CONVEYOR_WAIT_TICKS = 300
+# 端盘取熟料的提前量（秒）：锅里的料离熟还有这么多秒以内才去端盘/走近。
+# 再早去（例如刚下锅）就只能端着盘子在锅边干等，把后面的命令（洗碗等）
+# 全堵住；留 4s 给取盘+走位，既不会从 0% 开始等，也不会晚到烧糊。
+TAKE_COOKED_LEAD_S = 4.0
 
 # 下料是**两趟**差事（空手走到料箱、拿着料走回灶），和灭火同构，默认 200
 # 拍压根不够：实机 trace-20261015-165358 九次 FillCooker 里四次撞线
@@ -67,7 +69,7 @@ class FetchToCooker(Task):
     """
 
     TYPE = "FetchToCooker"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把生料下进锅里煮（为某张订单）"
     LABEL = "下锅"
     PROCESS = "煮"
@@ -191,17 +193,21 @@ class FetchToCooker(Task):
         def holding_pot(c):
             return bool(lp) and P.held_matches(c["chef"], lp)
 
-        def pot_placed(c):
-            cc = cooker_state(c, cooker_id)
-            return cc is not None and P.cooker_has_pot(cc)
+        # 散锅放到**最近的空灶**（动态落点），而不是写死的绑定灶。清手阶段
+        # 可能已经把另一口锅归位到绑定灶（trace-20261115-005140 t=2845：锅B
+        # 被归位到 1 号灶），再往绑定灶放锅A 会 no effect 卡死。锅灶可互换，
+        # 放哪口空灶都一样；放置成功判「散锅离手」即可。
+        def pot_released(c):
+            return not holding_pot(c)
+
+        def empty_cooker(c):
+            return placement.find_empty_cooker(c["w"], c["field"])
 
         recover = None
         if lp:
             recover = Sequence([
                 PR.InteractWith(pot_target, "pickup", holding_pot, face=False),
-                PR.InteractWith(
-                    lambda c: cooker_station(c, cooker_id), "placement",
-                    pot_placed),
+                PR.InteractWith(empty_cooker, "placement", pot_released),
             ])
 
         timeout = FETCH_TO_COOKER_TIMEOUT_TICKS * max(len(raws), 1)
@@ -236,38 +242,25 @@ class FetchToCooker(Task):
                     cc.get("pot_contents") or [])
 
             def pickup():
-                # ingredient_source 对「挂站点上的散落料」返回站点（有朝向），
-                # face=True 让 Face 转身；裸散落料 Face 内部直接 SUCCESS 跳过，
-                # 行为与旧 face=False 等价。
-                #
-                # 传送带上的料（1-6 的米/鱼/海苔）在持续移动：ingredient_source
-                # 每拍把料解析成它当前所在的传送带段，段随料跨段移动而变，角色
-                # 追着移动的料跑永远追不上（trace-20261021-131529 全程 0 帧拿到
-                # 米、灶从没开煮）。这里把取料目标**锁死在第一次解析出的站点**，
-                # 再 WaitUntil 等料经过这一段才 tap——拦截等料，不追移动目标。
-                locked = {}
-
-                def target(c):
-                    st = locked.get("st")
-                    if st is None:
-                        st = ingredient_source(c, form(c))
-                        if st is not None:
-                            locked["st"] = st
-                    return st
-
-                def arrived(c):
-                    st = locked.get("st")
-                    if not isinstance(st, dict) or st.get("t") != "conveyor":
-                        return True       # 箱子/板/散落不是传送带，不需等
-                    return loose_on_station(c["w"], form(c), st)
-
-                return PR.InteractWith(
-                    target, "pickup", holding, face=True,
-                    wait_pred=arrived, wait_timeout=CONVEYOR_WAIT_TICKS)
+                # 传送带上的料锁段等料；箱子/台面/散落行为与普通 pickup 一致。
+                return conveyor_pickup(
+                    resolve=lambda c: ingredient_source(c, form(c)),
+                    held=holding,
+                    arrived=lambda c, seg: loose_on_station(c["w"], form(c), seg),
+                    face=True)
 
             def drop():
-                return PR.InteractWith(
-                    lambda x: cooker_station(x, cooker_id), "placement", placed)
+                # 最后几步：离锅还远、能直线投进时精准投进锅（ThrowOntoStation），
+                # 否则 / 投偏后走过去放。投偏料落在锅附近地上，先捡回来再放
+                # （ingredient_source 散落优先于料箱），不回料箱重取。
+                station = lambda x: cooker_station(x, cooker_id)  # noqa: E731
+                return Selector([
+                    PR.ThrowOntoStation(station, holding, placed, cooker_id),
+                    Sequence([
+                        Selector([Condition(holding), pickup()]),
+                        PR.InteractWith(station, "placement", placed),
+                    ]),
+                ])
 
             fill = Selector([
                 # 分支1：地上有散落米 → 直接拿散落米下锅（最便宜的一路，
@@ -286,7 +279,7 @@ class FetchToCooker(Task):
                 # →投」实测约 80 拍，整树却裹在 TASK_TIMEOUT_TICKS=200 里
                 # ——第二轮没结束就被砍，planner 换个 order 重建树又从第一
                 # 轮开始，`drop()` 一次都没执行过。实机后果：米全堆在地上、
-                # 灶始终空着、整局 0 送达（trace-20261014-011202，2527 拍）。
+                # 灶始终空着、整局 0 送达（2527 拍）。
                 #
                 # 投掷本身也不该留在 N=1 的路径上：摊销为零，却保留了落点
                 # 不可控的缺点（米曾落到地图边界行 (4,4)，Approach 够不到
@@ -321,9 +314,12 @@ class FetchToCooker(Task):
 
             steps = [PR.EnsureHandsFree(keep=lambda c: holding(c, raws[0]))]
             for r in raws:
-                steps.append(PR.InteractWith(
-                    lambda c, r=r: raw_src(c, r), "pickup",
-                    lambda c, r=r: holding(c, r)))
+                steps.append(conveyor_pickup(
+                    resolve=lambda c, r=r: raw_src(c, r),
+                    held=lambda c, r=r: holding(c, r),
+                    arrived=lambda c, seg, r=r: loose_on_station(
+                        c["w"], c["book"].cook_input_form(r), seg),
+                    face=True))
                 steps.append(PR.InteractWith(
                     lambda c: cooker_station(c, cooker_id), "placement",
                     lambda c, r=r: placed(c, r)))
@@ -352,8 +348,8 @@ class FillCooker(FetchToCooker):
     """填灶：订单无关地把生料下进空锅，让灶常驻满载。
 
     **为什么不能靠调权重解决**（第 1 组 1.1）：`FetchToCooker` 绑订单，
-    只能由 `recipe_graph.emit` 按单发射，`_in_flight_cook_claim` 压掉同一单
-    的第二个下锅候选，`_match_cookers_to_orders` 又是严格 1:1 —— 结构上
+    只能由 `recipe_graph.emit` 按单发射，一份熟料在一单里只发一个下锅候选，
+    `_match_cookers_to_orders` 又是严格 1:1 —— 结构上
     「5 单要米」就不可能变成「3 口灶在烧」。实测 trace-20261014-120406 的
     1700~3270 窗口 **59% 的拍里三口灶一个都没在煮**（峰值也只有 2 口），而
     order#3/4/5 三单全在这个窗口过期。灶空转的机会成本是 12 秒不可压缩的
@@ -370,7 +366,7 @@ class FillCooker(FetchToCooker):
     """
 
     TYPE = "FillCooker"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "趁灶空着先下锅备料（不绑订单）"
     LABEL = "填灶"
     HANDS = "empty"
@@ -427,6 +423,27 @@ class FillCooker(FetchToCooker):
                    for r in raws)
 
 
+def _cooker_ready_to_take(c):
+    # type: (Dict) -> bool
+    """端盘取熟料的时机：已熟，或煮到离熟 TAKE_COOKED_LEAD_S 秒以内。
+
+    旧帧没有 cooking_progress / cooking_time 时退回旧行为（煮中即可去），
+    避免因为缺字段把 TakeCookedToPlate 永久判成不可行。
+    """
+    if P.cooker_cooked(c):
+        return True
+    if not P.cooker_started(c):
+        return False
+    try:
+        total = float(c.get("cooking_time") or 0)
+        progress = float(c.get("cooking_progress") or 0)
+    except (TypeError, ValueError):
+        return True
+    if total <= 0:
+        return True
+    return total - progress <= TAKE_COOKED_LEAD_S
+
+
 @_register
 class TakeCookedToPlate(Task):
     """第 4 号：端着盘子去熟料源把熟料盛进缺此料的盘。
@@ -440,7 +457,7 @@ class TakeCookedToPlate(Task):
     """
 
     TYPE = "TakeCookedToPlate"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "端着盘把煮好的料盛进盘里"
     LABEL = "盛盘"
     HANDS = "empty"       # 要空手去端盘；手不空时打分加腾手代价（spec §6.1(b)）
@@ -476,7 +493,9 @@ class TakeCookedToPlate(Task):
         # type: (Dict) -> bool
         """可行性分两段（spec §6.1 第 4 号 + §6.5）：
 
-          - **启动看源**：灶上熟料 / 台面散熟锅才值得去取；
+          - **启动看源 + 时机**：灶上熟料 / 台面散熟锅才值得去取；灶上还在
+            煮时只等到「离熟 TAKE_COOKED_LEAD_S 秒以内」才放行，避免刚下锅
+            就端盘去锅边干等、把队列里后面的命令堵住；
           - **执行中看手**：本 task 第一步就是把盘从原位拿起，盘随即离开
             原位。若可行性绑死在"盘还在原位"，它一动手就把自己判成不可行 →
             被承诺惯性抛弃 → 死循环（实机复现）。故"目标盘已在手上"也算可行。
@@ -493,7 +512,23 @@ class TakeCookedToPlate(Task):
             return False                       # 盘内容与该单不再兼容（P1 放错料）
         if _holding_plate(ctx, self.plate_id):
             return True                        # 执行中：目标盘已在手上
-        return self._source(ctx) is not None
+        s = self._source(ctx)
+        if s is None:
+            return False
+        if s["kind"] == "cooker":
+            c = cooker_state(ctx, self.cooker_id)
+            if not _cooker_ready_to_take(c):
+                return False                   # 还早：先去做别的，别端盘干等
+        return True
+
+    def resource_target(self, rid, ctx):
+        # type: (Any, Dict) -> Optional[Dict]
+        """可达性层解析资源用（reachability._task_target）：散熟料源按 _source
+        精确取那一件，避免同名生饼顶替熟饼；其余资源走默认按 id 查。"""
+        if rid != self.cooker_id or cooker_state(ctx, rid) is not None:
+            return None
+        s = self._source(ctx)
+        return s["target"] if s else None
 
     def _source(self, ctx):
         # type: (Dict) -> Optional[Dict]
@@ -510,18 +545,25 @@ class TakeCookedToPlate(Task):
             if P.cooker_started(c) and not P.cooker_burning(c):
                 return {"kind": "cooker", "target": cooker_station(ctx, sid)}
             return None
-        for it in ctx["w"].items:
-            if str(it.get("n")) != str(sid):
+        # 散熟料源（散熟锅 / 出炉的熟披萨）与 cooked_sources 同一口径，并且要
+        # 装着本 task 这样熟料：同名物品可能有多件（Pizza_Base_Raw 生饼和熟饼
+        # 同名），只看第一件同名物会撞上生饼 → 有熟披萨却判不可行。
+        token = ctx["book"].rich_token(self.item)
+        for src in cooked_sources(ctx["w"], ctx["book"]):
+            if src["kind"] != "loose" or str(src["id"]) != str(sid):
                 continue
-            toks = parse_plate_detail(it.get("detail") or [])
-            if any(t.startswith("cooked:") for t in toks):
-                return {"kind": "loose", "target": it}
-            # 与 cooked_sources 同款兜底：detail 只报原始料名（ing:SushiRice）、
-            # 没有 cooked: token 时，cooked 字段才是熟的权威信号。漏掉会把熟锅
-            # 当生锅 → feasible 恒 False → 有熟饭却取不动（AI 卡死）。
-            if str(it.get("cooked") or "").lower() == "cooked":
-                return {"kind": "loose", "target": it}
-            return None
+            if token and token not in src["tokens"]:
+                continue
+            item = src["item"]
+            # 散熟源（锅具/炸篮/出炉熟载体）挂在台面上时，游戏的句柄是台面、
+            # 不是源物品本身，要对着承载它的站点盛（与灶上锅对着灶站盛同理），
+            # 否则目标名对不上 → handle mismatch（4-2 散炸篮 trace-20261111-130956
+            # t=3260+；3-2 台面熟披萨 trace-20261115-133954 t=8348）。
+            # 散在地上（on_station=null）的散物句柄就是它自己，照旧对 item 盛。
+            station = _station_for_item(ctx["w"], item)
+            if station is not None:
+                return {"kind": "loose", "target": station}
+            return {"kind": "loose", "target": item}
         return None
 
     def build(self):
@@ -555,10 +597,10 @@ class TakeCookedToPlate(Task):
             p = plate_by_id(c, plate_id)
             return p is not None and c["book"].plate_has(p, cooked)
 
-        # 盛饭的交互句柄用 kind=None（通用朝向句柄）：端盘面对锅时，游戏的
-        # placement 句柄为 null、pickup 句柄会被地上的散料抢走（实机：脚边有
-        # 散米时 pickup=SushiRice 而非锅），只有 m_gridLocation（面朝的那格）
-        # 稳定指向锅。改回 "placement" 会因句柄 null 而 re-aim 空转。
+        # 盛饭的交互用 kind="use"：端盘面对锅时，游戏的 placement 句柄为
+        # null、pickup 句柄会被地上的散料抢走（实机：脚边有散米时
+        # pickup=SushiRice 而非锅）。插件按 UseName / 朝向句柄校验，句柄
+        # 指向旁边的柜台时不会误按（4-2 散炸篮 vs 柜台，trace-20261111-001945）。
         return PR.Timeout(Sequence([
             PR.EnsureHandsFree(keep=holding_plate),
             PR.InteractWith(plate_target, "pickup", holding_plate),
@@ -567,7 +609,7 @@ class TakeCookedToPlate(Task):
             PR.Approach(source_target, None),
             PR.Face(source_target),
             PR.WaitUntil(source_ready, WAIT_COOKED_TIMEOUT_TICKS),
-            PR.InteractWith(source_target, None, poured),
+            PR.InteractWith(source_target, "use", poured),
             # 树尾不许挂等待节点（与旧实现同款原因）：盘里一有料本 task 就
             # 不可行 → planner 下一拍换 task → executor halt 这棵树；若树尾有
             # 等待节点，成功记账（释放认领）会被静默吞掉，下一拍又去取熟料
@@ -616,7 +658,7 @@ class ReturnPot(Task):
     """
 
     TYPE = "ReturnPot"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把空锅放回灶上"
     LABEL = "放回锅"
 
@@ -672,10 +714,13 @@ class RescueCooked(Task):
     """
 
     TYPE = "RescueCooked"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把快糊的锅端离火"
     LABEL = "端锅离火"
     NO_ABANDON = True     # 端锅离灶是停烧糊的兜底：拉黑它就等于判这口锅死刑
+    # 同理不让「目标-站位」拉黑把灶的全部站位封死：拉黑可能来自别的动作
+    # （往满盘里加料被拒），见 reachability._interact_goals。
+    STANCE_LAST_RESORT = True
 
     @property
     def cooker_id(self):

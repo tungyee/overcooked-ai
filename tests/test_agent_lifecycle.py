@@ -200,7 +200,7 @@ def test_firefighting_task_is_never_abandoned():
 def test_cooked_pot_tasks_are_never_abandoned():
     """端锅/盛饭这类停火关键任务不写也不读 abandoned 拉黑。
 
-    拉黑期（200 拍）比烧糊倒计时还长：一旦把 RescueCooked / TakeCookedToPlate
+    拉黑期再短也可能让锅烧糊：一旦把 RescueCooked / TakeCookedToPlate
     拉黑，熟锅必糊必着火（实机 trace-20261018-153802：盛饭失败把端锅一起
     拉黑 → 熟锅烧糊起火）。所以这两个 task 声明 NO_ABANDON，写侧与读侧
     都不受 abandoned 约束；bad_cells（格子级绕路）仍照常写。

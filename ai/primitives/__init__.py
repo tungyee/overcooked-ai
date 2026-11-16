@@ -15,11 +15,12 @@ from ai.primitives.align import (
     ALIGN_MAX_TICKS,
     ALIGN_PAIR_TTL_TICKS,
 )
-from ai.primitives.move import Approach, Face
+from ai.primitives.move import Approach, Face, GoToCell
 from ai.primitives.tap import Tap, Confirm, Settle
-from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitUntil
+from ai.primitives.hold import HoldUntil, TapWhileHolding, WaitNewFrame, WaitUntil
 from ai.primitives.interact import EnsureHandsFree, InteractWith
-from ai.primitives.throw import ThrowTo
+from ai.primitives.throw import ThrowTo, ThrowOntoStation
+from ai.primitives.raft import Raft
 from ai.primitives.stuck import (
     MarkBlocked,
     AbandonTarget,
@@ -32,6 +33,7 @@ __all__ = [
     "target_grid_callbacks",
     "Approach",
     "Face",
+    "GoToCell",
     "AlignToCell",
     "ALIGN_MAX_TICKS",
     "ALIGN_PAIR_TTL_TICKS",
@@ -40,10 +42,13 @@ __all__ = [
     "Settle",
     "HoldUntil",
     "TapWhileHolding",
+    "WaitNewFrame",
     "WaitUntil",
     "EnsureHandsFree",
     "InteractWith",
     "ThrowTo",
+    "ThrowOntoStation",
+    "Raft",
     "MarkBlocked",
     "AbandonTarget",
     "Timeout",

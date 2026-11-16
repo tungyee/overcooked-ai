@@ -96,7 +96,9 @@ class AudioCapture:
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
-            blocksize=0,
+            # 显式 50ms 一帧：游戏（Steam 音频）可能把同一设备的缓冲改大，
+            # 导致回调被拉到几百 ms 才来一次、PTT 录音被截断（spec §8.1）。
+            blocksize=self.frame_samples,
             device=self.device_index,
             callback=self._callback,
         )
@@ -438,11 +440,14 @@ class AudioPlayer:
         if self._stream is not None:
             return
         sd = self._sd if self._sd is not None else _load_sd()
+        rate = self._output_rate or self.sample_rate
         stream = sd.OutputStream(
-            samplerate=self._output_rate or self.sample_rate,
+            samplerate=rate,
             channels=1,
             dtype="float32",
-            blocksize=0,
+            # 显式 100ms 输出缓冲：输入流固定 50ms 后，输出若沿用系统默认
+            # 小缓冲，CPU 忙时容易欠载、播报卡顿（spec §8.1）。
+            blocksize=int(rate * 0.1),
             device=self._device,
             callback=self._callback,
         )

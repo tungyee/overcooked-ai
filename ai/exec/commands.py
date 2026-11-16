@@ -9,13 +9,17 @@ ExecClient 负责 JSON 序列化/收发；`parse_result` 把插件回的结果�
 import json
 from typing import Dict
 
-# 六种命令。unknown cmd 在 build_command 里抛 ValueError——宁可早报错，
+# 六种执行命令 + ping（仅用于启动时确认 exec 通道是活插件）。
+# unknown cmd 在 build_command 里抛 ValueError——宁可早报错，
 # 也别把一个打错的命令名悄悄发出去、让插件回 not implemented 再返工。
-CMD_NAMES = ("move", "tap", "hold", "wait", "throw", "halt")
+# raft：触发舢板（5-1）移动到对岸——插件按交互键 + 方向，语义到岸由 Python 判。
+CMD_NAMES = ("move", "tap", "hold", "wait", "throw", "halt", "ping", "raft")
 
 # 结果行里可能缺席的键：插件旧版本/异常回包不保证字段齐全，Python 侧
 # 统一补 None，调用方可以安全读（对应 spec 的「结果不丢」之外的「字段可缺」）。
-_RESULT_KEYS = ("cmd_id", "ok", "why", "held_after", "blocked_cell")
+# blocked_box / blocked_kind：碰撞探测回传（插件 0.24.9+），缺则 None。
+_RESULT_KEYS = ("cmd_id", "ok", "why", "held_after", "blocked_cell",
+                "blocked_box", "blocked_kind")
 
 
 def build_command(cmd, **fields):

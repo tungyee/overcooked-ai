@@ -263,7 +263,7 @@ def test_make_walkable_real_frame_baseline():
     parsed = O.parse_node_map(frame["grid"].get("nodeMap"))
     assert parsed is not None
     nm, rows, cols = parsed
-    cells, _ = O.parse_belts(frame.get("belts"))
+    cells, _, _ = O.parse_belts(frame.get("belts"))
     walk = O.make_walkable(
         nm, rows, cols,
         O.playable_bounds(frame["stations"]),
@@ -504,6 +504,42 @@ def test_walkable_blocks_wall_layers():
     assert is_walkable(0, 0) is False
 
 
+def test_walkable_does_not_block_wall_below_floor():
+    """带高度的墙盒整段在地板顶面之下（矿洞地板下空腔）不挡路。
+
+    Mine_4_6 右半厨房地板（Ground 顶 y=0）下方有一个 Walls(10) 盒
+    y[-4,-0.5]，2D 范围与地板完全重合；点判若忽略高度会把整片厨房判成
+    不可走，P2 从出生点只够得到 1 格、全部 task infeasible
+    （trace-20261113-215358）。
+    """
+    terrain = {
+        9: [(9.0, 10.2, -3.0, -1.8)],
+        10: [(9.0, 10.2, -3.0, -1.8)],
+    }
+    terrain_y = {
+        9: [((9.0, 10.2, -3.0, -1.8), -0.5, 0.0)],
+        10: [((9.0, 10.2, -3.0, -1.8), -4.0, -0.5)],
+    }
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, terrain_y=terrain_y)
+    assert is_walkable(0, 0) is True
+
+
+def test_walkable_blocks_wall_at_floor_level_with_height():
+    """带高度且顶面高于地板的墙盒照常挡路（高度判定不误放真墙）。"""
+    terrain = {
+        9: [(9.0, 10.2, -3.0, -1.8)],
+        10: [(9.0, 10.2, -3.0, -1.8)],
+    }
+    terrain_y = {
+        9: [((9.0, 10.2, -3.0, -1.8), -0.5, 0.0)],
+        10: [((9.0, 10.2, -3.0, -1.8), 0.0, 1.2)],
+    }
+    is_walkable = O.make_walkable_from_terrain(
+        terrain, [], set(), MAPPING, terrain_y=terrain_y)
+    assert is_walkable(0, 0) is False
+
+
 def test_walkable_blocks_wall_within_chef_radius():
     """阻挡 box 距格心 < CHEF_RADIUS(0.4) 时，即使格心点在 box 外也应判不可走。
 
@@ -597,6 +633,18 @@ def test_edge_blocker_ignores_thick_station_block():
         [], set(), MAPPING)
     assert is_walkable(0, 0) is False
     assert is_walkable(0, 1) is True
+
+
+def test_edge_blocker_ignores_below_floor_thin_wall():
+    """薄墙整段在地板顶面之下不拦边（与 is_walkable 同一高度口径）。"""
+    terrain = {10: [(10.1, 10.3, -3.0, -1.8)]}   # 竖薄墙：宽 0.2，跨 gx=0/1
+    terrain_y = {
+        9: [((-100.0, 100.0, -100.0, 100.0), -0.5, 0.0)],
+        10: [((10.1, 10.3, -3.0, -1.8), -4.0, -0.5)],
+    }
+    edge = O.make_edge_blocker(terrain, MAPPING, terrain_y=terrain_y)
+    assert edge((0, 0), (1, 0)) is False
+    assert edge((1, 0), (0, 0)) is False
 
 
 def test_walkable_blocks_hazard_boxes():
@@ -722,22 +770,77 @@ def test_parse_wind_zones_skips_malformed():
          "vx": 0.0, "vz": 0.0}]
 
 
+def _wind_grid():
+    """cell=1、origin=0 的轻量 to_grid / to_world，风区格测试用。"""
+    def to_grid(x, z):
+        return (int(round(x)), int(round(z)))
+    def to_world(gx, gz):
+        return (float(gx), float(gz))
+    return to_grid, to_world
+
+
+def test_wind_flow_basic():
+    """风区 AABB → 每格方向/速度：格心落 AABB 的格记上，方向按 vx/vz 符号归一。"""
+    to_grid, to_world = _wind_grid()
+    raw = [{"minx": -0.5, "maxx": 1.5, "minz": -0.5, "maxz": 0.5,
+            "vx": 2.5, "vz": 0.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert set(dirs) == {(0, 0), (1, 0)}
+    assert dirs[(0, 0)] == (1, 0)
+    assert dirs[(1, 0)] == (1, 0)
+    assert speeds[(0, 0)] == 2.5
+    assert speeds[(1, 0)] == 2.5
+
+
+def test_wind_flow_diagonal_direction_by_sign():
+    """斜向风按符号取整（±1 分量），速度保留 |v|（同 parse_belts 斜向带口径）。"""
+    to_grid, to_world = _wind_grid()
+    raw = [{"minx": -0.5, "maxx": 0.5, "minz": -0.5, "maxz": 0.5,
+            "vx": 3.0, "vz": 4.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert dirs[(0, 0)] == (1, 1)
+    assert speeds[(0, 0)] == 5.0
+
+
+def test_wind_flow_skips_zero_and_malformed():
+    """风速 0 或缺 AABB / 非 dict 的风区不落格。"""
+    to_grid, to_world = _wind_grid()
+    raw = [None,
+           {"minx": 1.0},                                  # 缺 AABB
+           {"minx": 0.0, "maxx": 1.0, "minz": 0.0, "maxz": 1.0, "vx": 0.0, "vz": 0.0}]
+    dirs, speeds = O.wind_flow(raw, to_grid, to_world)
+    assert dirs == {}
+    assert speeds == {}
+
+
 def test_parse_belts_direction_from_velocity():
     """传送带方向从 vx/vz 归一化，不信任任何枚举字段。"""
     raw = [{"grid": "GridManager", "gx": -4, "gz": 2, "vx": 2.5, "vz": 0.0},
            {"grid": "GridManager", "gx": -4, "gz": -3, "vx": -2.5, "vz": 0.0}]
-    cells, dirs = O.parse_belts(raw)
+    cells, dirs, speeds = O.parse_belts(raw)
     assert cells == {(-4, 2), (-4, -3)}
     assert dirs[(-4, 2)] == (1, 0)
     assert dirs[(-4, -3)] == (-1, 0)
+    assert speeds[(-4, 2)] == 2.5
+    assert speeds[(-4, -3)] == 2.5
 
 
 def test_parse_belts_empty_on_zero_velocity():
-    """vx/vz 都是 0 时该格仍算传送带（belt_cells），但不记方向。"""
+    """vx/vz 都是 0 时该格仍算传送带（belt_cells），但不记方向/速度。"""
     raw = [{"grid": "G", "gx": 0, "gz": 0, "vx": 0.0, "vz": 0.0}]
-    cells, dirs = O.parse_belts(raw)
+    cells, dirs, speeds = O.parse_belts(raw)
     assert cells == {(0, 0)}
-    assert dirs == {}   # 方向不可定义，但格仍可走
+    assert dirs == {}    # 方向不可定义，但格仍可走
+    assert speeds == {}
+
+
+def test_parse_belts_speed_magnitude():
+    """速度保留 |v|（斜向带也给模长），供 navigation 判「快带逆行硬挡」。"""
+    raw = [{"grid": "G", "gx": 0, "gz": 0, "vx": 3.0, "vz": 4.0}]
+    cells, dirs, speeds = O.parse_belts(raw)
+    assert cells == {(0, 0)}
+    assert dirs[(0, 0)] == (1, 1)     # 斜向按符号取整
+    assert speeds[(0, 0)] == 5.0
 
 
 def test_station_block_cells_plate_station_uses_layer20():

@@ -5,7 +5,7 @@
 实机确认）。外部不直接 import 本模块，一律 `from ai import tasks as T`
 （分组边界是实现细节，见 ai/tasks/__init__.py）。
 """
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from ai.query import predicates as P
 from ai import primitives as PR
@@ -47,15 +47,60 @@ def _available_extinguisher(ctx):
     return best
 
 
+def _extinguisher_target(w, ext):
+    # type: (Any, Optional[Dict]) -> Optional[Dict]
+    """灭火器的 pick 目标：挂/放在台面上时用台面站点，否则用灭火器自己。
+
+    灭火器挂在气球篮的 countertop 上时，游戏的 pickup 句柄是承载它的台面、
+    不是灭火器自己（trace-20261115-213622 Balloon_2_3_2P：pickup=countertop(3)
+    而非 extinguisher）。按位置就近解析到台面站点，pick 的目标名才跟句柄对得上；
+    挂墙/放地上（没有同位置站点）就原样返回灭火器。
+    """
+    if not ext:
+        return None
+    x, z = ext.get("x"), ext.get("z")
+    if x is None or z is None:
+        return ext
+    best = None
+    best_d = 0.6 * 0.6  # 半格以内才算「挂在这台面上」
+    for st in w.stations:
+        sx, sz = st.get("x"), st.get("z")
+        if sx is None or sz is None:
+            continue
+        d = (sx - x) ** 2 + (sz - z) ** 2
+        if d < best_d:
+            best_d = d
+            best = st
+    return best if best is not None else ext
+
+
+def _burning_targets(world):
+    # type: (Any) -> List[Dict]
+    """所有在烧目标：烧灶（cookers 里 onFire/burning）+ 烧柜台/砧板/工作台。
+
+    灶的着火走 cooker_burning（burning=糊锅 / onFire=灶火两个信号）；柜台没有锅，
+    只有插件报的 onFire（见 station_burning）。灶在 stations[] 里也有 t="cooking"
+    的条目，这里排除掉避免和 cookers 重复计数。
+    """
+    pts = [cc for cc in world.cookers if P.cooker_burning(cc)]
+    pts += [s for s in world.stations
+            if s.get("t") not in ("cooking",) and P.station_burning(s)]
+    return pts
+
+
 @_register
 class Extinguish(Task):
-    """第 6.5 号：灭火——全局 task，一棵树循环处理所有着火灶。
+    """第 6.5 号：灭火——全局 task，一棵树循环处理所有着火目标（灶 + 柜台）。
 
     一局火情 = 一个 task = 一棵树，不再按灶拆分：换灶不重建树、不丢灭火器
     （旧实现「一灶一 task」换目标就重建树，树首 EnsureHandsFree 会把端着的
     灭火器放下，实机复现）。
 
-    顺序（用户实机确认的机制）：**先端所有带锅的着火灶，再逐灶喷**——
+    着火目标两种：灶（cookers 的 onFire/burning，带锅才要端）和普通柜台/砧板/
+    工作台（stations 的 onFire，没有锅、直接喷）。`_burning_targets` 把它们合到
+    一起；`burning()` 按「离 P2 最近」排序，先喷身边的起火点。
+
+    顺序（用户实机确认的机制）：**先端所有带锅的着火灶，再逐个起火目标喷**——
     锅留在灶上会一直烧、火不断复燃，只喷不端灭不掉。喷的过程中用 Guard
     每拍盯「有没有新着火的锅」，出现就中断喷、转去端锅。
 
@@ -71,15 +116,16 @@ class Extinguish(Task):
     HoldCommand 的 UseMatches 门恒不中、按不出键；spray 改走朝向句柄
     （m_gridLocation，HandleMatches(kind=null)），正对灶才按键。
 
-    换下一灶由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定最近
-    那口灶的名字，`spray_done` 判「这口灶还在不在燃烧列表里」。这口一灭 →
+    换下一目标由 `spray_done` 谓词驱动：HoldUntil 用 `spray_target` 锁定离 P2
+    最近的起火目标的名字，`spray_done` 判「这个目标还在不在燃烧列表里」。
+    这口一灭 →
     提前 SUCCESS（不再等「全灭」）→ RepeatUntil 重新评估 Selector，走到
     下一口着火灶。否则 pred 若仍是「not any_fire」，多口火时会一直喷已经
     灭掉的那口、不换目标（实机 trace 里火反复蔓延、灭火器喷半天灭不完）。
     """
 
     TYPE = "Extinguish"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "用灭火器灭火"
     LABEL = "灭火"
     # 一局火情是循环树，比普通 task 长，用专属上限兜底（默认 200 拍会中途砍树）。
@@ -89,39 +135,40 @@ class Extinguish(Task):
     NO_ABANDON = True
 
     def claims(self):
-        # 全局灭火 task 不按灶认领：火情协调靠 arbiter 的 _is_fire_unhandled
+        # 全局灭火 task 不按灶认领：火情协调靠 planner 的 _fire_needs_ai
         # （P1 是否在旁 / 持灭火器），不靠 claims（spec §5.3）。
         return ()
 
     def done(self, ctx):
         # type: (Dict) -> bool
-        return not any(P.cooker_burning(c) for c in ctx["w"].cookers)
+        return not _burning_targets(ctx["w"])
 
     def feasible(self, ctx):
         # type: (Dict) -> bool
-        return any(P.cooker_burning(c) for c in ctx["w"].cookers)
+        return bool(_burning_targets(ctx["w"]))
 
     def build(self):
         # type: () -> Node
+        from ai.space import reachability
+
         def burning(c):
-            # 所有着火 / 烧焦的灶，**按离 P2 的距离排序**。
+            # 所有在烧目标（烧灶 + 烧柜台），**按离 P2 的距离排序**。
             #
-            # 排序是必须的，不是优化：下面 pot_station / fire_station 都取
-            # 第 0 个，若用 world.cookers 的列表序，新灶着火就会把目标瞬间
-            # 翻转到别处——实机 trace-20261014-011202 t=2404~2478：P2 端着
-            # 灭火器已经走到灶 (2) 跟前（goal 已到 (6,1)），灶 (3) 跟着着火，
-            # 目标立刻跳成 (7,-2)，人被拖去灶 (3)，喷了 50 拍两口火都没灭。
-            # 按距离排序后「已经站在跟前的那口」天然最近，不会被抢走。
-            out = [cc for cc in c["w"].cookers if P.cooker_burning(cc)]
+            # 排序是必须的，不是优化：下面 pot_station / fire_station /
+            # spray_target 都取第 0 个，若用 world 的列表序，新火点出现就会把
+            # 目标瞬间翻转到别处（旧实机 t=2404~2478：
+            # 新灶一着火目标就跳走、喷半天没灭）。按离 P2 距离排序后，第 0 个
+            # 是最近的起火点，先就近喷，喷完再换下一个最近的。
+            pts = _burning_targets(c["w"])
             cx, cz = c["chef"].get("x"), c["chef"].get("z")
             if cx is None or cz is None:
-                return out
-            def d2(cc):
-                x, z = cc.get("x"), cc.get("z")
+                return pts
+            def d2(pt):
+                x, z = pt.get("x"), pt.get("z")
                 if x is None or z is None:
                     return float("inf")
                 return (x - cx) ** 2 + (z - cz) ** 2
-            return sorted(out, key=d2)
+            return sorted(pts, key=d2)
 
         def with_pot(c):
             # 只有「糊锅」（锅里的食物烧糊、pot.IsBurning()=True）才需要先端走；
@@ -139,28 +186,47 @@ class Extinguish(Task):
             cc = with_pot(c)
             return cooker_station(c, cc[0]["n"]) if cc else None
 
-        # 「当前正在喷哪口灶」的可变标记（build 闭包共享）。喷完一口后
+        def station_of(c, pt):
+            # 起火点 → 站点 dict：柜台/砧板等带 t 的站点直接用；灶（无 t）经
+            # cooker_station 从 stations 里反查。Approach/HoldUntil 都要 gx/gz
+            # （交互位）和 x/z（朝向/重瞄）。
+            if pt.get("t"):
+                return pt
+            return cooker_station(c, pt["n"])
+
+        def reachable_fire(c):
+            # 最近的**可达**起火点：跳过交互位不可达的死角（如角落柜台四邻全被
+            # 墙/柜台堵死），否则 fire_station 一直对着这个死角、Approach 第一拍
+            # 就失败、树反复重建，P2 卡住不去喷旁边可达的火点
+            # （trace-20261115-223025 Mine_2_4_2P：counter_corner(1)@(-1,4) 死角）。
+            for pt in burning(c):
+                st = station_of(c, pt)
+                if st is not None and reachability.can_interact(c, st):
+                    return pt, st
+            return None, None
+
+        # 「当前正在喷哪口」的可变标记（build 闭包共享）。喷完一口后
         # spray_done 用它判「这口灭了没」，让 HoldUntil 提前 SUCCESS、
         # RepeatUntil 重新评估去喷下一口。否则 pred 只能等「全灭」（not
         # any_fire），多口火时会一直喷已经灭掉的那口、不换目标（实机复现）。
         spray = {"n": None}
 
         def fire_station(c):
-            # 供 Approach 走位用：解析最近的着火灶。顺便把上一口的喷标记
-            # 清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应
-            # 从零开始，否则 spray_done 会拿上一口的旧名提前判 True。
-            cc = burning(c)
+            # 供 Approach 走位用：解析最近的可达起火目标。顺便把上一口的喷标记
+            # 清掉——Approach 在每次喷之前走位，走到新目标时「喷哪口」应从零开始，
+            # 否则 spray_done 会拿上一口的旧名提前判 True。
             spray["n"] = None
-            return cooker_station(c, cc[0]["n"]) if cc else None
+            _, st = reachable_fire(c)
+            return st
 
         def spray_target(c):
-            # 供 HoldUntil 喷用：锁定当前最近的着火灶，并记下它的名字。
-            cc = burning(c)
-            if not cc:
+            # 供 HoldUntil 喷用：锁定最近的可达起火目标，并记下名字。
+            pt, st = reachable_fire(c)
+            if pt is None:
                 spray["n"] = None
                 return None
-            spray["n"] = cc[0]["n"]
-            return cooker_station(c, cc[0]["n"])
+            spray["n"] = pt["n"]
+            return st
 
         def spray_done(c):
             # 当前锁定的这口灶灭了（或全灭）→ 本轮喷完，交 RepeatUntil 换下一口。
@@ -173,7 +239,8 @@ class Extinguish(Task):
             return not any(cc0.get("n") == n for cc0 in cc)
 
         def ext(c):
-            return _available_extinguisher(c)
+            e = _available_extinguisher(c)
+            return _extinguisher_target(c["w"], e) if e else None
 
         def holding_ext(c):
             return "extinguish" in P.held_name(c["chef"])

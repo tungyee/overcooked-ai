@@ -1,5 +1,5 @@
 """规划与食材查询共用当前帧的可达性；未知拓扑保留离线兼容。"""
-from ai.space import navigation, occupancy
+from ai.space import navigation, occupancy, portals, seams, shuttle
 from ai.query import predicates as P
 
 
@@ -18,20 +18,21 @@ def field_for(world, bb=None, name=P.P2_NAME, soft_cost=None):
     tick = getattr(bb, 'tick', 0)
     blocked = {tuple(cell) for cell, until in (getattr(scratch, 'bad_cells', None) or {}).items()
                if until > tick}
-    # 移动篮子护栏（已按用户要求注释）：篮子移动且 P2 不在篮子上时，把篮子
-    # 格子拉黑，避免跨网格踩空掉落（trace-20261017-215633 t=1121 respawn 5s）。
-    # 注释后 planner 不再因篮子移动而把料箱/洗碗池判 unreachable。
-    # if getattr(bb, 'balloon_moving', False) and hasattr(world, 'balloon_cells'):
-    #     platform = world.balloon_cells()
-    #     if start not in platform:
-    #         blocked |= platform
     cache = getattr(world, '_reach_fields', None)
     if cache is None:
         cache = world._reach_fields = {}
-    key = (start, frozenset(blocked), tuple(sorted((soft_cost or {}).items())))
+    # 门洞时间表（bb.seam_clock）参与寻路：同一帧里 now 不变，按 now 进缓存键。
+    clock = getattr(bb, 'seam_clock', None)
+    key = (start, frozenset(blocked), tuple(sorted((soft_cost or {}).items())),
+           getattr(clock, 'now', None))
     if key not in cache:
-        cache[key] = navigation.distance_field(start, world.walkable, world.belt_dir,
-            blocked, soft_cost=soft_cost, edge_blocked=getattr(world, 'edge_blocked', None))
+        # 寻路谓词叠了平台接缝门洞（ai/space/seams.py）与传送门（ai/space/portals.py），
+        # 站位判定仍用 world.walkable。
+        cache[key] = navigation.distance_field(
+            start,
+            belt_dir=getattr(world, "flow_dir", None) or getattr(world, "belt_dir", None) or {},
+            belt_speed=getattr(world, "flow_speed", None) or getattr(world, "belt_speed", None),
+            blocked=blocked, soft_cost=soft_cost, **portals.nav_args(world, bb, blocked))
     return cache[key]
 
 
@@ -60,25 +61,174 @@ def can_interact(ctx, entry):
     field = ctx.get('field')
     if field is None:
         return True
+    goals = _interact_goals(ctx, entry)
+    if goals is True:
+        return True
+    return any(goal in field for goal in goals or ())
+
+
+def shuttle_clock(ctx):
+    # type: (dict) -> object
+    return getattr(ctx.get('bb'), 'shuttle_clock', None)
+
+
+def shuttle_wait(ctx, entry):
+    # type: (dict, dict) -> object
+    """entry 在渡运台面上时走过去还要在口边等几秒（0 = 不用等 / 不在渡运台面；
+    None = 够不着且时间表预测不了）。"""
+    return shuttle.wait_seconds(ctx['w'], entry, ctx.get('field'), shuttle_clock(ctx))
+
+
+def interact_wait(ctx, entry):
+    # type: (dict, dict) -> float
+    """走到 entry 旁交互的最短路上要在门洞口等几秒（不可达 / 不用等返回 0）。
+
+    渡运台面上的东西：等篮子转回来的秒数（见 shuttle.wait_seconds）。
+    """
+    sw = shuttle_wait(ctx, entry)
+    if sw:
+        return sw
+    field = ctx.get('field')
+    waits = getattr(field, 'waits', None)
+    if not waits:
+        return 0.0
+    goals = _interact_goals(ctx, entry)
+    if goals is True or not goals:
+        return 0.0
+    reach = [(field[g], waits.get(g, 0)) for g in goals if g in field]
+    if not reach:
+        return 0.0
+    return min(reach)[1] * seams.SEC_PER_STEP
+
+
+def interact_cost(ctx, entry):
+    # type: (dict, dict) -> Optional[int]
+    """走到 entry 旁交互的最短行走代价（可达场步数）；无场/不可达返回 None。
+
+    取料源按距离排序用：散落/箱子哪个近选哪个。自己拿着（goals=True）返回 0。
+    """
+    field = ctx.get('field')
+    if field is None:
+        return None
+    goals = _interact_goals(ctx, entry)
+    if goals is True:
+        return 0
+    costs = [field[g] for g in (goals or ()) if g in field]
+    return min(costs) if costs else None
+
+
+def task_shuttle_wait_seconds(task, ctx):
+    # type: (object, dict) -> float
+    """task 要碰的资源里，在渡运台面上、最晚那个还要等篮子几秒（不在 / 预测不了 = 0）。"""
+    world = ctx.get('w')
+    if world is None or not shuttle.shuttle_grids(world):
+        return 0.0
+    worst = 0.0
+    for rid in _task_resource_ids(task):
+        if rid == 'bin':
+            continue
+        target = _task_target(task, rid, ctx)
+        if target is not None:
+            worst = max(worst, shuttle_wait(ctx, target) or 0.0)
+    for target in _extra_wait_targets(task, ctx):
+        worst = max(worst, shuttle_wait(ctx, target) or 0.0)
+    return worst
+
+
+def _extra_wait_targets(task, ctx):
+    # type: (object, dict) -> list
+    """task 资源表之外、执行时还要等的目标（如 SendAcross 要放的渡运台面格）。"""
+    fn = getattr(task, 'wait_targets', None)
+    return list(fn(ctx) or ()) if callable(fn) else []
+
+
+def task_wait_seconds(task, ctx):
+    # type: (object, dict) -> float
+    """task 要碰的资源里，最晚那个的等门时间（秒）。与 task_veto 同一份资源表。"""
+    field = ctx.get('field')
+    if not getattr(field, 'waits', None) and not shuttle.shuttle_grids(ctx['w']):
+        return 0.0
+    worst = 0.0
+    for rid in _task_resource_ids(task):
+        if rid == 'bin':
+            continue
+        target = _task_target(task, rid, ctx)
+        if target is not None:
+            worst = max(worst, interact_wait(ctx, target))
+    for target in _extra_wait_targets(task, ctx):
+        worst = max(worst, interact_wait(ctx, target))
+    destination = _DESTINATIONS.get(task.TYPE)
+    if destination:
+        waits = [interact_wait(ctx, s) for s in ctx['w'].stations
+                 if s.get('t') == destination and can_interact(ctx, s)]
+        if waits:
+            worst = max(worst, min(waits))
+    return worst
+
+
+def _interact_goals(ctx, entry):
+    # type: (dict, dict) -> object
+    """entry 的可用交互站位集合；手持物是本人拿着返回 True（无需走）。"""
     if not isinstance(entry, dict):
-        return False
+        return set()
     chef = ctx.get('chef') or {}
     holder = entry.get('held_by')
     if holder:
-        return holder == chef.get('name')
+        return True if holder == chef.get('name') else set()
     world = ctx['w']
     cell = cell_of(world, entry)
     if cell is None:
-        return False
-    cells = {cell}
+        return set()
+    extra = set()
     if entry.get('t') == 'plate_station' and hasattr(world, 'mapping'):
-        cells = occupancy.station_block_cells(entry, world.terrain, world.mapping)
+        fp = occupancy.station_block_cells(entry, world.terrain, world.mapping)
+        # 与执行层 move._station_interact_cells 同一判据：距离场可达侧优先，
+        # 否则墙外死区比厨房侧更深时规划层会认为能送、执行层永远走不到。
+        goals = set(navigation.serving_hatch_interact_cells(
+            fp, world.walkable, world.belt_cells,
+            field=ctx.get('field'), include_belts=True))
+        # 漂移出餐口量化到「紧邻是水面」的那一行时，格内交互位为空；
+        # 补格外站位（与 move.Approach 同一判据，见 shuttle.hatch_fallback）。
+        extra = {s['cell'] for s in shuttle.hatch_fallback(world, entry)}
     elif entry.get('t') == 'washing':
         from ai.query.stations import sink_place_cells
         cells = sink_place_cells(entry, world.stations, world.to_grid)
-    goals = set(navigation.interact_cells_multi(cells, world.walkable, world.belt_cells, include_belts=True))
+        goals = set(navigation.interact_cells_multi(
+            cells, world.walkable, world.belt_cells, include_belts=True))
+        if not goals:
+            # 竹筏边缘的洗碗池：主网格量化后整排交互格被台面/边缘挡住，
+            # 用格外站位（池前约 0.9m）兜底，否则 WashPlate 恒判不可达，
+            # 传送带送来的脏盘一路进垃圾桶。
+            goals = {s['cell'] for s in shuttle.wash_stances(world, entry)}
+    elif entry.get("t") == "conveyor":
+        from ai.space import channels as CH
+        moving = CH.conveyor_interact_cells(world, entry)
+        if moving is not None:
+            # 已经是「竹筏地板上可站、映射回主网格」的站位格，直接用作 goals；
+            # 不再走 interact_cells_multi（那会再取四邻，把站位推到别的格）。
+            goals = set(moving)
+        else:
+            cells = occupancy.interaction_footprint(
+                entry, cell, world.stations, world.to_grid, world.to_world,
+                world.walkable)
+            goals = set(navigation.interact_cells_multi(
+                cells, world.walkable, world.belt_cells, include_belts=True))
+    else:
+        # 与执行层 move._station_interact_cells 同一口径：按占地（含承载台面）
+        # 取交互位，移动篮亚格偏移时盘不会因量化到台面后一格而判不可达。
+        cells = occupancy.interaction_footprint(entry, cell, world.stations,
+                                                world.to_grid, world.to_world,
+                                                world.walkable)
+        goals = set(navigation.interact_cells_multi(
+            cells, world.walkable, world.belt_cells, include_belts=True,
+            allow_diagonal=navigation.is_corner_counter(entry)))
+    goals |= extra
     if world.walkable(*cell):
         goals.add(cell)
+    # 渡运台面（人上不去、隔着围栏够）：常规四邻交互位没有，用格外站位的落脚格。
+    st = shuttle.station_of(world, entry)
+    if st is not None:
+        goals |= {s['cell'] for s in shuttle.stances(world, st)}
     # 执行层认定「该目标在此站位交互失败」后，规划层也必须读取同一事实。
     # 否则 NO_ABANDON 的盛饭任务会每拍重建，在唯一坏站位上失败数百次。
     bb = ctx.get('bb')
@@ -88,7 +238,13 @@ def can_interact(ctx, entry):
     bad = {tuple(stance) for (resource, stance), until
            in (getattr(scratch, 'bad_pairs', None) or {}).items()
            if resource == rid and until > tick}
-    return any(goal in field and goal not in bad for goal in goals)
+    left = goals - bad
+    # 兜底任务（端快糊的锅）：站位全被拉黑时仍按原站位放行。拉黑可能来自
+    # 别的动作的失败（盘已满、往盘里加料被拒 → 封了灶前唯一站位），不能让它
+    # 连带判「锅救不了」，否则锅在 TTL 内烧穿起火（trace-20261031-230344）。
+    if not left and goals and ctx.get('stance_last_resort'):
+        return goals
+    return left
 
 
 def resource(world, rid):
@@ -96,7 +252,8 @@ def resource(world, rid):
     if isinstance(rid, tuple) and len(rid) == 2 and all(isinstance(v, (int, float)) for v in rid):
         return dict(gx=rid[0], gz=rid[1])
     groups = (P.all_plates(world), world.stations, world.cookers, world.workstations,
-              world.items, getattr(world, 'extinguishers', ()))
+              world.items, getattr(world, 'held_items', ()),
+              getattr(world, 'extinguishers', ()))
     for group in groups:
         for entry in group:
             if isinstance(rid, tuple):
@@ -107,23 +264,77 @@ def resource(world, rid):
     return None
 
 
-def task_veto(task, ctx):
-    # type: (object, dict) -> str
-    if ctx.get('field') is None or task.TYPE == 'Throw':
-        return ''
+def _task_target(task, rid, ctx):
+    # type: (object, object, dict) -> object
+    """rid 对应的实体：task 自己能精确解析的（resource_target）优先，否则按 id 查。
+
+    按名字查只取第一件同名物：Pizza_Base_Raw 生饼和出炉熟饼同名，熟饼在 P2
+    区、生饼在 P1 区的砧板上时，端盘候选被判 unreachable，熟披萨晾在台面上
+    没人装盘（trace-20261101-170754 t=6630~8005）。
+    """
+    fn = getattr(task, 'resource_target', None)
+    if callable(fn):
+        target = fn(rid, ctx)
+        if target is not None:
+            return target
+    return resource(ctx['w'], rid)
+
+
+_DESTINATIONS = {'DeliverPlate': 'plate_station', 'ResetPlate': 'bin', 'Discard': 'bin'}
+
+
+def _task_resource_ids(task):
+    # type: (object) -> list
     ids = [rid for rid, _ in task.claims()]
     plate = getattr(task, 'plate_id', None)
     if plate is not None and plate not in ids:
         ids.append(plate)
-    for rid in ids:
+    return ids
+
+
+def _plate_reach_grace(ctx, target):
+    # type: (dict, dict) -> bool
+    """盘最近可交互的宽限内（移动筏投影逐帧翻转时别判 unreachable）。"""
+    bb = ctx.get("bb")
+    cache = getattr(bb, "plate_reachable_until", None) if bb is not None else None
+    if not isinstance(cache, dict):
+        return False
+    pid = str(target.get("n") or "")
+    return bool(pid) and cache.get(pid, 0) > getattr(bb, "tick", 0)
+
+
+def task_veto(task, ctx):
+    # type: (object, dict) -> str
+    # ThrowBatch 的消费站本就可能在对面（分割地图）：来源与出手位的可达性
+    # 由它自己的 feasible 判（throw_supply.sources / launch_plan）。
+    if ctx.get('field') is None or task.TYPE == 'ThrowBatch':
+        return ''
+    if getattr(task, 'STANCE_LAST_RESORT', False):
+        ctx = dict(ctx, stance_last_resort=True)  # planner 的 ctx 跨候选共享，不能原地改
+    for rid in _task_resource_ids(task):
         if rid == 'bin' and task.TYPE == 'Discard':
             continue  # 逻辑共享资源，下面按站点类型解析真实垃圾桶。
-        target = resource(ctx['w'], rid)
+        target = _task_target(task, rid, ctx)
         if target is None:
             return 'missing_resource'
         if not can_interact(ctx, target):
-            return 'unreachable'
-    destination = {'DeliverPlate': 'plate_station', 'ResetPlate': 'bin', 'Discard': 'bin'}.get(task.TYPE)
+            # 盘在移动筏上时 can_interact 会逐帧翻转；最近够着过就先不否决，
+            # 由 TakeCookedToPlate 继续执行，别退回 RescueCooked 把锅端走。
+            if task.TYPE in ('TakeCookedToPlate', 'SendAcross') \
+                    and _plate_reach_grace(ctx, target):
+                continue
+            # 传送带上的盘/脏盘摞：带子格在主网格投影里不可走，can_interact
+            # 恒假，但执行层 Approach 用 belt 兜底去接，和别的传送带物料一样。
+            if task.TYPE == 'FetchConveyorPlate':
+                from ai.space import channels as CH
+                if CH.plate_on_conveyor(ctx['w'], target):
+                    continue
+            # 渡运台面上的东西：篮子转回来就够得着，时间表能预测就不否决，
+            # 由等待成本（task_wait_seconds → planner 等门让位）决定什么时候去。
+            if (shuttle.station_of(ctx['w'], target) is None
+                    or shuttle_wait(ctx, target) is None):
+                return 'unreachable'
+    destination = _DESTINATIONS.get(task.TYPE)
     if destination and not any(s.get('t') == destination and can_interact(ctx, s)
                                for s in ctx['w'].stations):
         return 'unreachable_destination'

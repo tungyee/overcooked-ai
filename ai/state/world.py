@@ -14,8 +14,11 @@ import socket
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ai.space import occupancy
+from ai.space import lanes, occupancy, portals, seams
 from ai.space.geometry import GridMapping, GridSet
+
+# 旧帧（无 grids[].main）里关卡主网格的约定名：已录关卡里静态厨房都叫它。
+MAIN_GRID_NAME = "GridManager"
 
 _FRAME_SEP = b"\n"
 _RECV_SIZE = 65536
@@ -154,6 +157,9 @@ class World(object):
         self.raw = state
         self.phase = state.get("phase")
         self.level = state.get("level")
+        # 主线 UI 编号（如 "4-1"），插件按场景目录算；DLC/Kevin 为 None。
+        # 攻略优先按它解析，避免依赖关卡资产名（Sushi_4_1_P2 这种）。
+        self.level_number = state.get("level_number")
         # 用 `is True`：插件漏发该字段时是 None，不能当成"已暂停"
         self.paused = state.get("paused") is True
         # 插件不发 tick 字段（实测帧无 tick），缺失或为 None 时退化为 0。
@@ -163,6 +169,11 @@ class World(object):
         self.chefs = _dicts(state.get("chefs"))
         self.stations = _dicts(state.get("stations"))
         self.recipes = _dicts(state.get("recipes"))
+        # 本关完整菜单（插件 GetAllRecipes，静态不漂移）：订单只刷出部分菜时，
+        # 用它补全 DAG，避免分工 prompt 看不到还没出单的物料（如虾 SushiPrawn）。
+        self.level_dishes = [
+            str(x) for x in (state.get("level_dishes") or []) if x
+        ]
         # plates[] 混合散落/就位盘与手持盘（插件给手持盘打 held_by）。散落语义
         # （clean_plate_exists / placed_plates / _emit_plate …）读 self.plates，
         # 只含非手持；按 id 找盘（plate_by_id / 盘匹配 / 送餐）必须能看见 P2 自己
@@ -170,7 +181,21 @@ class World(object):
         deduped_plates = _dicts(state.get("plates"))
         self.plates = [p for p in deduped_plates if not p.get("held_by")]
         self.held_plates = [p for p in deduped_plates if p.get("held_by")]
+        # state_dump 把手持盘单列在 held_plates（插件原始帧则混在 plates 里带
+        # held_by）。离线回放走前者，不补这行会让手持盘在重建时丢失、all_plates
+        # 少一块，按全量盘口径的判据（_plate_pressure、plate_by_id 找 P2 端着的
+        # 盘）在回放里失真。生产帧无 held_plates 键，此行是无操作。
+        self.held_plates += _dicts(state.get("held_plates"))
         self.workstations = _dicts(state.get("workstations"))
+
+        # 4-1 过街状态：{road, lights[], cars[]}；旧插件/其它关卡为 None。
+        # road 是马路条带的格心范围；lights 的 on/on_car_b 对应两辆车是否发车。
+        traffic = state.get("traffic")
+        self.traffic = traffic if isinstance(traffic, dict) else {}
+        self.traffic_lights = _dicts(self.traffic.get("lights"))
+        self.vehicles = _dicts(self.traffic.get("cars"))
+        road = self.traffic.get("road")
+        self.traffic_road = road if isinstance(road, dict) else None
 
         # 这三类插件会报重复，构造时就去重（各自规则不同，见 occupancy）
         self.cookers = occupancy.dedupe_cookers(state.get("cookers"))
@@ -182,11 +207,18 @@ class World(object):
         # 全部归入散落，保持原行为。
         self.items = [it for it in deduped_items if not it.get("held_by")]
         self.held_items = [it for it in deduped_items if it.get("held_by")]
+        # state_dump 把手持物单列在 held_items（插件原始帧则混在 items 里带
+        # held_by）。离线回放走前者，不补这行会让手持锅/卷饼在重建时丢失、
+        # held_cookware_state 在回放里判断不了手里锅的状态。
+        self.held_items += _dicts(state.get("held_items"))
         deduped_ext = occupancy.dedupe_extinguishers(state.get("extinguishers"))
         # 灭火器手持后也会留在 extinguishers[]（坐标跟厨师），按 held_by 拆开：
         # 灭火 task 只认非手持（挂墙/地上），手持灭火器不能当可用的取。
         self.extinguishers = [e for e in deduped_ext if not e.get("held_by")]
         self.held_extinguishers = [e for e in deduped_ext if e.get("held_by")]
+        # state_dump 把手持灭火器单列在 held_extinguishers（插件原始帧则混在
+        # extinguishers[] 里带 held_by）。离线回放走前者，补上才不丢。
+        self.held_extinguishers += _dicts(state.get("held_extinguishers"))
 
         # 注意：self.stations 现在混合了全部网格的站点（Task 7 Step 11 起
         # stations 不再按单一网格缓存）。GridMapping 的众数校准如果对全部站点
@@ -202,8 +234,19 @@ class World(object):
                                 if str(s.get("grid") or "") == primary_grid]
         else:
             primary_stations = self.stations
+
+        # 多网格坐标集合（spec §5.1）：换关卡/换帧直接重建，不反解。
+        # 必须在 GridMapping 之前建好：4-2 双竹筏没有主网格站点，校准会
+        # 落到默认原点（Sushi_1_4 的 14.4/-6.0）；有 grids[].main 时直接
+        # 用插件给的主网格原点，才不会把站点局部 gx/gz 算到别处。
+        self.grids = GridSet.from_frame(state.get("grids"))
+        main_grid = None
+        for g in state.get("grids") or ():
+            if isinstance(g, dict) and g.get("main") is True:
+                main_grid = g
+                break
         self.mapping = GridMapping.from_grid(
-            state.get("grid"), primary_stations)
+            state.get("grid"), primary_stations, fallback=main_grid)
 
         parsed = occupancy.parse_node_map(
             (state.get("grid") or {}).get("nodeMap"))
@@ -211,9 +254,6 @@ class World(object):
             self._node_map, self._nm_rows, self._nm_cols = None, 0, 0
         else:
             self._node_map, self._nm_rows, self._nm_cols = parsed
-
-        # 多网格坐标集合（spec §5.1）：换关卡/换帧直接重建，不反解。
-        self.grids = GridSet.from_frame(state.get("grids"))
 
         # station_blocked 不再喂给 walkable（新判定走 terrain 的
         # BLOCKING_LAYERS），但仍作为独立属性保留——调用方（如
@@ -225,11 +265,27 @@ class World(object):
         # 可走性改用层号地形 + 运行时占用（spec §5.3），取代
         # playable_bounds + floor 扩 bounds + nodeMap。
         self.terrain = occupancy.parse_terrain(state.get("terrain"))
+        # 插件 0.23.5+ 才带墙高；旧帧为空 dict（投掷不做墙高判定）
+        self.terrain_y = occupancy.parse_terrain_y(state.get("terrain"))
         level_bounds = occupancy.parse_level_bounds(state.get("level_bounds"))
         self.hazards = occupancy.parse_hazards(state.get("hazards"))
         self.wind_zones = occupancy.parse_wind_zones(state.get("wind_zones"))
         hazard_boxes = occupancy.hazard_boxes(self.hazards, cell=self.mapping.cell)
         occ_cells = self._occupancy_cells(state.get("occupancy"))
+        # 5-1 舢板：主网格把船底板报成占用（船是移动物体，游戏里 m_gridOccupancy
+        # 记它当前占住的格），但角色实际能站上去、骑它过河。把船底板格从运行时
+        # 占用里排除，寻路才能走上船；船中间的柜台仍由 TableBlock 层挡。
+        from ai.space import raft as _raft
+        _raft_box = _raft.raft_box(self)
+        if _raft_box is not None:
+            g0 = self.to_grid(_raft_box[0], _raft_box[2])
+            g1 = self.to_grid(_raft_box[1], _raft_box[3])
+            for gx in range(min(g0[0], g1[0]), max(g0[0], g1[0]) + 1):
+                for gz in range(min(g0[1], g1[1]), max(g0[1], g1[1]) + 1):
+                    x, z = self.to_world(gx, gz)
+                    if _raft_box[0] <= x <= _raft_box[1] \
+                            and _raft_box[2] <= z <= _raft_box[3]:
+                        occ_cells.discard((gx, gz))
         # 写死（1-6）：出餐口（plate_station）grid=None，碰撞 footprint 没进
         # occupancy；且碰撞盒北缘（maxz≈3.6）伸进北邻那排，角色半径过不去 →
         # 把出餐口北邻一排标成不可走，避免寻路北上钻墙后死路（1-6 实机两处卡死）。
@@ -246,17 +302,51 @@ class World(object):
                 for dx in (0, 1):      # 出餐口约 2 格宽
                     for dz in (1,):    # 只挡北邻一排（墙后死路）
                         occ_cells.add((cell[0] + dx, cell[1] + dz))
-        self.belt_cells, self.belt_dir = occupancy.parse_belts(state.get("belts"))
+        self.belt_cells, self.belt_dir, self.belt_speed = occupancy.parse_belts(
+            state.get("belts"))
+
+        # 风区 → 每格方向/速度，与传送带合并成 flow（寻路统一消费的「地板推力」）。
+        # 重叠时传送带优先：风不覆盖传送带格（4-4 无带，纯防御）。belt_dir /
+        # belt_speed 仍只含传送带，供 interact hold-key / placement 排除按带语义用。
+        wind_dir, wind_speed = occupancy.wind_flow(
+            self.wind_zones, self.to_grid, self.to_world)
+        self.flow_dir = dict(wind_dir)
+        self.flow_dir.update(self.belt_dir)
+        self.flow_speed = dict(wind_speed)
+        self.flow_speed.update(self.belt_speed)
 
         # belt_cells 必须在 walkable 之前解析好：传送带格要从运行时占用里
         # 豁免（ConveyorStation 自己占住那格，但角色能走上去）。
         self.walkable = occupancy.make_walkable_from_terrain(
             self.terrain, hazard_boxes, occ_cells, self.mapping,
-            belt_cells=self.belt_cells, level_bounds=level_bounds)
+            belt_cells=self.belt_cells, level_bounds=level_bounds,
+            terrain_y=self.terrain_y)
 
         # 薄墙拦「边」不拦「格」：凸起在网格边缘的 collider 夹在两格之间、
         # 盖不住任何格中心，点判漏掉它，交给 distance_field 的边检查。
-        self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping)
+        self.edge_blocked = occupancy.make_edge_blocker(self.terrain, self.mapping,
+                                                       terrain_y=self.terrain_y)
+
+        # 半格走廊（ai/space/lanes.py）：通道夹在两排格中心之间时的寻路跳边，
+        # 与 walkable 同一套阻挡/占用口径。寻路方取用走 portals.nav_args。
+        self.lane_map = lanes.build(self.terrain, hazard_boxes, occ_cells,
+                                    self.mapping, belt_cells=self.belt_cells)
+
+        # 平台接缝门洞（ai/space/seams.py）：寻路专用的 walkable / edge_blocked，
+        # 门洞开在两排格中心之间时也能穿缝。站位/交互位仍用 self.walkable。
+        killplane = self.terrain.get(occupancy.LAYER_KILLPLANE) or []
+
+        def _clear(x, z):
+            # type: (float, float) -> bool
+            return not (occupancy._point_in_any_box(x, z, killplane)
+                        or occupancy._point_in_any_box(x, z, hazard_boxes))
+
+        # 寻路方取用走 seams.nav_predicates(world)：现取 walkable，测试替换后不失同步。
+        self.seam_gates = seams.build(self.terrain, self.mapping, clear=_clear)
+
+        # 传送门（插件 portals[]，ai/space/portals.py）：触发格对寻路不可走 +
+        # 过门跳边。没有门的关卡 / 旧帧为 None。寻路方取用走 portals.nav_args。
+        self.portal_map = portals.build(state.get("portals"), self.mapping, self.walkable)
 
     @property
     def all_plates(self):
@@ -291,12 +381,32 @@ class World(object):
 
     def _majority_grid(self):
         # type: () -> Optional[str]
-        """stations[].grid 出现次数最多的网格名（静态计数，不随篮子漂移）。"""
+        """关卡主网格名（静态，不随木筏/篮子漂移）。
+
+        判据按优先级：
+          1. 插件 0.21+ 的 grids[].main（挂 GridNavSpace 的网格，同参考项目
+             cortico-world Kitchen.Rescan）；
+          2. 旧帧：站点里出现过名为 GridManager 的网格就取它；
+          3. 再退回 stations[].grid 众数，并排除 grids[].moving。
+        单靠众数会选错：Rapids_2_1 木筏 Raft_Top 15 站 > 厨房 13 站、Balloon_2_3
+        RightBasket 14 > GridManager 7，主网格原点跟着木筏漂、静止的 P1 格坐标
+        每帧跳（trace-20261028-234917）。
+        """
+        grids = [g for g in (self.raw.get("grids") or ()) if isinstance(g, dict)]
+        for g in grids:
+            if g.get("main") is True and g.get("id"):
+                return str(g["id"])
         votes = Counter()  # type: Counter
         for st in self.stations:
             g = st.get("grid")
             if g:
                 votes[str(g)] += 1
+        if MAIN_GRID_NAME in votes:
+            return MAIN_GRID_NAME
+        moving = {str(g.get("id")) for g in grids if g.get("moving") is True}
+        for name, _ in votes.most_common():
+            if name not in moving:
+                return name
         return votes.most_common(1)[0][0] if votes else None
 
     def _primary_grid_name(self, occupancy_list):

@@ -23,14 +23,23 @@ class HoldUntil(Primitive):
     位置重验 + timeout FAILURE，所以语义完成由 Python 侧判 pred 后发 halt。
     """
 
-    def __init__(self, key, pred, timeout, target=None, kind=None):
-        # type: (str, Callable[[Dict], bool], int, Any, Optional[str]) -> None
+    def __init__(self, key, pred, timeout, target=None, kind=None, guard=None,
+                 sweep_deg=None, sweep_period=None, sweep_stick=None):
+        # type: (str, Callable[[Dict], bool], int, Any, Optional[str], Optional[Callable[[Dict], bool]], Optional[float], Optional[float], Optional[float]) -> None
         Primitive.__init__(self)
         self.key = key
         self.pred = pred
         self.timeout = timeout
         self.target = target
         self.kind = kind
+        # 每拍前置守卫（可选）：例如切菜要求空手。旧树的 tap/pickup 可能
+        # 在新树 EnsureHandsFree 之后才落地；守卫在 HoldUntil 每拍复检，
+        # 手不空就 FAILURE，Sequence 回到树首重新清手。
+        self.guard = guard
+        # 扫射（灭火器 spray）参数：None 走插件默认，实机标定后由 fire.py 传值。
+        self.sweep_deg = sweep_deg
+        self.sweep_period = sweep_period
+        self.sweep_stick = sweep_stick
 
     def reset(self):
         # type: () -> None
@@ -43,6 +52,12 @@ class HoldUntil(Primitive):
 
     def _tick_delegated(self, ctx, ex):
         # type: (Dict, Any) -> str
+        # 守卫不成立（例如手不空了）：松键并 FAILURE，让 Sequence 回树首
+        # 重新 EnsureHandsFree；不能继续按 chop 假装在切。
+        if self.guard is not None and not self.guard(ctx):
+            if self._pending_cmd is not None:
+                self._exec_halt()
+            return Status.FAILURE
         # 语义早停：切/洗/喷的 done 就写在 self.pred 里，pred 成立即松键 SUCCESS
         #（C# HoldCommand 不做 pred，只负责按住 + 位置重验 + timeout FAILURE）。
         if self.pred(ctx):
@@ -53,13 +68,19 @@ class HoldUntil(Primitive):
             st = resolve(self.target, ctx) if self.target is not None else None
             if self.target is not None and st is None:
                 return Status.FAILURE
-            cmd = build_command(
-                "hold",
-                target=handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
-                kind=self.kind,
-                target_world=target_world(st),
-                timeout_ms=self.timeout * 50,
-            )
+            fields = {
+                "target": handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
+                "kind": self.kind,
+                "target_world": target_world(st),
+                "timeout_ms": self.timeout * 50,
+            }
+            if self.sweep_deg is not None:
+                fields["sweep_deg"] = self.sweep_deg
+            if self.sweep_period is not None:
+                fields["sweep_period"] = self.sweep_period
+            if self.sweep_stick is not None:
+                fields["sweep_stick"] = self.sweep_stick
+            cmd = build_command("hold", **fields)
             return self._begin_exec(ctx, ex, cmd)
         return self._poll_exec(ctx, ex)
 
@@ -140,6 +161,45 @@ class WaitUntil(Primitive):
         # type: (Dict) -> str
         self._enter(ctx)
         if self.pred(ctx):
+            self.reset()
+            return Status.SUCCESS
+        if self._ticks > self.timeout:
+            self.reset()
+            return Status.FAILURE
+        return Status.RUNNING
+
+
+class WaitNewFrame(Primitive):
+    """等插件推来下一帧快照才 SUCCESS（按 ctx["frame_seq"] 变化判）。
+
+    插件 5 Hz、Python 20 Hz：move 命令由插件逐帧闭环、到位即回 ok，那一拍
+    Python 手上的快照还是到位前的位置。紧接着按「此刻位置」算瞄准会用到旧
+    位置（trace-20261031-150043 t=153/257：旧位置判投不过去，退回瞄炸锅撞框）。
+    ctx 没有 frame_seq（离线 / 测试）时直接 SUCCESS。timeout 拍数兜底。
+    """
+
+    def __init__(self, timeout):
+        # type: (int) -> None
+        Primitive.__init__(self)
+        self.timeout = timeout
+        self._seq0 = None  # type: Any
+
+    def reset(self):
+        # type: () -> None
+        Primitive.reset(self)
+        self._seq0 = None
+
+    def tick(self, ctx):
+        # type: (Dict) -> str
+        self._enter(ctx)
+        seq = ctx.get("frame_seq")
+        if seq is None:
+            self.reset()
+            return Status.SUCCESS
+        if self._seq0 is None:
+            self._seq0 = seq
+            return Status.RUNNING
+        if seq != self._seq0:
             self.reset()
             return Status.SUCCESS
         if self._ticks > self.timeout:

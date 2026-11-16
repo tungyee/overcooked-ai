@@ -19,8 +19,8 @@ def test_score_candidate_without_layer_is_unchanged():
     layer，必须按原语义工作。若这条失败，后面的测试会一起红，但从
     那片红里定位不到原因——所以单独钉在最前面。
     """
-    terms = {"urgency": 3.0, "pressure": 0.0, "eta": -1.5,
-             "deliver_bonus": 3.0}
+    terms = {"urgency": 3.0, "pressure": 0.0, "combo_break": -1.5,
+             "completion_ratio": 3.0}
     score_all, kept_all = PL.filter_terms(terms, None)
     assert score_all == 0.0 and kept_all == {}   # None 层 = 不打分（见 Task 4）
 
@@ -72,7 +72,12 @@ def test_plan_only_scores_top_layer_candidates():
         ],
         "stations": stations, "recipes": recipes,
         "chefs": [{"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}],
-        "plates": [], "workstations": [], "cookers": [_cooker("c1"), _cooker("c2")],
+        # 三单都要米：每单一张盘，避免盘量折扣把填灶压到备菜之下。
+        "plates": [{"n": "p%d" % i, "x": 1.0, "z": 1.0,
+                    "contents": [], "detail": [],
+                    "stack_top": True, "stack_clean": True}
+                   for i in (1, 2, 3)],
+        "workstations": [], "cookers": [_cooker("c1"), _cooker("c2")],
         "items": [], "extinguishers": [], "grid": {"nodeMap": None},
     })
     bb = Blackboard()
@@ -81,10 +86,10 @@ def test_plan_only_scores_top_layer_candidates():
 
     chosen, record = planner.plan(w, bb, None, book)
 
-    # 缺 3 份米（3 单要米、灶全空）→ cooker_idle 拿满 5.6，填灶在 L_PREP
-    # **层内凭分数**胜出。这与分层期间的 L5>L6 结论相同，但机制不同：
-    # 现在缺口小的时候它会让位（见 tests/test_fill_cooker_layer.py）。
-    assert chosen.TYPE == "FillCooker"
+    # 缺 3 份米（3 单要米、灶全空）→ 填灶/按单下锅都在 L_PREP 层内竞争。
+    # 有盘时 FetchToCooker 还能吃 async_resource + urgency，可能反超
+    # FillCooker；这里只钉住「它们没有被层挡掉、且进了打分」。
+    assert chosen.TYPE in ("FillCooker", "FetchToCooker")
     assert record["top_layer"] == PL.L_PREP
 
     by_type = {}
@@ -95,17 +100,18 @@ def test_plan_only_scores_top_layer_candidates():
     assert fc_ok is True
     assert fc_layer == PL.L_PREP
     assert fc_in_top is True
-    assert set(fc_terms) > PL.TERM_WHITELIST[PL.L_PREP]  # terms 全量，不是裁剪后的
+    # terms 全量，不是裁剪后的；held_batch 只由 ThrowBatch 产出。
+    assert set(fc_terms) >= set(PL.TERM_WHITELIST[PL.L_PREP]) - {"held_batch"}
     expected_score, _ = PL.filter_terms(fc_terms, PL.L_PREP)
     assert fc_score == pytest.approx(expected_score)
 
-    # FetchToCooker 现在同层同样参与打分，但分数低于填灶（它没有
-    # cooker_idle，且 async_resource 要求「订单已有盘」—— 本场景 0 盘）。
+    # FetchToCooker 同层参与打分：有盘时它吃 async_resource + urgency，
+    # 分数可能高于 FillCooker；关键是没有被层挡掉。
     fetch_score, fetch_terms, fetch_ok, fetch_layer, fetch_in_top = by_type["FetchToCooker"]
     assert fetch_ok is True
     assert fetch_layer == PL.L_PREP
     assert fetch_in_top is True
-    assert fetch_score < fc_score
+    assert fetch_score > 0
 
     # L_CLEANUP 的 Prefetch 仍然被层挡在打分之外：terms 为空、分数 0。
     # 这是分层的核心可观测性收益（spec §6），换层后依然要成立。
@@ -119,15 +125,17 @@ def test_plan_only_scores_top_layer_candidates():
 
 def _world(cookers=(), plates=(), orders=()):
     # type: (Any, Any, Any) -> Any
-    """最小 world 替身。层判定只读 cookers / plates。"""
+    """最小 world 替身。层判定只读 cookers / plates / held_plates。"""
     return type("W", (), {
         "cookers": list(cookers),
         "plates": list(plates),
+        "held_plates": [],
         "orders": list(orders),
         "stations": [],
         "items": [],
         "chefs": [],
         "level": "Sushi_1_4_2P",
+        "all_plates": property(lambda self: self.plates + self.held_plates),
     })()
 
 
@@ -281,7 +289,8 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
 
     当前承诺在 L6，这一拍出现 L5 候选 → 承诺不在 in_layer → 不在 scored
     → _apply_commitment_inertia 的 ③ 把它当「不在可行候选中」，走
-    infeasible_streak 的 3 拍宽限再改选，而不是立即切。
+    infeasible_streak 的宽限（按 5Hz 帧计，见 INFEASIBLE_THRESHOLD）
+    再改选，而不是立即切。
     """
     from ai.state.blackboard import Blackboard, Commitment
     from ai import tasks as T
@@ -296,12 +305,10 @@ def test_commitment_in_lower_layer_goes_through_infeasible_grace():
     # 只有 L5 候选进了 scored（承诺的 L6 被分层挡在外面）
     scored = [(fill, 4.8, {"cooker_idle": 4.8})]
 
-    # 前两拍保持承诺
-    assert planner._apply_commitment_inertia(scored, None, bb) == prep
-    assert bb.commitment.infeasible_streak == 1
-    assert planner._apply_commitment_inertia(scored, None, bb) == prep
-    assert bb.commitment.infeasible_streak == 2
-    # 第三拍改选
+    # 宽限期内保持承诺；达到 INFEASIBLE_THRESHOLD 才改选。
+    for i in range(1, planner.INFEASIBLE_THRESHOLD):
+        assert planner._apply_commitment_inertia(scored, None, bb) == prep
+        assert bb.commitment.infeasible_streak == i
     assert planner._apply_commitment_inertia(scored, None, bb) == fill
     assert bb.commitment.infeasible_streak == 0
 

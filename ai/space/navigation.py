@@ -13,17 +13,49 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 BELT_REVERSE_COST = 1
 
+# 快带（4-3 的 5 m/s）逆行走不动，硬挡；1-4 的 2.5 m/s 还能逆行 + dash 顶住。
+# 阈值取两者中间。belt_speed（occupancy.parse_belts 保留的 |v|）超过它就判快带。
+# 风区（4-4 的 6.5 m/s）走同一套：flow_speed 里 |v| 超阈值即判硬挡。
+FAST_BELT_SPEED = 3.5
+
+# 顺流（顺带/顺风）一步的代价：默认 1 = 不给助力奖励，与普通步同价。设成 <1
+# （如 0.5）会让寻路偏好顺风路线——实机可能为了蹭风绕远，留作旋钮，默认不启用。
+WITH_FLOW_COST = 1
+
 _NEIGHBORS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+# 四邻全不可走时兜底的对角格：角落柜台（corner counter）四邻被墙/柜台堵死、
+# 交互位在斜对角（trace-20261115-223025 Mine_2_4_2P counter_corner(1)@(-1,4)）。
+_DIAGONALS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
 
 
-def step_cost(belt_dir, cur, nxt):
-    # type: (Dict, Tuple[int, int], Tuple[int, int]) -> int
-    """cur → nxt 的移动代价。逆着传送方向走要长按，代价高。"""
+def is_corner_counter(entry):
+    # type: (object) -> bool
+    """角落柜台（corner counter）：四邻全被墙/柜台堵死、交互位在斜对角。"""
+    return (isinstance(entry, dict)
+            and entry.get("t") == "counter"
+            and "corner" in str(entry.get("n") or "").lower())
+
+
+def step_cost(belt_dir, cur, nxt, belt_speed=None):
+    # type: (Dict, Tuple[int, int], Tuple[int, int], Optional[Dict[Tuple[int, int], float]]) -> Optional[int]
+    """cur → nxt 的移动代价；返回 None 表示这一步走不了（快带/逆风硬挡）。
+
+    逆着流场方向走要长按，慢流记 BELT_REVERSE_COST；快流（> FAST_BELT_SPEED）
+    走不动，直接挡掉（None），逼寻路绕流 / 顺流，而不是顶流卡死。顺流（dot>0）
+    记 WITH_FLOW_COST（默认 1，不给助力奖励）；横穿流场（dot==0）记 1。
+    """
     d = (nxt[0] - cur[0], nxt[1] - cur[1])
     bd = belt_dir.get(cur)
-    if bd and d[0] * bd[0] + d[1] * bd[1] < 0:
-        return BELT_REVERSE_COST
-    return 1
+    if not bd:
+        return 1
+    dot = d[0] * bd[0] + d[1] * bd[1]
+    if dot > 0:
+        return WITH_FLOW_COST
+    if dot == 0:
+        return 1
+    if belt_speed and belt_speed.get(cur, 0.0) > FAST_BELT_SPEED:
+        return None
+    return BELT_REVERSE_COST
 
 
 def cross_grid_bridges(primary_to_world, other_cells_world, max_gap=0.5):
@@ -56,10 +88,38 @@ def cross_grid_bridges(primary_to_world, other_cells_world, max_gap=0.5):
     return bridges
 
 
+class Field(dict):
+    """距离场 {格子: 代价}，额外带等门信息（平台接缝门洞，ai/space/seams.py）。
+
+    waits: {格子: 一路上等门的步数}（没等过门的格不在里面）。
+    wait_cost: 建场用的等门代价函数；trace_back 必须用同一个才对得上账。
+    普通 dict 用法不受影响。
+    """
+
+    def __init__(self, *args, **kwargs):
+        dict.__init__(self, *args, **kwargs)
+        self.waits = {}        # type: Dict[Tuple[int, int], int]
+        self.wait_cost = None  # type: Optional[Callable]
+        # 快带速度表（occupancy.parse_belts 的第三返回值）；trace_back 回溯时
+        # 用它做与建场一致的「快带逆行硬挡」账。
+        self.belt_speed = None  # type: Optional[Dict[Tuple[int, int], float]]
+        # 经跳边（seams.nav_jumps：门洞格 ↔ 开门时对面那格现在的位置）到达的格 → 前驱
+        self.via = {}          # type: Dict[Tuple[int, int], Tuple[int, int]]
+
+
 def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
-                   soft_cost=None, bridges=None, edge_blocked=None):
-    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]]) -> Dict[Tuple[int, int], int]
+                   soft_cost=None, bridges=None, edge_blocked=None, wait_cost=None,
+                   jumps=None, jump_cost=None, belt_speed=None):
+    # type: (Tuple[int, int], Callable[[int, int], bool], Dict, Optional[Set], int, Optional[Dict], Optional[Dict], Optional[Callable[[Tuple[int,int], Tuple[int,int]], bool]], Optional[Callable], Optional[Dict], Optional[Dict], Optional[Dict[Tuple[int, int], float]]) -> Dict[Tuple[int, int], int]
     """从 start 做 Dijkstra，返回 {格子: 最小代价}。
+
+    wait_cost(cost, cur, nxt) -> Optional[int]：走进 nxt 前要等几步（门洞没开
+    时到缝口等），None = 这一步走不了。cost 是到 cur 的代价（按它推算到达时刻）。
+    只要「早到不会晚走」（等门时刻表满足 FIFO），Dijkstra 照样最短。
+    jumps：{格: [格]} 额外的非相邻边（同样收 1 步 + 等门代价），到达方式记在
+    返回 Field 的 via 里，trace_back 据此回溯。
+    jump_cost：{(格, 格): 步数} 跳边的基础代价，缺省 1（门洞跳边）；传送门
+    跳边按进门 + 传送 + 出门折步数（ai/space/portals.py）。
 
     start 本身总在结果里（代价 0），即使它被判为不可走——厨师可能正站在
     被站点占用兜底误判的格子上，直接返回空会让所有 ETA 失效。
@@ -78,7 +138,13 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
     blocked = set(blocked or ())
     soft_cost = soft_cost or {}
     bridges = bridges or {}
-    dist = {start: 0}
+    dist = Field({start: 0})
+    dist.wait_cost = wait_cost
+    dist.belt_speed = belt_speed
+    waits = dist.waits
+    via = dist.via
+    jumps = jumps or {}
+    jump_cost = jump_cost or {}
     pq = [(0, start)]
     while pq:
         if len(dist) > max_cells:
@@ -86,24 +152,47 @@ def distance_field(start, is_walkable, belt_dir, blocked=None, max_cells=4096,
         cost, cur = heapq.heappop(pq)
         if cost > dist.get(cur, 1 << 60):
             continue
-        for dx, dz in _NEIGHBORS:
-            nxt = (cur[0] + dx, cur[1] + dz)
+        steps = [((cur[0] + dx, cur[1] + dz), False) for dx, dz in _NEIGHBORS]
+        steps.extend((j, True) for j in jumps.get(cur, ()))
+        for nxt, jumped in steps:
             if nxt in blocked:
                 continue
             if not is_walkable(nxt[0], nxt[1]):
                 continue
-            if edge_blocked is not None and edge_blocked(cur, nxt):
+            if not jumped and edge_blocked is not None and edge_blocked(cur, nxt):
                 continue
-            # 基础代价 + P1 软代价
-            ncost = cost + step_cost(belt_dir, cur, nxt) + soft_cost.get(nxt, 0)
+            wait = 0
+            if wait_cost is not None:
+                wait = wait_cost(cost, cur, nxt)
+                if wait is None:
+                    continue
+            # 基础代价 + P1 软代价 + 等门
+            if jumped:
+                base = jump_cost.get((cur, nxt), 1)
+            else:
+                base = step_cost(belt_dir, cur, nxt, belt_speed)
+                if base is None:
+                    continue          # 快带逆行：走不动，直接不展开
+            ncost = cost + base + soft_cost.get(nxt, 0) + wait
             if ncost < dist.get(nxt, 1 << 60):
                 dist[nxt] = ncost
+                if jumped:
+                    via[nxt] = cur
+                else:
+                    via.pop(nxt, None)
+                w_total = waits.get(cur, 0) + wait
+                if w_total:
+                    waits[nxt] = w_total
+                else:
+                    waits.pop(nxt, None)
                 heapq.heappush(pq, (ncost, nxt))
         bridge_target = bridges.get(cur)
         if bridge_target is not None and bridge_target not in blocked:
             ncost = cost + 1
             if ncost < dist.get(bridge_target, 1 << 60):
                 dist[bridge_target] = ncost
+                if waits.get(cur):
+                    waits[bridge_target] = waits[cur]
                 heapq.heappush(pq, (ncost, bridge_target))
     return dist
 
@@ -148,8 +237,9 @@ def interact_cells_with_belts(gx, gz, is_walkable, belt_cells=None):
     return fallback
 
 
-def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=False):
-    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], bool) -> List[Tuple[int, int]]
+def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=False,
+                         allow_diagonal=False):
+    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], bool, bool) -> List[Tuple[int, int]]
     """多格站点（出餐口 1×2）的可站立交互位：各占地格的四邻并集。
 
     出餐口这类多格站点，游戏接受站在它任一占地格的邻侧交互（placement
@@ -157,7 +247,12 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
     交互位，角色已站在能送餐的位置却还要多挪一格。并集去重；传送带规则
     与 interact_cells / interact_cells_with_belts 一致（include_belts=True
     放行传送带位，供「非传送带位全不可达」时兜底）。
+
+    allow_diagonal：角落柜台（corner counter）四邻全被墙/柜台堵死、交互位在
+    斜对角。只有显式传 True 且四邻全空时才补对角可走格；普通站点四邻总有
+    可走格，不受影响。
     """
+    cells = list(cells)
     preferred = set()  # type: Set[Tuple[int, int]]
     fallback = set()   # type: Set[Tuple[int, int]]
     belts = set(belt_cells or ())
@@ -165,19 +260,56 @@ def interact_cells_multi(cells, is_walkable, belt_cells=None, include_belts=Fals
         p, f = _interact_cells(gx, gz, is_walkable, belts)
         preferred.update(p)
         fallback.update(f)
+    if allow_diagonal and not fallback:
+        for gx, gz in cells:
+            for dx, dz in _DIAGONALS:
+                cell = (gx + dx, gz + dz)
+                if not is_walkable(cell[0], cell[1]):
+                    continue
+                fallback.add(cell)
+                if cell not in belts:
+                    preferred.add(cell)
     if include_belts:
         return list(fallback)
     return list(preferred) if preferred else list(fallback)
 
 
-def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None):
-    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set]) -> List[Tuple[int, int]]
+def _pick_hatch_side(primary_cells, secondary_cells, primary_depth,
+                     secondary_depth, field):
+    # type: (List[Tuple[int, int]], List[Tuple[int, int]], int, int, Optional[Dict]) -> Optional[List[Tuple[int, int]]]
+    """两侧交互位里选厨房侧：距离场可达优先，其次比可走深度。
+
+    4-1 红绿灯寿司街：出餐口东侧（墙外）地面延伸到关卡边界外，按可走深度
+    比厨房侧更深，但被墙隔开、距离场到不了；P1 实际站西侧 (9,2) 送餐。
+    只看深度会把交互位定到墙外死区，Approach 永远 `nearest_cost=None`。
+    """
+    if field is not None:
+        primary_reach = [c for c in primary_cells if c in field]
+        secondary_reach = [c for c in secondary_cells if c in field]
+        if primary_reach and not secondary_reach:
+            return primary_reach
+        if secondary_reach and not primary_reach:
+            return secondary_reach
+    if primary_depth > secondary_depth:
+        return primary_cells
+    if secondary_depth > primary_depth:
+        return secondary_cells
+    return None
+
+
+def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None,
+                                 field=None, include_belts=False):
+    # type: (Iterable[Tuple[int, int]], Callable[[int, int], bool], Optional[Set], Optional[Dict], bool) -> List[Tuple[int, int]]
     """出餐口（嵌墙）交互位：只取厨房内侧（前侧），排除墙后死路一侧。
 
     出餐口是嵌在外墙里的一段墙，只有朝厨房的一面能送餐；墙后那一面是
     贴墙的死路（0~1 格），站过去既送不了餐、也常被柜台/墙卡住。前/后按
     「沿墙法向连续可走多少格」的深度区分：深度大的一面是厨房（前侧）。
     两面深度相等（出餐口不在墙边，罕见）时退回全部四邻，不做过滤。
+
+    传了 `field`（P2 的距离场）时先看两侧是否可达：只有一侧可达就用那一侧。
+    4-1 的墙外死区比厨房侧更深但不可达，纯深度判据会送不出去（见
+    `_pick_hatch_side`）。
 
     水平墙（占地 gz 相同、gx >= 2）比南北，垂直墙（占地 gx 相同、gz >= 2）
     比东西；1×1 或方向不明确的占地退化为 interact_cells_multi。
@@ -190,20 +322,23 @@ def serving_hatch_interact_cells(footprint, is_walkable, belt_cells=None):
         mid_gx = xs[len(xs) // 2]
         north = _walkable_depth(mid_gx, gz, 0, 1, is_walkable)
         south = _walkable_depth(mid_gx, gz, 0, -1, is_walkable)
-        if north > south:
-            return [(gx, gz + 1) for gx in xs if is_walkable(gx, gz + 1)]
-        if south > north:
-            return [(gx, gz - 1) for gx in xs if is_walkable(gx, gz - 1)]
+        north_cells = [(gx, gz + 1) for gx in xs if is_walkable(gx, gz + 1)]
+        south_cells = [(gx, gz - 1) for gx in xs if is_walkable(gx, gz - 1)]
+        side = _pick_hatch_side(north_cells, south_cells, north, south, field)
+        if side is not None:
+            return side
     elif len(xs) == 1 and len(zs) >= 2:
         gx = xs[0]
         mid_gz = zs[len(zs) // 2]
         east = _walkable_depth(gx, mid_gz, 1, 0, is_walkable)
         west = _walkable_depth(gx, mid_gz, -1, 0, is_walkable)
-        if east > west:
-            return [(gx + 1, gz) for gz in zs if is_walkable(gx + 1, gz)]
-        if west > east:
-            return [(gx - 1, gz) for gz in zs if is_walkable(gx - 1, gz)]
-    return interact_cells_multi(footprint, is_walkable, belt_cells)
+        east_cells = [(gx + 1, gz) for gz in zs if is_walkable(gx + 1, gz)]
+        west_cells = [(gx - 1, gz) for gz in zs if is_walkable(gx - 1, gz)]
+        side = _pick_hatch_side(east_cells, west_cells, east, west, field)
+        if side is not None:
+            return side
+    return interact_cells_multi(footprint, is_walkable, belt_cells,
+                                include_belts=include_belts)
 
 
 def _walkable_depth(gx, gz, dx, dz, is_walkable, limit=8):
@@ -231,8 +366,8 @@ def nearest_cost(field, cells):
     return best
 
 
-def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
-    # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[Tuple[int, int]]
+def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None, wait_cost=None):
+    # type: (Dict, Tuple[int, int], Dict, Optional[Dict], Optional[Callable], Optional[Callable]) -> Optional[Tuple[int, int]]
     """cur 在距离场里的合法前驱。
 
     判据是**代价账对得上**：field[n] + step_cost(n → cur) == field[cur]，
@@ -248,6 +383,7 @@ def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
     extra = (soft_cost or {}).get(cur, 0)
     if want is None:
         return None
+    belt_speed = getattr(field, "belt_speed", None)
     for dx, dz in _NEIGHBORS:
         n = (cur[0] + dx, cur[1] + dz)
         c = field.get(n)
@@ -257,19 +393,30 @@ def _predecessor(field, cur, belt_dir, soft_cost=None, edge_blocked=None):
         if edge_blocked is not None and edge_blocked(n, cur):
             continue
         # 软代价按进入的格子收费，必须与 distance_field 的账一致。
-        if c + step_cost(belt_dir, n, cur) + extra == want:
+        wait = 0
+        if wait_cost is not None:
+            wait = wait_cost(c, n, cur)
+            if wait is None:
+                continue
+        sc = step_cost(belt_dir, n, cur, belt_speed)
+        if sc is None:
+            continue          # 快带逆行：建场时就没走过这条边
+        if c + sc + extra + wait == want:
             return n
     return None
 
 
-def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
-    # type: (Dict, Tuple[int, int], Dict, Optional[Dict]) -> Optional[List[Tuple[int, int]]]
+def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None, wait_cost=None):
+    # type: (Dict, Tuple[int, int], Dict, Optional[Dict], Optional[Callable], Optional[Callable]) -> Optional[List[Tuple[int, int]]]
     """从距离场回溯 start → goal 的格子序列（含两端）。
 
     goal 不在 field 里（不可达）返回 None。start 自身返回 [start]。
+    wait_cost 缺省取建场时挂在 Field 上的那个（等门代价要与建场同一套账）。
     """
     if goal not in field:
         return None
+    if wait_cost is None:
+        wait_cost = getattr(field, "wait_cost", None)
     path = [goal]
     cur = goal
     # 上限 len(field)：每格最多进路径一次，断链/环都在这里止住而不是死循环
@@ -277,7 +424,9 @@ def trace_back(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
         if field[cur] == 0:
             path.reverse()
             return path
-        prev = _predecessor(field, cur, belt_dir, soft_cost, edge_blocked)
+        prev = getattr(field, "via", {}).get(cur)
+        if prev is None:
+            prev = _predecessor(field, cur, belt_dir, soft_cost, edge_blocked, wait_cost)
         if prev is None:
             return None          # 距离场被破坏，交还调用方（原语会转 FAILURE）
         path.append(prev)
@@ -296,3 +445,19 @@ def first_step(field, goal, belt_dir, soft_cost=None, edge_blocked=None):
     if not path or len(path) < 2:
         return None
     return path[1]
+
+
+def path_blocked_by_fast_belt(path, belt_dir, belt_speed=None):
+    # type: (List[Tuple[int, int]], Dict, Optional[Dict[Tuple[int, int], float]]) -> bool
+    """路径里有没有「快带逆行」的步。
+
+    传送带方向翻转后，发令时冻结的路径会变得走不动：move 原语每拍用它判
+    「方向变了、得改方向」，一旦命中就提前中止在途 move，交回 Planner 按
+    新方向重算，而不是硬等插件 8s 超时。
+    """
+    if not belt_speed:
+        return False
+    for i in range(len(path) - 1):
+        if step_cost(belt_dir, path[i], path[i + 1], belt_speed) is None:
+            return True
+    return False

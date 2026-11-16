@@ -1,0 +1,306 @@
+# -*- coding: utf-8 -*-
+"""4-2 双竹筏实机 trace 的回归钉子（trace-20261111-001945）。
+
+覆盖四类问题：
+  - 传送带接缝闪断时 SendAcross 应该等，而不是 failure/放下成品盘；
+  - 手持本任务要用的料时，不被 L2 熟锅抢占（避免拿起-放下循环）；
+  - 手持成品盘时，需要空手的备菜 task 吃重罚（避免把盘放下）；
+  - 不可行阈值按 5Hz 帧计，单帧抖动不切任务；
+  - 原地动作不报 stuck。
+"""
+import gzip
+import json
+import os
+
+import pytest
+
+from ai import tasks as T
+from ai.core import arbiter
+from ai.core import planner
+from ai.query import predicates as P
+from ai.query.recipes import RecipeBook
+from ai.space import channels as CH
+from ai.state.bb_factory import make_bb
+from ai.state.blackboard import Commitment, StuckScratch
+from ai.state.world import World
+from tests.test_exec_primitives import FakeExec
+
+FIX = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                   "rapids42-live-fixes.ndjson.gz")
+FIX_OWN = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                       "rapids42-own-belt.ndjson.gz")
+
+PID_OWN = "-18776"
+
+
+def _frame(t, path=FIX):
+    with gzip.open(path, "rt", encoding="utf8") as fh:
+        return next(json.loads(line) for line in fh
+                    if line.strip() and json.loads(line)["_trace_t"] == t)
+
+
+def _world(frame):
+    return World(json.loads(json.dumps(frame)))
+
+
+def _ctx(world, tick=0):
+    book = RecipeBook(world.recipes, world.stations, world.items)
+    bb = make_bb(tick)
+    ctx = planner._make_context(world, bb, book)
+    # 与 plan() 的可行性过滤对齐：_holding_plated_dish 要看「手里盘绑给哪单」
+    # 判它是不是成品，缺了会把成品盘当半成品放开 hands_full_plate。
+    ctx["plate_match"] = planner._match_plates_to_orders(world, bb, book)
+    return ctx, book
+
+
+def _frame_world(t, path=FIX):
+    frame = _frame(t, path)
+    world = _world(frame)
+    ctx, book = _ctx(world, tick=frame.get("_trace_t", 0))
+    return frame, world, ctx, book
+
+
+def test_send_across_waits_through_belt_flicker():
+    """接缝闪断（conveyor_slots 为空）时，刚见过的送件通道应允许等。"""
+    frame, world, ctx, book = _frame_world(234, FIX_OWN)
+    bb = ctx["bb"]
+    task = T.SendAcross("2", (PID_OWN, CH.CONVEYOR), "plated_dish")
+
+    assert not task.feasible(ctx)        # 没见过的通道不能送（会进本侧桶）
+    bb.conveyor_open_until[CH.CONVEYOR] = bb.tick + CH.CONVEYOR_GRACE_TICKS
+    assert task.feasible(ctx)            # 刚开过：允许端着盘等接缝重开
+
+    ctx = dict(ctx, exec=FakeExec(), tick=bb.tick)
+    assert task.build().tick(ctx) == "running"
+    # 等待阶段不应为了腾手把盘子放下；也不应盲发 tap。
+    assert not any(c.get("cmd") == "tap" for c in ctx["exec"].issued)
+
+
+def test_no_feasible_freeze_becomes_send_wait():
+    """t=2940 的真实停摆：接缝刚漂开时仍要生成 SendAcross 候选并等。"""
+    _frame, world, ctx, book = _frame_world(2940)
+    bb = ctx["bb"]
+    assert CH.channel_keys(world, bb) == []      # 当前帧确实没有槽位
+    bb.conveyor_open_until[CH.CONVEYOR] = bb.tick + CH.CONVEYOR_GRACE_TICKS
+    chosen, record = planner.plan(world, bb, None, book)
+    assert chosen is not None and chosen.TYPE == "SendAcross", chosen
+    # 成品盘跨区送现在归 L_REDEEM（送餐兑现），不再是 L_UNBLOCK 的解拼装卡。
+    assert record["top_layer"] == 3
+    assert not record.get("waiting") or record["waiting"].get("reason") != "no_feasible_task"
+
+
+def test_plate_match_survives_one_frame_reachability_flicker():
+    """t=445→449：盘的可交互句柄闪一帧，不能把盘从匹配里踢掉、退回 RescueCooked。"""
+    _f1, w1, ctx1, book1 = _frame_world(445)
+    bb = ctx1["bb"]
+    pm1 = planner._match_plates_to_orders(w1, bb, book1)
+    assert pm1.get("-20214") == "1"
+
+    _f2, w2, ctx2, book2 = _frame_world(449)
+    bb.tick = 449
+    pm2 = planner._match_plates_to_orders(w2, bb, book2)
+    assert pm2.get("-20214") == "1"       # 宽限内仍匹配
+
+    # 对照：没有宽限缓存时，这一帧确实匹配不到盘。
+    fresh = make_bb(449)
+    assert planner._match_plates_to_orders(w2, fresh, book2) == {}
+
+    chosen, record = planner.plan(w2, bb, None, book2)
+    assert chosen is not None and chosen.TYPE == "TakeCookedToPlate", chosen
+    assert record["top_layer"] == 2
+
+
+def test_own_belt_segments_all_reachable_when_on_raft():
+    """P2 在自己竹筏上时，自己这侧整条传送带都应可达，不被投影闪断漏掉。"""
+    _frame, world, ctx, _book = _frame_world(367)
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    own = CH._chef_grid(world, chef)
+    assert own == "Raft Two"
+    segs = {s.get("n") for s in world.stations
+            if s.get("t") == "conveyor" and s.get("grid") == own}
+    slots = {s.get("n") for s in CH.conveyor_slots(world, ctx["bb"])}
+    assert slots == segs and slots
+
+    from ai.tasks import relay
+    from ai import tasks as T
+    task = T.SendAcross("1", ("-19508", CH.CONVEYOR), "plated_dish")
+    assert task.feasible(ctx)
+    slot = relay._channel_slot(ctx, CH.CONVEYOR, {}, False)
+    assert slot is not None and slot.get("grid") == own
+
+
+def test_conveyor_dirty_stack_rescued_like_plates():
+    """脏盘摞在 P2 这侧传送带上，和普通盘一样走 FetchConveyorPlate 抢救。"""
+    _frame, world, ctx, book = _frame_world(3510)
+    dirty = next(i.get("n") for i in world.items
+                 if "dirty" in str(i.get("n") or "").lower())
+    task = T.FetchConveyorPlate(resources=(dirty,))
+    assert task.feasible(ctx)
+
+    chosen, record = planner.plan(world, ctx["bb"], None, book)
+    assert chosen is not None and chosen.TYPE == "FetchConveyorPlate", chosen
+    assert str(chosen.plate_id) == dirty
+    assert record["top_layer"] == 4
+
+
+def test_wash_not_feasible_when_only_p1_holds_dirty():
+    """只有 P1 手里端着一摞脏盘时，WashPlate 不可行——别空跑三次后冻结。"""
+    _frame, world, ctx, _book = _frame_world(3486)
+    task = T.WashPlate(resources=("WashingPart",))
+    assert not task.feasible(ctx)
+    chosen, _record = planner.plan(world, ctx["bb"], None, _book)
+    assert chosen is None or chosen.TYPE != "WashPlate"
+
+
+def test_hand_holding_needed_raw_blocks_rescue_preemption():
+    """t=477：手里拿着 NuggetChoppedChicken，不能被 TakeCookedToPlate 抢走。"""
+    _frame, world, ctx, book = _frame_world(477)
+    bb = ctx["bb"]
+    fill = T.FillCooker(None, (("Raft Two", "FryingStation#631208"),
+                               ("NuggetChicken",)), "FriedChickenNuggets")
+    take = T.TakeCookedToPlate("1", (("Raft Two", "FryingStation#634432"),
+                                     "-19500"), "FriedChips")
+    assert planner._holding_needed_for(fill, world, book)
+    assert not planner._holding_needed_for(take, world, book)
+
+    bb.commitment = Commitment(active_task=fill, steps_done=3)
+    scored = [(take, 5.42, {}), (fill, 0.93, {})]
+    assert planner._apply_commitment_inertia(scored, world, bb, book) == fill
+
+
+def test_plated_dish_gets_hands_penalty_for_empty_hand_tasks():
+    """t=600：手里端着盘子，FetchToBoard 这类要空手的 task 要吃重罚。"""
+    _frame, world, ctx, book = _frame_world(600)
+    bb = ctx["bb"]
+    task = T.FetchToBoard("2", (("Raft Two",
+                                 "countertop_01_chopping_board_swamp (2)"),),
+                          "Lettuce")
+    cand = planner.Candidate(task, ["hands_empty"], planner.EST_FETCH)
+    _score, terms = planner._score_candidate(world, bb, cand, book)
+    assert terms["hands"] == -planner.W_HANDS_VALUABLE
+
+    # 空手时不罚。
+    _frame2, world2, ctx2, book2 = _frame_world(2513)
+    task2 = T.FetchToBoard("2", (("Raft Two",
+                                  "countertop_01_chopping_board_swamp (2)"),),
+                           "Lettuce")
+    cand2 = planner.Candidate(task2, ["hands_empty"], planner.EST_FETCH)
+    _score2, terms2 = planner._score_candidate(world2, ctx2["bb"], cand2, book2)
+    assert terms2["hands"] == 0.0
+
+
+def test_plated_dish_prep_not_hard_vetoed():
+    """端着成品盘时备菜不再被硬否决（送餐分修好后软罚 -6.0 兜底即可）。
+
+    送餐路被 combo_break / 通道不可达堵死时，硬否决会让 P2 端着盘干等
+    （trace-20261111-211624 里 755 拍持盘空转）。改成只靠 _HANDS_PENALTY_TYPES
+    的 -6.0 软罚：送餐可行时送餐分更高自然赢，送餐不可行时 AI 能放下盘做
+    点别的，不再冻结。
+    """
+    _frame, world, ctx, _book = _frame_world(2900)
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    assert P.held_is_plate(chef)
+    task = T.FetchToBoard("2", (("Raft Two",
+                                 "countertop_01_chopping_board_swamp (2)"),),
+                          "Lettuce")
+    cand = planner.Candidate(task, ["hands_empty"], planner.EST_FETCH)
+    ok, veto = planner._feasibility_of(cand, ctx, ctx["bb"])
+    assert ok, veto
+
+    # 空盘同样可行（本来就不算成品盘）。
+    _frame2, world2, ctx2, _book2 = _frame_world(600)
+    task2 = T.FetchToBoard("2", (("Raft Two",
+                                  "countertop_01_chopping_board_swamp (2)"),),
+                           "Lettuce")
+    cand2 = planner.Candidate(task2, ["hands_empty"], planner.EST_FETCH)
+    ok2, veto2 = planner._feasibility_of(cand2, ctx2, ctx2["bb"])
+    assert ok2, veto2
+
+    # 端着 -19502 时，仍不能被另一块盘 -19500 的 SendAcross 抢走（那会先把
+    # 手里的盘放下）。t=2900 两块盘同时可送——这条硬否决保留。
+    bb = ctx["bb"]
+    bb.conveyor_open_until[CH.CONVEYOR] = bb.tick + CH.CONVEYOR_GRACE_TICKS
+    chosen, _record = planner.plan(world, bb, None, _book)
+    assert chosen is not None and chosen.TYPE == "SendAcross"
+    assert chosen.source_id == "-19502", chosen
+
+
+def test_loose_cooked_basket_targets_containing_counter():
+    """散炸篮盛料要对着承载它的台面盛，不是对着炸篮 item。
+
+    4-2 trace-20261111-130956 t=3260+：炸篮被端出锅后，TakeCookedToPlate
+    若还对着炸篮 item 盛，游戏的句柄是台面、名字对不上 → handle mismatch。
+    """
+    _frame, world, ctx, book = _frame_world(2900)
+    pid = next(p["n"] for p in world.all_plates
+               if not p.get("contents") and not p.get("held_by"))
+    task = T.TakeCookedToPlate("3", ("FrierBasket (1)", pid),
+                               "FriedChickenNuggets")
+    src = task._source(ctx)
+    assert src is not None and src["kind"] == "loose"
+    assert src["target"].get("t") == "counter"
+    assert src["target"].get("n") == "countertop_01_standard_swamp (7)"
+
+
+def test_infeasible_threshold_survives_one_5hz_frame():
+    """3 拍 < 一帧 4 拍；阈值必须至少撑过 2 帧，单帧抖动不切任务。"""
+    _frame, world, ctx, book = _frame_world(477)
+    bb = ctx["bb"]
+    current = T.FetchToBoard("1", (("Raft Two",
+                                    "countertop_01_chopping_board_swamp (2)"),),
+                             "Lettuce")
+    other = T.FetchToBoard("2", (("Raft Two",
+                                  "countertop_01_chopping_board_swamp (2)"),),
+                           "Tomato")
+    bb.commitment = Commitment(active_task=current, steps_done=0)
+
+    # 当前 task 不在候选里（模拟移动网格一帧不可达）。
+    for _ in range(planner.INFEASIBLE_THRESHOLD - 1):
+        assert planner._apply_commitment_inertia([(other, 1.0, {})],
+                                                 world, bb) == current
+    assert bb.commitment.infeasible_streak == planner.INFEASIBLE_THRESHOLD - 1
+    assert planner._apply_commitment_inertia([(other, 1.0, {})],
+                                             world, bb) == other
+    assert planner.INFEASIBLE_THRESHOLD >= 8
+
+
+def test_stationary_task_does_not_report_stuck():
+    """切菜/盛盘站定是正常动作，不该被 trace 报成 stuck。"""
+    _frame, world, ctx, _book = _frame_world(477)
+    bb = ctx["bb"]
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    cell = P.chef_cell(chef, world.to_grid)
+    bb.scratch = StuckScratch(last_cell=cell,
+                              same_count=arbiter.STUCK_SAME_CELL_THRESHOLD)
+    bb.commitment = Commitment(
+        active_task=T.Chop("2", (("Raft Two",
+                                 "countertop_01_chopping_board_swamp (2)"),),
+                           "Lettuce"))
+    assert not arbiter._is_stuck(world, bb)
+    assert bb.scratch.same_count == 0
+
+    # 移动类 task 仍然能报 stuck。
+    bb.scratch.same_count = arbiter.STUCK_SAME_CELL_THRESHOLD
+    bb.commitment = Commitment(
+        active_task=T.FetchToBoard(
+            "2", (("Raft Two", "countertop_01_chopping_board_swamp (2)"),),
+            "Lettuce"))
+    assert arbiter._is_stuck(world, bb)
+
+
+def test_take_cooked_to_plate_sends_explicit_use_kind():
+    """盛料交互必须显式发 kind=use，插件才能按 UseName/句柄校验，而不是
+    默认 pickup 把盘子放到旁边的柜台上。"""
+    from ai import primitives as PR
+    from ai.exec.bt import Status
+
+    _frame, world, ctx, _book = _frame_world(600)
+    basket = next(it for it in world.items if it.get("n") == "FrierBasket (1)")
+    ex = FakeExec()
+    ctx = dict(ctx, exec=ex, tick=0)
+    node = PR.TapWhileHolding("pickup", None, target=lambda c: basket,
+                              kind="use")
+    assert node.tick(ctx) == Status.RUNNING
+    cmd = ex.issued[0]
+    assert cmd["cmd"] == "tap" and cmd["kind"] == "use"
+    assert cmd["target"]["name"] == "FrierBasket (1)"

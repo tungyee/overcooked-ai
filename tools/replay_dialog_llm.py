@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""用历史 trace 的真实状态回放 LLM 对话回合（v2：账本 + function calling）。
+"""用历史 trace 的真实状态回放 LLM 对话回合（scenario + 当前工具协议）。
 
 历史 trace 每拍落一条 JSONL；较新的 trace 带 `state` 快照。本脚本把快照
 还原成 `World`，按局面选帧，然后走**线上同一条路径**：
 
   DialogWorker._run_llm（真实方舟 LLM）→ DutyBatch → Agent._service_dialog
-  落账本 → ack 写回历史 → planner 重新选
+  落分工 → ack 写回历史 → planner 重新选
 
-每个场景是一串回合（玩家原话或 new_order / rescue 事件），逐轮检查：
+每个场景是一串回合（玩家原话或 rescue 事件），逐轮检查：
 
   - 有没有回复、回复长度；
   - 工具调用是否全部落地（被拒的打印原因）；
-  - 账本是否符合预期（mode + target）；
+  - 分工是否符合预期（旧 scenario 的 mode/target 视图）；
   - 落地后 P2 的 planner 选择是否符合预期（避开 / 转向某类节点）。
 
 用法（仓库根执行）：
@@ -28,6 +28,7 @@ import gzip
 import json
 import os
 import queue
+from types import SimpleNamespace
 import sys
 import threading
 import time
@@ -206,7 +207,7 @@ def scan_frames(paths, sample_every, max_frames):
 class Expect:
     """一轮的期望；全部可选。
 
-    duties：账本里必须有的 (mode, target 或链上的 task 类型)；no_duties：不能有的。
+    duties：分工里必须有的 (mode, target 或链上的 task 类型)；no_duties：不能有的。
     avoid：落地后 P2 选择不能是这些类型；prefer：选择必须是这些类型之一。
     tools：True 必须调用工具 / False 不能调用 / None 不管。
     """
@@ -216,14 +217,14 @@ class Expect:
     prefer: Tuple[str, ...] = ()
     tools: Optional[bool] = None
     speak: bool = True
-    # 账本里每条 (mode) 约定都必须满足的加工方式（如 "切"）：查多认/错认
+    # 分工里每条 (mode) 约定都必须满足的加工方式（如 "切"）：查多认/错认
     only: Optional[Tuple[str, str]] = None
 
 
 @dataclass
 class Step:
     say: str = ""                 # 玩家原话；空 = 事件
-    event: str = "speech"         # speech / new_order / rescue
+    event: str = "speech"         # speech / rescue
     expect: Expect = field(default_factory=Expect)
     # 回合前改黑板（例如把某个 task 设成截止闸抢回），参数 (agent, world)
     setup: Optional[Callable[[Any, World], None]] = None
@@ -255,7 +256,7 @@ def _drop_sink(agent, world):
 SCENARIOS = [
     Scenario("greet", "any", [
         Step("你好。", expect=Expect(tools=False)),
-    ], "闲聊：要回话，不改账本"),
+    ], "闲聊：要回话，不改分工"),
     Scenario("ask_doing", "busy", [
         Step("你在干啥？", expect=Expect(tools=False)),
     ], "状态提问：照世界状态如实回答"),
@@ -306,10 +307,6 @@ SCENARIOS = [
     Scenario("offtopic", "any", [
         Step("给我捶捶背。", expect=Expect(tools=False)),
     ], "跟游戏无关：轻松接一句，不调工具"),
-    Scenario("new_order_then_yes", "any", [
-        Step(event="new_order", expect=Expect(tools=False)),
-        Step("好，就这么办。", expect=Expect(tools=True)),
-    ], "新菜商量 → 玩家同意后落账本"),
 ]
 
 
@@ -379,7 +376,7 @@ def _make_pair(frame, llm):
 
 
 def _prime(agent, world):
-    """跑一拍对话服务 + planner：生成 new_order 记账、p2_options、承诺。"""
+    """跑一拍对话服务 + planner：生成分工记账、p2_options、承诺。"""
     agent.bb.tick = agent.tick = 1000
     agent.book = RecipeBook(world.recipes, world.stations)
     agent._service_dialog(world)
@@ -411,8 +408,7 @@ def _run_turn(agent, worker, world, step):
                 worker.state.last_transcript = ""
                 worker._run_llm(context, "speech", step.say)
             else:
-                worker._run_llm(context, step.event, "",
-                                new_orders=[o.get("id") for o in world.orders])
+                worker._run_llm(context, step.event, "")
         finally:
             done.set()
 
@@ -429,6 +425,17 @@ def _run_turn(agent, worker, world, step):
 
 
 _KITCHEN = {}  # type: Dict[str, Any]
+
+
+def _division_rows(agent):
+    # type: (Any) -> list
+    """旧 scenario 的 (mode, target) 视图 → 新分工表。"""
+    rows = []
+    for entry in agent.bb.division.entries:
+        rows.append(SimpleNamespace(
+            mode="leave_to_p1" if entry.owner == "P1" else "do",
+            target=entry.action))
+    return rows
 
 
 def _covers(duty, want):
@@ -460,18 +467,18 @@ def _check(step, mute_before, history_before, mute, agent, worker, chosen):
     for msg in turn_msgs:
         if msg.get("role") == "tool" and '"ok": false' in msg.get("content", ""):
             fails.append("工具被拒：%s" % (msg["content"],))
-    duties = agent.ledger.duties
+    duties = _division_rows(agent)
     for mode, prefix in exp.duties:
         if not any(d.mode == mode and _covers(d, prefix) for d in duties):
-            fails.append("账本缺 %s %s*" % (mode, prefix))
+            fails.append("分工缺 %s %s*" % (mode, prefix))
     for mode, prefix in exp.no_duties:
         if any(d.mode == mode and _covers(d, prefix) for d in duties):
-            fails.append("账本不该有 %s %s*" % (mode, prefix))
+            fails.append("分工不该有 %s %s*" % (mode, prefix))
     text = "".join(said)
     if exp.only is not None:
         mode, proc = exp.only
         kitchen = _KITCHEN.get("current")
-        for d in agent.ledger.duties:
+        for d in duties:
             if d.mode != mode:
                 continue
             procs = kitchen.processes(d.target) if d.target in kitchen.materials else []
@@ -532,9 +539,9 @@ def run_scenario(scenario, frame, llm, args):
         print("     回复：%s" % ("｜".join(mute.spoken[spoken_before:]) or "（无）",))
         if calls:
             print("     工具：%s" % ("  ".join(calls),))
-        print("     账本：%s" % ("；".join(
-            "%s %s %s" % (d.id, d.mode, d.target)
-            for d in agent.ledger.duties) or "（空）",))
+        print("     分工：%s" % ("；".join(
+            "%s %s %s" % (e.key, e.owner, e.item)
+            for e in agent.bb.division.entries) or "（空）",))
         print("     P2 选择：%s" % (_label(result["chosen"]),))
         for fail in fails:
             print("     ✗ %s" % (fail,))

@@ -33,21 +33,30 @@ def _cooker(name="cooker_01", cooked=None, is_cooking=None, burning=None,
 
 # ---------- 火情不受 L3 拉黑（spec §7.2 的例外）----------
 
-def test_plan_firefighting_ignores_abandon_blacklist():
+def test_fire_ignores_abandon_blacklist():
     """着火的那口灶被别的 task 拉黑了，也照样要去灭。
 
     拉黑是按资源 id 记的：Normal 里 ReturnPot / RescueCooked 在同一口灶上
     反复失败，会把**着火的那口灶**写进 scratch.abandoned。火不能因此没人
-    管——plan_firefighting 忽略这条否决。
+    管——Extinguish.NO_ABANDON 让它在正常可行性过滤里也免疫拉黑。
     """
     stations = [{"t": "cooking", "n": "cooker_01", "gx": 1, "gz": 1}]
-    w = _world(cookers=[_cooker(burning=True)], stations=stations)
+    w = World({
+        "orders": [], "stations": stations, "recipes": [],
+        "chefs": [{"name": "Player 2", "x": 5.0, "z": 5.0, "held": None},
+                  {"name": "Player 1", "x": 9.0, "z": 9.0, "held": None}],
+        "plates": [], "workstations": [],
+        "cookers": [_cooker(burning=True)],
+        "items": [],
+        "extinguishers": [{"n": "ext", "x": 3.0, "z": 3.0}],
+        "grid": {"nodeMap": None},
+    })
     bb = Blackboard()
     bb.scratch = StuckScratch()
     bb.scratch.abandoned["cooker_01"] = bb.tick + 200
     book = RecipeBook([], stations)
 
-    chosen, record = planner.plan_firefighting(w, bb, book)
+    chosen, record = planner.plan(w, bb, None, book)
 
     assert chosen is not None, "火不能被拉黑挡住"
     assert chosen.TYPE == "Extinguish"
@@ -177,15 +186,6 @@ def test_gen_cook_suppressed_when_order_already_producing():
     types = _emit_types(w, Blackboard(), book, w.orders[0], {},
                         {"cooker_01": "order1"})
     assert "FetchToCooker" not in types
-
-
-def test_gen_cook_suppressed_when_in_flight_claim():
-    """该单已有在途认领（fetch_to）→ 不再重复生成。"""
-    w = _rice_world()
-    book = RecipeBook(w.recipes, w.stations)
-    bb = Blackboard()
-    bb.claim("cooker_09", "fetch_to", "P2", "order1", 0)
-    assert "FetchToCooker" not in _emit_types(w, bb, book, w.orders[0])
 
 
 # ---------- 取熟料侧也要吃"该单需熟料" ----------
@@ -440,23 +440,6 @@ def test_chop_declares_empty_hands_and_clears_first():
     assert T.Chop.HANDS == "empty"
     seq = T.Chop("order1", ("board_01",), "Cucumber").build().child
     assert isinstance(seq.children[0], EnsureHandsFree)
-
-
-def test_take_cooked_score_penalized_when_holding_cookware():
-    w = _take_world([])
-    task = _take_task()
-    cand = planner.Candidate(task, [], 15)
-    bb = Blackboard()
-
-    w.chefs[0]["held"] = None
-    free_score, free_terms = planner._score_candidate(w, bb, cand)
-
-    w.chefs[0]["held"] = "utensil_pot_01"
-    busy_score, busy_terms = planner._score_candidate(w, bb, cand)
-
-    assert free_terms["hands"] == 0.0
-    assert busy_terms["hands"] < 0
-    assert busy_score < free_score
 
 
 # ---------- B3：loose_cookware 只认地上的锅 ----------

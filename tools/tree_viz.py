@@ -31,6 +31,7 @@ from ai.state.blackboard import Blackboard       # noqa: E402
 from ai.exec.bt import Node, Status             # noqa: E402
 from ai.exec.client import NullExec             # noqa: E402
 from ai.space.navigation import distance_field   # noqa: E402
+from ai.space.seams import nav_predicates        # noqa: E402
 from ai.query.predicates import P2_NAME, chef_by_name   # noqa: E402
 from ai.query.recipes import RecipeBook          # noqa: E402
 from ai.state.world import World                 # noqa: E402
@@ -105,12 +106,13 @@ def make_ctx(world, chef=None, tick=0, with_exec=False):
 
     ex = NullExec()
     start = world.to_grid(chef.get("x") or 0.0, chef.get("z") or 0.0)
+    nav_walkable, nav_edge_blocked = nav_predicates(world)
     ctx = {
         "w": world,
         "chef": chef,
         "bb": Blackboard(),
-        "field": distance_field(start, world.walkable, world.belt_dir,
-                                edge_blocked=getattr(world, "edge_blocked", None)),
+        "field": distance_field(start, nav_walkable, world.belt_dir,
+                                edge_blocked=nav_edge_blocked),
         "book": RecipeBook(world.recipes, world.stations),
         "tick": tick,
         "exec": ex,
@@ -150,6 +152,7 @@ def placeholder_task(cls):
         "DeliverPlate": ("p0",),
         "StashHeld": (),
         "Prefetch": (),
+        "FillCarrier": ("cooker0", "Tortilla", ()),
     }
     return cls(order_id="0", resources=needs.get(cls.TYPE, ()),
                item="Cucumber")
@@ -190,6 +193,9 @@ def enumerate_tasks(ctx):
         out.append(T.DeliverPlate(oid, (plate_id,)))
         for ing in reqs:
             out.append(T.FetchToPlate(oid, (plate_id,), ing))
+    plates = [p for p in w.plates if p.get("n")]
+    if len(plates) >= 2 and oid is not None:
+        out.append(T.MergePlates(oid, (plates[0]["n"], plates[1]["n"])))
     if sink_id is not None:
         out.append(T.WashPlate(resources=(sink_id,)))
     if cooker_id is not None:

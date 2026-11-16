@@ -6,20 +6,22 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai.dialog.schema import (NO_BRANCH_TYPES, RESCUE_TYPES,
-                              preference_matches_task)
+                              preference_matches_task, scope_matches)
 from ai.revenue import cook_supply as CS
 from ai.revenue import economy as ECON
 from ai.revenue import eta as ETA
+from ai.revenue import throw_supply as TS
+from ai.query import carriers as CR
 from ai.query import predicates as P
 from ai.query import recipe_graph
 from ai.query import stations as S
 from ai import tasks as T
-from ai.state.blackboard import Blackboard, Commitment
+from ai.state.blackboard import Blackboard
 from ai.query.plate_tokens import parse_plate_detail, parse_pot_contents
-from ai.query.recipes import RecipeBook, find_ingredient
+from ai.query.recipes import RecipeBook
 from ai.tasks.base import _grid_matches, _unpack_resource_id, cooked_sources
 from ai.state.world import World
-from ai.space import reachability
+from ai.space import reachability, shuttle, traffic
 
 # Plan 3 固定估计步数（spec §7.3.4）
 EST_FETCH, EST_CHOP, EST_COOK_OPS, EST_SERVE = 10, 20, 15, 5
@@ -79,8 +81,9 @@ def _dialog_live_orders(world, bb):
     return [o for o in world.orders if not _order_is_abandoned(bb, o.get("id"))]
 
 
-def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=None):
-    # type: (World, Blackboard, Optional[Any], RecipeBook, Optional[Dict[Any, Any]], Optional[Dict[Any, Any]]) -> List[Candidate]
+def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=None,
+                        carrier_match=None):
+    # type: (World, Blackboard, Optional[Any], RecipeBook, Optional[Dict[Any, Any]], Optional[Dict[Any, Any]], Optional[Dict[Any, Dict]]) -> List[Candidate]
     """为所有订单生成候选任务（Plan 4 多订单模式）。
 
     order 参数保留用于向后兼容，但在多订单模式下被忽略。
@@ -92,6 +95,12 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     """
     plate_match = plate_match or {}
     cooker_match = cooker_match or {}
+    # send_requests 在候选生成阶段就要知道盘绑给了哪张单：否则同一块
+    # 装了一半的盘会被 SendAcross 当成另一张简单单的成品（拿起/放下）。
+    try:
+        world._plate_match = plate_match
+    except AttributeError:
+        pass
     candidates = []  # type: List[Candidate]
     chef = P.chef_by_name(world.chefs, P.P2_NAME)
     hands_empty = P.hands_free(chef)
@@ -102,13 +111,25 @@ def generate_candidates(world, bb, order, book, plate_match=None, cooker_match=N
     # 配方驱动的候选（放盘 + 备菜 + 上盘 + 出餐），逐订单从 DAG 发射
     for ord in orders:
         for task in recipe_graph.emit(world, bb, book, ord,
-                                      plate_match, cooker_match):
+                                      plate_match, cooker_match, carrier_match):
             pre, est = _CAND_META.get(task.TYPE, ([], EST_FETCH))
             candidates.append(Candidate(task, list(pre), est,
                                         branch=branch_of_task(task, book)))
 
+    # 盘合并：互补盘对 → MergePlates（spec 2026-11-01-plate-merge-design §5.2）
+    candidates.extend(_gen_merge(world, bb, book))
+
     # 与订单无关的清理 / 回收 / 待命 task（第 2/5/6/11/12/13/14/15 号）
     candidates.extend(_gen_misc(world, bb, book, chef, hands_empty))
+
+    # 火情：发一个全局 Extinguish（L_FIRE 顶层，见 _fire_needs_ai 的三条件门）
+    candidates.extend(_gen_fire(world, bb))
+
+    # 换布局：窗口打开时把自己挪进「两种布局都算对」的格。不接订单、不认领，
+    # 由「马上去」闸硬选（见 _select_reposition），普通打分排在 L_PREP 里。
+    if getattr(bb, "reposition", None) is not None:
+        candidates.append(Candidate(T.Reposition(), [], EST_FETCH,
+                                    branch=branch_of_task(T.Reposition(), book)))
 
     # 当前承诺的 task 必须留在候选里：手持状态是 ETA 惩罚而非硬否决
     # （spec §6.1 选 (b)），所以"拿着料去装盘"这类 task 会被上面的
@@ -134,7 +155,11 @@ _CAND_META = {
     "TakeCookedToPlate": (["holding_plated_dish"], EST_COOK_OPS),
     "DeliverPlate": (["holding_plated_dish"], EST_SERVE),
     "Mix": (["hands_empty"], EST_COOK_OPS),
-    "PlaceToRelay": (["hands_empty"], EST_FETCH),
+    "SendAcross": (["hands_empty"], EST_FETCH),
+    "FetchToCarrier": (["hands_empty"], EST_FETCH),
+    "FillCarrier": (["hands_empty"], EST_COOK_OPS),
+    "PlaceCarrierInCooker": (["hands_empty"], EST_COOK_OPS),
+    "MergePlates": (["hands_empty"], EST_FETCH),
 }
 
 
@@ -165,7 +190,7 @@ def _loose_pots(world):
     # type: (World) -> List[Dict]
     out = []  # type: List[Dict]
     for it in world.items:
-        if not P.held_is_cookware({"held": it.get("n")}, world.recipes):
+        if not P.item_is_cookware(it, world.recipes):
             continue
         toks = parse_plate_detail(it.get("detail") or [])
         if any(t.startswith("cooked:") for t in toks):
@@ -200,25 +225,143 @@ def _has_dirty_plate(world, sink):
     return dirty_plate_exists({"w": world}, (sink or {}).get("n"))
 
 
+def _gen_merge(world, bb, book):
+    # type: (World, Blackboard, RecipeBook) -> List[Candidate]
+    """互补盘对 → MergePlates 候选（盘合并，spec 2026-11-01-plate-merge-design §5.2）。
+
+    只扫描「并集 ⊆ 某单需求 且 缺料数严格减少」的盘对；src/dst 定向匹配无关
+    （dst = token 多的盘、平手 id 小者），逐拍稳定。目标订单取并集缺料最少的
+    单，同分取队首。盘过滤口径与 `_match_plates_to_orders` 一致。
+    """
+    orders = _dialog_live_orders(world, bb)
+    if not orders:
+        return []
+    from ai.query.recipe_graph import _counter_cells
+    counter_cells = set(_counter_cells(world))
+    p2 = P.chef_by_name(world.chefs, P.P2_NAME)
+    p1 = P.chef_by_name(world.chefs, P.P1_NAME)
+    head = _combo_head_id(orders)
+
+    eligible = []  # type: List[Tuple[Dict, Set[str]]]
+    for p in P.all_plates(world):
+        pid = p.get("n")
+        if not pid:
+            continue
+        on_counter = _plate_cell(world, p) in counter_cells
+        held_by_p2 = P.holds_plate(p2, p)
+        held_by_p1 = P.holds_plate(p1, p)
+        buried = P.plate_buried_in_stack(p)
+        loose_with_contents = (not on_counter and not held_by_p2
+                               and not held_by_p1 and not buried
+                               and P.plate_count(p) > 0)
+        stack_top = not held_by_p1 and P.plate_stack_top(p)
+        if not (on_counter or held_by_p2 or loose_with_contents or stack_top):
+            continue
+        toks = book.plate_tokens(p)
+        if not toks:
+            continue
+        eligible.append((p, toks))
+
+    cands = []  # type: List[Candidate]
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            pa, ta = eligible[i]
+            pb, tb = eligible[j]
+            union = ta | tb
+            if ta & tb:
+                # 两盘有重叠料（如都已有饼皮/海苔），游戏无法并盘。集合并集会
+                # 把重叠料去重，单靠 union ⊆ want + 严格进展会被骗过。
+                continue
+            best_oid, best_key = None, None
+            for o in orders:
+                oid = o.get("id")
+                if not (union <= book.order_want_tokens(o)):
+                    continue
+                missing_after = len(book.missing_union(o, [pa, pb]))
+                if not (missing_after < len(book.missing(o, pa))
+                        and missing_after < len(book.missing(o, pb))):
+                    continue
+                key = (missing_after, 0 if oid == head else 1)
+                if best_key is None or key < best_key:
+                    best_key, best_oid = key, oid
+            if best_oid is None:
+                continue
+            if len(tb) > len(ta):
+                src_p, dst_p = pa, pb
+            elif len(ta) > len(tb):
+                src_p, dst_p = pb, pa
+            else:
+                # dst = id 小者（平手 tiebreak，逐拍稳定）
+                if str(pa.get("n")) < str(pb.get("n")):
+                    src_p, dst_p = pb, pa
+                else:
+                    src_p, dst_p = pa, pb
+            cands.append(Candidate(
+                T.MergePlates(best_oid, (src_p.get("n"), dst_p.get("n"))),
+                ["hands_empty"], EST_FETCH))
+    return cands
+
+
 def _gen_misc(world, bb, book, chef, hands_empty):
     # type: (World, Blackboard, RecipeBook, Any, bool) -> List[Candidate]
     """与订单无关的 task：锅具回收 / 清理 / 待命（spec §6.1 第 2/5/6/11/12/13/14/15 号）。
 
     这些 task 的 feasible 谓词会再过滤一遍；这里只做资源枚举与手部门——
-    需要先拿起东西的（Discard / RescueCooked / RecoverLoosePot / ResetPlate /
-    WashPlate）只在手空时生成，否则其树首的 pickup 会把手里的东西换掉。
+    需要先拿起东西的（Discard / RescueCooked / RecoverLoosePot / ResetPlate）
+    只在手空时生成，否则其树首的 pickup 会把手里的东西换掉。WashPlate 例外：
+    它只看有没有脏盘，树首自带 EnsureHandsFree 处理手持物。
     """
     cands = []  # type: List[Candidate]
 
-    # 第 2 号 WashPlate：有洗碗池且有脏盘才生成；feasible 再判物理可行性。
+    # 第 2 号 WashPlate：只看「有没有脏盘」，不看手里拿没拿东西；feasible 再判
+    # 物理可行性。手里有干净盘也得能接洗碗任务——树首 EnsureHandsFree 负责把
+    # 非脏盘手持物放回合法落点，然后再去洗（拿着干净盘去回盘台洗是常态）。
     # 只按洗碗池生成会把「没有脏盘」也当成一个当前候选，玩家说「去洗碗」
     # 时 ack 会误报 accepted（spec §4.7：目标不存在时应 pending，等盘出现）。
-    if hands_empty:
-        for st in world.stations:
-            if (st.get("t") == "washing" and st.get("n")
-                    and _has_dirty_plate(world, st)):
-                cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
-                                       ["hands_empty"], EST_FETCH))
+    for st in world.stations:
+        if (st.get("t") == "washing" and st.get("n")
+                and _has_dirty_plate(world, st)):
+            cands.append(Candidate(T.WashPlate(resources=(st.get("n"),)),
+                                   ["hands_empty"], EST_FETCH))
+
+    # 传送带上的盘/脏盘摞快到末端垃圾桶：先抢救下来。脏盘摞和盘是同一类
+    # 东西（都在 `attach:ConveyorStation` 上走），WashPlate 够不着传送带上的
+    # 散落物，所以这里也要给它发 FetchConveyorPlate，别让 P2 看着它进桶
+    # （t=3510）。
+    from ai.space import channels as CH
+    entries = []  # type: List[Dict]
+    for p in P.all_plates(world):
+        if not p.get("n") or p.get("held_by"):
+            continue
+        if "dirtyplate" in str(p.get("n") or "").lower():
+            continue
+        entries.append(p)
+    for it in world.items:
+        if "dirtyplate" in str(it.get("n") or "").lower():
+            entries.append(it)
+    for e in entries:
+        if not CH.plate_on_conveyor(world, e):
+            continue
+        # 玩家那侧的带子交给他自己拿；P2 抢回来会与 SendAcross 互相拆台。
+        if CH.plate_on_player_side_conveyor(world, e, bb):
+            continue
+        cands.append(Candidate(T.FetchConveyorPlate(resources=(e.get("n"),)),
+                               [], EST_FETCH))
+
+    # 4-5：P1 把脏盘放上传送带、方向朝 P1 时，P2 先按自己的开关把方向翻到朝
+    # P2，才能接住流过来的脏盘。开关是方向设定器，P2 的按钮只能设朝 P2。
+    from ai.revenue import cross_supply as XS
+    if CH.switch_direction(world) is not None \
+            and XS.dirty_plate_to_receive(world, bb):
+        cands.append(Candidate(T.ReceiveConveyor(), [], EST_FETCH))
+
+    # 5-1 舢板：开船过河到对岸。feasible 再判「船停本侧、对岸才是目标」，
+    # 平时与切/煮等有订单紧急性分的 task 同场，只在「本侧无活、对岸有活但
+    # 够不着」时胜出——正是 trace-20261113-224047 里 P2 卡死要过的场景。
+    from ai.space import raft
+    if raft.raft_box(world) is not None:
+        for side in ("left", "right"):
+            cands.append(Candidate(T.RideRaft(item=side), [], EST_FETCH))
 
     for c in _cookers(world):
         if not c.get("n"):
@@ -245,10 +388,14 @@ def _gen_misc(world, bb, book, chef, hands_empty):
                                            branch=branch_of_task(task, book)))
 
     if hands_empty:
-        # 第 14 号 ResetPlate：绑盘当前所在格为拼装格（feasible 判是否错料盘）
+        # 第 14 号 ResetPlate：绑盘当前所在格为拼装格（feasible 判是否错料盘）；
+        # 篮子台面上的盘绑 (grid, 站名)，篮子一动 done 不至于误判「已移走」
+        from ai.query.placement import counter_key_at
         for p in world.plates:
             pid = p.get("n")
             cell = _plate_cell(world, p) if pid else None
+            if cell is not None:
+                cell = counter_key_at(world, cell)
             if pid and cell is not None:
                 cands.append(Candidate(T.ResetPlate(None, (pid, cell)),
                                        [], EST_FETCH))
@@ -268,19 +415,14 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         # 第 13 号 StashHeld：手里有无用物（feasible 再判）
         cands.append(Candidate(T.StashHeld(), [], EST_FETCH))
 
-    # 1-3 中转交接候选：仅在配置了中转台的关卡生成（relay_cells 非空）。
-    # 可投掷食材的批量取+投已并入通用 FetchToBoard（见 chop.py）；这里只剩
-    # 传盘（PlaceToRelay）。feasible 再精确判（中转台有空位），这里只做粗枚举。
-    # order_id 一律 None：relay 是协作动作，不绑定特定订单（同 Prefetch）。
-    relay_cells = S.relay_cells_for(world)
-    if relay_cells:
-        # 干净盘 → 放中转台（传盘子；feasible 判盘干净 + 中转台有空位）
-        for p in world.plates:
-            pid = p.get("n")
-            if pid and P.plate_count(p) == 0:
-                task = T.PlaceToRelay(item=pid)
-                cands.append(Candidate(task, [], EST_FETCH,
-                                       branch=branch_of_task(task, book)))
+    # 跨区送件（SendAcross）：规格表统一回答四种 kind 的来源/触发
+    # （ai/revenue/handover.py），这里只把每行请求翻成候选。
+    from ai.revenue import handover as HO
+    for req in HO.send_requests(world, book, bb):
+        task = T.SendAcross(req.source.order_id,
+                            (req.source.source_id, req.channel), req.kind)
+        cands.append(Candidate(task, [], EST_FETCH,
+                               branch=branch_of_task(task, book)))
 
     # 第 18 号 FillCooker：订单无关的填灶（第 1 组 1.1）。
     # 按单发射的 FetchToCooker 受「同单只发一个 + 灶↔单 1:1」限制，无法把
@@ -310,6 +452,110 @@ def _gen_misc(world, bb, book, chef, hands_empty):
         cands.append(Candidate(task, ["hands_empty"], EST_COOK_OPS,
                                branch=branch_of_task(task, book)))
 
+    cands.extend(_gen_throw(world, bb, book))
+    return cands
+
+
+def _gen_throw(world, bb, book):
+    # type: (World, Blackboard, RecipeBook) -> List[Candidate]
+    """批量投掷候选：订单里每条加工链的每一站 × 该站的每个消费站（粗枚举）。
+
+    是否构成投掷（分割 / 远距）、缺口、出手位都留给 feasible 判。订单无关
+    （order_id=None），同 FillCooker：投过去的料谁的单都能用。
+    """
+    cands = []  # type: List[Candidate]
+    seen = set()
+    for order in _dialog_live_orders(world, bb):
+        for product in book.requirements(order):
+            for form, consumer, raw in TS.stages(book, product):
+                for st in TS.dest_candidates(world, book, consumer, product):
+                    task = T.ThrowBatch(None, (P.resource_id(st), consumer, raw, product), form)
+                    if task.key in seen:
+                        continue
+                    seen.add(task.key)
+                    cands.append(Candidate(task, [], EST_FETCH,
+                                           branch=branch_of_task(task, book)))
+    return cands
+
+
+# P1 在灶附近多少距离算「正在处理」火情（平移自原 arbiter.HANDLING_DISTANCE）。
+HANDLING_DISTANCE = 2.0
+
+
+def _fire_needs_ai(world, bb):
+    # type: (World, Blackboard) -> bool
+    """是否该由 AI 去灭火（平移自原 arbiter._should_enter_firefighting）。
+
+    三条件合取：有 onFire 的灶/柜台 + AI 有可获得的灭火器 + 至少一口着火目标
+    未被 P1 处理。只用 onFire、不用 burning——糊锅走 RescueCooked/L1，不进灭火。
+    柜台/砧板/工作台也会着火（实机确认），只有 onFire 信号，没有锅要端。
+    """
+    on_fire = [c for c in world.cookers if c.get("onFire")]
+    on_fire += [s for s in world.stations
+                if s.get("t") not in ("cooking",) and s.get("onFire") is True]
+    if not on_fire:
+        return False
+    if not _extinguisher_available(world, bb):
+        return False
+    p1 = P.chef_by_name(world.chefs, "Player 1")
+    return any(_fire_unhandled(c, p1, world) for c in on_fire)
+
+
+def _extinguisher_available(world, bb):
+    # type: (World, Blackboard) -> bool
+    """AI 是否有可用的灭火器（平移自原 arbiter._has_available_extinguisher）。
+
+    world.extinguishers 只含非手持（挂墙/地上），列表里每个都是可获得的。
+    但「P2 已经手持灭火器」也算可用——灭火进行中，手上的那瓶从非手持列表消失，
+    不能据此把灭火任务判成「无灭火器」而改去做别的（trace-20261115-002229
+    灭火器反复拿起放下、灭一下又去切菜的 flap 根因）。
+    特殊规则：P1 持唯一灭火器时不进（读 p1_model 的持有状态）。
+    """
+    p2 = P.chef_by_name(world.chefs, P.P2_NAME)
+    if p2 and "extinguisher" in P.held_name(p2):
+        return True
+    total_count = 0
+    available_count = 0
+    p1_holds_extinguisher = False
+    if bb.p1_model and bb.p1_model.holding:
+        if "extinguisher" in bb.p1_model.holding.lower():
+            p1_holds_extinguisher = True
+    for _ext in world.extinguishers:
+        total_count += 1
+        available_count += 1
+    if p1_holds_extinguisher and total_count == 1:
+        return False
+    return available_count > 0
+
+
+def _fire_unhandled(cooker, p1_chef, world):
+    # type: (dict, object, World) -> bool
+    """着火灶是否未被 P1 处理（平移自原 arbiter._is_fire_unhandled）。
+
+    未被处理 = P1 不在该灶旁 且 P1 不持该灶对应的灭火器。
+    """
+    if not p1_chef:
+        return True
+    cooker_pos = (cooker.get("x"), cooker.get("z"))
+    p1_pos = (p1_chef.get("x"), p1_chef.get("z"))
+    if None not in cooker_pos and None not in p1_pos:
+        dx = cooker_pos[0] - p1_pos[0]
+        dz = cooker_pos[1] - p1_pos[1]
+        distance = (dx * dx + dz * dz) ** 0.5
+        if distance <= HANDLING_DISTANCE:
+            return False
+    p1_held = P.held_name(p1_chef)
+    if "extinguisher" in p1_held:
+        return False
+    return True
+
+
+def _gen_fire(world, bb):
+    # type: (World, Blackboard) -> List[Candidate]
+    """火情候选：发一个全局 Extinguish（树内部循环处理所有着火灶）。"""
+    cands = []  # type: List[Candidate]
+    if _fire_needs_ai(world, bb):
+        cands.append(Candidate(T.Extinguish(), [], EST_COOK_OPS))
     return cands
 
 
@@ -408,44 +654,120 @@ def _breaks_combo(task, world):
     队首 = _combo_head_id（id 最小）；credited = _credited_order_id（游戏把
     一盘菜记给同 dish 存活单里 remaining 最小者）。credited != 队首时 combo 断。
 
-    刻意**不做跳单 escape**：多人协作下 solo_slack 是 P2 单人手口径、不准，
-    用它当「队首没救就放开跳单」的信号会误放行。先严格保顺序；队首做不出来
-    时的取舍，留到有更准的协作口径再处理。
+    两个放行出口（都不拦）：
+      1. _head_credit_blocked：队首那道菜被同菜更短的别单挡着、注定记不到
+         队首——「保连击」是伪命题，继续拦只会让 P2 空转、其他单跟着过期
+         （trace-20261102-000650/002822：Balloon 队首被同菜更短单挡着，
+          10 个送餐全被 combo_break 拦死）。
+      2. _head_order_doomed：队首快过期、且场上没有它的料齐盘时放行跳单。
+         队首过期本身就会断 combo，再拦着备好的菜只会让它跟着一起过期
+         （trace-20261029-130632：MeatOnly 盘料齐后被拦 65 秒，直到队首
+         Marinara 过期才送出）。
+
+    不用 solo_slack 判「队首没救」：多人协作下它是 P2 单人手口径、不准，会误放行。
     """
     if getattr(task, "TYPE", None) != "DeliverPlate":
         return False
     head = _combo_head_id(world.orders)
     if head is None:
         return False
+    if _head_credit_blocked(world):
+        return False
     dish = _dish_of_order(world.orders, getattr(task, "order_id", None))
     credited = _credited_order_id(world.orders, dish)
-    return credited is not None and credited != head
+    if credited is None or credited == head:
+        return False
+    return not _head_order_doomed(world)
 
 
-def _feasibility_of(cand, ctx, bb, ignore_abandon=False, time_left=None):
-    # type: (Candidate, Dict, Blackboard, bool, Optional[float]) -> Tuple[bool, str]
+def _head_credit_blocked(world):
+    # type: (World) -> bool
+    """队首单是否注定记不到：同菜里存在 remaining 比队首更小的另一单。
+
+    游戏把一盘菜记给同 dish 存活单里 remaining 最小者（_credited_order_id）。
+    若队首那道菜的最小 remaining 不是队首自己，任何该菜的送达都会记给那单
+    而非队首——combo 在队首这格本来就接不上，继续拦送餐没有意义。
+    """
+    head_id = _combo_head_id(world.orders)
+    head_dish = _dish_of_order(world.orders, head_id)
+    if head_dish is None:
+        return False
+    return _credited_order_id(world.orders, head_dish) != head_id
+
+
+# 队首剩余时间低于此值（秒）且没有料齐盘时，判定队首救不回来、允许跳单。
+# 煮一锅最短也要 ~10s，再装盘+走到出餐口，8s 内凭空做出一盘不现实。
+COMBO_SKIP_HEAD_REMAINING = 8.0
+
+
+def _head_order_doomed(world):
+    # type: (World) -> bool
+    """队首单是否已救不回来：快过期，且场上没有一只给它的料齐盘。"""
+    head_id = _combo_head_id(world.orders)
+    head = next((o for o in world.orders if o.get("id") == head_id), None)
+    if head is None:
+        return False
+    rem = head.get("remaining")
+    if rem is None or float(rem) > COMBO_SKIP_HEAD_REMAINING:
+        return False
+    return not _head_plate_ready(world, head)
+
+
+def _head_plate_ready(world, head_order):
+    # type: (World, Dict) -> bool
+    """队首单是否已经有一只料齐的盘（随时能送）。"""
+    from ai.query.recipes import RecipeBook
+    book = RecipeBook(world.recipes, world.stations)
+    for p in world.plates:
+        if book.matches(head_order, p):
+            return True
+    return False
+
+
+def _feasibility_of(cand, ctx, bb, time_left=None):
+    # type: (Candidate, Dict, Blackboard, Optional[float]) -> Tuple[bool, str]
     """判断单个候选是否可行，返回 (ok, 否决原因)。
 
-    否决原因供 trace 排查：claimed（资源被他人认领）/ abandoned（L3 拉黑）
-    / p2_suppressed（账本 stop：玩家让先别做）/ infeasible（task.feasible()
-    为假）。ok=True 时原因为空串。
+    否决原因供 trace 排查：abandoned（L3 拉黑）/ p2_suppressed（账本 stop：
+    玩家让先别做）/ infeasible（task.feasible() 为假）。ok=True 时原因为空串。
 
-    ignore_abandon=True 给火情用：拉黑是按资源 id 记的，别的 task 在同一
-    口灶上反复失败也会把着火的那口灶写进 scratch.abandoned（比如 Normal
-    模式里 ReturnPot 卡在灶边），但火不能不管。
+    单 agent（只有 P2 写认领）下不再检查 `claims_available`：所有认领都是
+    P2 自己的，`is_claimed_by_other` 恒假，只会让同一 task 隔拍被压掉。
+
+    火情不受 L3 拉黑约束：`Extinguish.NO_ABANDON` 让 `_is_abandoned` 直接
+    放行——着火的那口灶被别的 task 反复失败写进 scratch.abandoned 也不能
+    不管。
     """
     task = cand.task
-    if not T.claims_available(task, ctx):
-        return False, "claimed"
     # 方案 B（篮子移动时否决目标在篮子上的候选 task）已禁用。
     # if _targets_moving_platform(task, ctx):
     #     return False, "platform_moving"
     if _is_stopped(task, bb):
         return False, "p2_suppressed"
-    if not ignore_abandon and _is_abandoned(task, bb):
+    if _is_abandoned(task, bb):
         return False, "abandoned"
     if _breaks_combo(task, ctx["w"]):
         return False, "combo_break"
+    chef = P.chef_by_name(ctx["w"].chefs, P.P2_NAME)
+    # 已经端着一盘有内容的菜时，SendAcross 只准送手里这块：选另一块盘的
+    # SendAcross 会先 EnsureHandsFree 把手里这盘放下
+    # （trace-20261111-001945 t=2900 两块盘同时在台上）。
+    # DeliverPlate 不拦：直接送队首的现成盘仍是更值钱的动作（3-6 实机
+    # t=9772/9800，手里是别的盘、队首鸡肉卷盘已经料齐）。
+    if task.TYPE == "SendAcross" and not P.hands_free(chef) \
+            and not _holding_needed_for(task, ctx["w"], ctx.get("book")):
+        # 手里拿着切好的料/锅具：SendAcross 树首会把它放下
+        # （trace-20261111-005439 t=363 丢 ChoppedLettuce）。先让
+        # ThrowBatch/StashHeld 用掉/收好，再送盘；拿着来源本身则放行。
+        # TakeCookedToPlate 不拦：熟料不等人，端盘去盛优先。
+        return False, "hands_full_send"
+    if task.TYPE == "SendAcross" and \
+            _holding_plated_dish(chef, ctx["w"], ctx.get("book"),
+                                 ctx.get("plate_match")):
+        held_plate = _held_plate_id(chef, ctx["w"])
+        target = getattr(task, "source_id", None)
+        if target is not None and str(target) != held_plate:
+            return False, "hands_full_plate"
     # 终局否决暂时禁用（用户反馈：临近结束角色停摆，看起来像卡了）。
     # 需要恢复时取消下面两行注释即可。
     # if _is_endgame_waste(task, cand, time_left):
@@ -463,6 +785,11 @@ def filter_feasible(world, bb, candidates, book):
     """可行性过滤（spec §6.2）。"""
     feasible = []  # type: List[Candidate]
     ctx = _make_context(world, bb, book)
+    # _holding_plated_dish 要看「手里的盘绑给哪张单」判它是不是成品，这里也
+    # 得喂同一份 1:1 匹配；缺了会把成品盘当半成品、放开 hands_full_plate。
+    # 离线/单测的 FakeWorld 可能没有 orders，直接给空匹配（无盘可绑）。
+    ctx["plate_match"] = (_match_plates_to_orders(world, bb, book)
+                          if getattr(world, "orders", None) is not None else {})
     for cand in candidates:
         ok, _ = _feasibility_of(cand, ctx, bb)
         if ok:
@@ -520,6 +847,23 @@ W_URGENCY = 5.0
 # 时间压力权重：锅熟了/快糊了要越早去端。pressure 曲线 0~2（0=生、1=刚熟、
 # 2=快糊），权重越高，熟料/快糊锅越能压过备菜、送餐等普通候选。
 W_PRESSURE = 5.0
+
+# 已经端着目标盘去盛熟料时的加分：端盘盛饭本身就能把料从锅里取走、停
+# 烧糊计时，还顺带完成这单；不该输给「把锅端离灶台」的救锅兜底。
+# 2.0 足够压过同一口锅 pressure 的差值（实测 4.5~6.0 一带），但压不过
+# 真正的快糊/火情（L1/L2 的 pressure 更高，且这里只在 L_RESCUE/L_PREP 生效）。
+W_HELD_PLATE = 2.0
+# 手里端着成品盘/熟锅时，需要空手的备菜 task 的腾手代价。必须压过
+# ThrowBatch(2.5) 这类低分候选：否则送餐一失败就切去扔料，树首
+# EnsureHandsFree 把成品盘放到柜台上（trace-20261111-001945 t=458）。
+W_HANDS_VALUABLE = 6.0
+# 这些 task 的树首是 EnsureHandsFree；手里有贵重物时选它们 = 直接放下。
+_HANDS_DROP_PRONE_TYPES = frozenset({
+    "ThrowBatch", "FetchToBoard", "FetchToPlate", "FetchToCooker",
+    "FillCooker", "PlaceCleanPlate", "MergePlates", "FetchToCarrier",
+    "FillCarrier", "PlaceCarrierInCooker", "Chop", "Prefetch",
+})
+_HANDS_PENALTY_TYPES = _HANDS_DROP_PRONE_TYPES
 # 洗盘压力权重：干净空盘越少越该洗（同 pressure 口径：0=充足、1=只剩一块、
 # 2=用光）。无盘时拼装被卡死，需压过备菜与填灶；只剩一块时提前补盘但不盖过
 # 送餐。
@@ -558,28 +902,22 @@ W_PRESSURE = 5.0
 # 问题。「不能压过快糊的锅」同理（L1 > L4）。若 W_NO_PLATE_PLACED 变动，
 # 上面那个区间要重算。
 W_PLATE_PRESSURE = 2.5
-W_ETA = 0.1
 
 # Plan 4 Task 4 权重（spec §6.8）
 W_ASYNC_RESOURCE = 2.0      # 异步资源优先（FetchToCooker > FetchToPlate）
 W_COMPLETION_RATIO = 1.0     # 完成度（盘里食材越接近完成优先级越高）
-W_INGREDIENT_REUSE = 0.5     # 食材复用（一次取料满足多个订单）
 # Combo 队首加分 / 跳单惩罚（第 3 组 3.3/3.4）。
 #
-# 量级依据（ai/economy.py 的实测收益函数）：新鲜度最多差 5 分（3→8，相对
+# 量级依据（ai/economy.py 的实测收益函数）：小费档位最多差 5 分（3→8，相对
 # base 60 只有 8%），而 combo 到 3 就系数翻倍、到 5 是 4 倍。所以优先级是
-# **不丢单 >> 按序送 >> 送得新鲜**，combo 项必须显著高于新鲜度项，否则两者
-# 在同一量级上互相抵消（队首不新鲜、后面某单很新鲜时该听谁的）。
+# **不丢单 >> 按序送 >> 送得新鲜**，combo 项必须高于小费档位差。
 #
-# 上限控制在 2.0：它叠加在 W_DELIVER_BONUS(3.0) 之上，合计 5.0 已与端刚熟的
-# 锅（W_PRESSURE*1.0）持平——再高就会为了保连击而让锅烧糊。
+# 上限控制在 2.0：与 W_COMBO_BREAK 一起形成 4.0 的队首/跳单分差——再高就会
+# 为了保连击而让锅烧糊（L2 救料层仍结构性优先）。
 W_COMBO_HEAD = 2.0
 # 跳单惩罚：队首仍可救时，送后面的单会把连击打断。取与加分同量级，形成
 # 「送队首 +2.0 / 送别人 -2.0」的 4.0 分差，足以压过备菜但不盖过救锅。
 W_COMBO_BREAK = 2.0
-# 新鲜度加分（满档与最低档之差）。实测只值 5 分小费，故权重取小。
-W_FRESHNESS = 0.6
-
 # 备菜吃 combo 偏好时的折扣。备菜离"兑现连击"还隔着好几步，不该和送餐等价，
 # 更不该盖过救锅（W_PRESSURE）/ 填灶（W_COOKER_IDLE）。
 #
@@ -591,7 +929,9 @@ COMBO_PREP_DISCOUNT = 0.25
 # 哪些备菜 task 吃 combo 偏好：都是「为某一单推进一步」的类型。
 # 不含 FillCooker（订单无关）与清理类。
 _COMBO_PREP_TYPES = ("FetchToPlate", "FetchToBoard", "Chop",
-                     "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate")
+                     "FetchToCooker", "TakeCookedToPlate", "PlaceCleanPlate",
+                     "FetchToCarrier", "FillCarrier", "PlaceCarrierInCooker",
+                     "MergePlates")
 W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩罚）
 
 # 填灶权重（第 1 组 1.4）：灶空转的机会成本是 12 秒不可压缩的时钟，补不回来。
@@ -613,33 +953,24 @@ W_DEADLINE_LOOKAHEAD = 10.0  # 截止前瞻（会导致烧糊/超时的 task 惩
 # （见 _deadline_forecast 的 ② 已移除那段），备菜候选的净分被压到 -4 左右，
 # 4.0/4.8 不战而胜。删掉重复计分后，备菜的真实合计是 **4.97**
 # （urgency 3.72 + ingredient_reuse 1.0 + combo_head 0.25，实测灶全空 3 单要米）。
+# ingredient_reuse 与 eta 已删除：同场景备菜降到 ~3.97，5.6 仍是 L6 的最高毛收益；
+# 刚熟/快糊的锅在 L1/L2，层序保证它们先于填灶，不需要再做净值比较。
+# 组装推进的固定加分。量级只需压过备菜的 combo_head（W_COMBO_HEAD *
+# COMBO_PREP_DISCOUNT = 0.5，实机常见 0.25），不参与跨类优先级：真正决定
+# 「该不该组装」的还是 urgency / 盘供应 / 灶缺口。
 #
-# 5.6 的推导依赖 **eta ≈ -1.5**：5.6 - 1.5 = 4.1 > 3.47，留 0.6 余量。
-# spec §10 列着「两套耗时常数统一」（EST_* 10/20/15/5 vs eta.COST_* 125/30/120/50），
-# 那件事会改 eta 的量级 —— 届时这个 5.6 必须重算。
-#
-# 注意 5.6 > W_PRESSURE*1.0 = 5.0，**字面上**违反了「不能压过端刚熟的锅」这条
-# 约束。但 cooker_idle 要扣 eta（净 4.1），而端熟锅的 pressure 分不扣同量 eta，
-# 所以净值仍是端熟锅优先。下面那条测试钉的是**净值**关系，不是常量大小。
+# 为什么需要它：组装（把料放到饼底、把饼底送进烤箱）是这条链上唯一的「兑现」
+# 一步，但它的分项和取料同源，同分时按候选顺序输给 FetchToBoard。实机
+# trace-20261109-124818 两个灶空了 225 秒，P2 一直在 FetchToBoard/Chop。
+W_ASSEMBLY = 0.3
 W_COOKER_IDLE = 5.6
 # 缺口饱和点：缺 3 份以上就算"满额紧急"，再多不额外加分——否则开局 5 单
 # 全要米时填灶会盖过送餐和灭火。
 COOKER_SHORTFALL_SATURATION = 3
-
-# 送餐优先（先上得分更高）：料齐的盘应尽快送出去，压过继续备菜的候选。
-# 取值要压过 W_ASYNC_RESOURCE(2.0)+completion_ratio(1.0)，但低于快糊锅
-# 的 pressure 分（W_PRESSURE*2.0=10.0），否则会耽误端快糊的锅（实机烧糊）。
-# 注：刚熟的锅 pressure 分 = W_PRESSURE*1.0=5.0，略高于送餐——熟料优先
-# 于送餐（锅会烧糊，盘不会）。若实机发现送餐被压过头，可下调 W_PRESSURE。
-# 由 4.0 降到 3.0：4.0 会把 DeliverPlate 抬到比当前 task 高 2.0 以上、频繁
-# 打破承诺惯性（实机：备菜/传盘做到一半被送餐抢走）。3.0 仍高于备菜（2.0
-# async + 1.0 completion），但分差落在 COMMITMENT_MARGIN(2.0) 内，不轻易改选。
-#
-# **分层后本权重已不参与打分**（Ruling 3 / spec §7.1）：deliver_bonus 不在任何
-# 层的白名单里——L3 兑现层的全部候选都是 DeliverPlate，给每个加同一个常数不改变
-# 任何排序。常量保留是因为三个测试文件引用它算量级天花板，删它会连带改测试，
-# 而「既有测试零改动」是分层正确性的核心证据。
-W_DELIVER_BONUS = 3.0
+# 盘量折扣下限：需要该熟料的订单一张盘都没有时，填灶只保留 25% 优先级。
+# 不能直接归零——否则「没盘 → 不煮 → 单过期」的死锁会回来（见
+# tests/test_fill_cooker_priority.py::test_fill_is_not_gated_on_having_a_plate）。
+FILL_PLATE_DISCOUNT_FLOOR = 0.25
 
 # 摆盘压力权重：一块盘都没就位时 = 拼装链没有落点，和「0 干净盘」等价
 # 地卡死整条装配。
@@ -663,53 +994,16 @@ W_DELIVER_BONUS = 3.0
 # （pressure 4.17/6.00）让位摆盘，快糊的锅（8.08）仍优先救。
 W_NO_PLATE_PLACED = 3.0
 
-# 1-3 关卡 relay task 的固定加分。
-#
-# **约束机制已变（Ruling 44）**：原注释写「必须低于端熟锅 pressure（≈5.0）和
-# 送餐（W_DELIVER_BONUS≈4.0），否则米熟了 P2 还在传盘、锅烧糊」——那个实机现象
-# 是真的，但分层后这两条「必须低于」都不再由**数值余量**保证，而由**层序**保证：
-#   - 送餐在 L3 兑现、传盘在 L6 备菜 → 送餐结构性优先（且 deliver_bonus 已不
-#     参与打分，不在任何层白名单里）；
-#   - 端熟锅在 L1/L2（pressure >= 1.0 即进救料层）、传盘在 L6 → 同理，且
-#     pressure 不在 L6 的白名单里。
-#
-# 所以这个数现在只需在 **L6 层内**与备菜的其余项可比（urgency / completion_ratio
-# / async_resource / ingredient_reuse / combo_* 等）。原注释的第二句「传盘是协作
-# 支线，低于下锅（W_ASYNC_RESOURCE≈2.0），否则 P2 一直传盘、不下锅煮（实机复现）」
-# **仍然有效**——两者同在 L6，仍靠数值分先后。
-#
-# 传盘（PlaceToRelay）是协作支线，低于下锅（FetchToCooker 的
-# W_ASYNC_RESOURCE≈2.0），否则 P2 一直传盘、不下锅煮（实机复现）。
-_RELAY_BONUS_1_3 = {
-    "PlaceToRelay": 1.5,
-}
-
-# 手部前置的腾手代价（spec §6.1(b)）：task 需要空手但手里有东西时，按
-# "约 EnsureHandsFree 的步数"折算成 ETA 代价。它不是"判不可行"，而是让
-# 打分能比较"先放下手里的活去干它"与"先把手里的活收尾"。
-HAND_CLEAR_STEPS = 10
-
-# 拾取代价（spec §6.1(b)）：holding_cooked / holding_plated_dish 这类前置
-# 的"手不对"不是要腾手，而是过去把目标物捡起来（锅/盘就在那儿），成本远
-# 低于 EnsureHandsFree 的清手。用同 HAND_CLEAR_STEPS 会让 DeliverPlate /
-# TakeCookedToPlate 被 10 步清手惩罚压着，做好的盘送不出去（实机复现）。
-HAND_PICKUP_STEPS = 3
-
-# 搬料惩罚：FetchToBoard 的来源若是"另一块板"，它其实是"搬"而非"取"，
-# 零产出。按 ETA 步数折算成代价，让 Chop（有产出）优先。数值取远大于
-# EST_CHOP，保证"搬"永远打不过"切"。
-MOVE_PENALTY_STEPS = 50
 
 # ==================== 承诺惯性（Plan 3 Task 6）====================
 
 # 承诺惯性常量（spec §6.5）
 COMMITMENT_MARGIN = 2.0         # 改选门槛（分数差）
 PROGRESS_BONUS_PER_STEP = 1.0   # 每完成一步的进度加成
-INFEASIBLE_THRESHOLD = 3        # 连续多少拍不可行才放弃
-
-# Task 5: 承诺穿插常量
-INTERLEAVE_THRESHOLD = 5        # 剩余步数阈值（低于此值不允许穿插）
-INTERLEAVE_PENALTY = 3.0        # 穿插的额外分数门槛
+# 连续多少拍不可行才放弃承诺。插件 5Hz（一帧 4 拍），3 拍 < 一帧：
+# 移动筏的格子投影闪一帧就够把任务切走，随后另一棵树的首步把手里的料/盘
+# 放下（trace-20261111-001945 t=477~529）。8 拍 = 2 帧，留一帧迟滞。
+INFEASIBLE_THRESHOLD = 8
 
 
 # ==================== 每拍 1:1 匹配（盘↔订单 / 灶↔订单）====================
@@ -778,6 +1072,48 @@ def _pinned_plate_order(world, bb, book):
     return (pid, oid)
 
 
+# 盘可交互的宽限（拍）：移动筏的格子投影会让 can_interact 逐帧翻转。
+# 5 秒内仍把盘算进匹配，别让 TakeCookedToPlate 一帧消失、退回 RescueCooked。
+PLATE_REACH_GRACE_TICKS = 100
+
+
+def _chopped_supply(world, book, bb=None):
+    # type: (World, RecipeBook, object) -> Dict[str, int]
+    """切好的料（散落/砧板上、P2 够得着）的盘态 token 供给：token → 份数。
+
+    与 cooked_sources 平行：熟料用 cooked:{raw}:{cookware}，切料用
+    want_tokens(ing) 的盘态 token（如 SushiFish → sushifish）。只数
+    world.items（散落物，含 on_station 指向砧板的）；不数 workstations——
+    那是同一份料的冗余视角，会 double count。逐份查 P2 可达：切料在 P1 侧
+    不算（P2 拿不到）。只算订单要切的成分，逐 ing 去重。
+    """
+    supply = {}  # type: Dict[str, int]
+    seen = set()  # type: Set[str]
+    rctx = reachability.context(world, bb)
+    for o in getattr(world, "orders", None) or ():
+        for ing in book.requirements(o):
+            key = str(ing).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not book.needs_chopping(ing):
+                continue
+            chopped = str(book.chop_target(ing) or "").lower()
+            if not chopped:
+                continue
+            n = 0
+            for it in getattr(world, "items", None) or ():
+                if str(it.get("n") or "").lower() == chopped \
+                        and not it.get("held_by") \
+                        and it.get("flying") is not True \
+                        and reachability.can_interact(rctx, it):
+                    n += 1
+            if n:
+                for tok in book.want_tokens(ing):
+                    supply[tok] = supply.get(tok, 0) + n
+    return supply
+
+
 def _match_plates_to_orders(world, bb, book, orders=None):
     # type: (World, Blackboard, RecipeBook, Optional[List[Dict]]) -> Dict[Any, Any]
     """盘↔订单 1:1 匹配（每拍重算、不写黑板）。返回 {plate_id: order_id}。
@@ -789,34 +1125,55 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     成本 missing = |单需求token − 盘token|。空盘 missing=整道菜，自然排最后、
     只填没盘的订单。
 
-    排序第一键是「是否队首」：队首（combo 队首，id 最小）优先拿盘，否则
-    接近完成的盘会被配给需求更少的非队首单、队首反而没盘 → 跳单送餐、combo
-    断。熟锅没盘可由 RescueCooked 端锅离火兜住，不必在这里优先。
+    排序第一键是「这块盘能否立刻用上」：订单有已熟未糊的熟料源、且这份熟料
+    该单要而盘里还缺。第二键才是「是否队首」：队首（combo 队首，id 最小）
+    优先拿盘，否则接近完成的盘会被配给需求更少的非队首单、队首反而没盘 →
+    跳单送餐、combo 断。
+
+    第一键对队首同样评估：队首能立刻用时照旧赢；只有队首这拍用不上、别的
+    单的熟锅却等着装盘时，才把盘让出去（送餐的 combo 由 _breaks_combo 守）。
+    否则缺料数键让需求更少的菜永远赢共用料的盘——实机 2-2
+    （trace-20261030-224658 t=660/1901 等 4 局 9 次）：意面盘绑给缺肉、
+    肉锅都没开的 MeatOnly，Marinara 的熟鱼/熟虾没盘只能 RescueCooked。
     """
     raw_orders = orders if orders is not None else world.orders
     orders = [o for o in raw_orders if o.get("id") is not None]
     if not orders:
         return {}
     want = {o["id"]: book.order_want_tokens(o) for o in orders}
+    # 已装料载体能补上的料（不看盘的初配）：缺料数要扣掉它，否则空盘对
+    # 「卷已包齐、只差一只盘」的单也算全缺，唯一的空盘会被分给别的单。
+    # 载体与盘不重复的约束在 match_carriers_to_orders 定盘后再查。
+    carrier_cover = {}  # type: Dict[Any, Set[str]]
+    for oid, c in CR.match_carriers_to_orders(world, book, None, orders=orders).items():
+        carrier_cover[oid] = set(c["contents"]) | {c["base"]}
     head = _combo_head_id(orders)
+    # 已熟未糊、可直接倒进盘的熟料供给：token → 几口锅（灶上熟锅 + 散熟锅）
+    supply = {}  # type: Dict[str, int]
+    for src in cooked_sources(world, book):
+        for tok in src["tokens"]:
+            supply[tok] = supply.get(tok, 0) + 1
+    # 切好的料（散落/砧板上）也当「能立刻用上」的供给：队首鱼片单只差切好的鱼，
+    # 也该优先拿盘，别被「米饭熟了」的黄瓜单把空盘抢走
+    # （trace-20261112-234841 t=650 空盘 -21228 被绑给 order#3 而非队首 order#1）。
+    for tok, n in _chopped_supply(world, book, bb).items():
+        supply[tok] = supply.get(tok, 0) + n
 
     # 匹配「已就位」的盘（落在 counter 拼装格上）+ P2 手里正端着的盘
-    # + 掉在地上且带料的半成品盘。仍排除：
+    # + 掉在地上且带料的半成品盘 + 干净盘堆（取盘站/沥碗架）的顶层盘。
+    # 堆顶盘能直接倒料、直接端去盛锅，不必先 PlaceCleanPlate 挪到台面；
+    # 插件 0.23.4+ 用 stack_top 标出顶层，旧帧无此字段时堆里的空盘照旧不匹配。
+    # 仍排除：
     #   - P1 手里端着的盘：P2 没法往 P1 手里的盘倒料、也没法端走；
-    #   - 沥碗架（plate_return+DryingPart）/ 盘堆里的**空**盘：空盘该走
-    #     PlaceCleanPlate 端到拼装格。空盘不匹配的另一个原因是堆叠里只有顶层
-    #     能被倒料，而 plates[] 没有高度/层信息，直接匹配空盘会误绑到中间层；
+    #   - 盘堆中间层/底层的盘：交互只作用于顶层，绑定它 done 永远等不到；
     #   - 洗碗池里还没洗的盘：脏盘不参与装配。
     # 地上的带料盘必须算进来：盘被碰掉/掉落后若不算，就成孤儿——没有任何
     # task 再 target 它（实机 trace-20261018-104804：BoiledPasta 盘掉地后
     # 躺到收盘没人碰）。
-    counter_cells = set()  # type: Set[Tuple[int, int]]
-    for st in world.stations:
-        if st.get("t") != "counter":
-            continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is not None and gz is not None:
-            counter_cells.add((int(round(gx)), int(round(gz))))
+    # 台面格用主网格坐标（x/z 投影）：篮子台面的 gx/gz 是篮子本地坐标，和
+    # _plate_cell 的主网格投影比永远对不上，篮子上的盘都不算「已就位」。
+    from ai.query.recipe_graph import _counter_cells
+    counter_cells = set(_counter_cells(world))  # type: Set[Tuple[int, int]]
     # P2 手里正端着的盘也计入匹配：端盘盛饭/送餐中盘会离开 counter 格，
     # 但「离开台面」不等于「丢了」。漏掉它会在 AI 端起盘的那一拍把订单
     # 重绑到另一块空盘 → task 身份变化 → 树重建 → 手里这块被放下（实机：
@@ -825,6 +1182,7 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     p2_held_plate = P.held_name(p2) if p2 is not None else ""
     p1 = P.chef_by_name(world.chefs, P.P1_NAME)
     p1_held_plate = P.held_name(p1) if p1 is not None else ""
+    rctx = reachability.context(world, bb)
     edges = []
     for p in P.all_plates(world):
         pid = p.get("n")
@@ -838,18 +1196,58 @@ def _match_plates_to_orders(world, bb, book, orders=None):
         # 地上散盘（有料、非手持、不在台面）：被碰掉/掉落的半成品盘也要能
         # 继续加料/盛饭/送餐。空盘（count==0）不在这里匹配——照旧走
         # PlaceCleanPlate 端到拼装格，避免改变空盘的行为。
+        buried = P.plate_buried_in_stack(p)
         loose_with_contents = (not on_counter and not held_by_p2
-                               and not held_by_p1 and P.plate_count(p) > 0)
-        if not (on_counter or held_by_p2 or loose_with_contents):
+                               and not held_by_p1 and not buried
+                               and P.plate_count(p) > 0)
+        stack_top = not held_by_p1 and P.plate_stack_top(p)
+        if not (on_counter or held_by_p2 or loose_with_contents or stack_top):
             continue
+        # 盘先要 P2 够得着才有意义：4-2 的盘会随竹筏漂到对面，把 P2
+        # 够不着的盘配给队首单会让 TakeCookedToPlate 恒 unreachable，
+        # 同时占住 P2 这侧唯一能用的空盘，整局没任务可做
+        # （trace-20261110-233159 t=1600~1726：-19556 在 Raft One、
+        # -19560 在 Raft Two，队首 All 单绑到 -19556，AI 静止）。
+        if not held_by_p2:
+            pid_key = str(pid)
+            if reachability.can_interact(rctx, p):
+                if bb is not None:
+                    until = getattr(bb, "plate_reachable_until", None)
+                    if isinstance(until, dict):
+                        until[pid_key] = (
+                            getattr(bb, "tick", 0) + PLATE_REACH_GRACE_TICKS)
+            elif not (
+                    bb is not None
+                    and isinstance(getattr(bb, "plate_reachable_until", None),
+                                   dict)
+                    and bb.plate_reachable_until.get(pid_key, 0)
+                    > getattr(bb, "tick", 0)):
+                # 从没够着过、或宽限期已过：不把对面/漂远的盘配给订单。
+                continue
         tokens = book.plate_tokens(p)
+        # 同等缺料时台面盘优先于堆顶空盘：已摆好的盘不该被晾成孤儿。
+        stack_rank = 1 if (stack_top and P.plate_count(p) == 0) else 0
         for o in orders:
             oid = o["id"]
             wt = want[oid]
             if tokens <= wt:
                 is_not_head = 0 if oid == head else 1
-                edges.append((is_not_head, len(wt - tokens), _remaining_of(o),
-                              str(pid), str(oid), pid, oid))
+                cover = carrier_cover.get(oid, set())
+                if cover & tokens:
+                    cover = set()      # 载体的料盘里已有：这只盘用不上载体
+                # 缺料数不能直接 wt - tokens - cover：熟料的订单 want 同时带
+                # rich token（cooked:{raw}:{cookware}）和旧帧 opaque
+                # COOKED_PLATE_TOKEN，detail 帧的盘只有 rich token，set 减法
+                # 会把 opaque 误算成「还缺一样」——队首已完整的熟料盘 missing
+                # 恒 ≥1，head_complete 判据永不成立，被「能立刻用上」的非队首
+                # 单把盘抢走（trace-20261113-000718 t=3380 Sushi_Fish 盘被改绑
+                # 去 Sushi_All）。用 book.missing（交集口径，见 recipes.py）
+                # 取顶层缺料数，再扣掉载体覆盖的料。
+                missing = sum(1 for ing in book.missing(o, p)
+                              if not (cover and (book.want_tokens(ing) & cover)))
+                edges.append((is_not_head, missing, stack_rank,
+                              _remaining_of(o), str(pid), str(oid), pid, oid,
+                              (wt & set(supply)) - tokens, bool(cover)))
     # 钉死手持盘：P2 当前承诺绑定的盘不参与贪心重排，保持它和订单的配对。
     # 否则 P1 往另一块盘里放一样料，就能让贪心 tiebreak 翻盘、把 P2 手里的盘
     # 改绑走（实机 trace-20261017-172221 t=663：换盘导致丢盘、熟饭烧糊）。
@@ -857,14 +1255,45 @@ def _match_plates_to_orders(world, bb, book, orders=None):
     matched = {pinned[0]: pinned[1]} if pinned else {}  # type: Dict[Any, Any]
     used_plates = set(matched.keys())  # type: Set[Any]
     used_orders = set(matched.values())  # type: Set[Any]
-    edges = [e for e in edges if e[5] not in used_plates]
-    edges.sort(key=lambda e: (e[0], e[1], e[2], e[3], e[4]))
-    for _is_head, _missing, _rem, _pid_s, _oid_s, pid, oid in edges:
-        if pid in used_plates or oid in used_orders:
-            continue
-        matched[pid] = oid
-        used_plates.add(pid)
-        used_orders.add(oid)
+    edges.sort(key=lambda e: e[:6])
+
+    def take_supply(usable):
+        # type: (Set[str]) -> bool
+        for tok in sorted(usable):
+            if supply[tok] > 0:
+                supply[tok] -= 1
+                return True
+        return False
+
+    # 钉住的配对若能用上熟料，也占掉一份供给。
+    for e in edges:
+        if pinned and (e[6], e[7]) == pinned:
+            take_supply(e[8])
+            break
+    edges = [e for e in edges if e[6] not in used_plates]
+    # 第一轮：只配「能立刻用上」的边，每配一条扣一份熟料供给——一口熟鱼锅
+    # 只够让一块盘提前，别让两单 Marinara 都以为自己能用。该单有可放进这
+    # 只盘的已装料载体（包好的卷）也算能立刻用上：载体本就 1:1 配给订单，
+    # 不必扣供给。第二轮：其余边按原序（队首 → 缺料数 → …）配。
+    for first_pass in (True, False):
+        for e in edges:
+            pid, oid, usable, carrier_ready = e[6], e[7], e[8], e[9]
+            if pid in used_plates or oid in used_orders:
+                continue
+            if first_pass:
+                # 第一轮放行「能立刻用上」的边（熟锅/载体）；另加「队首且已
+                # 完整」的边——它不缺料、该立刻绑定送掉，否则会被「能马上加
+                # 熟料」的队尾半成品边抢走、绑错单（trace-20261112-230754
+                # 盘 -44018 已完整 Sushi_PlainFish 却被绑去 Sushi_Fish）。
+                # 队首半成品盘不在这里放行：它这拍用不上，仍允许熟锅等的队尾
+                # 边先拿盘（test_match_plates_cooked_order_takes_plate_head_cannot_use）。
+                head_complete = (e[0] == 0 and e[1] == 0)
+                if not head_complete and not carrier_ready \
+                        and not (usable and take_supply(usable)):
+                    continue
+            matched[pid] = oid
+            used_plates.add(pid)
+            used_orders.add(oid)
     return matched
 
 
@@ -892,7 +1321,7 @@ def _burn_eta_ticks(c):
     # type: (Dict) -> Optional[float]
     """这口灶还有多少**拍**烧糊；没在煮则 None（无烧糊截止）。
 
-    字段语义按真实帧实测（trace-20261014-011202）：
+    字段语义按真实帧实测：
 
       - `cooking_time` 是**常量容量**（Sushi_1_4_2P 恒为 12），不是已耗时；
       - `cooking_progress` 是进度，单位≈秒（实测 1.07/秒）；
@@ -922,8 +1351,9 @@ def _burn_eta_ticks(c):
     return max(0.0, (burn_at - prog) * TICKS_PER_SECOND)
 
 
-def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
-    # type: (World, Blackboard, RecipeBook, Dict[Any, Any], Optional[List[Dict]]) -> Dict[Any, Any]
+def _match_cookers_to_orders(world, bb, book, plate_match, orders=None,
+                             carrier_match=None):
+    # type: (World, Blackboard, RecipeBook, Dict[Any, Any], Optional[List[Dict]], Optional[Dict[Any, Dict]]) -> Dict[Any, Any]
     """熟料源↔订单 1:1 匹配（每拍重算）。返回 {source_id: order_id}。
 
     orders 显式传入时只用这些单（同 `_match_plates_to_orders`）；缺省仍读
@@ -950,7 +1380,9 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
         if not (c.get("isCooking") or c.get("cooked")
                 or c.get("burning") or c.get("onFire")):
             continue
-        names = book.cooked_of_raw(raw[0])
+        # 多料同炉（整份披萨）按生料集精确反查；单料锅沿用 comp[0] 口径
+        names = (book.cooked_of_raws(raw) if len(raw) > 1 else []) \
+            or book.cooked_of_raw(raw[0])
         if not names:
             continue
         toks = set()  # type: Set[str]
@@ -971,8 +1403,11 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
                         "danger": 0.0})
     if not sources:
         return {}
-    needy = {}  # type: Dict[str, List[Tuple[Any, Dict]]]
     raw_orders = orders if orders is not None else world.orders
+    if carrier_match is None:
+        carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                    orders=raw_orders)
+    needy = {}  # type: Dict[str, List[Tuple[Any, Dict]]]
     for o in raw_orders:
         oid = o.get("id")
         if oid is None:
@@ -983,6 +1418,9 @@ def _match_cookers_to_orders(world, bb, book, plate_match, orders=None):
             if not book.needs_cooking(ing):
                 continue
             if matched_plate is not None and book.plate_has(matched_plate, ing):
+                continue
+            # 该单的载体里已有这份熟料（包了熟肉的卷饼）：锅留给别的单
+            if CR.carrier_covers(book, carrier_match.get(oid), ing):
                 continue
             token = book.rich_token(ing)
             if token:
@@ -1028,6 +1466,62 @@ def select_task(world, bb, order, book):
     return plan(world, bb, order, book)[0]
 
 
+def feasible_candidates(world, bb, book, command_scope=None):
+    # type: (World, Blackboard, RecipeBook, Any) -> Tuple[List[Any], List[Any], Dict, Dict, Dict]
+    """只读地算出当前可行候选；供对话层的命令调度用。
+
+    与 `plan` 的候选生成、可行性过滤同口径，但不选任务、不写黑板、不触发
+    截止闸/承诺惯性。`command_scope` 非空时只保留命中 scope 的候选。
+    """
+    live_orders = _dialog_live_orders(world, bb)
+    plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
+    carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                orders=live_orders)
+    cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
+                                            orders=live_orders,
+                                            carrier_match=carrier_match)
+    slack_map = ETA.solo_slack_by_order(world, book, plate_match,
+                                        cooker_match, orders=live_orders)
+    candidates = generate_candidates(world, bb, None, book,
+                                     plate_match, cooker_match, carrier_match)
+    ctx = _make_context(world, bb, book)
+    ctx["plate_match"], ctx["cooker_match"] = plate_match, cooker_match
+    time_left = _time_left_ticks(world)
+    feasible = []
+    for cand in candidates:
+        ok, _veto = _feasibility_of(cand, ctx, bb, time_left=time_left)
+        if not ok:
+            continue
+        if command_scope and not scope_matches(command_scope, cand.task):
+            continue
+        feasible.append(cand)
+    return feasible, candidates, ctx, plate_match, cooker_match
+
+
+# 命令 scope 之外仍允许抢占命令的动作：它们会随时间恶化，晚一步就糊/着火。
+# 其它任务（取料/切/装盘等）仍然严格受命令 scope 约束，避免把用户指令饿死。
+# Reposition 也在内：换布局的连通窗口只有 2~3 秒，错过就被关在另一侧 31 秒；
+# 命令本身不会丢，窗口一关立刻回来接着做（trace-20261109-123544 t=152/187/220
+# 三个窗口都是被一条迟迟完不成的 plate 命令挡住的）。
+PREEMPT_COMMAND_TYPES = ("RescueCooked", "TakeCookedToPlate", "FillCarrier",
+                         "Extinguish", "Reposition")
+
+
+def _preempts_command(task):
+    # type: (Any) -> bool
+    return getattr(task, "TYPE", None) in PREEMPT_COMMAND_TYPES
+
+
+def _scope_with_preemption(feasible, command_scope):
+    # type: (List[Candidate], Any) -> List[Candidate]
+    """命令 scope 内候选 + 允许抢占的恶化型候选（去重：scoped 优先）。"""
+    scoped = [c for c in feasible if scope_matches(command_scope, c.task)]
+    urgent = [c for c in feasible
+              if _preempts_command(c.task)
+              and not scope_matches(command_scope, c.task)]
+    return scoped + urgent
+
+
 def plan(world, bb, order, book):
     # type: (World, Blackboard, Optional[Any], RecipeBook) -> Tuple[Optional[Any], Dict]
     """select_task 的完整版：额外返回候选/打分明细（供 trace 记录）。
@@ -1041,11 +1535,21 @@ def plan(world, bb, order, book):
     尾部两项由分层添加：layer 是该候选所在层，in_top_layer 标记它是否进了打分
     （spec §6）。`top_layer` 是**实际选中**的层；分工认领只影响该层内评分。
     截止闸打开且抢到的候选还会写 `rescue_override`（订单 id）。
-    plan_firefighting 不分层，仍发 6 元组。
 
     candidates 含**全部**生成候选：被可行性过滤掉的（ok=False）也保留，
     并用 veto 标注被否决原因，方便复盘「为什么没选拿熟饭」。
     """
+    # 临时停手（cancel_action 之后）：planner 不选任何任务。
+    hold_until = getattr(bb, "hold_until", 0) or 0
+    if hold_until and getattr(bb, "tick", 0) < hold_until:
+        record = _record([], {}, {})
+        record["hold"] = True
+        return None, record
+
+    # 对话层临时命令：只在命令 scope 内选任务；scope 没可行任务时由
+    # Agent 标 waiting 并尝试下一条命令。
+    command_scope = getattr(bb, "command_scope", None)
+
     # ⓪ 同步硬停止/放弃整单；柔性分工认领不打断当前承诺。
     _clear_claimed_commitment(bb)
     # ⓪.1 抢回保护期只保护「还在执行的那个 task」：承诺已清（做完/失败/
@@ -1056,17 +1560,29 @@ def plan(world, bb, order, book):
     # 替活单占掉 1:1 盘/灶匹配或队列容量。
     live_orders = _dialog_live_orders(world, bb)
 
+    # ⓪.6 断供看门狗：**暂时停用**。override 撤销 cook 的 -6 认领负分后，
+    # P2 会从正在做的事（尤其手里拿着料、正要装盘）切走去补锅；先关掉观察。
+    # 此前它还会把分差推到穿插阈值以上，暴露逐拍交替；穿插逻辑已删除（切换
+    # 后重新打分），不再有那个问题。要恢复这条行为时取消注释即可。
+    # 函数与相关测试保留。
+    # _update_supply_watch(world, bb, book)
+    # ⓪.7 4-1 过街灯态：记录行人红灯起始拍（Approach 只在刚亮/长红灯起步）。
+    traffic.observe(world, bb)
     # ① 每拍 1:1 匹配（盘↔订单、灶↔订单，只算不写黑板）
     plate_match = _match_plates_to_orders(world, bb, book, orders=live_orders)
+    # 已装料载体（包了熟肉的卷饼等）↔订单：覆盖的料不再配锅、不再备料
+    carrier_match = CR.match_carriers_to_orders(world, book, plate_match,
+                                                orders=live_orders)
     cooker_match = _match_cookers_to_orders(world, bb, book, plate_match,
-                                            orders=live_orders)
+                                            orders=live_orders,
+                                            carrier_match=carrier_match)
     # 独立 slack：打分 urgency、截止闸 cushion 两处共用。
     slack_map = ETA.solo_slack_by_order(world, book, plate_match,
                                         cooker_match, orders=live_orders)
 
     # ② 生成候选（多订单模式：枚举所有订单）
     candidates = generate_candidates(world, bb, order, book,
-                                     plate_match, cooker_match)
+                                     plate_match, cooker_match, carrier_match)
     if not candidates:
         _finalize_rescue_hold(bb, None)
         record = _record([], plate_match, cooker_match)
@@ -1075,6 +1591,9 @@ def plan(world, bb, order, book):
 
     # ③ 可行性过滤（同时记下每个候选的否决原因）
     ctx = _make_context(world, bb, book)
+    # StashHeld 判「手里的生料是否多余」要和 recipe_graph 用同一份匹配，
+    # 否则一边不再发切菜候选、一边不让放下，P2 拿着料干站（见 chop_waiters）。
+    ctx["plate_match"], ctx["cooker_match"] = plate_match, cooker_match
     time_left = _time_left_ticks(world)
     feasible = []  # type: List[Candidate]
     ok_map = {}    # type: Dict[Any, Tuple[bool, str]]
@@ -1084,9 +1603,31 @@ def plan(world, bb, order, book):
         if ok:
             feasible.append(cand)
 
+    # ③.4 对话层临时命令：只在 scope 内选任务。没有可行任务时返回空记录，
+    # 由 Agent 把命令标 waiting、尝试下一条命令。
+    # 例外：会随时间恶化的动作（熟锅/快糊锅/火）允许在 scope 外抢占当前命令，
+    # 端完/救完后自动回到命令 scope；这不是取消命令。
+    if command_scope:
+        feasible = _scope_with_preemption(feasible, command_scope)
+        if not feasible:
+            record_cands = []
+            for cand in candidates:
+                ok, veto = ok_map[cand.task.key]
+                record_cands.append((cand.task, 0.0, {}, ok, veto, False))
+            record = _record(record_cands, plate_match, cooker_match)
+            record["command_scope_empty"] = True
+            record["branches"] = {str(c.task.key): c.branch
+                                  for c in candidates}
+            return None, record
+
     # ③.5「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中，跳过
     # 层选择 / 打分 / 承诺惯性。L0-L2 救援在闸内让位，这里只在无火情时抢选。
-    imperative = _select_imperative(feasible, world, bb)
+    # 命令模式下命令 scope 本身就是硬指令，不再走旧 now 闸。
+    # 换边闸先于命令 scope：窗口是硬截止，命令不丢（队列不动），关窗即回。
+    # now 闸仍受命令 scope 约束。
+    imperative = _select_reposition(feasible, world, bb)
+    if imperative is None and not command_scope:
+        imperative = _select_imperative(feasible, world, bb)
     if imperative is not None:
         chosen_task = imperative.task
         # 仍用 layer_filter 算 layer_map 供 trace（闸跳过了层选择，但层号是
@@ -1113,7 +1654,9 @@ def plan(world, bb, order, book):
     top_layer = None    # type: Optional[int]
     layer_map = {}      # type: Dict[Any, int]
     in_layer = []       # type: List[Candidate]
+    gate_waits = {}     # type: Dict[Any, float]
     rescue_order = None  # type: Optional[Any]
+    held_crossing = False  # 本拍是否因过街承诺保留旧 task
     if feasible:
         # ③.5 分层（spec §6）。分工偏好只参与同层打分，不改变业务层级：
         # 高层收尾动作即使由 P1 优先负责，仍留在最高层供 P2 必要时补位。
@@ -1130,8 +1673,9 @@ def plan(world, bb, order, book):
         # trace-20261014-204822 有 94% 的可比候选组（3516/3745）urgency 与
         # 到期顺序反向。slack_map 已在候选过滤前算好（选层用它当截止闸 cushion，
         # 送餐 combo 闸用它当 escape）。
+        gate_waits = _gate_waits(feasible, ctx, bb)
         top_layer, in_layer = _select_layer(
-            feasible, world, layer_map, bb, slack_map, bb.tick)
+            feasible, world, layer_map, bb, slack_map, bb.tick, gate_waits)
 
         # 闸只对「本来会被认领负分压掉」的候选生效。记下它们对应的订单，
         # 选中后写冷却与对话事件（让 Agent 能转告玩家「这单要来不及了」）。
@@ -1155,8 +1699,14 @@ def plan(world, bb, order, book):
             # ⑤ 承诺惯性（Plan 3 Task 6）。**分层不改这里一行**：分层管
             # 「挑哪个」，抢占仍由 COMMITMENT_MARGIN 与 pressure>=1.0 跳过
             # 惯性负责（spec §8）。当前承诺若落在低层，它不在 scored 里 →
-            # 走 infeasible_streak 的 3 拍宽限再改选，白捡一个防抖。
-            chosen_task = _apply_commitment_inertia(scored, world, bb)
+            # 走 infeasible_streak 的宽限（INFEASIBLE_THRESHOLD，按 5Hz
+            # 帧计）再改选，白捡一个防抖。
+            chosen_task = _apply_commitment_inertia(scored, world, bb, book)
+            # ⑤.5 过街承诺：已经走到马路上时不因“刚熟”换任务；火/快糊仍可抢。
+            crossing_task = _crossing_hold(world, bb, feasible, chosen_task)
+            if crossing_task is not None:
+                chosen_task = crossing_task
+                held_crossing = True
             score_map = {task.key: (score, terms)
                          for task, score, terms in scored}
             rescue_order = gate_orders.get(getattr(chosen_task, "key", None))
@@ -1188,68 +1738,16 @@ def plan(world, bb, order, book):
     record["top_layer"] = top_layer
     record["layers"] = {str(k): v for k, v in layer_map.items()}
     record["branches"] = {str(c.task.key): c.branch for c in candidates}
+    if gate_waits:
+        # 要在门洞口等门的候选及等待秒数（让位复盘用）
+        record["gate_waits"] = {str(k): round(v, 1) for k, v in gate_waits.items()}
     if rescue_order is not None:
         record["rescue_override"] = rescue_order
+    if held_crossing:
+        record["crossing_hold"] = True
     # 本拍没再选抢回的那个 task（做完 / 不可行 / 被更高层抢走）→ 保护期结束。
     _finalize_rescue_hold(bb, chosen_task)
     return chosen_task, record
-
-
-def plan_firefighting(world, bb, book):
-    # type: (World, Blackboard, RecipeBook) -> Tuple[Optional[Any], Dict]
-    """Firefighting 模式专用规划：生成一个全局 Extinguish 候选。
-
-    返回 (chosen_task, decision_record)，格式与 plan() 一致。
-
-    实机复现：拍 596-727 Firefighting 触发但 P2 完全 idle，原因是 Agent
-    主循环在非 Normal 模式下跳过了 Planner 调用 → candidates=0 → 无任务可选。
-    旧实现按灶逐个生成 Extinguish 候选、每拍选列表里第一个着火的灶，既没有
-    承诺惯性、又会在火复燃时反复换灶（换灶＝重建树＝丢灭火器，实机复现）。
-    现在灭火是一个全局 task：树内部循环处理所有着火灶，这里只发一个候选。
-    """
-    ctx = _make_context(world, bb, book)
-    cands = []  # type: List[Candidate]
-
-    # 有任一着火/烧焦的灶 → 发一个全局 Extinguish（树内部循环处理所有灶）
-    if any(c.get("onFire") or c.get("burning") for c in world.cookers):
-        cands.append(Candidate(T.Extinguish(), [], EST_COOK_OPS))
-
-    if not cands:
-        # 无灶着火（Arbiter 误判 or 火已被 P1 扑灭）→ 返回空
-        return None, {"candidates": []}
-
-    # 可行性过滤
-    feasible_cands = []  # type: List[Candidate]
-    ok_map = {}          # type: Dict[Any, Tuple[bool, str]]
-    for cand in cands:
-        # 火情不受 L3 拉黑约束：着火的那口灶必须一直可攻击（拉黑按资源
-        # id 记，别的 task 在同一口灶上反复失败也会把它写进去）。
-        ok, veto = _feasibility_of(cand, ctx, bb, ignore_abandon=True)
-        ok_map[cand.task.key] = (ok, veto)
-        if ok:
-            feasible_cands.append(cand)
-
-    if not feasible_cands:
-        # 候选不可行（灭火器被 P1 拿走 / 无法到达）
-        record_cands = [(c.task, 0.0, {}, False, ok_map[c.task.key][1], False)
-                        for c in cands]
-        return None, {"candidates": record_cands, "plate_match": {}, "cooker_match": {}}
-
-    chosen = feasible_cands[0].task
-    chosen_key = chosen.key
-
-    # 组装 decision_record（格式同 plan()，方便 trace 记录）
-    record_cands = []
-    for cand in cands:
-        key = cand.task.key
-        ok, veto = ok_map[key]
-        # Firefighting 不打分，统一给 0 分
-        # 火情路径**不分层**（单候选，且 L_FIRE 的白名单为空、分层等于恒等变换），
-        # 所以仍发 6 元组。trace 渲染出的 `chosen=True, in_top_layer=False` 不是
-        # 矛盾：in_top_layer 只对分层路径有意义（spec §6）。
-        record_cands.append((cand.task, 0.0, {}, ok, veto, key == chosen_key))
-
-    return chosen, {"candidates": record_cands, "plate_match": {}, "cooker_match": {}}
 
 
 def _record(candidates, plate_match, cooker_match):
@@ -1311,6 +1809,12 @@ def _matching_preferences(candidate, bb, layer):
         weight = float(getattr(pref, "weight", 0.0) or 0.0)
         if weight < 0 and immune:
             continue
+        # 断供补位：玩家负责 cook 但长时间不煮时，撤销 cook 类任务的认领负分，
+        # 否则 FetchToCooker/FillCooker 永远选不上（4-1 55 秒无米）。
+        if (weight < 0 and getattr(bb, "supply_override", False)
+                and getattr(pref, "kind", None) == "claim"
+                and task.TYPE in SUPPLY_TAKEOVER_TASK_TYPES):
+            continue
         out.append((pref, weight))
     return out
 
@@ -1334,11 +1838,127 @@ def _claim_penalty(candidate, bb, layer):
                if getattr(pref, "kind", None) == "claim" and weight < 0)
 
 
+# 断供补位：灶连续空闲且订单还缺熟料超过这么久，允许 P2 无视「cook 归玩家」
+# 的认领负分去补位下锅。4-1 实机（trace-20261109-223643）：分工 player=cook，
+# FetchToCooker 固定 -6 分，玩家 55 秒没下锅，米断供、寿司一起过期。
+# 截止闸救不了这种局面：它只在「这单还有救」时开（cushion >= 0），
+# 已经进入必死区间的订单不会替 P2 抢下锅。
+SUPPLY_OVERRIDE_TICKS = 160        # 8 秒
+SUPPLY_TAKEOVER_TASK_TYPES = ("FetchToCooker", "FillCooker",
+                              "PlaceCarrierInCooker")
+
+
+def _update_supply_watch(world, bb, book):
+    # type: (World, Blackboard, Any) -> None
+    """维护断供看门狗：持续短缺超过宽限期后打开 cook 补位开关。"""
+    if _supply_starving(world, bb, book):
+        if getattr(bb, "supply_idle_since", None) is None:
+            bb.supply_idle_since = getattr(bb, "tick", 0) or 0
+        done = (getattr(bb, "tick", 0) or 0) - bb.supply_idle_since
+        bb.supply_override = done >= SUPPLY_OVERRIDE_TICKS
+    else:
+        bb.supply_idle_since = None
+        bb.supply_override = False
+
+
+def _supply_starving(world, bb, book):
+    # type: (World, Blackboard, Any) -> bool
+    """当前是否「有灶可煮、订单缺熟料、但没人在煮」。
+
+    只看熟料缺口，不看有没有已装盘的成品：成品盘会在台面/手里来回移动，
+    按盘数判会抖动。缺口口径见 cook_supply.cooked_shortfall（已修成把手持
+    盘也算供给）。
+    """
+    wanted = CS.cooked_items_wanted(world, book)
+    if not wanted:
+        return False
+    if not (CS.idle_cookers(world) or CS.recoverable_cookers(world, book)):
+        return False
+    if not any(CS.cooked_shortfall(world, book, item) > 0 for item in wanted):
+        return False
+
+    # 玩家手里正拿着能煮成所需熟料的生料：他在路上，别抢。
+    holding = getattr(getattr(bb, "p1_model", None), "holding", None)
+    wanted_l = {str(i).lower() for i in wanted}
+    if holding:
+        for cooked in (book.cooked_of_raw(holding) or ()):
+            if str(cooked).lower() in wanted_l:
+                return False
+
+    # 只救还有时间兑现的单：煮一锅 12 秒 + 装盘送餐的余量。
+    need = ETA.task_cost_ticks("FetchToCooker") + ENDGAME_DELIVER_RESERVE
+    time_left = _time_left_ticks(world)
+    if time_left is not None and time_left < need:
+        return False
+    for order in (world.orders or ()):
+        rem = order.get("remaining")
+        if rem is None or float(rem) * ETA.TICKS_PER_SECOND < need:
+            continue
+        for ing in book.requirements(order):
+            if str(ing).lower() in wanted_l:
+                return True
+    return False
+
+
+# 过街承诺：已经走到马路上时，除非有火/快糊（pressure >= 1.5），否则不换
+# 任务，先把这一趟走完。4-1 实机里跨街取鱼/海苔要 5~10 秒，期间“刚熟”
+# 的锅（pressure≈1.0）会把任务抢走，AI 走到对面又折返。
+CROSS_HOLD_PRESSURE = 1.5
+
+
+def _crossing_hold(world, bb, feasible, chosen_task):
+    # type: (World, Blackboard, List[Candidate], Optional[Any]) -> Optional[Any]
+    """正在过街时保持当前任务；有火/快糊才允许切走。"""
+    current = getattr(getattr(bb, "commitment", None), "active_task", None)
+    if current is None or chosen_task is None or _tasks_equal(chosen_task, current):
+        return None
+    chef = P.chef_by_name(getattr(world, "chefs", None) or (), P.P2_NAME)
+    cur = P.chef_cell(chef, world.to_grid) if chef is not None else None
+    if cur is None:
+        return None
+    # 用实际位置而不是格心：路沿那一列的格心正好压在 road 边界上，按格心判
+    # 会把「在路沿等灯」当成「已经在过街」，白白锁住任务不让换。
+    if not traffic.chef_in_road(world, chef):
+        return None
+    # 当前任务已不可行（目标消失/被拿）→ 不能硬保。
+    if not any(_tasks_equal(c.task, current) for c in feasible):
+        return None
+    # 灭火无条件放行；快糊（>=1.5）也放行；刚熟（1.0）不打断过街。
+    if getattr(chosen_task, "TYPE", None) == "Extinguish":
+        return None
+    if _time_pressure(chosen_task, world) >= CROSS_HOLD_PRESSURE:
+        return None
+    return current
+
+
+def _select_reposition(feasible, world, bb):
+    # type: (List[Candidate], World, Blackboard) -> Optional[Candidate]
+    """换边闸：布局窗口里先把腿走进安全区。
+
+    `bb.reposition` 由主循环在「全图刚连通」那一帧布置（`ai/space/zoning.py`）。
+    和 now 闸同样的让位规则：有 L0/L1/L2（火 / 快糊 / 刚熟救锅）就交给正常
+    分层路径——那口锅的倒计时不可压缩，而换边还有 2~3 秒窗口。
+    """
+    if getattr(bb, "reposition", None) is None:
+        return None
+    from ai.core.planner_layers import layer_of_task
+    # 只让位给火（L0）和快糊（L1）。**让给 L2「刚熟」是错的**：那口锅还有
+    # 十几秒才糊，而窗口只有 2~3 秒（实测 t=118~121 整段窗口都在端刚熟的
+    # 披萨，换边一次没选中，之后被隔 31 秒）。
+    for cand in feasible:
+        if layer_of_task(cand.task, world) in (0, 1):
+            return None
+    for cand in feasible:
+        if cand.task.TYPE == "Reposition":
+            return cand
+    return None
+
+
 def _select_imperative(feasible, world, bb):
     # type: (List[Candidate], World, Blackboard) -> Optional[Candidate]
     """「马上去」硬指令闸（Task 2）：命中未过期的 now 偏好直接选中候选。
 
-    找未过期的 now 偏好；没有则返回 None。任一 feasible 候选落在
+    找未过期的 now 偏好；没有则交给换边闸。任一 feasible 候选落在
     L0/L1/L2（火 / 快糊 / 刚熟救锅）→ 让位返回 None，交给正常分层路径；
     否则返回第一个命中 now scope 的 feasible 候选（feasible 顺序即链的
     下一步）。
@@ -1352,7 +1972,7 @@ def _select_imperative(feasible, world, bb):
                  and (not getattr(p, "expires_tick", 0)
                       or tick < getattr(p, "expires_tick", 0))]
     if not now_prefs:
-        return None
+        return _select_reposition(feasible, world, bb)
     # 「马上去」已经认下：把它**钉住**，别让普通打分（送餐等更高分任务）抢走。
     # 否则 now 任务每拍被更高分候选顶掉、永远做不成——trace-20261021-145504 的
     # 1-6 段正是 FetchToBoard(Cucumber)↔DeliverPlate 逐拍交替、角色在 (0,-3)↔(1,-3)
@@ -1373,7 +1993,8 @@ def _select_imperative(feasible, world, bb):
         for pref in now_prefs:
             if preference_matches_task(pref, cand.task):
                 return cand
-    return None
+    # now 没命中（偏好已过期 / 作用域对不上）时，换边仍然该走。
+    return _select_reposition(feasible, world, bb)
 
 
 # ---------- 截止闸与分工补位（spec §4.6）----------
@@ -1510,13 +2131,18 @@ def _finalize_rescue_hold(bb, chosen_task):
         _clear_rescue_hold(bb)
 
 
-def _select_layer(feasible, world, layer_map, bb, slack_map, tick):
-    # type: (List[Candidate], World, Dict[Any, int], Blackboard, Optional[Dict[Any, float]], int) -> Tuple[Optional[int], List[Candidate]]
+def _select_layer(feasible, world, layer_map, bb, slack_map, tick, gate_waits=None):
+    # type: (List[Candidate], World, Dict[Any, int], Blackboard, Optional[Dict[Any, float]], int, Optional[Dict[Any, float]]) -> Tuple[Optional[int], List[Candidate]]
     """取最高优先层的全部可行候选。
 
     `leave_to_p1` 现在是软偏好，只在层内分数里减分，不再把候选从本层排除。
     因此订单紧迫度、完成度和物理压力能让 P2 主动补位；`stop` 仍由
     `_is_stopped` 硬否决，实际资源认领仍由 task claims 保护。
+
+    gate_waits（{task key: 秒}，见 _gate_waits）：要在平台接缝门洞口等门超过
+    GATE_DEFER_S 的候选先**让出**本拍——同层有不用等的就只在它们里挑，整层都
+    要等就往下找低层不用等的先做；门快开时等待缩到阈值内，它自然回到本层
+    （先做点别的，掐着开门时间出发）。整张表都要等时照旧选（宁可去门口等）。
 
     返回 `(选中的层, 该层可用候选)`；全层都不可用返回 `(None, [])`。
     候选顺序保持 `feasible` 的原顺序——下游同分时靠稳定排序决定胜者。
@@ -1528,10 +2154,66 @@ def _select_layer(feasible, world, layer_map, bb, slack_map, tick):
             continue
         by_layer.setdefault(layer, []).append(cand)
 
+    if gate_waits:
+        def ready(cand, layer):
+            # type: (Candidate, int) -> bool
+            return (layer in GATE_DEFER_EXEMPT_LAYERS
+                    or gate_waits.get(cand.task.key, 0.0) <= GATE_DEFER_S)
+        for layer in sorted(by_layer):
+            now = [c for c in by_layer[layer] if ready(c, layer)]
+            if now:
+                return layer, now
+
     for layer in sorted(by_layer):
         if by_layer[layer]:
             return layer, by_layer[layer]
     return None, []
+
+
+# 等门让位（_select_layer）：要在门洞口等超过这么久的候选先让别的做。3s ≈ 走 12 格，
+# 让出去做的活一般一两步就能停手；太小会在门快开时来回切。
+GATE_DEFER_S = 3.0
+# 当前承诺等渡运篮子超过这么久（秒）也让位（见 _gate_waits）。比 GATE_DEFER_S 大，
+# 留出迟滞带：3~8s 之间已承诺的接着等，不在快到时来回切换。
+ACTIVE_SHUTTLE_DEFER_S = 8.0
+# 火 / 快糊 / 刚熟的锅：时钟不等人，等门也得去，不让位。
+GATE_DEFER_EXEMPT_LAYERS = (0, 1, 2)
+
+
+def _gate_waits(feasible, ctx, bb):
+    # type: (List[Candidate], Dict, Blackboard) -> Dict[Any, float]
+    """每个候选到它要碰的资源前，要在门洞口等多久（秒；不用等的不进表）。
+
+    两种情况不让位（记 0）：当前承诺的 task（已经在路上 / 门口等，换掉只会
+    来回折返）；P2 手里拿着东西（让位去做别的要先放下，放下再拿回来比等门亏）。
+    """
+    if (not getattr(ctx.get('field'), 'waits', None)
+            and not (ctx.get('w') is not None and shuttle.shuttle_grids(ctx['w']))):
+        return {}
+    active = getattr(getattr(bb, 'commitment', None), 'active_task', None)
+    active_key = getattr(active, 'key', None)
+    chef = ctx.get('chef')
+    holding = chef is not None and not P.hands_free(chef)
+    out = {}  # type: Dict[Any, float]
+    for cand in feasible:
+        key = cand.task.key
+        if key == active_key:
+            # 当前承诺照旧不让门洞（已在路上 / 门口等，换掉只会来回折返）；但渡运篮子
+            # 要等的远超门洞（最长一圈 ≈36s），等太久就让出去先干别的，快到了再回来
+            #（trace-20261031-204801 t=67~99：送餐在口边干站 30s 等篮子转一圈）。
+            w = reachability.task_shuttle_wait_seconds(cand.task, ctx)
+            if w > ACTIVE_SHUTTLE_DEFER_S:
+                out[key] = w
+            continue
+        if holding:
+            # 拿着东西时门洞照旧不让位；渡运篮子要等一整段（最长一圈 ≈36s），
+            # 放下手里的料干等太亏，仍让位（ai/space/shuttle.py）。
+            w = reachability.task_shuttle_wait_seconds(cand.task, ctx)
+        else:
+            w = reachability.task_wait_seconds(cand.task, ctx)
+        if w > 0:
+            out[key] = w
+    return out
 
 
 def _clear_claimed_commitment(bb):
@@ -1585,7 +2267,129 @@ def _is_rescue_action(task):
     """
     task_type = getattr(task, "TYPE", None)
     return task_type in RESCUE_TYPES or task_type in (
-        "Extinguish", "TakeCookedToPlate")
+        "Extinguish", "TakeCookedToPlate", "FillCarrier")
+
+
+def _holding_valuable(chef, world):
+    # type: (Optional[Dict], World) -> bool
+    """手里是不是「放下就亏」的东西：盘子（含成品盘）或锅具。"""
+    if chef is None or P.hands_free(chef):
+        return False
+    return bool(P.held_is_plate(chef)
+                or P.held_is_cookware(chef, getattr(world, "recipes", None)))
+
+
+def _held_plate_id(chef, world):
+    # type: (Optional[Dict], World) -> Optional[str]
+    """P2 手里那块盘的实例 id；不是盘返回 None。"""
+    if chef is None or not P.held_is_plate(chef):
+        return None
+    name = P.held_name(chef)
+    fallback = None
+    for p in P.all_plates(world):
+        if str(p.get("name") or "").lower() != name:
+            continue
+        # 盘名会重复（equipment_plate_01 / (1) / (2)），必须优先按 held_by
+        # 认手里那块；只按名字会拿到台面上同名的另一块（3-6 实机帧里
+        # -88364 在手上、-61740 在台面，二者同名）。
+        if p.get("held_by") == P.P2_NAME:
+            return str(p.get("n"))
+        if p.get("held_by") is None and fallback is None:
+            fallback = str(p.get("n"))
+    return fallback
+
+
+def _holding_plated_dish(chef, world, book=None, plate_match=None):
+    # type: (Optional[Dict], World, Optional[Any], Optional[Dict[Any, Any]]) -> bool
+    """手里是不是端着一盘「已经做满它所绑订单」的成品菜。
+
+    半成品盘不算贵重：端着只有薯条的盘、且这盘被绑给缺鸡块的 All 单时，
+    还需要 FillCooker 下鸡块 / Chop 备菜才能做满；旧的「有内容就算」判据会把
+    这些活全否决（trace-20261111-124037 t=1260：-18838 薯条盘绑给队首 All，
+    但内容只够 ChipsOnly，hands_full_plate 把 38 个备菜/下锅候选全否掉，P2
+    整局静止）。成品判定只认「这盘对当前绑定的订单 book.matches」：对别的
+    单做满、但对绑定的单还缺料时，仍算半成品、可以放下继续备料。
+    """
+    plate_id = _held_plate_id(chef, world)
+    if plate_id is None:
+        return False
+    plate = next((p for p in P.all_plates(world)
+                  if str(p.get("n")) == plate_id), None)
+    if plate is None or P.plate_count(plate) == 0:
+        return False
+    if book is None:
+        # 没有 book 时退回旧判据：有内容就算贵重（宁可不放）。
+        return True
+    oid = plate_match.get(plate_id) if plate_match else None
+    if oid is None:
+        return False           # 没绑任何单：算孤儿半成品，可放下
+    order = next((o for o in world.orders if o.get("id") == oid), None)
+    return book.matches(order, plate)
+
+
+def _held_matches_source(chef, world, source_id):
+    # type: (Optional[Dict], World, Any) -> bool
+    """手里拿的是不是这个 task 的来源（盘 / 散锅 / 载体）。"""
+    if source_id is None or chef is None:
+        return False
+    if P.held_matches(chef, source_id):
+        return True
+    key = str(source_id)
+    for p in P.all_plates(world):
+        if str(p.get("n")) == key:
+            return P.holds_plate(chef, p)
+    for it in list(getattr(world, "items", ()) or ()) + list(
+            getattr(world, "held_items", ()) or ()):
+        if str(it.get("n")) == key:
+            return P.held_matches(chef, it.get("n"))
+    return False
+
+
+def _holding_needed_for(task, world, book=None):
+    # type: (Any, World, Optional[Any]) -> bool
+    """当前 task 是不是正拿着它下一步要用的料/盘。
+
+    用于承诺惯性：FillCooker 拿着 NuggetChoppedChicken 时，L2 的熟锅不该
+    把它抢走——抢走的第一步 EnsureHandsFree 就会把料放下，下一拍再回来捡，
+    形成「拿起 → 放下」循环（trace-20261111-001945 t=477~529）。
+    """
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    if chef is None or P.hands_free(chef):
+        return False
+    held = P.held_name(chef)
+    task_type = getattr(task, "TYPE", None)
+
+    if task_type in ("FillCooker", "FetchToCooker"):
+        raws = getattr(task, "raws", ()) or ()
+        forms = set()
+        for raw in raws:
+            form = book.cook_input_form(raw) if book is not None else raw
+            if form:
+                forms.add(str(form).lower())
+        return held in forms
+
+    if task_type in ("SendAcross", "TakeCookedToPlate"):
+        # 端盘去盛/送，或直接拿着来源（散锅、载体）都算“拿着有用的东西”。
+        src = getattr(task, "source_id", None)
+        if src is None and task_type == "TakeCookedToPlate":
+            src = getattr(task, "cooker_id", None)
+        return bool(P.held_is_plate(chef)
+                    or _held_matches_source(chef, world, src))
+
+    if task_type == "DeliverPlate":
+        return bool(P.held_is_plate(chef))
+
+    if task_type in ("FetchToBoard", "Chop", "FetchToPlate", "ThrowBatch"):
+        item = getattr(task, "item", None)
+        if item and P.held_matches(chef, item):
+            return True
+        if book is not None and item:
+            form = book.cook_input_form(item)
+            if form and held == str(form).lower():
+                return True
+        return False
+
+    return False
 
 
 def _score_candidate(world, bb, candidate, book=None, plate_match=None,
@@ -1593,16 +2397,32 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
     """对单个候选打分（spec §6.4）。
 
-    Plan 3 最小权重集：订单紧迫、时间压力、ETA
-    Plan 4 新增：P1 冲突惩罚 + 6 项新权重（Task 4）
+    只保留能在层内区分候选的信号：订单紧迫、锅压力、加工链进度、
+    连击、截止前瞻、盘供应、填灶与对话偏好。
     """
     task = candidate.task
-    terms = {}
+    if task.TYPE == "ThrowBatch":
+        return _score_throw_batch(world, bb, candidate, book, plate_match,
+                                  slack_map, cooker_match, layer)
+    terms = {"held_plate": 0.0, "hands": 0.0}
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    if task.TYPE == "TakeCookedToPlate":
+        pid = getattr(task, "plate_id", None)
+        p = next((x for x in P.all_plates(world)
+                  if str(x.get("n")) == str(pid)), None)
+        if p is not None and P.holds_plate(chef, p):
+            terms["held_plate"] = W_HELD_PLATE
+
+    # 手持贵重物（成品盘/熟锅）时，树首要 EnsureHandsFree 的 task 吃重罚。
+    # 这不是硬否决：当前 task 若已经拿着它要的盘子/锅，由
+    # _holding_needed_for 在承诺惯性里保护。
+    if (getattr(task, "TYPE", None) in _HANDS_PENALTY_TYPES
+            and _holding_valuable(chef, world)
+            and not _holding_needed_for(task, world, book)):
+        terms["hands"] = -W_HANDS_VALUABLE
 
     # 送餐的「有效订单」是游戏会记账的那一单，不是 task 绑的那个（实测 55/0：
-    # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 新鲜度 / 完成度都该
-    # 按它求值——否则同一盘菜绑给不同 order_id 会算出不同分数，而实机行为完全
-    # 一样，纯属自欺。见 _credited_order_id / _effective_order_id。
+    # 游戏挑同 dish 存活单里 remaining 最小者）。紧迫度 / 完成度都该按它求值。
     effective_order_id = _effective_order_id(world, task)
 
     # ① 订单紧迫：读 slack（remaining - ETA）而非裸 remaining（第 3 组 3.1）。
@@ -1629,44 +2449,31 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms["urgency"] = urgency_score
 
     # ② 时间压力
-    pressure = _time_pressure(task, world)
-    pressure_score = W_PRESSURE * pressure
-    terms["pressure"] = pressure_score
+    terms["pressure"] = W_PRESSURE * _time_pressure(task, world)
 
-    # ③ ETA（暂用 estimated_steps 的负数）
-    eta = candidate.estimated_steps
-    eta_score = -W_ETA * eta
-    terms["eta"] = eta_score
-
-    # ④ 异步资源优先（Plan 4 Task 4）
-    # 仅当订单已有盘就位时才给下锅/切菜加分：没盘时它们的输出无处可去，
+    # ③ 异步资源优先（Plan 4 Task 4）：加工链最终进灶才给（_feeds_cooker），
+    # 取料上砧板与下锅同分，不进灶的切配不给。
+    # 仅当订单已有盘就位时才给：没盘时它们的输出无处可去，
     # 提前备料会抢走放盘（实机：洗好碗后 P2 一直煮饭/切菜、不去端盘）。
     #
     # 这条曾经把「灶空转」钉死（没盘 → 不煮 → 米不够 → 单过期），但现在
     # 不再是问题：填灶走订单无关的 FillCooker（第 1 组 1.1），没有 order_id、
     # 不经过这一项，而是吃 cooker_idle 加分。所以这里保持收紧语义不动——
     # 它修的是另一个实机 bug，放宽会让那个 bug 复发。
-    if _is_async_task(task) and order is not None \
+    if _feeds_cooker(task, world, book) and order is not None \
             and _order_has_plate(plate_match, task.order_id):
         terms["async_resource"] = W_ASYNC_RESOURCE
     else:
         terms["async_resource"] = 0.0
 
-    # ⑤ 完成度（Plan 4 Task 4）。曲线是凸的，见 _completion_bonus。
+    # ④ 完成度（Plan 4 Task 4）。曲线是凸的，见 _completion_bonus。
     # 按 effective_order_id 求值：送餐时它是 credited order，与 task 绑的
     # order_id 可能不同（见本函数开头的注释）。
     completion_ratio = _order_completion_ratio(task, world, bb, book,
                                                plate_match, effective_order_id)
     terms["completion_ratio"] = _completion_bonus(completion_ratio)
 
-    # ⑥ 食材复用（Plan 4 Task 4）
-    reuse_count = _ingredient_reuse_count(task, world, bb, plate_match, book)
-    if reuse_count >= 2:
-        terms["ingredient_reuse"] = W_INGREDIENT_REUSE * (reuse_count - 1)
-    else:
-        terms["ingredient_reuse"] = 0.0
-
-    # ⑨ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
+    # ⑤ Combo：按屏幕队首依次送才累加，跳单或过期归零（第 3 组 3.3/3.4）。
     # 旧实现判的是「连续送同类菜」（比较 order["name"]），与游戏机制无关。
     # 关键：combo 由「送的是哪种**菜**」决定，不由 task 绑的 order_id 决定。
     # 游戏把这一盘记给「同 dish 存活单里 remaining 最小」的那个（实测 55/0），
@@ -1677,7 +2484,9 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # 所以备菜也给（打折，见 COMBO_PREP_DISCOUNT）。
     combo_head = 0.0
     combo_break = 0.0
-    is_deliver = (task.TYPE == "DeliverPlate")
+    is_deliver = (task.TYPE == "DeliverPlate"
+                  or (task.TYPE == "SendAcross"
+                      and getattr(task, "item", None) == "plated_dish"))
     if task.order_id is not None and (is_deliver or task.TYPE in _COMBO_PREP_TYPES):
         head = _combo_head_id(world.orders)
         dish = _dish_of_order(world.orders, task.order_id)
@@ -1694,17 +2503,7 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     terms["combo_head"] = combo_head
     terms["combo_break"] = combo_break
 
-    # ⑨.5 新鲜度：送得越早小费档位越高（8/5/3）。权重刻意取小——实测只值
-    # 5 分（相对 base 60 仅 8%），单独追新鲜度不值得牺牲任何东西。读「距掉档
-    # 还有几秒」而非线性 remaining：档位是台阶，离边界远时早送晚送没区别。
-    freshness = 0.0
-    if task.TYPE == "DeliverPlate" and order is not None:
-        tier = ECON.tip_tier(order.get("remaining"), order.get("lifetime"))
-        span = float(ECON.TIP_FRESH - ECON.TIP_LATE) or 1.0
-        freshness = W_FRESHNESS * (tier - ECON.TIP_LATE) / span
-    terms["freshness"] = freshness
-
-    # ⑩ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
+    # ⑥ 截止前瞻（Plan 4 Task 4；口径改为 slack，见第 2 组 2.4）。
     # **必须乘 W_DEADLINE_LOOKAHEAD**：_deadline_forecast 返回 0~1 的系数，
     # 不乘权重的话这一项的实际量级是 1.0 而非 10.0，比 W_COOKER_IDLE=5.6
     # （Ruling 12 重标后的值，原文的 4.8 已过期）小一个数量级——等于这条
@@ -1713,74 +2512,35 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
                                           cooker_match)
     terms["deadline_lookahead"] = -W_DEADLINE_LOOKAHEAD * deadline_penalty
 
-    # ⑪ 手部前置的腾手代价 + 收尾加分（spec §6.1(b)）：按候选 preconditions
-    # 精确判，而非笼统的 HANDS。手持目标物（holding_cooked / holding_plated_dish）
-    # 时任务已在「收尾」，给正向加分，别让异步任务（FetchToCooker / Chop）抢走。
-    hand_penalty = 0.0
-    hand_bonus = 0.0
-    chef = P.chef_by_name(world.chefs, P.P2_NAME)
-    pre = candidate.preconditions or []
-    if chef is not None:
-        need_clear = False
-        need_pickup = False
-        holding_ok = False
-        if "hands_empty" in pre:
-            need_clear = not P.hands_free(chef)
-        elif "holding_cooked" in pre:
-            holding_ok = (P.held_cookware_state(
-                chef, P.held_items(world), world.recipes) == P.COOKWARE_COOKED)
-            need_pickup = not holding_ok
-        elif "holding_plated_dish" in pre:
-            holding_ok = P.held_is_plate(chef)
-            need_pickup = not holding_ok
-        elif getattr(task, "HANDS", "any") == "empty":
-            need_clear = not P.hands_free(chef)
-        if need_clear:
-            hand_penalty = W_ETA * HAND_CLEAR_STEPS
-        elif need_pickup:
-            hand_penalty = W_ETA * HAND_PICKUP_STEPS
-        elif holding_ok:
-            hand_bonus = W_ASYNC_RESOURCE
-    terms["hands"] = hand_bonus - hand_penalty
-
-    # ⑫ 搬料惩罚：FetchToBoard 的来源若是"另一块板"，它是"搬"而非"取"，
-    # 零产出——让 Chop 这类有产出的动作优先。
-    move_penalty = 0.0
-    if task.TYPE == "FetchToBoard":
-        loc = find_ingredient(world, task.item)
-        if loc is not None and loc.get("kind") == "board":
-            move_penalty = W_ETA * MOVE_PENALTY_STEPS
-    terms["move_penalty"] = -move_penalty
-
-    # ⑬ 送餐优先（先上得分更高）：料齐的盘尽快送出去，别被继续备菜压住。
-    # DeliverPlate.feasible 已经保证"盘料齐"，所以这里是硬加分。
-    if task.TYPE == "DeliverPlate":
-        terms["deliver_bonus"] = W_DELIVER_BONUS
-    else:
-        terms["deliver_bonus"] = 0.0
-
-    # ⑭ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
+    # ⑦ 洗盘压力：干净空盘越少越该洗（提前补盘，别等到用光拼装被卡死）。
     if task.TYPE == "WashPlate":
+        terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
+    elif task.TYPE == "SendAcross" and task.item == "carrier":
+        # 料齐 / 补不了料的饼卡在我这边：不送这一单就做不出来，按最缺算
+        terms["plate_pressure"] = W_PLATE_PRESSURE * 2.0
+    elif task.TYPE == "SendAcross" and task.item == "clean_plate":
+        # 对面缺盘的程度（同一条曲线：0 块=2.0、1 块=1.0），按对面的干净盘数算
+        from ai.revenue import cross_supply as XS
+        acc = XS.far_plate_need(world, book, bb)
+        far = acc["far"]
+        terms["plate_pressure"] = W_PLATE_PRESSURE * (2.0 if far <= 0 else 1.0 if far == 1 else 0.5)
+    elif task.TYPE == "SendAcross" and task.item == "dirty_plate":
+        # 把脏盘交给唯一能洗的对面：干净盘越少越该送，量级同 WashPlate。
         terms["plate_pressure"] = W_PLATE_PRESSURE * _plate_pressure(world)
     else:
         terms["plate_pressure"] = 0.0
 
-    # ⑮ 1-3 关卡 relay 加分：让 P2 倾向投掷/中转（支线），但不盖过端锅/送餐。
-    if world.level == "Sushi_1_3_2P" and task.TYPE in _RELAY_BONUS_1_3:
-        terms["relay_1_3_bonus"] = _RELAY_BONUS_1_3[task.TYPE]
-    else:
-        terms["relay_1_3_bonus"] = 0.0
-
-    # ⑯ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
+    # ⑧ 填灶（第 1 组 1.4）：按熟料缺口加分。只给 FillCooker——按单发射的
     # FetchToCooker 已有 async_resource 加分，不重复给。
     if task.TYPE == "FillCooker":
         shortfall = CS.cooked_shortfall(world, book, task.item) \
             if book is not None else 0
-        terms["cooker_idle"] = _cooker_idle_bonus(shortfall)
+        terms["cooker_idle"] = _cooker_idle_bonus(shortfall) * _fill_plate_factor(
+            shortfall, world, book, plate_match, task.item)
     else:
         terms["cooker_idle"] = 0.0
 
-    # ⑰ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
+    # ⑨ 摆盘压力：一块盘都没就位 = 拼装链无落点，和「0 干净盘」等价地卡死。
     # 判据用 plate_match 而不是「盘的数量」：盘在晾干架/盘堆里一样倒不进料，
     # 只有进了匹配表（落在 counter 拼装格或 P2 手上）的盘才算就位。
     # plate_match 为 None 是「没有匹配信息」而不是「没盘」（同
@@ -1792,9 +2552,17 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     else:
         terms["no_plate_placed"] = 0.0
 
-    # ⑱ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
+    # ⑨.5 组装推进：同分时让「把料放进饼底 / 把饼底送进烤箱」先走。
+    if task.TYPE in ("FetchToCarrier", "FillCarrier", "PlaceCarrierInCooker"):
+        terms["assembly"] = W_ASSEMBLY
+    else:
+        terms["assembly"] = 0.0
+
+    # ⑩ 对话偏好（spec §4.5）：role/claim/assign/direct 的权重之和。
     # 进 terms 后无论 layer 是否启用都由白名单决定是否参与本层打分；
     # layer=None（扁平老路）时照常全量求和。
+    # ⑪ 批量投掷：只有 ThrowBatch 非零（_score_throw_batch 覆写）。
+    terms["batch_bonus"] = 0.0
     terms["pref"] = _preference_score(candidate, bb, layer)
     # 截止闸既要放行候选，也要撤销同一条 claim 的负分。只放行而保留
     # -8 会让危急装盘仍输给「优先煮饭」；保护期内也必须保持同一口径。
@@ -1814,6 +2582,106 @@ def _score_candidate(world, bb, candidate, book=None, plate_match=None,
     # layer 非 None 时只算该层白名单内的项（spec §7）。terms 仍然全量返回
     # ——trace 要能看见「这一项算出来是多少、只是本层不用它」。layer 为
     # None（默认）时与分层前完全一致：全项求和。
+    if layer is not None:
+        from ai.core.planner_layers import filter_terms
+        score, _kept = filter_terms(terms, layer)
+        return score, terms
+    return sum(terms.values()), terms
+
+
+# 批量投掷加分：第 k 份（k≥2）加 W_BATCH × BATCH_DECAY^(k−2)，几何递减、
+# 总额封顶 W_BATCH / (1 − BATCH_DECAY)。经验初值，量级对照 L6 备菜分（约
+# -1.75~4）：N=1 时与等价取料打平，靠触发门槛决定投不投；N≥2 才因「一趟顶
+# 多趟」胜出。待按实机 throw 日志标定（改权重前读 status-backlog.md §4）。
+#
+# 为什么递减而不是线性 W_BATCH × (N−1)：N 跟着订单数涨（Balloon_2_3 五张单都
+# 要意面 → N=6），但越往后的那份越不值——服务的是 slack 更大的单、锅位不够
+# 要在地上等、planner 每拍重选也常把批次中途打断（trace-20261029-213506 投 1 份
+# 即被 FillCooker 抢走）。线性时 N=4 就加 1.5，比 urgency 之外的大多数备菜项都大。
+W_BATCH = 0.5
+BATCH_DECAY = 0.5
+
+# 已经拿着这一批料时给 ThrowBatch 的固定加分：手里有可投的料，先投出去
+# 比换一个「要空手」的 task（FetchToBoard 等）更省——后者树首会把手里的
+# 料放下，再捡再放。切好投锅（4-2 切好的土豆/鸡块）与生料远投都适用；
+# 切好的沙拉料也适用，但它先过「对面有干净盘」的门控（throw_supply.gap）。
+W_HELD_BATCH = 1.0
+
+
+def _batch_bonus(n):
+    # type: (int) -> float
+    """N 份一批的投掷加分：首份 0，之后每份按 BATCH_DECAY 几何递减。
+
+    N=2→0.5、3→0.75、4→0.875、6→0.97，上限 1.0（W_BATCH=0.5、DECAY=0.5）。
+    """
+    total, step = 0.0, W_BATCH
+    for _ in range(max(0, int(n) - 1)):
+        total += step
+        step *= BATCH_DECAY
+    return total
+
+
+def _throw_proxy(world, bb, task, book=None, gap=None):
+    # type: (World, Blackboard, Any, Optional[Any], Optional[int]) -> Any
+    """ThrowBatch 等价的取料 task：投过去本质上是在替它跑腿。
+
+    绑定**这一份料真正服务的那一单**，让紧迫度/完成度/combo 照原口径继承。
+    已越过这一站的料（切好的 / 锅里的 / 盘里的）先按 remaining 从小到大填给
+    最急的单；新投的这份服务的是第一张没被填满的单。
+
+    旧口径直接绑「需要这道菜、最急的单」：地上已有两份切好的肉、盘里一份熟肉，
+    最急的单早被现成的料盖住，ThrowBatch 却继承它的紧迫分，压过把现成料下锅的
+    FillCooker——四口灶全空着，P2 跑去料箱拿新肉切（trace-20261101-163138
+    t=1840~1926：#3 剩 31s 吃满紧迫分 4.23，按边际份数应绑 #6 剩 107s）。
+
+    gap = task.full_gap（未封顶缺口）；book / gap 缺省时退回旧口径。
+    消费站在对面时这个 proxy 会被判 unreachable——这里只拿它打分，不过可行性，
+    正是「走得过去值多少分」。
+    """
+    want = str(task.product).lower()
+    live = []  # type: List[Tuple[float, Any, int]]
+    for o in _dialog_live_orders(world, bb):
+        reqs = book.requirements(o) if book is not None else (o.get("composition") or ())
+        units = sum(1 for r in reqs if str(r).lower() == want)
+        if units <= 0:
+            continue
+        rem = o.get("remaining")
+        rem = float(rem) if rem is not None else float("inf")
+        live.append((rem, o.get("id"), units))
+    live.sort(key=lambda e: e[0])
+    order_id = live[0][1] if live else None
+    if gap is not None and gap > 0 and live:
+        # 现成料盖住的份数 = 总需求 − 缺口；跳过被盖住的单
+        covered = max(0, sum(u for _, _, u in live) - gap)
+        for _rem, oid, units in live:
+            if covered < units:
+                order_id = oid
+                break
+            covered -= units
+    if task.consumer in (TS.CONSUMER_BOARD, TS.CONSUMER_PLATE):
+        return T.FetchToBoard(order_id, (task.dest_id,), task.raw)
+    return T.FetchToCooker(order_id, (task.dest_id, (task.raw,)), task.product)
+
+
+def _score_throw_batch(world, bb, candidate, book=None, plate_match=None,
+                       slack_map=None, cooker_match=None, layer=None):
+    # type: (World, Blackboard, Candidate, Optional[Any], Optional[Dict[Any, Any]], Optional[Dict[Any, float]], Optional[Dict[Any, Any]], Optional[int]) -> Tuple[float, Dict]
+    """score(ThrowBatch) = score(等价取料 task) + W_BATCH × (N − 1)。"""
+    task = candidate.task
+    ctx = _make_context(world, bb, book) if book is not None else None
+    gap = task.full_gap(ctx) if ctx is not None else None
+    proxy = _throw_proxy(world, bb, task, book, gap)
+    _pre, est = _CAND_META.get(proxy.TYPE, ([], EST_FETCH))
+    pc = Candidate(proxy, [], est, branch=candidate.branch)
+    _score, terms = _score_candidate(world, bb, pc, book, plate_match,
+                                     slack_map, cooker_match, layer)
+    terms = dict(terms)
+    n = 0
+    if ctx is not None:
+        n = task.batch_size(ctx)
+    terms["batch_bonus"] = _batch_bonus(n)
+    chef = P.chef_by_name(world.chefs, P.P2_NAME)
+    terms["held_batch"] = W_HELD_BATCH if P.held_matches(chef, task.item) else 0.0
     if layer is not None:
         from ai.core.planner_layers import filter_terms
         score, _kept = filter_terms(terms, layer)
@@ -1886,16 +2754,99 @@ def _cooker_idle_bonus(shortfall):
     return W_COOKER_IDLE * ratio
 
 
+def _fill_plate_factor(shortfall, world, book, plate_match, item):
+    # type: (int, World, Any, Optional[Dict[Any, Any]], Any) -> float
+    """按「有多少订单真的能上盘」给填灶打折。
+
+    `cooked_demand` 数所有活单；没有匹配到盘的订单即使煮了也上不了桌，
+    盘瓶颈时会把灶全部占满、挡住鱼/菜等备菜。这里把缺口按**有盘订单数**
+    封顶：
+
+      3 单都要米、都有盘 → 1.0
+      3 单都要米、只有 1 单有盘 → 只按缺 1 份计
+      一张盘都没有 → FILL_PLATE_DISCOUNT_FLOOR（不是 0，避免死锁）
+
+    `plate_match is None` 表示没有匹配信息，不惩罚（旧调用点/单测）。
+    """
+    if book is None or plate_match is None:
+        return 1.0
+    want = str(item).lower()
+    matched = {str(v) for v in plate_match.values()}
+    demand = 0
+    platable = 0
+    for order in getattr(world, "orders", None) or ():
+        if not any(str(r).lower() == want
+                   for r in book.requirements(order)):
+            continue
+        demand += 1
+        if str(order.get("id")) in matched:
+            platable += 1
+    if demand <= 0:
+        return 1.0
+    if platable <= 0:
+        return FILL_PLATE_DISCOUNT_FLOOR
+    if shortfall <= platable:
+        return 1.0
+    base = _cooker_idle_bonus(shortfall)
+    target = _cooker_idle_bonus(platable)
+    return target / base if base > 0 else 1.0
+
+
 def _plate_pressure(world):
     # type: (Any) -> float
     """干净空盘稀缺度：0=充足，越大越该洗。0 块=2.0（拼装被卡死）、1 块=1.0、
-    ≥2 块=0.0（不洗）。"""
-    clean = P.clean_plate_count(world.plates)
+    ≥2 块=0.0（不洗）。
+
+    数**全量**干净空盘（含手持，走 world.all_plates）：P2 端起一块干净盘去盛料
+    是正常流程，不能因为「盘离开盘堆」就把稀缺度抬上去——否则 PlaceCleanPlate
+    升到 L4 抢走 TakeCookedToPlate、盘一放下压力又归零，形成拿放死循环
+    （trace-20261101-223804 尾部十几秒的左右震荡）。手持的装料盘 contents 非空，
+    clean_plate_count 天然不计它，不影响「干净盘」语义。
+    """
+    clean = P.clean_plate_count(world.all_plates)
     if clean <= 0:
         return 2.0
     if clean == 1:
         return 1.0
     return 0.0
+
+
+def _is_two_plate_level(level):
+    # type: (Any) -> bool
+    """已知的 2 盘关卡。只认 3-5，避免用帧里的盘数猜关卡容量。"""
+    base = str(level or "").strip()
+    if base.endswith("_2P"):
+        base = base[:-3]
+    return base == "Rapids_3_5"
+
+
+def _plate_total(world):
+    # type: (Any) -> int
+    """场上盘子总数：干净/装料/手持 + 洗碗池里的 + 脏盘摞。
+
+    3-5 只有 2 块盘；这个数用来把「2 盘关有 1 个脏盘」直接抬进 L4。
+    脏盘摞在 items 里、池里的盘只体现在 washing.plate_count，两者都要算。
+
+    **非 2 盘关卡返回 99（禁用该规则）**：一个 DirtyPlateStack 可能是一摞
+    （Wizard 3-3 三块盘会变成一个 item），按帧数猜会把 3+ 盘关误判成 2 盘。
+    合成测试/旧帧没有 level 时仍按帧数算，便于单测。
+    """
+    level = str(getattr(world, "level", "") or "")
+    if level and not _is_two_plate_level(level):
+        return 99
+    total = len(world.all_plates)
+    for it in (list(getattr(world, "items", ()) or ())
+               + list(getattr(world, "held_items", ()) or ())):
+        if "dirtyplate" in str(it.get("n") or "").lower():
+            total += 1
+    for st in getattr(world, "stations", ()) or ():
+        if not isinstance(st, dict) or st.get("t") != "washing":
+            continue
+        try:
+            total += int(st.get("plate_count") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
 
 
 def _placed_plates(world):
@@ -1904,21 +2855,32 @@ def _placed_plates(world):
 
     与 ai/tasks/base.placed_plates(ctx) 同口径，但按 world 重写：拼装格由
     stations 里 t=="counter" 且带 gx/gz 的站点给出，盘用 to_grid 反解网格
-    坐标后比对。只认 world.plates（非手持）：还在盘堆/晾干架/手上的盘不算
-    「已就位」，不能往上倒料。
+    坐标后比对。只认落在 counter 拼装格上的盘；盘堆顶层由 `_usable_plate`
+    另行判定（堆顶能直接接料），晾干架/手上的盘仍不算。
     """
-    counters = set()
-    for st in world.stations:
-        if st.get("t") != "counter":
-            continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is not None and gz is not None:
-            counters.add((gx, gz))
+    from ai.query.recipe_graph import _counter_cells
+    counters = set(_counter_cells(world))   # 主网格坐标，篮子台面按 x/z 投影
     for p in world.plates:
         x, z = p.get("x"), p.get("z")
         if x is None or z is None:
             continue
         if world.to_grid(x, z) in counters:
+            return True
+    return False
+
+
+def _usable_plate(world):
+    # type: (Any) -> bool
+    """是否已有可直接接料的盘：counter 拼装格上的盘，或干净盘堆顶层。
+
+    `_placed_plates` 只认 counter 格；盘堆顶层虽然不在 counter 上，
+    `_match_plates_to_orders` 也把它当作可用盘，`FetchToPlate` 可以直接把
+    料放上去（实机确认）。这时 `PlaceCleanPlate` 不该再以 L4 解卡身份抢先。
+    """
+    if _placed_plates(world):
+        return True
+    for p in getattr(world, "plates", None) or ():
+        if p.get("stack_top") and p.get("stack_clean"):
             return True
     return False
 
@@ -1939,16 +2901,27 @@ def _cooker_lookup(world, cid):
     return None
 
 
+# 熟散锅的压力：必须 < planner_layers.PRESSURE_RESCUE（1.0），否则进 L2 压过送餐；
+# 又要尽量高，让 L6 里的 pressure 项压过常规备菜。理由见 _loose_pot_pressure。
+LOOSE_COOKED_PRESSURE = 0.9
+
+
 def _loose_pot_pressure(world, source_id):
     # type: (Any, str) -> float
     """散锅（台面/地上的锅）的时间压力。灶上查不到时走这条退路。
 
     散锅不在灶上、不走烹饪进度，帧里没有 cooking_progress，所以这里只能给
-    二元压力——与 `_time_pressure` 里「无连续进度（旧帧/空锅）→ 退回二进制」
-    那条退路同口径：
+    离散压力：
       糊了   → 2.0（L1，还要灭火，比刚熟的更急）
-      熟了   → 1.0（L2，马上去盛）
+      熟了   → LOOSE_COOKED_PRESSURE（< 1.0，落 L6 备菜层）
       生/空  → 0.0
+
+    熟散锅**不进 L2**：L2 的判据是「12 秒不可压缩的烧糊时钟在走」，散锅已离
+    火、不会再烧糊（同 `_cooker_burn_danger` 对散锅给 0 的口径）。放进 L2 会
+    结构性压过 L3 送餐：实机 trace-20261101-180609 t=12480~13457 最后 13 秒，
+    P2 手里端着装好的鸡块盘，被台面上一篮熟薯条的 L2 盛料抢走，把成品盘放到
+    木筏上去拿空盘，到收盘一单没送。落 L6 后 pressure 项（W_PRESSURE×0.9=4.5）
+    仍压过常规备菜，不会重蹈 1979 拍没人盛（L7）的覆辙。
 
     判据与 `TakeCookedToPlate._source` 完全一致（rich token 或 cooked 字段，
     两条任一成立），刻意不另起一套：那边认得源、这边算不出压力，正是实机
@@ -1962,9 +2935,9 @@ def _loose_pot_pressure(world, source_id):
             return 2.0
         toks = parse_plate_detail(it.get("detail") or [])
         if any(str(t).startswith("cooked:") for t in toks):
-            return 1.0
+            return LOOSE_COOKED_PRESSURE
         if str(it.get("cooked") or "").lower() == "cooked":
-            return 1.0
+            return LOOSE_COOKED_PRESSURE
         return 0.0
     return 0.0
 
@@ -1985,10 +2958,16 @@ def _time_pressure(task, world):
     （ratio 0.25）起又加一段 0→1.0 的「快熟」渐变，让端盘盛饭能提前去准备。
     """
     task_type = getattr(task, "TYPE", "")
-    # 只有"取熟料 / 救熟料 / 清糊锅"这类灶状态相关任务才吃时间压力
-    if task_type not in ("TakeCookedToPlate", "RescueCooked", "Discard"):
+    # 只有"取熟料 / 救熟料 / 清糊锅"这类灶状态相关任务才吃时间压力。
+    # FillCarrier 也是「端着容器去盛熟料」（换成卷饼），与 TakeCookedToPlate
+    # 同一时间敏感性——锅里熟了/快糊了它同样要进救料层，否则会被端盘盛熟
+    # 结构性压住、永不选中（trace-20261108-195728）。
+    if task_type not in ("TakeCookedToPlate", "RescueCooked", "Discard",
+                         "FillCarrier"):
         return 0.0
     cid = getattr(task, "cooker_id", None)
+    if cid is None:
+        cid = getattr(task, "source_id", None)   # FillCarrier 的灶 id 叫 source_id
     if cid is None:
         return 0.0
     c = _cooker_lookup(world, cid)
@@ -2040,17 +3019,16 @@ def _find_order_by_id(world, order_id):
 
 # ==================== 承诺惯性实现（Plan 3 Task 6）====================
 
-def _apply_commitment_inertia(scored, world, bb):
-    # type: (List[Tuple[Any, float, Any]], World, Blackboard) -> Optional[Any]
+def _apply_commitment_inertia(scored, world, bb, book=None):
+    # type: (List[Tuple[Any, float, Any]], World, Blackboard, Optional[Any]) -> Optional[Any]
     """承诺惯性：除非完成/失败/连续不可行/出现显著更高分者，否则不改选（spec §6.5）。
 
     两条规则：
     1. 进度加成：已完成的步数越多，改选门槛越高
     2. 不可行迟滞：连续 N 拍不可行才允许切换
 
-    Task 5 新增：承诺穿插（Commitment Interleaving）
-    3. 穿插条件：当前 task RUNNING、剩余步数 > INTERLEAVE_THRESHOLD、新 task 分数显著更高
-    4. 穿插时暂停当前 task 到 bb.paused_task，完成后恢复
+    改选后旧 task 不保留「暂停」状态；它仍参与正常打分，分数还高就会再次
+    被选中，分数被压低就自然不再回去。
 
     返回: 选中的 task（可能是当前承诺或新选择）
     """
@@ -2061,38 +3039,27 @@ def _apply_commitment_inertia(scored, world, bb):
     scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
     top_task, top_score, top_terms = scored_sorted[0]
 
-    # ① 优先恢复 paused_task（Task 5）
-    if bb.paused_task:
-        # 查找 paused_task 是否在可行候选中
-        paused_task_id = bb.paused_task.get("task_id")
-        for task, score, terms in scored:
-            if task.key == paused_task_id:
-                # 恢复暂停的任务，并保留暂停前的进度。bb.commitment 可能是 None：
-                # 穿插的那个 task 刚在 agent.py ⑬ 成功/失败，commitment 被清成了
-                # None（而非测试里模拟的 active_task=None），直接 .steps_done 会
-                # AttributeError。这里先把 commitment 恢复成指向被暂停 task 的有效
-                # 对象，再写回进度。
-                if bb.commitment is None:
-                    bb.commitment = Commitment()
-                bb.commitment.active_task = task
-                bb.commitment.steps_done = bb.paused_task.get("steps_done", 0)
-                bb.paused_task = None  # 清空 paused_task
-                return task
-
-        # 如果 paused_task 不可行了，清空并继续正常流程
-        bb.paused_task = None
-
-    # ② 检查是否有当前承诺
+    # ① 检查是否有当前承诺
     if not bb.commitment or not bb.commitment.active_task:
         # 无承诺，选最高分
         return top_task
 
     current_task = bb.commitment.active_task
 
+    # 火情无条件抢占当前承诺：L0 火会蔓延，不能等承诺惯性/进度加成。分层只
+    # 决定候选池，这里若不显式放行，current_task（L6 备菜）不在 L0 的 scored
+    # 里 → current_entry is None → infeasible_streak < 8 时继续做旧活，火情
+    # 白等 8 拍。L1/L2 靠下面的 _time_pressure >= 1.0 紧急切换，但 Extinguish
+    # 的 _time_pressure 恒 0（白名单只认 TakeCookedToPlate/RescueCooked/
+    # Discard/FillCarrier），必须在这里显式放行。
+    if getattr(top_task, "TYPE", None) == "Extinguish" \
+            and not _tasks_equal(top_task, current_task):
+        return top_task
+
     # 熟/快糊/已糊的锅要第一时间去端/救，跳过承诺惯性。光靠把 pressure 加进
     # 分数不够：pressure 把 TakeCookedToPlate 拉到 ~1-2，但当前 FetchToCooker /
-    # FetchToPlate 也会被 async_resource / ingredient_reuse / completion_ratio
-    # 抬到 ~0.5-1.4，分差 < COMMITMENT_MARGIN，于是锅都熟了还赖在当前 task 上
+    # FetchToPlate 也会被 async_resource / completion_ratio 抬到 ~0.5-1.3，
+    # 分差 < COMMITMENT_MARGIN，于是锅都熟了还赖在当前 task 上
     # 不去端盘（实机复现：米熟了 P2 还在给下一单下锅，不去盛饭）。
     # pressure >= 1.0 即「已熟」（ratio 0.5），正是该立刻去盛饭的点。
     # 只有「当前任务本身不是在处理热锅」时才用这条紧急切换去救锅。若已经
@@ -2101,6 +3068,11 @@ def _apply_commitment_inertia(scored, world, bb):
     if (_time_pressure(top_task, world) >= 1.0
             and not _tasks_equal(top_task, current_task)
             and _time_pressure(current_task, world) < 1.0):
+        # 当前 task 正拿着它下一步要用的料/盘时，L2 熟锅也不能抢：抢走的
+        # 第一步 EnsureHandsFree 会把料放下，下一拍再回来捡（4-2 鸡块
+        # 在 FillCooker ↔ TakeCookedToPlate 之间反复丢，t=477~529）。
+        if _holding_needed_for(current_task, world, book):
+            return current_task
         return top_task
 
     # 在候选中查找当前承诺的 task
@@ -2125,32 +3097,15 @@ def _apply_commitment_inertia(scored, world, bb):
     bb.commitment.infeasible_streak = 0
     current_task_obj, current_score, current_terms = current_entry
 
-    # ⑤ Task 5: 检查是否允许穿插
-    est_steps = _estimate_task_steps(current_task_obj)
-    remaining_steps = est_steps - bb.commitment.steps_done
-
-    # 穿插条件判断
-    if (remaining_steps > INTERLEAVE_THRESHOLD and
-        _task_is_interruptible(current_task_obj) and
-        top_score - current_score > (COMMITMENT_MARGIN + INTERLEAVE_PENALTY)):
-
-        # 穿插：保存当前 task 到 paused_task
-        bb.paused_task = {
-            "task_id": current_task_obj.key,
-            "steps_done": bb.commitment.steps_done
-        }
-        return top_task  # 执行新任务
-
-    # ⑤.5 不可打断的 task 一律保持承诺（Discard = 倒掉还在烧的锅）。
-    # 这一条原先只写在上面的"穿插"分支里，而下面的**常规改选**分支没查——
-    # 于是分差够大时 Discard 照样会被普通备菜抢走，不可打断形同虚设。
-    # 以前分差很少够大（urgency 旧曲线在中段恒 ~0.1），所以没暴露；
-    # urgency 改读 slack 后中段能到 4+，这个洞立刻就会被踩到
-    # （tests/test_planner_multi.py::test_no_interleave_firefighting）。
+    # ⑤ 不可打断的 task 一律保持承诺（Discard = 倒掉还在烧的锅）。
+    # 常规改选分支必须查这一条：分差够大时 Discard 不能被普通备菜抢走
+    # （urgency 改读 slack 后中段能到 4+，不查立刻会被踩到；
+    # tests/test_planner_multi.py::test_non_interruptible_task_not_preempted）。
     if not _task_is_interruptible(current_task_obj):
         return current_task_obj
 
     # ⑥ 计算进度加成（常规承诺惯性）
+    est_steps = _estimate_task_steps(current_task_obj)
     progress_ratio = bb.commitment.steps_done / max(est_steps, 1.0)
     progress_bonus = progress_ratio * PROGRESS_BONUS_PER_STEP
     threshold = COMMITMENT_MARGIN + progress_bonus
@@ -2193,7 +3148,7 @@ def _estimate_task_steps(task):
 
 def _task_is_interruptible(task):
     # type: (Any) -> bool
-    """检查任务是否可被穿插打断（Task 5）。
+    """检查任务是否可被更高分候选抢占。
 
     某些任务不允许被打断：
     - Discard: 灭火/倒垃圾必须立即完成
@@ -2217,18 +3172,46 @@ def _task_is_interruptible(task):
 
 # ==================== Plan 4 Task 4: 新增打分辅助函数 ====================
 
-def _is_async_task(task):
-    # type: (Any) -> bool
-    """检测是否为异步资源任务（spec §6.8 异步资源优先）。
+# 下锅前的备料环节：料最终会进灶时，与下锅同吃「异步资源优先」。
+_PREP_TO_COOKER_TYPES = ("FetchToBoard", "Chop", "FetchToCarrier")
 
-    异步任务：下锅（FetchToCooker）、切菜（Chop）等启动后可自动运行的任务。
-    同步任务：取盘（PlaceCleanPlate）、送餐（DeliverPlate）等需要人等待的任务。
+
+def _feeds_cooker(task, world, book=None):
+    # type: (Any, World, Optional[Any]) -> bool
+    """这个 task 所在的加工链最终会不会进灶（spec §6.8 异步资源优先）。
+
+    「异步」的本意是**灶**：下锅后自己煮，人可以走开。切配不是异步的——
+    反编译 ServerWorkstation.UpdateSynchronising，进度只在有人切（m_interacters
+    非空）时推进。旧判据按类型名只认 FetchToCooker / Chop，于是：
+
+      - 意面（取料即下锅）第一步就吃 +2；肉/鱼/虾第一步 FetchToBoard 吃不到，
+        起点差一截、一直排不上（trace-20261029-213506 t=62：ThrowBatch(Pasta)
+        1.75 vs FetchToBoard(BurritoMeat) -0.75）；
+      - 寿司鱼/黄瓜这类切完直接装盘、不进灶的 Chop 却照吃 +2。
+
+    现在按「进不进灶」判：FetchToCooker 恒是；FetchToBoard / Chop 看它的生料
+    是不是该单某道熟料的成分。没有配方书时退回旧判据（只认 FetchToCooker /
+    Chop），不凭空改无书调用方的语义。
     """
     task_type = getattr(task, "TYPE", "")
-    # FetchToCooker: 下锅后煮饭自动进行（20秒）
-    # Chop: 切菜后自动完成
-    async_types = ["FetchToCooker", "Chop"]
-    return any(t in task_type for t in async_types)
+    if task_type in ("FetchToCooker", "PlaceCarrierInCooker"):
+        return True
+    if task_type not in _PREP_TO_COOKER_TYPES:
+        return False
+    if book is None:
+        return task_type == "Chop"
+    raw = str(getattr(task, "item", "") or "").lower()
+    if not raw:
+        return False
+    order = _find_order_by_id(world, getattr(task, "order_id", None))
+    if order is None:
+        return False
+    for comp in book.requirements(order):
+        if not book.needs_cooking(comp):
+            continue
+        if any(str(r).lower() == raw for r in book.raws_of(comp)):
+            return True
+    return False
 
 
 def _completion_bonus(ratio):
@@ -2246,8 +3229,8 @@ def _completion_bonus(ratio):
 
     取平方（ratio^2 * W * 3）：0 / 1/3 / 2/3 → 0 / 0.33 / 1.33，最后一步的
     增益（1.0）是第一步（0.33）的 3 倍，且 2/3 与 1/3 的差距 1.0 显著超过
-    urgency 的典型组间差。系数 3 让满档仍落在 W_COMPLETION_RATIO*3 = 3.0，
-    与 W_DELIVER_BONUS 同量级 —— 盘齐了就该去送，而不是继续加料。
+    urgency 的典型组间差。系数 3 让满档落在 W_COMPLETION_RATIO*3 = 3.0，
+    足以压过同层其它备菜项。
     """
     if ratio <= 0:
         return 0.0
@@ -2287,72 +3270,40 @@ def _order_completion_ratio(task, world, bb, book=None, plate_match=None,
     if not composition:
         return 0.0
 
+    if book is None:
+        from ai.query.recipes import RecipeBook
+        book = RecipeBook(world.recipes, world.stations)
+
+    # 盘合并：完成度按 src∪dst 并集算（spec 2026-11-01-plate-merge-design §5.3）。
+    # MergePlates 没有 plate_match 里的单盘——它同时动两块盘，走并集口径。
+    if getattr(task, "TYPE", None) == "MergePlates":
+        src = _plate_by_n(world, getattr(task, "src_id", None))
+        dst = _plate_by_n(world, getattr(task, "dst_id", None))
+        if src is None or dst is None:
+            return 0.0
+        union = book.plate_tokens(src) | book.plate_tokens(dst)
+        filled = sum(1 for ing in composition if book.want_tokens(ing) & union)
+        return float(filled) / len(composition)
+
     # 查找该订单对应的盘子
     plate = _find_plate_for_order(oid, world, plate_match)
     if not plate:
         return 0.0
 
-    if book is None:
-        from ai.query.recipes import RecipeBook
-        book = RecipeBook(world.recipes, world.stations)
-
+    # 载体候选（FetchToPlate 带内容签名）按「做完这一步之后」算：底料与它
+    # 装着的料一起进盘。只对这一个候选这样算，同单其它 task 照旧按盘现状——
+    # 否则包肉卷饼与空卷饼同分，凑齐的那一手赢不了 FillCooker
+    # （trace-20261031-233010 t=1790：2/3 盘 + 包肉卷饼，输给填灶到收盘）。
+    extra = set()  # type: Set[str]
+    if getattr(task, "TYPE", None) == "FetchToPlate" and getattr(task, "contents", ()) \
+            and str(task.order_id) == str(oid):
+        extra = set(task.contents) | book.want_tokens(task.item)
     filled_count = 0
     for ingredient in composition:
-        if book.plate_has(plate, ingredient):
+        if book.plate_has(plate, ingredient) or (book.want_tokens(ingredient) & extra):
             filled_count += 1
 
     return float(filled_count) / len(composition)
-
-
-def _ingredient_reuse_count(task, world, bb, plate_match=None, book=None):
-    # type: (Any, World, Blackboard, Optional[Dict[Any, Any]], Optional[Any]) -> int
-    """统计食材复用次数（spec §6.8 食材复用）。
-
-    返回：该食材**还能**同时满足多少个订单的需求（已经摆好的不算）。
-
-    这里踩过与 `_order_completion_ratio` 完全相同的两个坑，修法也相同：
-
-      1. 盘内容读的是 `plate["item"]`——帧里的字段叫 `contents`。于是
-         "盘已有该料"永不成立，计数恒等于「所有要这料的订单数」；
-      2. 字面比较对熟料不成立（盘里记的是装盘态词汇），故有 `book` 时
-         必须走 `book.plate_has`。
-
-    实机后果（trace-20261014-011202）：Seaweed 的 reuse 恒为 4，拿满
-    `W_INGREDIENT_REUSE*(4-1)=1.5~2.0` 分，压过 FetchToCooker 的异步
-    2.0 分（后者还要扣更高的 ETA）。于是 P2 挨个盘摆海苔、锅一直空着，
-    多个订单都要米饭却只下了第一锅。
-    """
-    task_type = getattr(task, "TYPE", "")
-
-    # 只对取料类任务计算复用
-    if "FetchToBoard" not in task_type and "FetchToPlate" not in task_type:
-        return 0
-
-    # 提取任务要取的食材
-    ingredient = getattr(task, "item", None)
-    if not ingredient:
-        return 0
-
-    if book is None:
-        from ai.query.recipes import RecipeBook
-        book = RecipeBook(world.recipes, world.stations)
-
-    # 统计有多少个订单还缺这个食材
-    count = 0
-    for order in world.orders:
-        composition = order.get("composition", [])
-        if ingredient not in composition:
-            continue
-        plate = _find_plate_for_order(order.get("id"), world, plate_match)
-        if plate is None:
-            # 没有盘也算需要：料取回来总有盘可放
-            count += 1
-            continue
-        # 只有盘子还缺这个食材时才计数（装盘态词汇，不做字面比较）
-        if not book.plate_has(plate, ingredient):
-            count += 1
-
-    return count
 
 
 def _current_combo(world):

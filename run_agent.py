@@ -30,7 +30,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ai.agent import Agent
 from ai.exec.client import NullExec
@@ -54,11 +54,13 @@ VOICE_DEFAULTS = {
     "VOLC_TTS_VOICE": "zh_female_vv_uranus_bigtts",
     "VOLC_TTS_RESOURCE_ID": "seed-tts-2.0",
     "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "MIMO_BASE_URL": "https://api.xiaomimimo.com/v1",
     "OC2_VOICE_RATE": 1.05,
     "OC2_VOICE_VOLUME": 0.7,
     "OC2_VOICE_VAD_DB": 9.0,
     "OC2_LLM_TIMEOUT": 10.0,
-    "OC2_VOICE_PTT_KEY": "",
+    # PTT 未配置时的默认键；f8 在 macOS/Windows 都有效（macOS 笔记本需 Fn+F8）。
+    "OC2_VOICE_PTT_KEY": "f8",
 }
 
 
@@ -77,6 +79,8 @@ def _parse_args(argv):
                     help="显式启用语音；缺必需环境变量时报错退出（退出码 2）")
     ap.add_argument("--no-voice", action="store_true",
                     help="强制关闭语音，忽略环境变量")
+    ap.add_argument("--nav-debug", action="store_true",
+                    help="打印 [NAV] 走位诊断（目标/交互位/路径/过街标记）")
     ap.add_argument("--voice-debug", action="store_true",
                     help="把 ai.dialog 日志开到 DEBUG（ASR/LLM/命令/ack/播报；"
                          "不含分段计时）")
@@ -103,6 +107,49 @@ def _env_text(env, key, default=""):
         return default
     raw = str(raw).strip()
     return raw or default
+
+
+def _default_voice_log():
+    # type: () -> str
+    """默认 voice 日志：与本次 trace 同时间戳，方便一一对应。"""
+    try:
+        from ai.output import trace as trace_mod
+        path = trace_mod.TRACE_PATH
+        name = os.path.basename(path)
+        if name.startswith("trace-") and name.endswith(".jsonl"):
+            stamp = name[len("trace-"):-len(".jsonl")]
+            return os.path.join(os.path.dirname(path), "voice-%s.jsonl" % stamp)
+    except Exception:                       # noqa: BLE001
+        pass
+    return ""
+
+
+def _use_mimo(env):
+    # type: (dict) -> bool
+    """LLM provider 选择：显式 LLM_PROVIDER 优先，否则有 MIMO key 就用 MIMO。"""
+    provider = _env_text(env, "LLM_PROVIDER", "").strip().lower()
+    if provider == "mimo":
+        return True
+    if provider == "ark":
+        return False
+    return bool(_env_text(env, "MIMO_API_KEY"))
+
+
+def _llm_env(env):
+    # type: (dict) -> tuple
+    """返回当前 provider 的 (api_key, base_url, model)。"""
+    if _use_mimo(env):
+        return (
+            _env_text(env, "MIMO_API_KEY"),
+            _env_text(env, "MIMO_BASE_URL",
+                      VOICE_DEFAULTS["MIMO_BASE_URL"]),
+            _env_text(env, "MIMO_MODEL"),
+        )
+    return (
+        _env_text(env, "ARK_API_KEY"),
+        _env_text(env, "ARK_BASE_URL", VOICE_DEFAULTS["ARK_BASE_URL"]),
+        _env_text(env, "ARK_MODEL"),
+    )
 
 
 def _env_float(env, key, default, min_value=None, max_value=None):
@@ -158,7 +205,13 @@ def _build_voice_config(args, env):
     if args.voice is None and not _auto_voice_requested(env):
         return None
 
-    missing = [key for key in VOICE_REQUIRED_KEYS if not _env_text(env, key)]
+    llm_key, llm_base, llm_model = _llm_env(env)
+    missing = [key for key in ("VOLC_ASR_API_KEY", "VOLC_TTS_API_KEY")
+               if not _env_text(env, key)]
+    if not llm_key:
+        missing.append("MIMO_API_KEY" if _use_mimo(env) else "ARK_API_KEY")
+    if not llm_model:
+        missing.append("MIMO_MODEL" if _use_mimo(env) else "ARK_MODEL")
     if missing:
         if args.voice is True:
             raise VoiceConfigError(
@@ -179,10 +232,9 @@ def _build_voice_config(args, env):
             env, "VOLC_TTS_VOICE", VOICE_DEFAULTS["VOLC_TTS_VOICE"]),
         tts_resource_id=_env_text(
             env, "VOLC_TTS_RESOURCE_ID", VOICE_DEFAULTS["VOLC_TTS_RESOURCE_ID"]),
-        ark_key=_env_text(env, "ARK_API_KEY"),
-        ark_base_url=_env_text(
-            env, "ARK_BASE_URL", VOICE_DEFAULTS["ARK_BASE_URL"]),
-        ark_model=_env_text(env, "ARK_MODEL"),
+        ark_key=llm_key,
+        ark_base_url=llm_base,
+        ark_model=llm_model,
         rate=_env_float(
             env, "OC2_VOICE_RATE", VOICE_DEFAULTS["OC2_VOICE_RATE"],
             min_value=0.5, max_value=2.0),
@@ -195,11 +247,12 @@ def _build_voice_config(args, env):
         llm_timeout=_env_float(
             env, "OC2_LLM_TIMEOUT", VOICE_DEFAULTS["OC2_LLM_TIMEOUT"],
             min_value=1.0, max_value=60.0),
-        ptt_key=(_env_text(
+        ptt_key=_env_text(
             env, "OC2_VOICE_PTT_KEY",
-            VOICE_DEFAULTS["OC2_VOICE_PTT_KEY"]) or None),
+            VOICE_DEFAULTS["OC2_VOICE_PTT_KEY"]),
         log_path=(args.voice_log
                   or _env_text(env, "OC2_VOICE_LOG", "")
+                  or _default_voice_log()
                   or None),
         debug=bool(args.voice_debug),
     )
@@ -228,8 +281,33 @@ def _load_env(args):
           % (path, added), file=sys.stderr)
 
 
+EXEC_PING_TIMEOUT = 2.0
+
+
+def _check_exec_channel(exec_client, timeout=EXEC_PING_TIMEOUT):
+    # type: (Any, float) -> Optional[str]
+    """确认 27412 对面是活插件；正常返回 None，否则返回给用户看的错误。
+
+    TCP 连接成功不代表对面活着：卡死的旧游戏进程会一直占着监听端口，
+    连接能进 backlog，但命令永远没人处理。启动时发 ping 拿回包，
+    避免 agent 空转、P2 一动不动却没有任何报错。
+    """
+    try:
+        exec_client.connect()
+    except OSError:
+        pass
+    if exec_client.ping(timeout) is not None:
+        return None
+    return ("exec 通道 127.0.0.1:27412 无响应：端口可能被卡死的旧游戏进程占着，"
+            "或插件版本过旧。先运行 lsof -nP -iTCP:27412 -sTCP:LISTEN 看占用者，"
+            "结束它后重启游戏。")
+
+
 def main(argv=None):
     args = _parse_args(argv)
+    if args.nav_debug:
+        os.environ["OC2_NAV_DEBUG"] = "1"
+        print("[run] [NAV] 走位诊断已开启（输出到 stderr）", file=sys.stderr)
 
     try:
         _load_env(args)
@@ -252,6 +330,14 @@ def main(argv=None):
         print("[run] 连接游戏失败（插件没起？127.0.0.1:27411）: %s" % exc,
               file=sys.stderr)
         return 1
+
+    if not args.dry_run:
+        exec_error = _check_exec_channel(agent.exec_client)
+        if exec_error:
+            print("[run] %s" % exec_error, file=sys.stderr)
+            agent.exec_client.close()
+            agent.client.close()
+            return 1
 
     def _stop(signum, frame):
         sys.exit(0)

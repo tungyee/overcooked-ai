@@ -3,12 +3,15 @@ import pytest
 from ai.space import navigation as N
 from ai.space.navigation import (
     BELT_REVERSE_COST,
+    FAST_BELT_SPEED,
+    WITH_FLOW_COST,
     cross_grid_bridges,
     distance_field,
     interact_cells,
     interact_cells_multi,
     interact_cells_with_belts,
     nearest_cost,
+    path_blocked_by_fast_belt,
     serving_hatch_interact_cells,
     step_cost,
 )
@@ -29,6 +32,71 @@ def test_step_cost_returns_reverse_cost_for_against_belt():
     assert step_cost(belt, (0, 0), (-1, 0)) == BELT_REVERSE_COST
     assert step_cost(belt, (0, 0), (1, 0)) == 1
     assert step_cost(belt, (0, 0), (0, 1)) == 1
+
+
+def test_step_cost_blocks_against_fast_belt():
+    """快带（4-3 的 5 m/s）逆行走不动 → None 硬挡；慢带仍只记逆向代价。"""
+    belt = {(0, 0): (1, 0)}
+    fast = {(0, 0): 5.0}
+    slow = {(0, 0): 2.5}
+
+    assert step_cost(belt, (0, 0), (-1, 0), fast) is None
+    assert step_cost(belt, (0, 0), (1, 0), fast) == 1
+    assert step_cost(belt, (0, 0), (0, 1), fast) == 1
+    assert step_cost(belt, (0, 0), (-1, 0), slow) == BELT_REVERSE_COST
+
+
+def test_distance_field_blocks_against_fast_belt():
+    """快带逆行不展开：只能绕带，绕不过去则该格不可达。"""
+    # (0,0) 站在快带上，带把人向 +x 推；往 -x（(0,0)→(-1,0)）是逆行。
+    walkable = lambda gx, gz: -1 <= gx <= 1 and gz == 0
+    belt = {(0, 0): (1, 0)}
+    fast = {(0, 0): 5.0}
+
+    field = distance_field((0, 0), walkable, belt, belt_speed=fast)
+
+    # (-1,0) 逆带：挡掉，不可达；(+1,0) 顺带可达。
+    assert (-1, 0) not in field
+    assert field[(1, 0)] == 1
+
+
+def test_path_blocked_by_fast_belt_detects_reverse_step():
+    belt = {(1, 0): (1, 0)}
+    fast = {(1, 0): 5.0}
+    # (0,0)→(1,0)→(0,0)：第二步 (1,0)→(0,0) 是快带逆行。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0), (0, 0)], belt, fast) is True
+    # 顺带路径不命中。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0)], belt, fast) is False
+    # 无速度表时不判定（旧行为兼容）。
+    assert path_blocked_by_fast_belt([(0, 0), (1, 0), (0, 0)], belt, None) is False
+
+
+def test_step_cost_blocks_against_fast_wind():
+    """4-4 逆风（6.5 m/s > 阈值）走不动 → None 硬挡；顺风记 WITH_FLOW_COST。
+
+    风走 flow 同一套 step_cost：这里用 6.5 m/s（4-4 实机值）钉住「逆风硬挡、
+    顺风默认不奖励（WITH_FLOW_COST=1）」两个口径。
+    """
+    flow = {(0, 0): (1, 0)}          # 风把格上的人向 +x 推
+    wind_speed = {(0, 0): 6.5}
+
+    assert WITH_FLOW_COST == 1       # 默认不给顺风助力奖励
+    assert step_cost(flow, (0, 0), (-1, 0), wind_speed) is None   # 逆风硬挡
+    assert step_cost(flow, (0, 0), (1, 0), wind_speed) == WITH_FLOW_COST  # 顺风
+    assert step_cost(flow, (0, 0), (0, 1), wind_speed) == 1       # 横穿风区
+
+
+def test_distance_field_blocks_against_fast_wind():
+    """逆风格不展开：只能顺风/横穿绕行，绕不过去则该格不可达。"""
+    # (0,0) 站在风区里，风把人向 +x 推；往 -x 是逆风，硬挡不可达。
+    walkable = lambda gx, gz: -1 <= gx <= 1 and gz == 0
+    flow = {(0, 0): (1, 0)}
+    wind_speed = {(0, 0): 6.5}
+
+    field = distance_field((0, 0), walkable, flow, belt_speed=wind_speed)
+
+    assert (-1, 0) not in field
+    assert field[(1, 0)] == 1
 
 
 def test_distance_field_expands_uniformly():
@@ -183,6 +251,36 @@ def test_serving_hatch_interact_cells_both_sides_open_falls_back():
     cells = serving_hatch_interact_cells({(0, 1), (1, 1)}, walkable)
 
     assert set(cells) == {(0, 2), (1, 2), (0, 0), (1, 0), (-1, 1), (2, 1)}
+
+
+def test_serving_hatch_interact_cells_prefers_reachable_side_over_deeper_dead_end():
+    """墙外死区比厨房侧更深时，按距离场选真正可达的一侧（4-1 实机）。
+
+    4-1 出餐口占地 (10,2)/(10,3)：西侧厨房只有 2 格深，东侧墙外是 3 格死路，
+    深度判据会选中东侧；但东侧被墙隔开、距离场到不了。P1 实际站 (9,2) 送餐。
+    """
+    blocked = {(10, 2), (10, 3), (7, 2), (7, 3)}
+    walkable = lambda gx, gz: -5 <= gx <= 20 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+    field = {(9, 2): 22, (9, 3): 23, (8, 2): 21, (8, 3): 22}
+
+    cells = serving_hatch_interact_cells(
+        {(10, 2), (10, 3)}, walkable, field=field)
+
+    assert set(cells) == {(9, 2), (9, 3)}
+
+
+def test_serving_hatch_interact_cells_keeps_deeper_side_when_both_reachable():
+    """两侧都可达时保持原判据：更深的一侧是厨房。"""
+    blocked = {(1, 0), (1, 1), (-1, 0), (-1, 1)}
+    walkable = lambda gx, gz: -5 <= gx <= 5 and -5 <= gz <= 5 \
+        and (gx, gz) not in blocked
+    field = {(0, 0): 1, (0, 1): 2, (2, 0): 1, (2, 1): 2, (3, 0): 3}
+
+    cells = serving_hatch_interact_cells(
+        {(1, 0), (1, 1)}, walkable, field=field)
+
+    assert set(cells) == {(2, 0), (2, 1)}
 
 
 def test_serving_hatch_interact_cells_single_cell_falls_back():

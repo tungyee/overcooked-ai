@@ -180,7 +180,16 @@ def test_world_parses_scalar_fields():
     w = W.World({"phase": "play", "level": "Sushi_1_4_2P", "paused": True})
     assert w.phase == "play"
     assert w.level == "Sushi_1_4_2P"
+    assert w.level_number is None
     assert w.paused is True
+
+
+def test_world_parses_level_number():
+    """插件按场景目录给的 UI 编号（4-1），攻略优先用它，不靠资产名。"""
+    w = W.World({"phase": "level", "level": "Sushi_4_1_P2",
+                 "level_number": "4-1"})
+    assert w.level == "Sushi_4_1_P2"
+    assert w.level_number == "4-1"
 
 
 def test_world_paused_only_true_for_exact_true():
@@ -248,6 +257,36 @@ def test_world_empty_state_does_not_crash():
     assert w.belt_cells == set()
     assert not hasattr(w, "bounds")
     assert w.walkable(0, 0) is True
+
+
+def test_world_wind_zones_merge_into_flow():
+    """4-4 风区：flow_dir/flow_speed = 传送带 ∪ 风；belt_dir 仍只含带，不被风污染。"""
+    w = W.World({
+        "wind_zones": [
+            {"minx": 13.8, "maxx": 15.0, "minz": -6.6, "maxz": -5.4, "vx": -6.5, "vz": 0},
+            {"minx": 14.4, "maxx": 16.8, "minz": -5.4, "maxz": -4.2, "vx": 6.5, "vz": 0},
+        ],
+        "belts": [],
+    })
+    assert w.belt_dir == {}                    # 无传送带：belt_dir 不含风
+    assert w.flow_dir[(0, 0)] == (-1, 0)       # 下路风向左
+    assert w.flow_dir[(0, 1)] == (1, 0)        # 上路风向右
+    assert w.flow_speed[(0, 0)] == 6.5
+
+
+def test_world_belt_overrides_wind_in_flow():
+    """重叠格传送带优先：flow 取带方向/速度，不被风覆盖。"""
+    w = W.World({
+        "wind_zones": [
+            {"minx": 13.8, "maxx": 15.0, "minz": -6.6, "maxz": -5.4, "vx": -6.5, "vz": 0},
+        ],
+        "belts": [
+            {"grid": "GridManager", "gx": 0, "gz": 0, "vx": 2.5, "vz": 0.0},
+        ],
+    })
+    assert w.belt_dir[(0, 0)] == (1, 0)        # 带向 +x
+    assert w.flow_dir[(0, 0)] == (1, 0)        # 传送带优先，不取风的 -x
+    assert w.flow_speed[(0, 0)] == 2.5         # 取带速，不取风 6.5
 
 
 def test_world_empty_state_walkable_feeds_bounded_distance_field():
@@ -523,6 +562,44 @@ def test_world_plates_and_extinguishers_legacy_all_non_held():
     assert len(w.all_plates) == 1
     assert len(w.extinguishers) == 1
     assert w.held_extinguishers == []
+
+
+def test_world_reads_held_plates_from_state_dump():
+    """state_dump 回放：手持盘单列在 held_plates（plates 里无 held_by），
+    World 必须把它并回 held_plates，否则 all_plates 少一块、_plate_pressure /
+    plate_by_id 在离线回放里失真（trace-20261101-223804 尾部拿放震荡复盘）。"""
+    w = W.World({
+        "plates": [
+            {"n": "-1", "name": "equipment_plate_01 (1)", "x": 1.0, "z": 2.0,
+             "count": 0},
+        ],
+        "held_plates": [
+            {"n": "-2", "name": "equipment_plate_01 (8)", "x": 3.0, "z": 4.0,
+             "count": 0, "held_by": "Player 2"},
+        ],
+    })
+    assert [p["n"] for p in w.plates] == ["-1"]
+    assert [p["n"] for p in w.held_plates] == ["-2"]
+    assert [p["n"] for p in w.all_plates] == ["-1", "-2"]
+
+
+def test_world_reads_held_items_and_extinguishers_from_state_dump():
+    """state_dump 回放：手持物/手持灭火器单列在 held_items / held_extinguishers
+    （items / extinguishers 里无 held_by），World 必须把它们并回，否则
+    held_cookware_state、灭火逻辑在离线回放里失真。"""
+    w = W.World({
+        "items": [{"n": "Cucumber", "x": 1.0, "z": 2.0}],
+        "held_items": [{"n": "utensil_pot_01", "x": 5.0, "z": 5.0,
+                        "held_by": "Player 2"}],
+        "extinguishers": [{"n": "ext_01", "x": 9.6, "z": 10.8}],
+        "held_extinguishers": [{"n": "ext_02", "x": 3.0, "z": 4.0,
+                                "held_by": "Player 1"}],
+    })
+    assert [it["n"] for it in w.items] == ["Cucumber"]
+    assert [(it["n"], it["held_by"]) for it in w.held_items] == [
+        ("utensil_pot_01", "Player 2")]
+    assert [e["n"] for e in w.extinguishers] == ["ext_01"]
+    assert [e["n"] for e in w.held_extinguishers] == ["ext_02"]
 
 
 def test_plate_by_id_sees_held_plate_via_all_plates():

@@ -13,7 +13,7 @@
 decompose() 不在这里——spec §8.2 明确"decompose() 删除"。它输出的线性
 步骤序列正是 §6.2 要换掉的东西：执行顺序从可行性涌现，不预先排序。
 """
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ai.query import predicates as P
 from ai.query.plate_tokens import parse_plate_detail
@@ -35,8 +35,8 @@ def _is_null(v):
 class RecipeBook(object):
     """一帧的配方视图：成分树（recipes）+ 箱子的加工信息（stations）。"""
 
-    def __init__(self, recipes, stations=None):
-        # type: (Optional[List[Dict]], Optional[List[Dict]]) -> None
+    def __init__(self, recipes, stations=None, items=None):
+        # type: (Optional[List[Dict]], Optional[List[Dict]], Optional[List[Dict]]) -> None
         self._by_name = {}      # type: Dict[str, Dict]
         for r in recipes or ():
             if isinstance(r, dict) and r.get("name"):
@@ -49,6 +49,16 @@ class RecipeBook(object):
             ing = st.get("ing")
             if ing:
                 self._crates[str(ing).lower()] = st
+        # 物品形态 → 烹饪能力（插件协议 8：crate.chop_cookable / items[].cookable，
+        # 见 Oc2AIPlugin.CookableJson）。键是物品名小写（Pizza_Base_Raw）。
+        self._cookable = {}     # type: Dict[str, Dict]
+        for st in stations or ():
+            if isinstance(st, dict) and st.get("t") == "crate" \
+                    and isinstance(st.get("chop_cookable"), dict) and st.get("chop"):
+                self._cookable[str(st["chop"]).lower()] = st["chop_cookable"]
+        for it in items or ():
+            if isinstance(it, dict) and isinstance(it.get("cookable"), dict) and it.get("n"):
+                self._cookable.setdefault(str(it["n"]).lower(), it["cookable"])
         self._branches = None   # type: Optional[Dict[str, str]]
 
     def recipe(self, ing):
@@ -95,10 +105,20 @@ class RecipeBook(object):
         """
         if not order:
             return ()
+        dish = order.get("dish")
+        # 整道菜本身是熟料节点（披萨 = CookedCompositeOrderNode{Dough,Tomato,
+        # Cheese}，整份进炉）：进盘的是**一个**熟料节点，不是三样料。插件给的
+        # composition 是扁平的生料表，按它判「盘里缺什么」会恒报缺三样（盘里
+        # 只有 cooked:cheese+dough+tomato:oventray）。生料由 raws_of(dish) 展开。
+        # 判据：composition 恰好是该熟料节点 comp 的扁平展开（或缺省）。
         comp = order.get("composition")
+        if self.node_kind(dish) == "cook":
+            own = sorted(c.lower() for c in self.components(dish))
+            if not comp or sorted(str(c).lower() for c in comp) == own:
+                return (str(self.recipe(dish).get("name") or dish),)
         if comp:
             return tuple(str(c) for c in comp)
-        r = self.recipe(order.get("dish"))
+        r = self.recipe(dish)
         if not r:
             return ()
         return tuple(str(c) for c in (r.get("comp") or ()))
@@ -114,6 +134,40 @@ class RecipeBook(object):
         盘里多放的料不影响判断——这里只管"还缺什么"。
         """
         have = self.plate_tokens(plate)
+        return tuple(ing for ing in self.requirements(order)
+                     if not (self.want_tokens(ing) & have))
+
+    def matches(self, order, plate):
+        # type: (Optional[Dict], Optional[Dict]) -> bool
+        """盘是否**正好**是这一单的菜：不缺料，且没有多余盘内容。
+
+        `missing` 只回答"还缺什么"，多放的料不影响它；但游戏只在盘内容与
+        菜谱一致时结算。多放一份料（例如给 Sushi_PlainFish 加米饭）会被
+        出餐口吞掉、不涨分——4-1 实机 trace-20261109-231509 t≈61.5：
+        鱼+米饭被当成 Sushi_PlainFish 送出，deliveries/base 都没变。
+
+        `optional` 里的成分算允许项：游戏允许订单的可选配料。
+        """
+        if not order or not plate:
+            return False
+        if self.missing(order, plate) != ():
+            return False
+        allowed = self.order_want_tokens(order)
+        for ing in order.get("optional") or ():
+            allowed |= self.want_tokens(ing)
+        return self.plate_tokens(plate) <= allowed
+
+    def missing_union(self, order, plates):
+        # type: (Optional[Dict], List[Dict]) -> Tuple[str, ...]
+        """多盘并集口径的 `missing`：还缺哪些顶层成分（盘合并用）。
+
+        与 `missing` 同一套装盘态词汇判断，只是把 `have` 换成 `plates`
+        里所有盘的 token 并集。用于 MergePlates 判「两块盘合起来离订单还差
+        几样料」——单盘口径的 `missing` 永远看不到 src 盘上的料。
+        """
+        have = set()  # type: Set[str]
+        for p in plates or ():
+            have |= self.plate_tokens(p)
         return tuple(ing for ing in self.requirements(order)
                      if not (self.want_tokens(ing) & have))
 
@@ -197,6 +251,115 @@ class RecipeBook(object):
         if not self.needs_cooking(ing):
             return None
         return str((self.recipe(ing) or {}).get("cook"))
+
+    def cooked_of_raws(self, raws):
+        # type: (Any) -> List[str]
+        """生料集合**恰好**等于其 comp 的熟料（多料同炉的精确反查）。
+
+        cooked_of_raw 只看 comp[0]：面团同时是十几种披萨的 comp[0]，烤箱里的
+        {cheese, dough, tomato} 只该认成 MargheritaPizza。
+        """
+        want = sorted(str(r).lower() for r in raws or ())
+        if not want:
+            return []
+        out = []  # type: List[str]
+        for name, r in self._by_name.items():
+            if not self.needs_cooking(name):
+                continue
+            comp = sorted(str(c).lower() for c in (r.get("comp") or ()))
+            if comp == want:
+                out.append(str(r.get("name") or name))
+        return out
+
+    # ---------- 可烹饪载体（协议 8） ----------
+    def cookable_of(self, form):
+        # type: (Optional[str]) -> Optional[Dict]
+        """物品形态的烹饪能力 {station, step, prep, vessel, time}；不能上灶 None。"""
+        if not form:
+            return None
+        return self._cookable.get(str(form).lower())
+
+    def carrier(self, dish):
+        # type: (Optional[str]) -> Optional[Tuple[str, str, str, Optional[str]]]
+        """统一的「载体菜」概念：底料本身能装别的料。
+
+        返回 (kind, base, form, station)：
+          - ("cook", base, form, station)  披萨：底料是可烹饪载体（cookable.prep），
+            配料放上底料后整份进炉，熟了端盘取；
+          - ("wrap", base, form, None)     卷饼/汉堡：底料是 Composite* 叶子，
+            熟料直接装进底料、不进炉，装齐后放进盘送餐。
+        不是载体菜返回 None。base = 底料的订单成分名；form = 底料的取料形态
+        （披萨是切好的饼、卷饼是卷饼皮本身）；station = 进炉类要求的灶型，
+        wrap 类恒为 None。
+        """
+        if self.node_kind(dish) == "cook":
+            # 披萨：底料切成可烹饪载体（cookable.prep），整份进炉。
+            for comp in self.components(dish):
+                form = self.cook_input_form(comp)
+                cap = self.cookable_of(form)
+                if cap and cap.get("prep") and cap.get("station"):
+                    return ("cook", comp, str(form), str(cap["station"]))
+            return None
+        if self.node_kind(dish) == "assemble":
+            # 卷饼/汉堡：唯一 Composite* 叶子是包裹底料，其余熟料装进去。
+            leaves = [c for c in self.components(dish) if self._composite_leaf(c)]
+            if len(leaves) != 1:
+                return None
+            base = leaves[0]
+            fillings = tuple(c for c in self.components(dish)
+                             if c != base and self.needs_cooking(c))
+            if not fillings:
+                return None          # 没有熟料要装：不是包裹底料
+            return ("wrap", base, base, None)
+        return None
+
+    def carrier_base(self, dish):
+        # type: (Optional[str]) -> Optional[Tuple[str, str, str]]
+        """整份进炉的熟料：(底料成分, 载体形态, 要求站型)；不是这种菜返回 None。
+
+        反编译：CookablePreparationContainer = 可放料的载体 + CookingHandler。
+        披萨的面团切成 Pizza_Base_Raw（prep=True, station=Oven），番茄/芝士
+        放在饼上、整份进烤箱。判据只读插件上报的能力，不按菜名。wrap 类
+        （卷饼）不进炉，不在此列——见 wrap_base。
+        """
+        c = self.carrier(dish)
+        return c[1:] if c is not None and c[0] == "cook" else None
+
+    def carrier_toppings(self, dish):
+        # type: (Optional[str]) -> Tuple[str, ...]
+        """整份进炉菜里放在载体上的料（除底料外的 comp）。"""
+        base = self.carrier_base(dish)
+        if base is None:
+            return ()
+        return tuple(c for c in self.components(dish) if c != base[0])
+
+    def wrap_base(self, dish):
+        # type: (Optional[str]) -> Optional[str]
+        """wrap 类载体菜（卷饼/汉堡）的唯一包裹底料名；不是返回 None。"""
+        c = self.carrier(dish)
+        return c[1] if c is not None and c[0] == "wrap" else None
+
+    def wrap_fillings(self, dish):
+        # type: (Optional[str]) -> Tuple[str, ...]
+        """wrap 类载体要装进去的熟料成分（保序，不含底料本身）。"""
+        c = self.carrier(dish)
+        if c is None or c[0] != "wrap":
+            return ()
+        base = c[1]
+        return tuple(x for x in self.components(dish)
+                     if x != base and self.needs_cooking(x))
+
+    def _composite_leaf(self, ing):
+        # type: (Optional[str]) -> bool
+        """叶子成分是否「Composite* 底料」：plate 字段是 Composite 预置件名。
+
+        普通叶子（米/蘑菇）plate 是 null 或食材名（ingredients_rice_boiled_01）；
+        卷饼皮/海苔/汉堡胚这类能叠料的底料 plate 是 Composite*。
+        """
+        if self.node_kind(ing) != "leaf":
+            return False
+        plate = str((self.recipe(ing) or {}).get("plate") or "")
+        return plate.startswith("Composite")
 
     def cooked_of_raw(self, raw):
         # type: (Optional[str]) -> List[str]
@@ -390,8 +553,9 @@ def _merge_station_coords(entry, stations):
     return entry
 
 
-def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_access=None):
-    # type: (object, Optional[str], str, bool, object) -> Optional[Dict]
+def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False,
+                    can_access=None, contents=frozenset()):
+    # type: (object, Optional[str], str, bool, object, Any) -> Optional[Dict]
     """定位食材当前位置，返回 {"kind": ..., "st"/"chef": ...}。
 
     可达来源的 kind 优先级：held（被**自己**拿着）→ board（砧板上）→ plate（已装盘）
@@ -406,44 +570,72 @@ def find_ingredient(world, ing, self_name=P.P2_NAME, exclude_plate=False, can_ac
     的料，宽松匹配会让"去拿生黄瓜"的 task 看到板上的切好黄瓜就以为
     料到手了。生/熟/切好的区分由调用方传对名字。
 
+    **内容也精确匹配**（contents，见 ai.query.carriers）：物品 detail 解析出
+    的 token 集必须与 contents 完全相等。缺省空集 = 普通料，包了熟肉的卷饼
+    不会被当成空卷饼拿去补蘑菇卷；contents={cooked:burritomeat:fryingpan}
+    = 只认包了熟肉的那张。箱子/砧板只出普通料，contents 非空时跳过。
+
     与 oc/ai/task.py:find_ingredient 的差异：kind=="plate" 时**返回盘
     本身**（旧实现只返回 {"kind":"plate"}）。spec §6.0 要求谓词按绑定
     参数求值——两单都缺黄瓜时，必须能区分料在哪只盘里。
     """
+    from ai.query.carriers import held_contents, item_contents
     il = str(ing or "").strip().lower()
     if not il:
         return None
+    want = frozenset(contents or ())
 
     for c in getattr(world, "chefs", None) or ():
         # 只认自己手里的：P1 手里的料 P2 拿不到，跳过继续找箱子/板/散落
         if str(c.get("name") or "").strip().lower() != str(self_name).strip().lower():
             continue
-        if P.held_name(c) == il:
+        if P.held_name(c) == il and held_contents(world, c.get("name")) == want:
             return {"kind": "held", "chef": c.get("name")}
 
+    from ai.space import reachability
+    route = reachability.context(world, name=self_name)
     if can_access is None:
-        from ai.space import reachability
-        route = reachability.context(world, name=self_name)
         can_access = lambda st: reachability.can_interact(route, st)
 
     for ws in getattr(world, "workstations", None) or ():
-        if str(ws.get("item") or "").lower() == il:
+        if not want and str(ws.get("item") or "").lower() == il:
             station = _merge_station_coords(ws, getattr(world, "stations", None))
             if can_access(station):
                 return {"kind": "board", "st": station}
 
-    if not exclude_plate:
+    if not exclude_plate and not want:
         for p in getattr(world, "plates", None) or ():
             if il in P.plate_contents(p) and can_access(p):
                 return {"kind": "plate", "st": p}
 
+    # 取料源（散落 + 箱子）按「可达 + 行走距离」排序取最近：以前散落恒优先于
+    # 箱子，P2 会去追传送带上的散料，而不是转身去旁边的箱子
+    # （trace-20261112-230754 追鱼、追海苔卡住）。
+    candidates = []  # type: List[Tuple[str, Dict, Optional[int]]]
     for it in getattr(world, "items", None) or ():
-        if str(it.get("n") or "").lower() == il and can_access(it):
-            return {"kind": "loose", "st": it}
-
-    for st in getattr(world, "stations", None) or ():
-        if not isinstance(st, dict) or st.get("t") != "crate":
+        # 飞行中的料（投掷途中）不算散落来源：坐标是空中的过渡点，走过去
+        # 料早已落在别处（trace-20261029-202903 t=231：锁定 x=18.7 的飞行
+        # 意面，实际落在 x≈23.6，P2 对空地反复拾取到关卡结束）。
+        if it.get("flying") is True:
             continue
-        if str(st.get("ing") or "").lower() == il and can_access(st):
-            return {"kind": "crate", "st": st}
+        # 内容不符不算：包了肉的卷饼不是「一份卷饼」，拿它去补别的单会把
+        # 不相干的料一起倒进盘（trace-20261031-233010）。
+        if item_contents(it) != want:
+            continue
+        if str(it.get("n") or "").lower() == il and can_access(it):
+            candidates.append(("loose", it, reachability.interact_cost(route, it)))
+
+    if not want:
+        for st in getattr(world, "stations", None) or ():
+            if not isinstance(st, dict) or st.get("t") != "crate":
+                continue
+            if str(st.get("ing") or "").lower() == il and can_access(st):
+                candidates.append(("crate", st, reachability.interact_cost(route, st)))
+
+    if candidates:
+        # 距离未知（无可达场/离线）排最后；同距离时散落优先于箱子（旧行为）。
+        candidates.sort(key=lambda c: (
+            c[2] is None, c[2] if c[2] is not None else 1e9,
+            c[0] == "crate"))
+        return {"kind": candidates[0][0], "st": candidates[0][1]}
     return None

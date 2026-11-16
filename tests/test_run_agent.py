@@ -162,7 +162,7 @@ def test_env_defaults():
     assert cfg.volume == pytest.approx(0.7)
     assert cfg.vad_threshold_db == pytest.approx(9.0)
     assert cfg.llm_timeout == pytest.approx(10.0)
-    assert cfg.ptt_key is None
+    assert cfg.ptt_key == "f8"
     assert cfg.log_path is None
     assert cfg.debug is False
 
@@ -250,3 +250,52 @@ def test_main_explicit_voice_missing_keys_returns_2(monkeypatch, capsys):
     # --no-env-file：避免自动加载仓库根 .env 把 key 补回来。
     assert run_agent.main(["--dry-run", "--voice", "--no-env-file"]) == 2
     assert "VOLC_ASR_API_KEY" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------ exec 通道启动校验
+
+class _FakeExec(object):
+    def __init__(self, reply):
+        self.reply = reply
+        self.connected = True
+        self.connects = 0
+
+    def connect(self):
+        self.connects += 1
+        self.connected = True
+
+    def ping(self, timeout=2.0):
+        return self.reply
+
+    def close(self):
+        pass
+
+
+def test_exec_channel_ok_when_ping_replies():
+    assert run_agent._check_exec_channel(_FakeExec({}), timeout=0.1) is None
+
+
+def test_exec_channel_reports_stale_listener_when_ping_times_out():
+    msg = run_agent._check_exec_channel(_FakeExec(None), timeout=0.1)
+    assert msg is not None
+    assert "27412" in msg
+    assert "lsof" in msg
+
+
+def test_main_exits_1_when_exec_channel_is_dead(monkeypatch, capsys):
+    class _Client(object):
+        def close(self):
+            pass
+
+    class _Agent(object):
+        def __init__(self, voice=None, exec_client=None):
+            self.exec_client = _FakeExec(None)
+            self.client = _Client()
+            self.ran = False
+
+        def run(self, **kwargs):
+            self.ran = True
+
+    monkeypatch.setattr(run_agent, "Agent", _Agent)
+    assert run_agent.main(["--no-voice", "--no-env-file"]) == 1
+    assert "27412" in capsys.readouterr().err

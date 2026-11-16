@@ -10,6 +10,7 @@ namespace Oc2AI
         int _sceneEpoch, _flowId;
         volatile bool _stopping;
         BepInEx.Configuration.ConfigEntry<bool> _discoverEnabled;
+        BepInEx.Configuration.ConfigEntry<bool> _trafficProbeEnabled;
         string _performanceJson = "null";
         int _frameCount, _slowFrames;
         double _frameSum, _frameMax;

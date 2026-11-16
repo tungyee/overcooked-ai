@@ -51,35 +51,6 @@ def _make_bb():
 
 # ---------- 测试用例 ----------
 
-def test_score_prefers_lower_estimated_steps():
-    """打分函数偏好估计步数更少的候选（ETA 权重生效）。"""
-    order = _make_order("Test", ["Tomato"], remaining=3)
-    w = _make_world(orders=[order])
-    bb = _make_bb()
-
-    # 创建两个候选：一个 10 步，一个 20 步
-    cand_short = Candidate(
-        task=T.Chop("order1", ("board_01",), "Tomato"),
-        preconditions=[],
-        estimated_steps=10
-    )
-    cand_long = Candidate(
-        task=T.Chop("order1", ("board_02",), "Tomato"),
-        preconditions=[],
-        estimated_steps=20
-    )
-
-    score_short, terms_short = _score_candidate(w, bb, cand_short)
-    score_long, terms_long = _score_candidate(w, bb, cand_long)
-
-    # 步数少的分数应该更高（因为 ETA 用负号）
-    assert score_short > score_long
-    # 验证 terms 包含所需的键
-    assert "urgency" in terms_short
-    assert "pressure" in terms_short
-    assert "eta" in terms_short
-
-
 def test_score_urgency_boosts_with_lower_remaining():
     """订单 remaining 越小，紧迫度分数越高。
 
@@ -156,13 +127,11 @@ def test_score_candidate_handles_missing_order():
         estimated_steps=10
     )
 
-    # 应该不崩溃，只是 urgency 部分不计分
+    # 应该不崩溃；订单不存在，所有订单相关信号都为 0
     score, terms = _score_candidate(w, bb, cand)
 
-    # 仍应有 ETA 的负分
-    assert score < 0
-    assert terms["urgency"] == 0.0  # 订单不存在，紧迫度为 0
-    assert terms["eta"] < 0  # ETA 应该是负数
+    assert score == 0.0
+    assert terms["urgency"] == 0.0
 
 
 def test_score_identical_candidates_equal():

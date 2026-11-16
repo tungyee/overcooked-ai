@@ -19,7 +19,14 @@ from ai.primitives.base import Primitive
 # "本文档中'拍'统一指 Python 循环拍（50 ms）"。混用两套时基会让测试
 # 必须 sleep。4.0 秒 → 20 Hz 下 80 拍。
 BAD_CELL_TTL_TICKS = 80
-ABANDON_TTL_TICKS = 200
+# 碰撞回传 blocked（硬障碍）的拉黑 TTL（拍）。比 BAD_CELL_TTL_TICKS 短：NPC 顾客
+# 会动，拉黑太久会误拦它走后空出来的路；2 秒够 AI 换条路绕过去。
+BLOCKED_BOX_TTL_TICKS = 40
+# 整体放弃的冷却（拍）。5 秒：10 秒（200 拍）会让移动木筏关卡里的送餐被锁
+# 过久——接缝/篮子停靠窗口约 10~16 秒，10 秒冷却一出窗口就错过、成品盘干放
+# 到终局（trace-20261111-220835 SendAcross -87392 三次捡盘失败后冷却还没
+# 结束接缝又断开）。仍须长于 HANDS_CLEAR_COOLDOWN_TICKS（清手短冷却）。
+ABANDON_TTL_TICKS = 100
 
 
 def _ensure_stuck_scratch(ctx):
@@ -45,12 +52,24 @@ def _resolve_value(v, ctx):
 def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
     # type: (Any, Any, int, Dict, Any, Any) -> None
     """按位置 / 资源避让已证实的无进展；订单切换不能重置同一处故障。"""
-    if failure.get("reason") not in ("no_progress", "observation_timeout") or bb.mode != "Normal":
+    reason = failure.get("reason")
+    if reason not in ("no_progress", "observation_timeout", "gate_closed", "blocked"):
         return
     scratch = _ensure_stuck_scratch({"bb": bb})
+    if reason == "blocked":
+        # 碰撞回传：按障碍整块短暂拉黑（不是单格），重算才能绕开真实障碍身体。
+        # 类别不是 obstacle（player/pushable/travelator）可推，不拉黑。
+        if failure.get("blocked_kind") != "obstacle":
+            return
+        for cell in failure.get("blocked_cells") or ():
+            scratch.bad_cells[tuple(cell)] = tick + BLOCKED_BOX_TTL_TICKS
+        return          # 障碍挡路是暂时性的，不拉黑资源（同 gate_closed）
     cell = failure.get("blocked_cell")
     if cell is not None:
         scratch.bad_cells[tuple(cell)] = tick + BAD_CELL_TTL_TICKS
+    # 门洞没开：门会再开，资源本身没问题——只绕开门洞格，不拉黑资源。
+    if reason == "gate_closed":
+        return
     # 风区里被吹得动不了：不是 AI 的错，只写 bad_cells 让寻路绕开这一格，
     # **不拉黑资源**——否则一阵风就把端料/盛饭的整个资源判死刑（实机：
     # 端番茄时被风推、位置无法移动，observation_timeout 把料箱拉黑 10 秒）。
@@ -58,7 +77,7 @@ def note_motion_failure(bb, task, tick, failure, world=None, chef=None):
         check = getattr(world, "chef_in_wind", None)
         if callable(check) and check(chef):
             return
-    # 端锅/盛饭/灭火这类任务不能拉黑资源：拉黑期(200拍)超过烧糊倒计时，
+    # 端锅/盛饭/灭火这类任务不能拉黑资源：拉黑期再短也可能让锅烧糊，
     # 等于判那口锅死刑（实机：盛饭失败把端锅一起拉黑 → 熟锅烧糊起火）。
     # bad_cells 仍照写——寻路绕开被堵的那一格，只废格、不废整个资源。
     if getattr(task, "NO_ABANDON", False):
@@ -153,9 +172,14 @@ class Timeout(Node):
             self._ticks = 0
             return Status.FAILURE
         self._ticks += 1
+        waited = ctx.get("external_wait", 0) if isinstance(ctx, dict) else 0
         s = self.child.tick(ctx)
         if s != Status.RUNNING:
             self._ticks = 0
+        elif isinstance(ctx, dict) and ctx.get("external_wait", 0) != waited:
+            # 子树这一拍在等外部（渡运篮子转回来，见 move.Approach._await_shuttle）：
+            # 不算进本 task 的超时预算，上限由等待方自己封顶。
+            self._ticks -= 1
         return s
 
     def halt(self):

@@ -49,16 +49,25 @@ namespace Oc2AI
 
         private void ServeLoop()
         {
-            try
+            // 端口可能被上次没退干净的游戏进程占着（macOS 上 FMOD/CoreAudio
+            // 退出死锁会让旧进程一直挂着 27412，状态端口反而已释放）。绑不上
+            // 就每 2s 重试：旧进程一退出就能接上，不用等下一次重启游戏。
+            while (_running)
             {
-                _listener = new TcpListener(IPAddress.Loopback, Port);
-                _listener.Start();
-                UnityEngine.Debug.Log("[EXEC] listening 127.0.0.1:" + Port);
-            }
-            catch (Exception e)
-            {
-                UnityEngine.Debug.LogWarning("[EXEC] listen fail: " + e.Message);
-                return;
+                try
+                {
+                    _listener = new TcpListener(IPAddress.Loopback, Port);
+                    _listener.Start();
+                    UnityEngine.Debug.Log("[EXEC] listening 127.0.0.1:" + Port);
+                    break;
+                }
+                catch (Exception e)
+                {
+                    UnityEngine.Debug.LogWarning("[EXEC] listen fail: " + e.Message
+                        + "（2s 后重试；若是卡死的旧游戏进程占着 " + Port
+                        + "，先结束它）");
+                    Thread.Sleep(2000);
+                }
             }
             while (_running)
             {
@@ -95,7 +104,9 @@ namespace Oc2AI
             if (cmd == null) return;
             UnityEngine.Debug.Log("[EXEC] cmd=" + cmd + " id=" + cmdId);
 
-            if (cmd != "halt" && !PadEngagement.IsEngaged())
+            // ping/halt 不依赖虚拟手柄：启动握手用 ping 确认端口对面是活插件
+            // （卡死的旧进程残留监听器只会让连接进 backlog，永不回包）。
+            if (cmd != "halt" && cmd != "ping" && !PadEngagement.IsEngaged())
             {
                 // 未 engage（游戏已在关卡内才启动 agent，虚拟手柄接不进去）→ 回
                 // not engaged，Python 侧据此回退旧路径。
@@ -105,6 +116,9 @@ namespace Oc2AI
 
             switch (cmd)
             {
+                case "ping":
+                    SendResult(cmdId, true, null);
+                    break;
                 case "move":
                     lock (_cmdLock) { _active = new MoveCommand(obj); _activeCmdId = cmdId; _activeStartedAt = Time.unscaledTime; }
                     break;
@@ -116,6 +130,9 @@ namespace Oc2AI
                     break;
                 case "throw":
                     lock (_cmdLock) { _active = new ThrowCommand(obj); _activeCmdId = cmdId; _activeStartedAt = Time.unscaledTime; }
+                    break;
+                case "raft":
+                    lock (_cmdLock) { _active = new RaftCommand(obj); _activeCmdId = cmdId; _activeStartedAt = Time.unscaledTime; }
                     break;
                 case "halt":
                     Halt();
@@ -180,7 +197,8 @@ namespace Oc2AI
             if (active.Done)
             {
                 EnsureReleased();
-                SendResult(cid, active.Ok, active.Why, null, active.BlockedCell);
+                SendResult(cid, active.Ok, active.Why, null, active.BlockedCell,
+                           active.BlockedBox, active.BlockedKind);
                 lock (_cmdLock)
                 {
                     if (ReferenceEquals(_active, active)) { _active = null; _activeCmdId = 0; _activeStartedAt = 0f; }
@@ -189,9 +207,10 @@ namespace Oc2AI
             }
         }
 
-        /// <summary>写一条结果回客户端。heldAfter / blockedCell 可空。</summary>
+        /// <summary>写一条结果回客户端。heldAfter / blockedCell / blockedBox / blockedKind 可空。</summary>
         public void SendResult(long cmdId, bool ok, string why,
-                               string heldAfter = null, double[] blockedCell = null)
+                               string heldAfter = null, double[] blockedCell = null,
+                               double[] blockedBox = null, string blockedKind = null)
         {
             UnityEngine.Debug.Log("[EXEC] result id=" + cmdId + " ok=" + (ok ? "true" : "false")
                                  + " why=" + (why ?? "null"));
@@ -213,6 +232,19 @@ namespace Oc2AI
                 {
                     sb.Append(",\"blocked_cell\":null");
                 }
+                if (blockedBox != null && blockedBox.Length == 4)
+                {
+                    sb.Append(",\"blocked_box\":[")
+                      .Append(blockedBox[0].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[1].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[2].ToString("R", CultureInfo.InvariantCulture)).Append(',')
+                      .Append(blockedBox[3].ToString("R", CultureInfo.InvariantCulture)).Append(']');
+                }
+                else
+                {
+                    sb.Append(",\"blocked_box\":null");
+                }
+                sb.Append(",\"blocked_kind\":").Append(Json.Quote(blockedKind));
                 sb.Append('}');
                 try { _writer.WriteLine(sb.ToString()); }
                 catch (Exception) { }

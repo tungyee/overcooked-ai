@@ -19,11 +19,12 @@ from ai.state.world import World
 
 # ---------------------------------------------------------------- fixtures
 
-def make_world(level="Sushi_1_4_2P", orders=None, chefs=None,
-               session_id=None, scene_epoch=None):
+def make_world(level="Sushi_1_4_2P", level_number=None, orders=None,
+               chefs=None, session_id=None, scene_epoch=None):
     return World({
         "phase": "level",
         "level": level,
+        "level_number": level_number,
         "session_id": session_id,
         "scene_epoch": scene_epoch,
         "orders": orders if orders is not None else [
@@ -113,85 +114,7 @@ def _batch(*calls, source=""):
     return DutyBatch(batch_id="b1", calls=list(calls), source=source)
 
 
-def _duty(**args):
-    return ("update_duties", args)
-
-
 # ---------------------------------------------------------- 账本落地
-
-
-def test_batch_applies_duties_and_compiles_preferences(agent, world):
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber"),
-        _duty(op="add", mode="do", target="WashPlate"),
-        source="我来切，你洗盘"))
-
-    assert [r["ok"] for r in results] == [True, True]
-    assert [r["id"] for r in results] == ["a1", "a2"]
-    kinds = {p.duty_id: (p.kind, p.weight) for p in agent.bb.preferences}
-    assert kinds == {"a1": ("claim", -1.0), "a2": ("direct", 1.0)}
-    assert agent.ledger.get("a1").source == "我来切，你洗盘"
-
-
-def test_batch_rejects_bad_calls_individually(agent, world):
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="SushiRice"),
-        ("update_duties", None),
-        ("teleport", {}),
-        _duty(op="add", mode="do", target="Cucumber")))
-
-    assert [r["ok"] for r in results] == [False, False, False, True]
-    assert "SushiRice" in results[0]["reason"]
-    assert "JSON" in results[1]["reason"]
-    assert "未知工具" in results[2]["reason"]
-    assert agent.ledger.ids() == ["a1"]
-
-
-def test_wash_rejected_without_sink(agent):
-    world = make_world()
-    world.stations = [st for st in world.stations if st.get("t") != "washing"]
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
-    assert results[0]["ok"] is False and "WashPlate" in results[0]["reason"]
-
-
-def test_leave_to_p1_keeps_matching_commitment(agent, world):
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
-    agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
-
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
-
-    assert agent.bb.commitment.active_task == active
-
-
-def test_do_keeps_commitment(agent, world):
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
-    agent.bb.commitment = Commitment(active, 90, 0, 0, 0)
-
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
-
-    assert agent.bb.commitment.active_task == active
-
-
-def test_edit_flips_ownership_and_keeps_id(agent, world):
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
-    results = agent._apply_duty_batch(world, _batch(
-        _duty(op="edit", id="a1", mode="do")))
-
-    assert results[0] == {"ok": True, "id": "a1",
-                          "text": "P2 优先做 Cucumber"}
-    assert [p.kind for p in agent.bb.preferences] == ["direct"]
-
-
-def test_first_level_observation_does_not_clear_ledger(agent, world):
-    agent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
-    agent._maybe_reset_dialog_level(world)
-    assert agent.ledger.ids() == ["a1"]
-    assert len(agent.bb.preferences) == 1
 
 
 # ------------------------------------------------------- service
@@ -257,40 +180,17 @@ def dagent(monkeypatch, book, fake_worker):
     return a
 
 
-def test_service_dialog_drains_batches_and_acks(dagent, world, fake_worker):
-    fake_worker.cmd_q.put(_batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber")))
-
-    record = dagent._service_dialog(world)
-
-    ack = fake_worker.ack_q.get_nowait()
-    assert ack["batch_id"] == "b1"
-    assert ack["results"][0]["ok"] is True
-    assert ack["duties"][0]["target"] == "Cucumber"
-    assert record["batches"][0]["results"] == ack["results"]
-    assert record["duties"][0]["id"] == "a1"
-    # 落地本拍立刻发一份新上下文：worker 下一轮看到的是新账本
-    assert fake_worker.contexts[-1]["duties"][0]["id"] == "a1"
-
-
 def test_service_dialog_survives_crashing_batch(dagent, world, fake_worker,
                                                 monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("bad")
     monkeypatch.setattr(dagent, "_apply_duty_batch", boom)
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="do", target="WashPlate")))
+    fake_worker.cmd_q.put(_batch(("speak", {"text": "好"})))
 
     dagent._service_dialog(world)
 
     ack = fake_worker.ack_q.get_nowait()
     assert ack["results"][0]["ok"] is False
-
-
-def test_service_dialog_has_no_help_event(dagent, world, fake_worker):
-    for tick in range(100, 160):
-        dagent.tick = dagent.bb.tick = tick
-        dagent._service_dialog(world)
-    assert [e for e in fake_worker.events if e[0] == "help"] == []
 
 
 def test_service_dialog_prunes_abandoned_orders(dagent, world):
@@ -303,43 +203,25 @@ def test_service_dialog_prunes_abandoned_orders(dagent, world):
 
 def test_level_start_is_logged_on_first_observation_and_change(
         dagent, fake_worker):
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P"))
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P"))
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P"))
+    # 主线记 UI 编号；同一关不重复记，换关记一次。
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P", "1-4"))
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_4_2P", "1-4"))
+    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P", "1-5"))
 
     assert fake_worker.level_events == [
-        ("level_start", "Sushi_1_4_2P"),
-        ("level_start", "Sushi_1_5_2P"),
+        ("level_start", "1-4"),
+        ("level_start", "1-5"),
     ]
 
 
-def test_level_change_clears_ledger_history_and_queues(dagent, fake_worker):
-    world = make_world("Sushi_1_4_2P")
-    dagent._service_dialog(world)
-    dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
-    dagent.bb.dialog = DialogState(last_rescue_tick=3)
-    dagent.bb.abandoned_orders = {1: 1300}
-    dagent.bb.rescue_cooldown_until = 150
-    fake_worker.cmd_q.put(_batch())
-    fake_worker.ack_q.put({"batch_id": "old"})
+def test_level_start_falls_back_to_internal_name_without_number(
+        dagent, fake_worker):
+    # DLC / Kevin / 教学关没有 level_number，回退内部关卡名。
+    dagent._maybe_reset_dialog_level(make_world("Mine_5_3_2P"))
 
-    # 暂停不算换关
-    paused = make_world("Sushi_1_4_2P")
-    paused.phase = "paused"
-    dagent._maybe_reset_dialog_level(paused)
-    assert fake_worker.reset_count == 0
-    assert dagent.ledger.ids() == ["a1"]
-
-    dagent._maybe_reset_dialog_level(make_world("Sushi_1_5_2P"))
-
-    assert fake_worker.reset_count == 1
-    assert dagent.ledger.ids() == []
-    assert dagent.bb.preferences == []
-    assert dagent.bb.dialog.last_rescue_tick == 0
-    assert dagent.bb.abandoned_orders == {}
-    assert dagent.bb.rescue_cooldown_until == 0
-    assert fake_worker.cmd_q.empty() and fake_worker.ack_q.empty()
+    assert fake_worker.level_events == [
+        ("level_start", "Mine_5_3_2P"),
+    ]
 
 
 def test_level_replay_same_name_clears_history(dagent, fake_worker):
@@ -347,7 +229,8 @@ def test_level_replay_same_name_clears_history(dagent, fake_worker):
     world = make_world("Sushi_1_4_2P", session_id="s1", scene_epoch=1)
     dagent._service_dialog(world)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="do", target="WashPlate")))
+        ("set_division", {"assignments": [
+            {"action": "chop", "owner": "player"}]})))
     dagent.bb.dialog = DialogState(last_rescue_tick=3)
     dagent.bb.abandoned_orders = {1: 1300}
     dagent.bb.rescue_cooldown_until = 150
@@ -358,14 +241,14 @@ def test_level_replay_same_name_clears_history(dagent, fake_worker):
     # 第一次观察只记账，不重置。
     dagent._maybe_reset_dialog_level(world)
     assert fake_worker.reset_count == 0
-    assert dagent.ledger.ids() == ["a1"]
+    assert dagent.bb.division.entries
 
-    # 同名重开：scene_epoch 变 → 完整重置（账本/偏好/对话态/弃单/救援/见单/队列）。
+    # 同名重开：scene_epoch 变 → 完整重置（分工/偏好/对话态/弃单/救援/见单/队列）。
     dagent._maybe_reset_dialog_level(
         make_world("Sushi_1_4_2P", session_id="s1", scene_epoch=2))
 
     assert fake_worker.reset_count == 1
-    assert dagent.ledger.ids() == []
+    assert dagent.bb.division.entries == []
     assert dagent.bb.preferences == []
     assert dagent.bb.dialog.last_rescue_tick == 0
     assert dagent.bb.abandoned_orders == {}
@@ -381,8 +264,8 @@ def test_build_dialog_context_fields(dagent, world):
     active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 0)
     dagent._apply_duty_batch(world, _batch(
-        _duty(op="add", mode="leave_to_p1", target="Cucumber"),
-        source="黄瓜我来"))
+        ("set_division", {"assignments": [
+            {"action": "chop", "owner": "player"}]})))
     world.chefs[0]["held"] = "Plate"
 
     ctx = dagent._build_dialog_context(world)
@@ -394,16 +277,16 @@ def test_build_dialog_context_fields(dagent, world):
     assert ctx["p1"] == {"holding": "plate"}
     assert ctx["orders"][0]["id"] == 1
     assert ctx["orders"][0]["dish"] == "CucumberSushi"
-    assert ctx["duties"][0]["source"] == "黄瓜我来"
-    assert "Cucumber（要切）：取料上砧板 → 切 → 装盘" in ctx["dag"]
+    assert ctx["division_text"].startswith("玩家负责")
+    assert "切" in ctx["dag"] and "下锅" in ctx["dag"]
     assert "CucumberSushi" in ctx["dish_dags"]
     assert ctx["cookers"][0] == {"name": "1 号灶", "text": "空"}
     assert ctx["plates"].startswith("空盘")
     names = [t["function"]["name"] for t in ctx["tools"]]
-    assert names == ["update_duties"]
+    assert names == ["execute_actions", "cancel_action", "speak",
+                     "get_world_state", "set_division"]
     props = ctx["tools"][0]["function"]["parameters"]["properties"]
-    assert props["id"]["enum"] == ["a1"]
-    assert "Cucumber" in props["target"]["enum"]
+    assert "chop" in props["actions"]["items"]["properties"]["action"]["enum"]
 
 
 def test_build_dialog_context_live_false_when_paused(dagent, world):
@@ -446,11 +329,34 @@ def test_build_dialog_context_has_grounding_fields(dagent, world):
 
     from ai.dialog.llm import render_state
     state_text = render_state(ctx)
-    assert "切菜板" in state_text
-    assert "空闲灶 1 个" in state_text
-    assert "连击 3" in state_text
-    assert "快过期" in state_text
+    # 明细（订单/灶/板/盘/连击/临期单）都不再进快照；需要时用 get_world_state。
     assert "总分 135" in state_text
+    assert "订单：1 个" in state_text
+    assert "灶：" not in state_text
+    assert "砧板：" not in state_text
+    assert "盘子：" not in state_text
+    assert "切菜板" not in state_text
+    assert "连击" not in state_text
+    assert "快过期" not in state_text
+    assert "get_world_state" in state_text
+
+
+def test_world_state_tool_returns_fresh_details(agent, world):
+    """get_world_state 读当前帧的明细，不复用 2 Hz 快照。"""
+    world.plates = [{"n": "plate_01", "x": 1.0, "z": 2.0,
+                     "contents": []}]
+    results = agent._apply_duty_batch(
+        world, _batch(("get_world_state", {})))
+    assert len(results) == 1
+    out = results[0]
+    assert out["ok"] is True and out["observation"] is True
+    state = out["state"]
+    assert state["orders"][0]["dish"] == "CucumberSushi"
+    assert state["plates"][0]["n"] == "plate_01"
+    assert isinstance(state["cookers"], list)
+    assert isinstance(state["deliver"]["ready"], list)
+    assert state["deliver"]["feasible"] is False
+    assert isinstance(state["commands"], list)
 
 
 def test_context_p2_doing_uses_dag_node(dagent, world):
@@ -471,9 +377,7 @@ def test_context_p2_options_come_from_planner_ranking(dagent, world):
         (t1, 5.0, {}, True, "", True, 6, True),
         (T.Chop(1, ("board_01",), "Cucumber"), None, {}, False, "x", False, 6, False),
     ]}
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit"):
         dagent._tick_once(world)
 
@@ -485,19 +389,18 @@ def test_context_p2_options_come_from_planner_ranking(dagent, world):
 
 def test_tick_once_includes_dialog_record(dagent, world):
     fake_worker = dagent.dialog_worker
-    fake_worker.cmd_q.put(_batch(_duty(op="add", mode="do", target="WashPlate")))
+    fake_worker.cmd_q.put(_batch(("set_division", {"assignments": [
+        {"action": "chop", "owner": "player"}]})))
 
     from unittest.mock import patch
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan",
+    with patch("ai.agent.planner.plan",
                return_value=(None, {"candidates": []})), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
 
     record = emit.call_args[0][0]
     assert record["dialog"]["batches"][0]["id"] == "b1"
-    assert record["dialog"]["duties"][0]["target"] == "WashPlate"
+    assert record["dialog"]["division"]["player"] == ["chop"]
 
 
 def test_tick_once_publishes_paused_context(dagent, world):
@@ -512,44 +415,10 @@ def test_tick_once_publishes_paused_context(dagent, world):
     assert fake_worker.contexts[-1]["live"] is False
 
 
-def test_service_dialog_emits_new_order_only_once(dagent, world,
-                                                  fake_worker):
-    dagent._service_dialog(world)
-    dagent._service_dialog(world)
-
-    new_orders = [e for e in fake_worker.events if e[0] == "new_order"]
-    assert new_orders == [("new_order", [1])]
-
-
-def test_service_dialog_new_order_skips_covered_materials(dagent, world,
-                                                          fake_worker):
-    world.orders = [
-        {"id": 1, "dish": "Salad", "composition": ["Cucumber", "Tomato"],
-         "remaining": 60, "lifetime": 130},
-    ]
+def test_service_dialog_emits_last_seconds_once(dagent, world, fake_worker):
+    # 最后 10 秒内：last_seconds 只发一次。先发掉开局分工，避免同拍合成 batch。
     dagent._service_dialog(world)
     fake_worker.events.clear()
-
-    # 新单「生菜」：物料全被之前的单覆盖，不播 new_order。
-    world.orders.append({
-        "id": 2, "dish": "CucumberSalad", "composition": ["Cucumber"],
-        "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events if e[0] == "new_order"] == []
-
-    # 新单「鱼」：有新物料，播一次。
-    world.orders.append({
-        "id": 3, "dish": "FishSalad", "composition": ["SushiFish"],
-        "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == [("new_order", [3])]
-
-
-def test_service_dialog_emits_last_seconds_once(dagent, world, fake_worker):
-    # 最后 10 秒内：last_seconds 只发一次。
     world.raw["timer"] = {"server": {"left": 5, "limit": 130}}
     dagent._service_dialog(world)
     dagent._service_dialog(world)
@@ -576,47 +445,10 @@ def test_tick_once_emits_round_summary_once(dagent, world, fake_worker):
             if e[0] == "round_summary"] == [("round_summary", None)]
 
 
-def test_service_dialog_new_order_dedupes_by_dish(dagent, world,
-                                                  fake_worker):
-    dagent._service_dialog(world)
-    fake_worker.events.clear()
-
-    # 同一道菜已经有单，再来一张重复单：不触发新菜谱事件。
-    world.orders.append({
-        "id": 2, "dish": "CucumberSushi",
-        "composition": ["Cucumber"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == []
-
-    # 新菜谱出现：触发一次，只带新单 id。
-    world.orders.append({
-        "id": 3, "dish": "FishSushi",
-        "composition": ["SushiFish"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == [("new_order", [3])]
-
-    # 这道菜全部消失后再出现：本局已经播过，不再触发。
-    world.orders = [order for order in world.orders
-                    if order.get("dish") != "FishSushi"]
-    dagent._service_dialog(world)
-    fake_worker.events.clear()
-    world.orders.append({
-        "id": 4, "dish": "FishSushi",
-        "composition": ["SushiFish"], "remaining": 60, "lifetime": 130,
-    })
-    dagent._service_dialog(world)
-    assert [e for e in fake_worker.events
-            if e[0] == "new_order"] == []
-
-
 def test_service_dialog_publishes_context_every_10_ticks(dagent, world,
                                                          fake_worker):
     dagent.tick = 8
-    dagent._service_dialog(world)          # 首拍有 new_order 事件，立刻发一份
+    dagent._service_dialog(world)          # 首拍有开局分工事件，立刻发一份
     fake_worker.contexts.clear()
 
     dagent.tick = 9
@@ -667,9 +499,7 @@ def test_tick_once_forwards_branches_and_rescue_override(dagent, world):
         "branches": {"key-1": "Cucumber"},
         "rescue_override": "order-1",
     }
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
 
@@ -682,14 +512,16 @@ def test_tick_once_forwards_branches_and_rescue_override(dagent, world):
 
 
 def test_context_reports_stuck_from_scratch(dagent, world):
+    from ai.core import arbiter
     from ai.state.blackboard import StuckScratch
-    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=5)
+    n = arbiter.STUCK_SAME_CELL_THRESHOLD
+    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=n)
 
     ctx = dagent._build_dialog_context(world)
 
     stuck = ctx["p2"]["stuck"]
     assert stuck is not None
-    assert "卡在" in stuck and "(3,4)" in stuck and "5 拍" in stuck
+    assert "卡在" in stuck and "(3,4)" in stuck and ("%d 拍" % n) in stuck
 
 
 def test_context_stuck_none_below_threshold_or_no_scratch(dagent, world):
@@ -702,14 +534,16 @@ def test_context_stuck_none_below_threshold_or_no_scratch(dagent, world):
 
 
 def test_tick_once_emits_stuck_event(dagent, world):
+    from ai.core import arbiter
     from ai.state.blackboard import StuckScratch
     from unittest.mock import patch
-    active = T.Chop(order_id=1, resources=("board_01",), item="Cucumber")
+    active = T.FetchToBoard(order_id=1, resources=("board_01",),
+                            item="Cucumber")
+    n = arbiter.STUCK_SAME_CELL_THRESHOLD
     dagent.bb.commitment = Commitment(active, 90, 0, 0, 2)
-    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=7)
+    dagent.bb.scratch = StuckScratch(last_cell=(3, 4), same_count=n)
 
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "stuck detected")), \
+    with patch("ai.agent.arbiter._is_stuck", return_value=False), \
          patch("ai.agent.planner.plan",
                return_value=(None, {"candidates": []})), \
          patch("ai.agent.trace.emit") as emit:
@@ -717,10 +551,10 @@ def test_tick_once_emits_stuck_event(dagent, world):
 
     stuck = emit.call_args[0][0]["stuck"]
     assert stuck == {
-        "task": "Chop:Cucumber（订单 #1）",
+        "task": "FetchToBoard:Cucumber（订单 #1）",
         "reason": "stuck detected",
         "pos": [3, 4],
-        "duration_ticks": 7,
+        "duration_ticks": n,
         "retries": 2,
     }
 
@@ -728,9 +562,7 @@ def test_tick_once_emits_stuck_event(dagent, world):
 def test_tick_once_forwards_imperative(dagent, world):
     from unittest.mock import patch
     plan_record = {"candidates": [], "imperative": "WashPlate"}
-    with patch("ai.agent.arbiter.select_mode",
-               return_value=("Normal", "test")), \
-         patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
+    with patch("ai.agent.planner.plan", return_value=(None, plan_record)), \
          patch("ai.agent.trace.emit") as emit:
         dagent._tick_once(world)
 
@@ -784,3 +616,62 @@ def test_build_dialog_context_marks_round_finished(dagent, world):
     assert dagent._build_dialog_context(world).get("round_finished") is False
 
 
+def test_service_dialog_batches_same_tick_events(monkeypatch, fake_worker):
+    """同一拍多个主动事件 → 合成一个 batch，而不是各自发（避免队列挤掉）。"""
+    import gzip
+    import json
+    import os
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "rapids",
+                           "rapids21-20261028.ndjson.gz")
+    with gzip.open(fixture, "rt", encoding="utf8") as fh:
+        frame = json.loads(next(l for l in fh if l.strip()))
+    monkeypatch.setattr("ai.agent.StateClient", lambda *a, **k: MagicMock())
+    w = World(frame)
+    book = RecipeBook(w.recipes, w.stations)
+    a = Agent(dialog_worker=fake_worker)
+    a.bb.tick = 100
+    a.book = book
+    w.raw["timer"] = {"server": {"left": 5, "limit": 130}}
+    a._service_dialog(w)
+    assert len(fake_worker.events) == 1
+    assert fake_worker.events[0][0] == "batch"
+    assert {e[0] for e in fake_worker.events[0][1]} == \
+        {"division", "last_seconds"}
+
+
+# ------------------------------------------------------- open_division 就近聚类
+
+def _with_stations(w, *stations):
+    w.stations = list(w.stations) + list(stations)
+    return w
+
+
+def test_reachable_actions_include_deliver_and_wash(monkeypatch):
+    """够得着的动作不看分工：送餐、洗盘只要站点可达就列出。"""
+    import ai.dialog.help as help_mod
+    w = _with_stations(
+        make_world(),
+        {"t": "cooking", "n": "cooker_s1", "gx": 6, "gz": 0},
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+    )
+    monkeypatch.setattr(help_mod, "cost_to", lambda *a, **k: 3)
+
+    assert help_mod.reachable_actions(w, None) == ["切", "下锅", "装盘", "送餐", "洗盘"]
+
+
+def test_reachable_actions_skip_unreachable_station(monkeypatch):
+    """站点够不着就不列；其余动作不受影响。"""
+    import ai.dialog.help as help_mod
+    w = _with_stations(
+        make_world(),
+        {"t": "plate_station", "n": "plate_s1", "gx": 0, "gz": 6},
+    )
+
+    def fake_cost(world, bb, name, source):
+        return None if source.get("t") == "plate_station" else 3
+
+    monkeypatch.setattr(help_mod, "cost_to", fake_cost)
+    labels = help_mod.reachable_actions(w, None)
+
+    assert "送餐" not in labels
+    assert "洗盘" in labels

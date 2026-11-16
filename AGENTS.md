@@ -11,11 +11,16 @@
 
 ## 2. 关键约定（务必遵守）
 
-- **`ai/` 目录结构**：根级只有入口 `agent.py` 和 `primitives/`、`tasks/` 两个子包（对外只认 `from ai import tasks as T` / `from ai import primitives as PR`）。其余模块按职责分到子目录：`core/`（arbiter/planner/planner_layers/executor）、`state/`（blackboard/bb_factory/world/reconcile/p1model）、`query/`（predicates/recipes/recipe_graph/plate_tokens/stations/placement）、`space/`（navigation/occupancy/geometry）、`revenue/`（economy/eta/cook_supply）、`output/`（trace/state_dump）、`exec/`（client/commands/bt/record/replay）、`dialog/`（schema/policy/worker/audio/ptt/asr/tts/llm/env）。跨目录 import 用 `from ai.<子目录> import X` 或 `from ai.<子目录>.<模块> import ...`。
+- **`ai/` 目录结构**：根级只有入口 `agent.py` 和 `primitives/`、`tasks/` 两个子包（对外只认 `from ai import tasks as T` / `from ai import primitives as PR`）。其余模块按职责分到子目录：`core/`（arbiter/planner/planner_layers/executor）、`state/`（blackboard/bb_factory/world/reconcile/p1model）、`query/`（predicates/recipes/recipe_graph/plate_tokens/carriers/stations/placement）、`space/`（navigation/occupancy/geometry/zoning）、`revenue/`（economy/eta/cook_supply）、`output/`（trace/state_dump）、`exec/`（client/commands/bt/record/replay）、`dialog/`（schema/policy/worker/audio/ptt/asr/tts/llm/env/commands/prompts）。跨目录 import 用 `from ai.<子目录> import X` 或 `from ai.<子目录>.<模块> import ...`。
 - **对话层线程边界**：主循环（20 Hz）仍是唯一碰 `World` / `Blackboard` 的地方；`ai/dialog/worker.py` 跑独立 daemon 线程（内部可 asyncio），只在 2 Hz 上下文快照、事件队列、命令/ack 队列之间通信，**不读 World、不写 Blackboard**。缺语音 key 或初始化失败时整个对话层可缺席，主循环照常跑。
+- **换布局复核**：`ai/space/zoning.py` 把可走格切成连通块，按当前分工算「每个角色该待哪一半」。站点不动、只是切法变了（3-3 的料箱竖列/横排切换）走 `layout_review`（只提醒站位、不改分工）；站点真的搬家走 `division_review`（可改分工）。连通窗口里主循环把目标写进 `bb.reposition`，由 `Reposition` task 走进去；窗口一关自动撤销。分区判据只用砧板/灶/水槽，**不用干净盘**（盘是动态物，拿它判会把两侧说反）。
+- **对话工具协议**：模型看到 `execute_actions / cancel_action / speak / get_world_state / set_division`（恒常驻），`read_cookbook` 按是否有攻略出现；`execute_actions` 接收有序数组，单动作也传长度为 1 的数组。动作 id 用英文 `chop/cook/mix/plate/deliver/wash/fetch`，target 用本关 DAG 英文名。旧 `execute_action` / `check_action` / Ledger / `assign_action` 已删除。命令 scope 可被熟锅/快糊锅的 `TakeCookedToPlate`/`RescueCooked`/`Extinguish` 抢占（不取消命令，救完自动回来）。命令队列、scope/done、目标归一化在 `ai/dialog/command_queue.py`；prompt 在 `ai/dialog/prompts/*.j2`（Jinja2）。模型可见文本统一用「你 / 队友 / 玩家」，不出现 P1/P2，避免被念出来。
+- **分工**：唯一写入入口是 LLM 的 `set_division`（动作级 + 可选 `item`；`owner=you/player/both`；送餐/洗盘/装盘不进分工）。主循环把 `bb.division` 编译成 `Preference` 给 planner（**只给玩家负责的动作扣分，分给自己的动作不加分**——加分会让自己的活压过更值钱但没分工的事，如实机里 55% 时间都在切菜、披萨组装不起来），不再自己猜分工；开局和动态复核都由模型调用工具落地。动态复核两级：**站点搬家**（连续 2 秒确认）走 `division_review`，`speak` 先缓冲、只有分工真的变了才播放；**布局换边**走 `layout_review`，站点没动、分工通常不改，只在有人站错半边时发，模型直接 `speak` 提醒站位（提示词里给了「只说去X半边」的目的地，实测方向不会说反）。
+- **攻略**：`ai/dialog/cookbook.py` 按文档里的「内部关卡名」建索引，主线再回退到 `story/{世界}-{关}.md`；摘要注入 system prompt，`read_cookbook` 按节取原文。`docs/guides` 统一用「你（AI）/ 玩家（人类）」，运行时不再做人称转换。
 - **频率**：插件推帧 **5 Hz**，Python 主循环 **20 Hz**。代码里「拍」（tick）= Python 循环拍 = **50 ms**，按拍计的阈值都按 20 Hz 理解。主循环用 `StateClient.read_latest()` **非阻塞读**，中间 4 拍复用最新帧重 tick（不能用阻塞 `read()`，否则被拖成 5 Hz）。
-- **task 契约**：`ai/tasks/base.py` 定义 `Task` 基类。task = 四元身份 `(TYPE, order_id, bound_resources, bound_item)`，不可变值对象。四个契约 `claims()`/`feasible(ctx)`/`done(ctx)`/`build()`。对外入口只有 `from ai import tasks as T`（不要 import 子模块），`T.TASK_TYPES` 登记全部 19 个类型。
-- **资源 id 与认领**：灶/板/洗碗池 → `(网格名, 站点实例名)`；拼装格 → 网格坐标 `(gx, gz)`；盘 → 实例名 `n`。认领是 **`(资源, 动作)` 动作级**粒度，owner 常量 `OWNER = "P2"`。
+- **4-1 过街**：插件 `state.traffic` 给 `road`/`lights`/`cars`（其它关卡 `null`）。灯对象 `traffic_light_animated_*` 的 `lights[]` 同时给两套状态：`on`/`on_car_b` 是两辆车的绿灯（车走），`red`/`yellow`/`green` 是从 `red_glow`/`yellow_glow`/`green_glow` 子物体直读的**玩家看到的灯色**。本关是「红灯行、绿灯停」，而且**每个信号周期只有一辆车跑（蓝/绿交替）**：`on` 是 Blue_Car 的绿灯、`on_car_b` 是 Green_Car 的。`ai/space/traffic.py` 按**车道腿**放行：近侧腿的车道没车就先走到**两条车道中间**（车的 `KillPlane` 在 x 方向的缝隙撞不到；等待点取缝隙中点，不是格心），远侧腿的车道没车再走完；两车都停（红灯）就整段一次走完。没有可站缝隙时退回红灯判据（红灯刚亮或已亮很久才从路沿起步；4-1 开局长红灯 20~27 秒、之后短红灯约 2 秒，短红灯尾巴等下一轮，不猜剩余时间）。门控在**离开路沿/中线那一拍**判，路径要过街而人还没到路沿时先只走到路沿（路沿格 gx=-3/6 的格心压在 road 边界上，但那是人行道边，不算「进入马路」——否则去拿人行道边的盘子也会被当成过街干等）。改道到中线后用**锁存状态**等下一腿；中线位置由两车缝隙中点直接算，不依赖「路径里还有没有中线格」（5Hz 快照最多滞后 1 格，不能拿位置反复判「到没到中线」）。`Approach` / `GoToCell` 共用这套门控；已经是实测确认在马路里且过了中线时不半途停下。过街本身是普通跑动：长直段 move 会带 `run` 字段，插件按 Dash 提速（不再只给缝隙跳边用），但离终点 1.5m 内、拐角、前方 2m 没地板时不按。车 `KillPlane` AABB 还作第二道兜底（车体当前压在路径格上仍不走）。planner 有过街承诺：人在马路上时只有火/快糊（`pressure >= 1.5`）能打断当前 task。trace 的 `traffic.wait/hold` 与 `state.traffic` 用于复盘。
+- **task 契约**：`ai/tasks/base.py` 定义 `Task` 基类。task = 四元身份 `(TYPE, order_id, bound_resources, bound_item)`，不可变值对象。四个契约 `claims()`/`feasible(ctx)`/`done(ctx)`/`build()`。对外入口只有 `from ai import tasks as T`（不要 import 子模块），`T.TASK_TYPES` 登记全部 26 个类型。
+- **资源 id 与认领**：灶/板/洗碗池 → `(网格名, 站点实例名)`；拼装格 → 主网格坐标 `(gx, gz)`，移动网格（气球篮/木筏）台面 → `(网格名, 站点实例名)`（`placement.counter_key`）；盘 → 实例名 `n`。认领是 **`(资源, 动作)` 动作级**粒度，owner 常量 `OWNER = "P2"`。
 - **代码风格**：注释/文档中文、标识符英文；类型注解用 `# type: (...) -> ...` 注释形式；谓词一律无副作用、只读入参不依赖 `World` 类；执行出口统一是 `ctx["exec"]`（ExecClient/NullExec），叶子原语发命令而非按键。
 - **测试**：pytest 7.4.4，配置见 `pytest.ini`。写新功能先加测试；真实帧 fixture 以 `.ndjson.gz` 入库（`tests/fixtures/`）。
 
@@ -27,7 +32,7 @@ Python 侧无构建步骤；C# 插件需单独编译。命令在仓库根执行�
 
 Windows 语音 PTT 使用只读 GetAsyncKeyState，建议 `caps_lock`，不依赖 Quartz/UAC、不注入按键；macOS PTT 仍用 Quartz，需要安装 pyobjc 并授权。`.env` 支持 UTF-8 BOM，已有环境变量优先。ASR/TTS 的异步队列读取必须可取消，不把无限期 queue.get 留在 executor 中，否则解释器退出会卡住并占住启动锁。
 
-macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.20.0 / 状态协议 4，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
+macOS 先 `python3 -m venv .venv` 并激活；`restart.sh` 默认使用仓库 `.venv/bin/python`，支持 `PYTHON` 覆盖，Agent 前台运行。当前插件 0.24.9 / 状态协议 10，旧键盘版 DLL 缺少 27412，更新必须部署并重启游戏。
 
 ```bash
 G="$HOME/Library/Application Support/Steam/steamapps/common/Overcooked! 2"
@@ -52,15 +57,17 @@ python3 run_agent.py --dry-run            # 不连 exec（NullExec），只看�
 pip3 install -r requirements-voice.txt
 python3 run_agent.py --voice --voice-debug  # 显式开语音 + 打印调试信息
 python3 run_agent.py --no-voice             # 强制关闭语音
+python3 run_agent.py --nav-debug            # 打印 [NAV] 走位诊断（stderr）
 python3 tools/voice_smoke.py doctor         # 独立冒烟：依赖/配置/音频设备（不连游戏）
 python3 tools/voice_smoke.py all            # TTS→ASR 回环 + 方舟 LLM + 扬声器
-python3 tools/replay_dialog_llm.py --trace trace-<时间戳>.jsonl  # 历史 trace 回放 LLM 对话 case
-# PTT：.env 设 OC2_VOICE_PTT_KEY=f8；笔记本按 Fn+F8，按住说话、松开发送
+python3 tools/replay_dialog_llm.py --trace runs/trace-<时间戳>.jsonl  # 历史 trace 回放 LLM 对话 case
+# PTT：.env 设 OC2_VOICE_PTT_KEY=f8（未设默认 f8）；笔记本按 Fn+F8，按住说话、松开发送
 ```
 
-- 语音 CLI：`--voice` 显式启用（缺必需 key 时报错退出 2；优先于 `OC2_VOICE=0`）；`--no-voice` 恒关闭；无 flag 时有 key 才启用、缺 key 告警后退回无语音。`--voice-debug` 把 `ai.dialog` 日志开到 DEBUG（ASR 文本、LLM 原文/回合、命令/ack、播报、错误；不含分段计时），`--voice-log PATH` 写逐行 JSON 对话日志（`ts`/`kind` + 事件字段；每轮 `turn_latency` 含 ASR/LLM 首 token/TTS 首包/首帧出声/`since_level_ms` 分段耗时）；`--env-file PATH` / `--no-env-file` 控制启动时 `.env` 的自动加载（默认仓库根 `.env`）。
-- 语音环境变量：`VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID`、`VOLC_TTS_API_KEY`、`VOLC_TTS_VOICE`、`VOLC_TTS_RESOURCE_ID`、`ARK_API_KEY`、`ARK_MODEL`、`ARK_BASE_URL`、`OC2_VOICE`、`OC2_VOICE_RATE`（0.5–2.0，当前仅保留、未接到 TTS 参数）、`OC2_VOICE_VOLUME`（0.3–1.2）、`OC2_VOICE_VAD_DB`（2–20，底噪之上的 dB，越小越敏感）、`OC2_VOICE_PTT_KEY`（如 `f8`；设置后按住录音、松开发送，手柄可用 Steam Input 映射）、`OC2_LLM_TIMEOUT`（1–60 秒，默认 10）、`OC2_VOICE_LOG`（示例见 `.env.example`，说明见 `docs/dialog_system.md`）。非有限值回退默认，超范围收敛到边界。
-- Agent 连不上 27411 直接退出（退出码 1）；收到 `level` 帧才真正决策。
+- 语音 CLI：`--voice` 显式启用（缺必需 key 时报错退出 2；优先于 `OC2_VOICE=0`）；`--no-voice` 恒关闭；无 flag 时有 key 才启用、缺 key 告警后退回无语音。`--voice-debug` 把 `ai.dialog` 日志开到 DEBUG（ASR 文本、LLM 原文/回合、命令/ack、播报、错误；不含分段计时），`--voice-log PATH` 写逐行 JSON 对话日志（`ts`/`kind` + 事件字段；每轮 `turn_latency` 含 ASR/LLM 首 token/TTS 首包/首帧出声/`since_level_ms` 分段耗时；另有 `turn_start`/`turn_stall`/`ptt_cb`/`barge_in` 诊断事件；不传路径时默认 `runs/voice-<trace 时间戳>.jsonl`，与 trace 一一对应；`restart.sh` 有语音时默认开 `--voice-debug` 并写该日志）；`--env-file PATH` / `--no-env-file` 控制启动时 `.env` 的自动加载（默认仓库根 `.env`）。
+- 走位诊断：`--nav-debug`（或 `OC2_NAV_DEBUG=1`）把 `[NAV] plan/move/no-goal/no-path` 打到 stderr，含目标身份/位置、当前格、交互位、路径和 4-1 过街标记；插件侧 `[EXEC] move start/stuck/ledge/skip/finish` 写到 `~/Library/Logs/Unity/Player.log`，带 `t=` 和 `target_id=`，可与 `[TRAFFIC-ROOT]` 的 `t=` 对照。`--nav-debug` 与 `--voice-debug` 独立，可同时开。
+- 语音环境变量：`VOLC_ASR_API_KEY`、`VOLC_ASR_RESOURCE_ID`、`VOLC_TTS_API_KEY`、`VOLC_TTS_VOICE`、`VOLC_TTS_RESOURCE_ID`、`ARK_API_KEY`、`ARK_MODEL`、`ARK_BASE_URL`、`OC2_VOICE`、`OC2_VOICE_RATE`（0.5–2.0，当前仅保留、未接到 TTS 参数）、`OC2_VOICE_VOLUME`（0.3–1.2）、`OC2_VOICE_VAD_DB`（已弃用：VAD 自动切句停用）、`OC2_VOICE_PTT_KEY`（默认 `f8`；按住录音、松开发送，手柄可用 Steam Input 映射）、`OC2_LLM_TIMEOUT`（1–60 秒，默认 10）、`OC2_VOICE_LOG`（示例见 `.env.example`，说明见 `docs/dialog_system.md`）。非有限值回退默认，超范围收敛到边界。
+- Agent 连不上 27411 直接退出（退出码 1）；收到 `level` 帧才真正决策。27412 exec 通道启动时发 `ping` 握手，无回包也退出 1——通常是卡死的旧游戏进程占着端口（`tools/exec_ping.py` / `lsof -nP -iTCP:27412 -sTCP:LISTEN` 排查，结束占用者再重启游戏）。
 - **执行后端**：唯一执行后端是插件逐帧闭环 + InControl 虚拟手柄（走 27412 exec 通道，**无需辅助功能**）。要求 agent 启动时游戏在主菜单（虚拟手柄只在主菜单能 engage 成 P2），已进关卡则报 not engaged、AI 空转。
 - **退出顺序：先停 Agent 再退游戏**（插件有 watchdog 兜底松键，但习惯仍保留）。
 
@@ -70,6 +77,7 @@ python3 -m pytest tests/                # 全部测试
 python3 -m pytest tests/test_eta.py -q  # 单文件 / 单用例（::test_xxx）
 python3 tools/tree_viz.py <帧文件>      # 离线冒烟：建全部 task 树、走分支、不按键
 python3 tools/record_frames.py          # 录制实时帧到 NDJSON
+python3 tools/exec_ping.py              # 探测 27412 exec 通道是否活着（有回包=0）
 ```
 
 ## 4. 安全
@@ -84,7 +92,7 @@ python3 tools/record_frames.py          # 录制实时帧到 NDJSON
 - `docs/agent/architecture.md` —— 技术栈、目录结构、核心架构（三层+黑板）、收益模型与产能。
 - `docs/agent/tasks-primitives.md` —— task 契约与类型表、执行原语表、资源 id/认领、代码风格。
 - `docs/agent/status-backlog.md` —— 已知限制/技术债务、当前状态、待办、改权重前必读。
-- `docs/dialog_system.md` —— 语音对话：依赖、环境变量、`--voice` 用法、排障（VAD/TTS 回声/延迟/音频设备）。
+- `docs/dialog_system.md` —— 语音对话：依赖、环境变量、`--voice` 用法、排障（TTS 回声/延迟/音频设备）。
 - `docs/map/` —— 各关卡网格/站点/配方数据。
 - `docs/superpowers/specs/2026-10-04-ai-behavior-architecture-design.md` —— 架构设计（「spec §N」出处）。
 - `docs/superpowers/specs/2026-10-18-voice-dialog-interaction-design.md` —— 语音对话设计（对话层 spec §N 出处）。

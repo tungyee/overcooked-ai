@@ -38,7 +38,7 @@ def test_result_never_silently_dropped():
     r1 = c.poll()
     r2 = c.poll()
     assert r1 == {"cmd_id": 1, "ok": True, "why": None, "held_after": None,
-                  "blocked_cell": None}
+                  "blocked_cell": None, "blocked_box": None, "blocked_kind": None}
     assert r2["cmd_id"] == 2 and r2["ok"] is False and r2["why"] == "stuck"
     assert c.poll() is None
 
@@ -79,6 +79,57 @@ def test_invalid_utf8_does_not_discard_following_result():
     finally:
         c.close()
         srv.close()
+
+
+def test_ping_returns_reply_from_live_server():
+    c, srv = _connected_client()
+    try:
+        srv.sendall(b'{"cmd_id":0,"ok":true}\n')
+        reply = c.ping(timeout=0.5)
+        assert reply["ok"] is True
+        sent = json.loads(srv.recv(4096).decode("utf-8").strip())
+        assert sent["cmd"] == "ping"
+    finally:
+        c.close()
+        srv.close()
+
+
+def test_ping_accepts_not_implemented_from_old_plugin():
+    """旧 DLL 不认识 ping 也会回一行 not implemented——能回包就说明通道活着。"""
+    c, srv = _connected_client()
+    try:
+        srv.sendall(b'{"cmd_id":0,"ok":false,"why":"not implemented"}\n')
+        reply = c.ping(timeout=0.5)
+        assert reply["ok"] is False
+        assert reply["why"] == "not implemented"
+    finally:
+        c.close()
+        srv.close()
+
+
+def test_ping_skips_unrelated_results():
+    c, srv = _connected_client()
+    try:
+        srv.sendall(b'{"cmd_id":99,"ok":true}\n{"cmd_id":0,"ok":true}\n')
+        reply = c.ping(timeout=0.5)
+        assert reply["cmd_id"] == 0
+    finally:
+        c.close()
+        srv.close()
+
+
+def test_ping_returns_none_when_listener_is_silent():
+    """僵死进程占着端口时 TCP 能连上，但永远不回包。"""
+    c, srv = _connected_client()
+    try:
+        assert c.ping(timeout=0.1) is None
+    finally:
+        c.close()
+        srv.close()
+
+
+def test_ping_returns_none_when_not_connected():
+    assert ExecClient().ping(timeout=0.1) is None
 
 
 def test_real_tcp_client_can_reconnect_after_plugin_disconnect():

@@ -35,12 +35,15 @@ class Tap(Primitive):
     不瞎按——瞎按会把手里的东西放到错误的格子上。
     """
 
-    def __init__(self, key, target=None, kind=None):
-        # type: (str, Any, Optional[str]) -> None
+    def __init__(self, key, target=None, kind=None, aim=None):
+        # type: (str, Any, Optional[str], Optional[Callable[[Dict], Optional[Any]]]) -> None
+        """aim(ctx) -> [x, z]：无 target 时插件重瞄朝向的世界点（kind="floor" 用，
+        朝空地转身直到面前没有 placement 句柄）。"""
         Primitive.__init__(self)
         self.key = key
         self.target = target
         self.kind = kind
+        self.aim = aim
         self._fired = False
 
     def reset(self):
@@ -59,12 +62,15 @@ class Tap(Primitive):
             st = resolve(self.target, ctx) if self.target is not None else None
             if self.target is not None and st is None:
                 return Status.FAILURE
+            aim = self.aim(ctx) if self.aim is not None else None
+            if self.aim is not None and aim is None:
+                return Status.FAILURE
             cmd = build_command(
                 "tap",
                 target=handle_desc(st, target_grid_callbacks(ctx["w"], st)[0]),
                 kind=self.kind,
                 hold_dir=None,
-                target_world=target_world(st),
+                target_world=list(aim) if aim is not None else target_world(st),
                 timeout_ms=TAP_TIMEOUT_MS,
             )
             s = self._begin_exec(ctx, ex, cmd)

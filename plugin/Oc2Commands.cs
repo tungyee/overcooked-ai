@@ -29,6 +29,18 @@ namespace Oc2AI
             double? tgx = Req.Num(target, "gx");
             double? tgz = Req.Num(target, "gz");
             string tname = Req.Str(target, "name");
+            if (kind == "use")
+            {
+                // 盛料/盛容器（TakeCookedToPlate / FillCarrier）：按键走
+                // PickupAndDrop，游戏按 pickup 句柄决定盛到哪——只有 pickup
+                // 指向目标才算命中。散料/散米抢走 pickup 时（pickup=SushiRice
+                // 而非锅）判不中，交给 Python 重站/清散料，不能再靠 GridName
+                // （面朝格）兜底误按（trace-20261115-162024：端盘被脚边散
+                // Pasta 抢 pickup，按下去盘掉地上）。
+                // 名字匹配、不做坐标兜底：保留 4-2 散炸篮/柜台局部坐标同名
+                // 的修复（trace-20261111-001945 t=600~690）。
+                return NameMatchesStrict(f.PickupName, tname);
+            }
             if (kind == "pickup")
             {
                 // 名字优先（实例感知）：句柄名 = 对象身份（FindNearbyObjects 权威
@@ -45,9 +57,22 @@ namespace Oc2AI
             {
                 if (NameMatchesStrict(f.PlacementName, tname))
                     return true;
-                if (tgx.HasValue && tgz.HasValue && f.PlacementGx > -9000f)
-                    return Mathf.Abs(f.PlacementGx - (float)tgx.Value) < 0.1f
-                        && Mathf.Abs(f.PlacementGz - (float)tgz.Value) < 0.1f;
+                if (tgx.HasValue && tgz.HasValue && f.PlacementGx > -9000f
+                    && Mathf.Abs(f.PlacementGx - (float)tgx.Value) < 0.1f
+                    && Mathf.Abs(f.PlacementGz - (float)tgz.Value) < 0.1f)
+                    return true;
+                // 盘堆上的盘：placement 句柄可能被同一沥水架的洗碗池抢走
+                // （trace-20261108-174744 t=2117：目标盘在 DryingPart(-7,0)、
+                // 句柄 WashingPart(-7,-1)）。游戏 PlaceHeldItem 走
+                // WashingStation.CanHandlePlacement 时会转给 m_dryingAttachStation
+                // （沥水架），按键仍落回盘堆；这里用朝向句柄 m_gridLocation 的
+                // 坐标兜底。只对带 stack 标记的目标放宽，普通台面/出餐口的
+                // placement 校验不变（防误放）。
+                if (IsStackTarget(target) && tgx.HasValue && tgz.HasValue
+                    && f.GridGx > -9000f
+                    && Mathf.Abs(f.GridGx - (float)tgx.Value) < 0.1f
+                    && Mathf.Abs(f.GridGz - (float)tgz.Value) < 0.1f)
+                    return true;
                 return NamesMatch(f.PlacementName, tname);
             }
             // kind=null：通用朝向句柄（m_gridLocation）——盛饭/倒料等端盘面对
@@ -64,6 +89,13 @@ namespace Oc2AI
         public static bool UseMatches(ChefFrame f, Dictionary<string, object> target)
         {
             return NamesMatch(f.UseName, Req.Str(target, "name"));
+        }
+
+        // Python handle_desc 对盘堆里的盘带 stack（盘堆名）；只有这类目标
+        // 允许 placement 句柄失配时改用 m_gridLocation 兜底。
+        private static bool IsStackTarget(Dictionary<string, object> target)
+        {
+            return !string.IsNullOrEmpty(Req.Str(target, "stack"));
         }
 
         private static bool NamesMatch(string a, string b)
@@ -126,6 +158,9 @@ namespace Oc2AI
         private const float REAIM_TIME = 0.6f;
         private const float TAP_HOLD = 0.1f;
         private const float VERIFY_TIME = 0.5f;
+        // 移动篮子上盛料弹回排查（trace-20261101-234046）：记录按键前后手持物
+        // 与朝向句柄（m_gridLocation）变化，定位游戏端在哪一步把料退回。排查完置 false。
+        private static readonly bool TAP_DIAG = true;
 
         private enum Phase { Reaim, Press, Verify }
         private Phase _phase = Phase.Reaim;
@@ -140,11 +175,16 @@ namespace Oc2AI
         private float _phaseStart;
         private string _heldBefore;
         private int _retries;
+        // 诊断：press 时刻的朝向句柄快照 + Verify 阶段上一次打日志的状态（变化才打）。
+        private string _lastDiagGrid;
+        private string _lastDiagHeld;
 
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public TapCommand(Dictionary<string, object> cmd)
         {
@@ -171,12 +211,16 @@ namespace Oc2AI
             switch (_phase)
             {
                 case Phase.Reaim:
+                    if (_kind == "floor") { ReaimFloor(f, now); break; }
                     if (_target == null || PadButtons.HandleMatches(f, _target, _kind))
                     {
                         PadEngagement.Pad.Stop();
                         _phase = Phase.Press;
                         _phaseStart = now;
                         _heldBefore = f.HeldName;
+                        _lastDiagGrid = DiagGrid(f);
+                        _lastDiagHeld = _heldBefore;
+                        LogTapDiag("press", f);
                     }
                     else if (_hasTargetWorld)
                     {
@@ -209,15 +253,88 @@ namespace Oc2AI
                     break;
 
                 case Phase.Verify:
+                    {
+                        string g = DiagGrid(f);
+                        if (g != _lastDiagGrid) { LogTapDiag("verify grid-change " + _lastDiagGrid + " -> " + g, f); _lastDiagGrid = g; }
+                        if (f.HeldName != _lastDiagHeld) { LogTapDiag("verify held-change " + (_lastDiagHeld ?? "null") + " -> " + (f.HeldName ?? "null"), f); _lastDiagHeld = f.HeldName; }
+                    }
                     if (f.HeldName != _heldBefore) { Finish(true, null); return; }
+                    // kind=use（盛料/盛容器）：预期效果是手里这盘/容器的内容
+                    // 变化，手部持有物不变。不能拿「手变了」当唯一成功判据，
+                    // 否则正确的倒料会被判 no effect 反复重按，最后把盘子放下。
+                    // 语义结果由 Python 的 Confirm(poured/filled) 复核。
+                    if (_kind == "use" && now - _phaseStart >= VERIFY_TIME)
+                    {
+                        Finish(true, null);
+                        return;
+                    }
                     if (now - _phaseStart > VERIFY_TIME)
                     {
                         if (++_retries >= 2) { Finish(false, "no effect"); return; }
+                        LogTapDiag("verify no-effect retry", f);
                         _phase = Phase.Reaim;   // 重瞄重按一次
                         _phaseStart = now;
                     }
                     break;
             }
+        }
+
+        // kind=floor：放到地上（0.24.3）。反编译 PlaceHeldItem_Client/Server：拿着东西按键时
+        // 面前有 placement 句柄就往句柄上放（放不下 OnFailedToPlace，东西留手里），没有句柄
+        // 才 TakeItem 落在面前。句柄按朝向扇形扫，只要求对象有 placement handler（满砧板 /
+        // 箱子 / 地上的盘都算），Python 的格子快照判不准，所以在这里逐帧确认：
+        //   朝 target_world（Python 选的空地格心）小推杆原地转身（同 ThrowCommand），
+        //   朝向对准且此刻没有 placement 句柄才按；FLOOR_FACE_TIMEOUT 内做不到回
+        //   no clear floor，交 Python 换一格。不带 target_world 不盲按（落点不可控）。
+        private const float FLOOR_FACE_DOT = 0.9f;        // ≈25°：扇形扫描够用，转得快
+        private const float FLOOR_FACE_STICK = 0.25f;     // 小推杆：只转身不怎么走
+        private const float FLOOR_FACE_TIMEOUT = 0.8f;
+
+        private void ReaimFloor(ChefFrame f, float now)
+        {
+            if (f.HeldName == null) { Finish(false, "hands empty"); return; }
+            if (!_hasTargetWorld) { LogHandleMismatch(f); Finish(false, "no clear floor"); return; }
+            Vector2 pos = new Vector2(f.PosX, f.PosZ);
+            Vector2 dir = (_targetWorld - pos).normalized;
+            Vector3 fw = f.Chef.transform.forward;
+            Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+            bool aligned = Vector2.Dot(fwd, dir) > FLOOR_FACE_DOT;
+            if (aligned && f.PlacementId == 0)
+            {
+                PadEngagement.Pad.Stop();
+                _phase = Phase.Press;
+                _phaseStart = now;
+                _heldBefore = f.HeldName;
+                return;
+            }
+            if (now - _phaseStart > FLOOR_FACE_TIMEOUT)
+            {
+                LogHandleMismatch(f);
+                Finish(false, "no clear floor");
+                return;
+            }
+            if (aligned) PadEngagement.Pad.Stop();   // 已对准但还扫到句柄：别再往前挪，等超时
+            else PadEngagement.Pad.Move(f.Chef, dir.x * FLOOR_FACE_STICK, dir.y * FLOOR_FACE_STICK);
+        }
+
+        private string DiagGrid(ChefFrame f)
+        {
+            return (f.GridName ?? "null") + "(" + f.GridGx + "," + f.GridGz + ")";
+        }
+
+        private void LogTapDiag(string evt, ChefFrame f)
+        {
+            if (!TAP_DIAG) return;
+            string tgt = _target != null ? (Req.Str(_target, "name") ?? "null") : "null";
+            UnityEngine.Debug.Log("[TAP] " + evt
+                + " held=" + (f.HeldName ?? "null")
+                + " grid=" + (f.GridName ?? "null") + "(" + f.GridGx + "," + f.GridGz + ")"
+                + " use=" + (f.UseName ?? "null")
+                + " pickup=" + (f.PickupName ?? "null")
+                + " place=" + (f.PlacementName ?? "null")
+                + " pos=(" + f.PosX.ToString("0.00") + "," + f.PosZ.ToString("0.00") + ")"
+                + " rel=(" + f.RelX.ToString("0.00") + "," + f.RelZ.ToString("0.00") + ")"
+                + " tgt=" + tgt);
         }
 
         private void Finish(bool ok, string why)
@@ -227,6 +344,10 @@ namespace Oc2AI
             Done = true;
             Ok = ok;
             Why = why;
+            if (TAP_DIAG)
+                UnityEngine.Debug.Log("[TAP] done ok=" + ok + " why=" + why
+                    + " held=" + (_lastDiagHeld ?? "null")
+                    + " grid=" + (_lastDiagGrid ?? "null"));
         }
 
         private void LogHandleMismatch(ChefFrame f)
@@ -236,8 +357,10 @@ namespace Oc2AI
                 + " gx=" + f.PickupGx + "," + f.PickupGz + "]"
                 + " placement[name=" + f.PlacementName + " id=" + f.PlacementId
                 + " gx=" + f.PlacementGx + "," + f.PlacementGz + "]"
-                + " target[name=" + Req.Str(_target, "name")
-                + " gx=" + Req.Num(_target, "gx") + "," + Req.Num(_target, "gz") + "]");
+                + (_target == null ? " target=null" :
+                   " target[name=" + Req.Str(_target, "name")
+                   + " gx=" + Req.Num(_target, "gx") + "," + Req.Num(_target, "gz") + "]")
+                + (_hasTargetWorld ? " aim=(" + _targetWorld.x + "," + _targetWorld.y + ")" : ""));
         }
     }
 
@@ -246,11 +369,21 @@ namespace Oc2AI
     {
         private const float REAIM_TIME = 0.6f;
 
+        // 扫射（灭火器 spray）：左右摆动朝向的默认参数。喷流是窄流，覆盖靠转头
+        // 扫出的扇面——单点喷灭不掉（实机确认）。Python 可传 sweep_deg/sweep_period/
+        // sweep_stick 覆盖，避免每次调参都重编插件。
+        private const float SWEEP_DEG = 20f;      // 单侧摆动角（度），总摆约 40°
+        private const float SWEEP_PERIOD = 1.2f;  // 一个完整来回的秒数
+        private const float SWEEP_STICK = 0.3f;   // 摇杆幅度（主要转身、少走动）
+
         private readonly Dictionary<string, object> _target;
         private readonly string _kind;
         private readonly Vector2 _targetWorld;
         private readonly bool _hasTargetWorld;
         private readonly float _timeout;
+        private readonly float _sweepDeg;
+        private readonly float _sweepPeriod;
+        private readonly float _sweepStick;
         private bool _started;
         private float _startTime;
         private float _phaseStart;
@@ -260,6 +393,8 @@ namespace Oc2AI
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public HoldCommand(Dictionary<string, object> cmd)
         {
@@ -272,6 +407,9 @@ namespace Oc2AI
                 _hasTargetWorld = true;
             }
             _timeout = (float)(Req.Num(cmd, "timeout_ms") ?? 5000.0) / 1000f;
+            _sweepDeg = (float)(Req.Num(cmd, "sweep_deg") ?? SWEEP_DEG);
+            _sweepPeriod = (float)(Req.Num(cmd, "sweep_period") ?? SWEEP_PERIOD);
+            _sweepStick = (float)(Req.Num(cmd, "sweep_stick") ?? SWEEP_STICK);
         }
 
         public void Tick(ChefFrame f, float now)
@@ -281,10 +419,17 @@ namespace Oc2AI
             if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
             if (!f.Valid) { Finish(false, "no chef"); return; }
             f.RefreshInteraction();
+
+            // spray（灭火器）：不是「正对目标才按键」，而是按住喷的同时左右摆面向
+            // （扫射）。use 句柄是手持灭火器本身而非灶，所以不比对 use 句柄。
+            if (_kind == "spray")
+            {
+                TickSpray(f, now);
+                return;
+            }
+
             // 句柄没命中（没正对目标）→ 有 target_world 就先 re-aim 转向，
             // 转正后下一拍命中再按键；无世界坐标则 drifted 交 Python。
-            // spray（灭火器）：use 句柄是手持灭火器本身而非灶，改比朝向句柄
-            // （m_gridLocation，HandleMatches(kind=null)）——正对灶才算命中。
             if (_target != null && !MatchesTarget(f))
             {
                 if (!_hasTargetWorld)
@@ -307,10 +452,37 @@ namespace Oc2AI
             PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
         }
 
+        /// <summary>灭火器扫射：baseDir 指向目标，左右摆一个角度边喷边扫。</summary>
+        private void TickSpray(ChefFrame f, float now)
+        {
+            if (!_hasTargetWorld)
+            {
+                Finish(false, "drifted");
+                return;
+            }
+            Vector2 pos = new Vector2(f.PosX, f.PosZ);
+            Vector2 baseDir = _targetWorld - pos;
+            if (baseDir.sqrMagnitude < 1e-6f) baseDir = Vector2.up;
+            baseDir.Normalize();
+            float t = now - _startTime;
+            float period = _sweepPeriod > 1e-3f ? _sweepPeriod : 1e-3f;
+            float ang = _sweepDeg * Mathf.Deg2Rad * Mathf.Sin(t * 2f * Mathf.PI / period);
+            Vector2 dir = Rotate(baseDir, ang);
+            // 小摇杆幅度：主要转身、尽量少走动（照 ThrowCommand FACE_STICK）。
+            PadEngagement.Pad.Move(f.Chef, dir.x * _sweepStick, dir.y * _sweepStick);
+            PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+        }
+
+        private static Vector2 Rotate(Vector2 v, float rad)
+        {
+            float c = Mathf.Cos(rad), s = Mathf.Sin(rad);
+            return new Vector2(v.x * c - v.y * s, v.x * s + v.y * c);
+        }
+
         private bool MatchesTarget(ChefFrame f)
         {
-            // spray 比朝向句柄（m_gridLocation），其余比 use 句柄（m_interactable）。
-            if (_kind == "spray") return PadButtons.HandleMatches(f, _target, null);
+            // 非 spray 比对 use 句柄（m_interactable）。spray 已单独走 TickSpray
+            // 扫射、不进这里——灭火器喷流朝向是手持灭火器自身，比 use 句柄恒不中。
             return PadButtons.UseMatches(f, _target);
         }
 
@@ -324,22 +496,46 @@ namespace Oc2AI
         }
     }
 
-    /// <summary>throw：面朝目标 → 单击 WorkstationInteract（切/洗/喷/投掷同键，靠上下文区分）。</summary>
+    /// <summary>throw：原地转向目标（朝向闭环）→ 单击 WorkstationInteract → 确认离手。
+    ///
+    /// 照参考项目 cortico-world Actor.ThrowAt：小推杆转身、dot(forward, 目标方向)
+    /// &gt; 0.97（≈14°）才按，按后 0.6s 内手空才算成功。旧版固定推 0.6 摇杆 0.35s
+    /// 不看朝向，既会挪位置（出手点偏离 Python 算好的站位），也会投歪。
+    /// 投掷射程固定（实测 ≈7.5m），落点只由出手点 + 朝向决定，所以朝向必须闭环。</summary>
     public sealed class ThrowCommand : IExecCommand
     {
-        private const float FACE_TIME = 0.35f;
+        private const float FACE_TIMEOUT = 0.6f;
+        private const float FACE_DOT = 0.97f;
+        private const float FACE_STICK = 0.25f;   // 小推杆：只转身不怎么走
         private const float TAP_HOLD = 0.1f;
+        private const float VERIFY_TIME = 0.6f;
 
+        // 精准投锅（可选字段，缺省 = 旧行为）：
+        //   aim_dot          朝向与目标方向的点积门槛（0.996 ≈ 5°）。锅的接料触发器
+        //                    约一格宽，4~5m 外 14°（0.97）的偏差横向就差 1m 多，
+        //                    实测 13° 落在锅旁地上、4° 进锅（trace-20261029-213506 t=558）。
+        //   strict           转向超时仍没对准就失败，不硬投（投偏了料落地还得再捡）。
+        //   face_timeout_ms  转向时限；精准投锅需要更久。
+        // 对准判定要连续 AIM_SETTLE_FRAMES 帧都满足，防止转身甩过头那一帧误判。
+        private const int AIM_SETTLE_FRAMES = 2;
+
+        private enum Phase { Face, Press, Verify }
+        private Phase _phase = Phase.Face;
         private readonly Vector2 _targetWorld;
         private readonly bool _hasTargetWorld;
+        private readonly float _aimDot = FACE_DOT;
+        private readonly bool _strict;
+        private readonly float _faceTimeout = FACE_TIMEOUT;
+        private int _alignedFrames;
         private bool _started;
-        private float _startTime;
-        private bool _tapped;
+        private float _phaseStart;
 
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
 
         public ThrowCommand(Dictionary<string, object> cmd)
         {
@@ -349,30 +545,164 @@ namespace Oc2AI
                 _targetWorld = new Vector2((float)(double)tw[0], (float)(double)tw[1]);
                 _hasTargetWorld = true;
             }
+            double? ad = Req.Num(cmd, "aim_dot");
+            if (ad.HasValue && ad.Value > 0.0 && ad.Value < 1.0) _aimDot = (float)ad.Value;
+            _strict = Req.Bool(cmd, "strict");
+            double? ft = Req.Num(cmd, "face_timeout_ms");
+            if (ft.HasValue && ft.Value > 0.0) _faceTimeout = (float)(ft.Value / 1000.0);
         }
 
         public void Tick(ChefFrame f, float now)
         {
             if (Done) return;
-            if (!_started) { _started = true; _startTime = now; }
+            if (!_started) { _started = true; _phaseStart = now; }
             if (!f.Valid) { Finish(false, "no chef"); return; }
 
-            if (!_tapped)
+            switch (_phase)
             {
-                if (_hasTargetWorld && now - _startTime < FACE_TIME)
-                {
-                    // 面朝目标：短暂朝目标方向推（投掷方向 = 朝向）。
-                    Vector2 pos = new Vector2(f.PosX, f.PosZ);
-                    Vector2 dir = (_targetWorld - pos).normalized;
-                    PadEngagement.Pad.Move(f.Chef, dir.x * 0.6f, dir.y * 0.6f);
-                    return;
-                }
-                PadEngagement.Pad.Stop();
-                PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
-                _tapped = true;
-                _startTime = now;   // 复用计时：给单击时长
+                case Phase.Face:
+                    if (_hasTargetWorld)
+                    {
+                        Vector2 pos = new Vector2(f.PosX, f.PosZ);
+                        Vector2 dir = (_targetWorld - pos).normalized;
+                        Vector3 fw = f.Chef.transform.forward;
+                        Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+                        bool aligned = Vector2.Dot(fwd, dir) > _aimDot;
+                        _alignedFrames = aligned ? _alignedFrames + 1 : 0;
+                        bool settled = _alignedFrames >= (_strict ? AIM_SETTLE_FRAMES : 1);
+                        if (!settled)
+                        {
+                            if (now - _phaseStart < _faceTimeout)
+                            {
+                                if (aligned) PadEngagement.Pad.Stop();   // 已对准、等稳一帧，别再推
+                                else PadEngagement.Pad.Move(f.Chef, dir.x * FACE_STICK, dir.y * FACE_STICK);
+                                return;
+                            }
+                            if (_strict) { Finish(false, "aim timeout"); return; }
+                        }
+                    }
+                    // 对准了，或非 strict 下转向超时（照样投，落点偏差由 Python 落地后重算接管）
+                    PadEngagement.Pad.Stop();
+                    f.RefreshInteraction();
+                    if (f.HeldName == null) { Finish(false, "hands empty"); return; }
+                    _phase = Phase.Press;
+                    _phaseStart = now;
+                    break;
+
+                case Phase.Press:
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+                    if (now - _phaseStart >= TAP_HOLD)
+                    {
+                        PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, false);
+                        _phase = Phase.Verify;
+                        _phaseStart = now;
+                    }
+                    break;
+
+                case Phase.Verify:
+                    f.RefreshInteraction();
+                    if (f.HeldName == null) { Finish(true, null); return; }
+                    if (now - _phaseStart > VERIFY_TIME) { Finish(false, "still held"); return; }
+                    break;
             }
-            if (now - _startTime >= TAP_HOLD) { Finish(true, null); return; }
+        }
+
+        private void Finish(bool ok, string why)
+        {
+            PadEngagement.Pad.Stop();
+            PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, false);
+            Done = true;
+            Ok = ok;
+            Why = why;
+        }
+    }
+
+    /// <summary>raft：触发舢板（5-1）移动到对岸——朝向可选目标、按交互键 + 按住方向，短暂保持后松键。</summary>
+    /// <remarks>
+    /// 语义到岸由 Python 判（docked_side），这里只做「触发」。按键控制的具体
+    /// 键位（交互键 + 方向）来自 Assembly-CSharp 反查 MovingPlatform /
+    /// OnSwitchPressed + 攻略「按钮 + 移动键」，实机可能需微调 hold_ms 或方向轴。
+    /// </remarks>
+    public sealed class RaftCommand : IExecCommand
+    {
+        private const float FACE_TIMEOUT = 0.6f;
+        private const float FACE_STICK = 0.25f;   // 小推杆：只转身不怎么走
+        private const float FACE_DOT = 0.97f;
+
+        private enum Phase { Face, Hold }
+        private Phase _phase = Phase.Face;
+        private readonly Vector2 _direction;
+        private readonly Dictionary<string, object> _target;
+        private readonly Vector2 _targetWorld;
+        private readonly bool _hasTargetWorld;
+        private readonly float _holdSeconds;
+        private readonly float _timeout;
+        private bool _started;
+        private float _startTime;
+        private float _phaseStart;
+
+        public bool Done { get; private set; }
+        public bool Ok { get; private set; }
+        public string Why { get; private set; }
+        public double[] BlockedCell { get { return null; } }
+        public double[] BlockedBox { get { return null; } }
+        public string BlockedKind { get { return null; } }
+
+        public RaftCommand(Dictionary<string, object> cmd)
+        {
+            _direction = PadButtons.DirVec(Req.Str(cmd, "direction"));
+            _target = Req.Obj(cmd, "target");
+            var tw = Req.List(cmd, "target_world");
+            if (tw != null && tw.Count >= 2)
+            {
+                _targetWorld = new Vector2((float)(double)tw[0], (float)(double)tw[1]);
+                _hasTargetWorld = true;
+            }
+            _holdSeconds = (float)(Req.Num(cmd, "hold_ms") ?? 800.0) / 1000f;
+            _timeout = (float)(Req.Num(cmd, "timeout_ms") ?? 5000.0) / 1000f;
+        }
+
+        public void Tick(ChefFrame f, float now)
+        {
+            if (Done) return;
+            if (!_started) { _started = true; _startTime = now; _phaseStart = now; }
+            if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
+            if (!f.Valid) { Finish(false, "no chef"); return; }
+
+            switch (_phase)
+            {
+                case Phase.Face:
+                    if (_hasTargetWorld && _target != null)
+                    {
+                        Vector2 pos = new Vector2(f.PosX, f.PosZ);
+                        Vector2 dir = (_targetWorld - pos).normalized;
+                        Vector3 fw = f.Chef.transform.forward;
+                        Vector2 fwd = new Vector2(fw.x, fw.z).normalized;
+                        bool aligned = Vector2.Dot(fwd, dir) > FACE_DOT;
+                        if (!aligned)
+                        {
+                            if (now - _phaseStart < FACE_TIMEOUT)
+                            {
+                                PadEngagement.Pad.Move(f.Chef, dir.x * FACE_STICK, dir.y * FACE_STICK);
+                                return;
+                            }
+                        }
+                    }
+                    PadEngagement.Pad.Stop();
+                    _phase = Phase.Hold;
+                    _phaseStart = now;
+                    break;
+
+                case Phase.Hold:
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.WorkstationInteract, true);
+                    if (_direction != Vector2.zero) PadEngagement.Pad.Stick(_direction.x, _direction.y);
+                    if (now - _phaseStart >= _holdSeconds)
+                    {
+                        Finish(true, null);
+                        return;
+                    }
+                    break;
+            }
         }
 
         private void Finish(bool ok, string why)

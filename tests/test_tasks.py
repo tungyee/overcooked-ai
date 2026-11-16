@@ -230,6 +230,7 @@ def test_package_facade_exports_base_names():
 RECIPES = [
     {"name": "Sushi_Cucumber", "comp":
         ["Seaweed", "BoiledSushiRice", "Cucumber"], "cook": "null"},
+    {"name": "Sushi_PlainFish", "comp": ["SushiFish"], "cook": "null"},
     {"name": "BoiledSushiRice", "comp": ["SushiRice"], "cook": "Pot"},
     {"name": "Seaweed", "comp": [], "cook": "null"},
     {"name": "Cucumber", "comp": [], "cook": "null"},
@@ -237,6 +238,8 @@ RECIPES = [
 ]
 ORDER = {"id": "1", "dish": "Sushi_Cucumber",
          "composition": ["Seaweed", "BoiledSushiRice", "Cucumber"]}
+ORDER_PLAIN_FISH = {"id": "2", "dish": "Sushi_PlainFish",
+                    "composition": ["SushiFish"]}
 
 COUNTER = {"t": "counter", "n": "assembly", "gx": 7, "gz": 0,
            "x": 7 * 1.2, "z": 0.0}
@@ -326,6 +329,42 @@ def test_place_clean_plate_not_done_when_plate_held_at_counter():
     assert t.feasible(ctx) is True   # 还没真放好，仍应可行
 
 
+def test_place_clean_plate_infeasible_when_counter_has_pan():
+    """拼装格上已放着锅 → 摆不上去。
+
+    实机 trace-20261031-002224 t=2752~2837：对放熟虾锅的台面摆盘，游戏把
+    这次放置变成倒料——虾在盘与锅之间来回倒，0.4 s 一轮振荡 6 次。
+    """
+    pan = {"n": "utensil_frying_pan_01", "x": 7 * 1.2, "z": 0.0,
+           "cooked": "Cooked", "cookware": True}
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES,
+                  orders=[ORDER], plates=[plate("p1", -1, 0)], items=[pan])
+    ctx, _ = make_ctx(w)
+    t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
+    assert t.feasible(ctx) is False
+
+
+def test_place_clean_plate_keep_requires_bound_plate():
+    """树首清手只放过**绑定的那块盘**；端着别的盘必须先放下。
+
+    实机同上 trace：P2 端着装虾的 -34858 去摆 -34158，旧 keep/expect 只看
+    「手里是盘」，把装料盘当空盘直接摆到台面上。
+    """
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0,
+            "held": "equipment_plate_01", "interactions": inter()}
+    other = dict(plate("pOther", 0, 0, ["Prawn"]), held_by="Player 2")
+    bound = dict(plate("p1", -1, 0), held_by=None)
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES, orders=[ORDER],
+                  plates=[bound, other], chefs=[chef])
+    ctx, _ = make_ctx(w, chef=chef)
+    tree = T.PlaceCleanPlate("1", ("p1", (7, 0))).build()
+    keep = tree.child.children[0]._keep
+    assert keep(ctx) is False
+    # 对照：手里正是绑定盘 → 不放下
+    bound["held_by"], other["held_by"] = "Player 2", None
+    assert keep(ctx) is True
+
+
 def test_place_clean_plate_tree_is_two_interactions():
     """spec §7.3：树退化为几步线性顺序。拿盘 + 放盘。"""
     t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
@@ -334,6 +373,38 @@ def test_place_clean_plate_tree_is_two_interactions():
     assert isinstance(tree.child, Sequence)
     assert len(tree.child.children) == 3
     assert isinstance(tree.child.children[0], PR.EnsureHandsFree)
+
+
+def test_place_clean_plate_excludes_target_counter_from_drop():
+    """清手落点排除目标拼装格：手里端着别的料时不会丢回目标台面再振荡。
+
+    实机 trace-20261103-221421 t=4287~4354：P2 捡起拼装台上的 Pasta 后，
+    PlaceCleanPlate 抢进来，树首 EnsureHandsFree 把 Pasta 就近丢回同一块
+    拼装台，台面被占 → PlaceCleanPlate 不可行 → 与 ThrowBatch 振荡。
+    """
+    t = T.PlaceCleanPlate(order_id="1", resources=("p1", (7, 0)))
+    tree = t.build()
+    ensure = tree.child.children[0]
+    assert isinstance(ensure, PR.EnsureHandsFree)
+    assert ensure._exclude is not None
+    w = FakeWorld(stations=[COUNTER, STACK], recipes=RECIPES, orders=[ORDER])
+    ctx, _ = make_ctx(w)
+    assert ensure._exclude(ctx) == {(7, 0)}
+
+
+def test_ensure_hands_free_exclude_skips_target_counter():
+    """EnsureHandsFree 的 exclude 格子不作为就近落点。"""
+    sts = [
+        {"t": "counter", "n": "target", "gx": 1, "gz": 0, "x": 1.2, "z": 0.0},
+        {"t": "counter", "n": "other", "gx": 3, "gz": 0, "x": 3.6, "z": 0.0},
+    ]
+    w = FakeWorld(stations=sts, walkable=lambda gx, gz: gz == 0)
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0, "held": "Pasta",
+            "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    e = PR.EnsureHandsFree(exclude=lambda c: {(1, 0)})
+    e._lock_target(ctx)
+    assert e._tgt is not None and e._tgt["n"] == "other"
 
 
 def test_wash_plate_claims_sink():
@@ -408,6 +479,17 @@ def test_wash_plate_done_requires_clean_plate_at_drying_or_stack():
                    plates=[plate("p1", 2, 0)])     # 在别处的空盘
     ctx2, _ = make_ctx(w2)
     assert T.WashPlate(resources=("sink1",)).done(ctx2) is False
+
+
+def test_wash_plate_done_false_while_holding_dirty_plate():
+    """手里端着脏盘时不能判洗完：先放池子，再等池子清空。"""
+    w = FakeWorld(stations=[SINK, DRYING], recipes=RECIPES, orders=[ORDER],
+                  plates=[plate("p1", -3, 0)])       # 晾干架上的干净盘
+    w.held_items = [{"n": "DirtyPlateStack", "held_by": "Player 2"}]
+    ctx, _ = make_ctx(w)
+    assert T.WashPlate(resources=("sink1",)).done(ctx) is False
+    w.held_items = []
+    assert T.WashPlate(resources=("sink1",)).done(ctx) is True
 
 
 def test_wash_plate_infeasible_when_already_done():
@@ -494,22 +576,28 @@ def test_wash_plate_feasible_when_p1_plates_in_sink_and_clean_exists():
 
 
 def test_wash_plate_tree_supports_plates_already_in_sink():
-    """build 支持「盘已在池子里」的起点：Selector 第一分支捡+放、第二分支直接去池子。"""
+    """build 支持三种起点：手里已有脏盘 / 去捡脏盘 / 盘已在池子里。"""
     t = T.WashPlate(resources=("sink1",))
     tree = t.build()
     seq = tree.child
     assert isinstance(seq, Sequence)
-    sel = seq.children[0]
+    # 树首清手（手持脏盘时保留），之后才是三分支起点
+    assert isinstance(seq.children[0], PR.EnsureHandsFree)
+    sel = seq.children[1]
     assert isinstance(sel, Selector)
-    assert len(sel.children) == 2
-    # 第一分支：捡脏盘 + 放进池子
+    assert len(sel.children) == 3
+    # 第一分支：手里已端着脏盘 → 直接放池子
     assert isinstance(sel.children[0], Sequence)
-    assert isinstance(sel.children[0].children[0], PR.InteractWith)
-    # 第二分支：直接走到池子洗（Condition + Approach + Face）
+    assert isinstance(sel.children[0].children[0], Condition)
+    assert isinstance(sel.children[0].children[1], PR.InteractWith)
+    # 第二分支：捡脏盘 + 放进池子
     assert isinstance(sel.children[1], Sequence)
-    assert isinstance(sel.children[1].children[0], Condition)
-    assert isinstance(sel.children[1].children[1], PR.Approach)
-    assert isinstance(sel.children[1].children[2], PR.Face)
+    assert isinstance(sel.children[1].children[0], PR.InteractWith)
+    # 第三分支：直接走到池子洗（Condition + Approach + Face）
+    assert isinstance(sel.children[2], Sequence)
+    assert isinstance(sel.children[2].children[0], Condition)
+    assert isinstance(sel.children[2].children[1], PR.Approach)
+    assert isinstance(sel.children[2].children[2], PR.Face)
 
 
 def test_reset_plate_feasible_when_contents_match_no_order():
@@ -618,7 +706,7 @@ def cooker(name, **kw):
 def test_extinguish_target_sticks_to_nearest_not_list_order():
     """灭火目标按**就近**选，且新灶着火不许把人从眼前那口灶拖走。
 
-    实机（trace-20261014-011202 t=2404~2478）：P2 端着灭火器走到灶 (2)
+    实机（t=2404~2478）：P2 端着灭火器走到灶 (2)
     跟前（目标 (7,1)、已到 goal (6,1)），这时灶 (3) 也着了火——`fire_station`
     取 `burning(c)[0]`，即 `world.cookers` 的**列表序**第一个，于是目标
     瞬间翻转到 (7,-2)，人被拖去灶 (3)。喷了 50 拍两口灶的火都还在，直到
@@ -800,6 +888,36 @@ def test_take_cooked_feasible_while_cooking():
                   orders=[ORDER],
                   cookers=[cooker("workstation_cooker_01",
                                   isCooking=True, cooked=False)],
+                  plates=[plate("p1", 7, 0, ["Seaweed"])])
+    ctx, _ = make_ctx(w)
+    t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
+                            "BoiledSushiRice")
+    assert t.feasible(ctx) is True
+
+
+def test_take_cooked_infeasible_when_just_started_cooking():
+    """刚下锅（离熟还远）不去端盘等，先让别的命令跑。"""
+    w = FakeWorld(stations=[COOKER, COUNTER], recipes=RECIPES,
+                  orders=[ORDER],
+                  cookers=[cooker("workstation_cooker_01",
+                                  isCooking=True, cooked=False,
+                                  cooking_time=12.0,
+                                  cooking_progress=2.0)],
+                  plates=[plate("p1", 7, 0, ["Seaweed"])])
+    ctx, _ = make_ctx(w)
+    t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
+                            "BoiledSushiRice")
+    assert t.feasible(ctx) is False
+
+
+def test_take_cooked_feasible_near_done():
+    """离熟 4s 以内放行：留够取盘+走位，避免熟了才去端。"""
+    w = FakeWorld(stations=[COOKER, COUNTER], recipes=RECIPES,
+                  orders=[ORDER],
+                  cookers=[cooker("workstation_cooker_01",
+                                  isCooking=True, cooked=False,
+                                  cooking_time=12.0,
+                                  cooking_progress=9.0)],
                   plates=[plate("p1", 7, 0, ["Seaweed"])])
     ctx, _ = make_ctx(w)
     t = T.TakeCookedToPlate("1", ("workstation_cooker_01", "p1"),
@@ -1053,7 +1171,7 @@ def test_deliver_plate_feasible_when_plate_still_on_counter():
 def test_rescue_cooked_feasible_when_too_late_to_fetch_plate():
     """来不及端盘来盛 → 先端锅离灶止损，别等到着火。
 
-    实机（trace-20261014-011202 t=2056~2184）：灶 (2) 的饭 progress 16.9
+    实机（t=2056~2184）：灶 (2) 的饭 progress 16.9
     已熟，P2 去取盘再走回来要 ~130 拍，锅 ~140 拍后烧糊着火。旧
     `_about_to_burn` 要求 `progress >= 2*ctime`——**那一刻已经着火了**，
     于是 P2 一路端着盘往锅跑，到 t=2184 才选中 RescueCooked，下一拍
@@ -1283,6 +1401,27 @@ def test_fetch_to_board_done_binds_specific_board():
         .done(ctx) is True
 
 
+def test_fetch_to_board_yields_to_inflight_throw_batch():
+    """进行中的 ThrowBatch 把料拿在手上时，FetchToBoard 不能把同一份料抢回去。
+
+    trace-20261108-233353 t=742~1382：ThrowBatch(Tomato→对面板) pickup 成功
+    的那一拍板恰好变空，FetchToBoard(Tomato, 同一块板) 由不可行翻成可行、
+    分数 2.25 vs -0.5 越过承诺惯性，把刚拿起的料放回原处；板一满
+    ThrowBatch 又可行……来回 20+ 次、一次也没投出去。
+    """
+    w = FakeWorld(stations=[BOARD, CUKE_CRATE], recipes=RECIPES,
+                  orders=[ORDER_CHOP], workstations=[board("board_01")])
+    chef = {"name": "Player 2", "x": 0, "z": 0, "held": "Cucumber",
+            "interactions": inter()}
+    bb = Blackboard()
+    bb.commitment.active_task = T.ThrowBatch(
+        None, ("board_01 (2)", "board", "Cucumber", "Sushi_Cucumber"),
+        "Cucumber")
+    ctx, _ = make_ctx(w, chef=chef, bb=bb)
+    assert T.FetchToBoard("9", ("board_01",), "Cucumber") \
+        .feasible(ctx) is False
+
+
 def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     """切料上板树 = Selector 三分支：散落优先 / 箱子取 / 已在手兜底。
 
@@ -1292,12 +1431,21 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     分支2 曾是「RepeatUntil 批量取+投 N 份，再捡散落上板」，与
     FetchToCooker 单料同构、也同样坏：必须投满 N 份才轮到 drop()，一轮
     取+投约 80 拍而整树只有 TASK_TIMEOUT_TICKS=200，第二轮没结束就被砍
-    → 料全堆在地上、板上一直空着。砧板一次只放一根（feasible 要求板上
-    为空），批量投更没有意义。现在钉住它**不再有**循环与投掷。
+    → 料全堆在地上、板上一直空着。现在钉住它**不再有**批量循环。
+
+    投上板也不再有 ThrowOntoStation：投掷射程固定 ≈7.5m，砧板又是只接
+    非飞行物的普通台面，3~5m 投过去必然飞过头落地上（trace-20261108-200713
+    t=659/1414）。三个分支都以走过去 placement 收尾；跨区/远距送料由
+    ThrowBatch 负责，不在这里。
     """
     tree = T.FetchToBoard("9", ("board_01",), "Cucumber").build()
     assert isinstance(tree, PR.Timeout)
-    sel = tree.child
+    # 树首是「腾板」（板空直接过），之后才是取料三分支
+    top = tree.child
+    assert isinstance(top, Sequence) and len(top.children) == 2
+    clear, sel = top.children
+    assert isinstance(clear, Selector)
+    assert isinstance(clear.children[0], Condition)
     assert isinstance(sel, Selector)
     assert len(sel.children) == 3
 
@@ -1321,9 +1469,11 @@ def test_fetch_to_board_tree_has_loose_first_and_no_batch_throw():
     assert not any(isinstance(n, RepeatUntil) for n in nodes), \
         "投满 N 份才上板必然超时，drop 永远执行不到"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes)
+    assert not any(isinstance(n, PR.ThrowOntoStation) for n in nodes), \
+        "砧板只接非飞行物，3~5m 投过去必飞过头；一律走过去放"
 
-    # 三个分支都必须以「往板上放」收尾
-    for branch in sel.children:
+    # 三个分支都以「往板上放」收尾
+    for branch in (loose, crate, held):
         last = branch.children[-1]
         assert isinstance(last, PR.InteractWith)
         assert last.kind == "placement"
@@ -1339,10 +1489,11 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     这里曾是「RepeatUntil 批量取+投 N 份，再捡散落下锅」。树结构决定了
     必须投满 N 份才轮到 drop()，而一轮取+投实测约 80 拍、整树裹在
     TASK_TIMEOUT_TICKS=200 里——第二轮没结束就被砍，drop() 一次都没执行
-    过，米全堆在地上、灶始终空着（trace-20261014-011202，2527 拍 0 送达）。
+    过，米全堆在地上、灶始终空着（2527 拍 0 送达）。
 
-    钉住：① 没有 RepeatUntil；② 没有 ThrowTo；③ 每个分支都以 placement
-    收尾（真的会下锅）。
+    钉住：① 没有 RepeatUntil；② 不往地上投——投掷只出现在「投进锅」
+    （ThrowOntoStation，投完等锅收下）里；③ 每个分支都以下锅收尾：先试投进锅，
+    不成就走过去 placement（真的会下锅）。
     """
     tree = T.FetchToCooker(
         "1", ("cooker", ("SushiRice",)), "BoiledSushiRice").build()
@@ -1365,14 +1516,19 @@ def test_fetch_to_cooker_single_raw_tree_has_no_batch_throw():
     assert not any(isinstance(n, RepeatUntil) for n in nodes), \
         "单料下锅不该有批量循环：投满 N 份才下锅必然超时"
     assert not any(isinstance(n, PR.ThrowTo) for n in nodes), \
-        "N=1 时投掷摊销为零，只剩落点不可控的缺点"
+        "不往地上投：投锅的 ThrowTo 在 ThrowOntoStation 内部按需建，不在静态树里"
 
-    # 两个分支都必须以「往灶里放」收尾
+    # 两个分支都必须以「下锅」收尾：先试投进锅，不成走过去放
     for branch in sel.children:
         assert isinstance(branch, Sequence)
         last = branch.children[-1]
-        assert isinstance(last, PR.InteractWith)
-        assert last.kind == "placement", "每个分支都要真的走到下锅"
+        assert isinstance(last, Selector)
+        assert isinstance(last.children[0], PR.ThrowOntoStation)
+        fallback = last.children[-1]
+        assert isinstance(fallback, Sequence)
+        place = fallback.children[-1]
+        assert isinstance(place, PR.InteractWith)
+        assert place.kind == "placement", "每个分支都要真的走到下锅"
 
 
 def test_chop_feasible_when_raw_on_board():
@@ -1457,6 +1613,8 @@ def test_chop_tree_holds_chop_key_with_explicit_timeout():
     assert len(holds) == 1
     assert holds[0].key == "chop"
     assert isinstance(holds[0].timeout, int) and holds[0].timeout > 0
+    # 手里被旧树命令晚到的盘子塞住时，HoldUntil 每拍复检、失败回树首清手。
+    assert holds[0].guard is not None
 
 
 def test_chop_timeout_covers_max_stages():
@@ -1734,6 +1892,24 @@ def test_deliver_plate_infeasible_when_plate_incomplete():
                   plates=[plate("p1", 7, 0, ["Seaweed"])])
     ctx, _ = make_ctx(w)
     assert T.DeliverPlate("1", ("p1",)).feasible(ctx) is False
+
+
+def test_deliver_plate_infeasible_with_extra_ingredient():
+    """多一份料游戏不结算：missing 为空也要看盘里有没有多余内容。"""
+    w = FakeWorld(stations=[PLATE_STATION], recipes=RECIPES,
+                  orders=[ORDER_PLAIN_FISH],
+                  plates=[plate("p1", 7, 0,
+                                ["SushiFish", "CookedCompositeAssembledNode"])])
+    ctx, _ = make_ctx(w)
+    assert T.DeliverPlate("2", ("p1",)).feasible(ctx) is False
+
+
+def test_deliver_plate_feasible_for_exact_plain_fish():
+    w = FakeWorld(stations=[PLATE_STATION], recipes=RECIPES,
+                  orders=[ORDER_PLAIN_FISH],
+                  plates=[plate("p1", 7, 0, ["SushiFish"])])
+    ctx, _ = make_ctx(w)
+    assert T.DeliverPlate("2", ("p1",)).feasible(ctx) is True
 
 
 def test_deliver_plate_infeasible_when_order_gone():
@@ -2222,6 +2398,8 @@ def test_all_spec_tasks_are_registered():
     """
     expected = {
         "PlaceCleanPlate", "WashPlate",                       # 1, 2
+        "FetchConveyorPlate",                                 # 传送带抢救
+        "ReceiveConveyor",                                    # 4-5 按开关收脏盘
         "FetchToCooker", "TakeCookedToPlate", "ReturnPot",    # 3, 4, 5
         "RescueCooked",                                       # 6
         "Extinguish",                                         # 6.5（灭火）
@@ -2232,8 +2410,14 @@ def test_all_spec_tasks_are_registered():
         "ResetPlate",                                         # 14
         "Prefetch",                                           # 15
         "Mix",                                                # 16（拌合，阶段 4）
-        "PlaceToRelay",                                       # 17（1-3 中转传盘）
         "FillCooker",                                         # 18（订单无关填灶）
+        "ThrowBatch",                                         # 20（批量投掷备料）
+        "SendAcross",                                         # 21（跨区通道送件）
+        "FetchToCarrier", "PlaceCarrierInCooker",             # 22, 23（可烹饪载体：披萨）
+        "FillCarrier",                                        # wrap 载体（卷饼直接装熟料）
+        "MergePlates",                                        # 盘合并（spec 2026-11-01-plate-merge-design）
+        "Reposition",                                         # 换布局时走进安全区
+        "RideRaft",                                           # 5-1 开舢板过河
     }
     assert set(T.TASK_TYPES) == expected, \
         "缺 %r / 多 %r" % (sorted(expected - set(T.TASK_TYPES)),
@@ -2298,3 +2482,22 @@ def test_recover_loose_pot_binds_to_that_pot():
     assert pickup.expect(make_ctx(w, chef=chef("utensil_pot_01 (3)"))[0]) is True
     assert pickup.expect(make_ctx(w, chef=chef("utensil_pot_01"))[0]) is False
     assert pickup.expect(make_ctx(w, chef=chef(None))[0]) is False
+
+
+def test_wash_plate_infeasible_while_holding_plated_dish():
+    """手里端着有料的盘时不许洗：否则会把成品盘放下、被送餐任务再捡起来。
+
+    实机 trace-20261109-124818 t=140~150（以及 216~220）就是这样循环 10 秒：
+    WashPlate 要空手 → EnsureHandsFree 把成品盘放到台面 → SendAcross 又把它
+    拾起 → 再放下。整段 wash 与 send 都没完成。
+    """
+    w = FakeWorld(stations=[SINK, DRYING], recipes=RECIPES, orders=[ORDER],
+                  workstations=[],
+                  items=[{"n": "DirtyPlateStack", "x": 0.0, "z": -12.0}],
+                  plates=[plate("p9", 0, 0, contents=["Pizza"])])
+    w.held_plates = [dict(w.plates[0], held_by="Player 2")]
+    w.plates = []
+    chef = {"name": "Player 2", "x": 0.0, "z": 0.0,
+            "held": "equipment_plate_01 (9)", "interactions": inter()}
+    ctx, _ = make_ctx(w, chef=chef)
+    assert T.WashPlate(resources=("sink1",)).feasible(ctx) is False

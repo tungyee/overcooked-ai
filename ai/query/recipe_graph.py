@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ai.revenue import cook_supply as CS
 from ai.query import predicates as P
 from ai import tasks as T
+from ai.query import carriers as CR
 from ai.query.plate_tokens import parse_pot_contents
 from ai.query.recipes import RecipeBook
 from ai.tasks.base import _grid_matches, cooked_sources
@@ -24,15 +25,22 @@ _MAX_ASSEMBLY_CELLS = 6
 
 def _counter_cells(world):
     # type: (Any) -> List[Tuple[int, int]]
+    """台面格，**主网格坐标**（x/z 投影，同 placement._station_cell）。
+
+    篮子上的台面 gx/gz 是篮子本地坐标：直接拿来当格，「离 P2 最近」排序全错，
+    选出的 6 个拼装格全在 P2 够不着的地方，摆盘候选 48 个全判 unreachable，
+    熟锅没盘可装（Balloon_2_3，trace-20261029-130632 t=1300/1700）。
+    """
+    from ai.query.placement import _station_cell
     cells = []  # type: List[Tuple[int, int]]
     seen = set()
     for st in world.stations:
         if st.get("t") != "counter":
             continue
-        gx, gz = st.get("gx"), st.get("gz")
-        if gx is None or gz is None:
+        cell = _station_cell(world, st)
+        if cell is None:
             continue
-        cell = (gx, gz)
+        cell = (int(cell[0]), int(cell[1]))
         if cell in seen:
             continue
         seen.add(cell)
@@ -40,17 +48,51 @@ def _counter_cells(world):
     return cells
 
 
-def _assembly_cells(world, counters):
-    # type: (Any, List[Tuple[int, int]]) -> List[Tuple[int, int]]
+def _station_cell_of(world, st):
+    # type: (Any, Dict) -> Optional[Tuple[int, int]]
+    from ai.query.placement import _station_cell
+    return _station_cell(world, st)
+
+
+def _assembly_cells(world, counters, bb=None):
+    # type: (Any, List[Tuple[int, int]], Any) -> List[Tuple[int, int]]
+    """拼装格候选：P2 够得着的台面优先，再按离 P2 近排。
+
+    只按直线距离排会选中隔着篮子缝、够不着的台面；够得着的不够数时才补上
+    够不着的（无拓扑的合成帧 field 为 None，全部当够得着）。
+
+    渡运台面（ai/space/shuttle.py）不当拼装格：摆上去的盘会被篮子运走。
+    """
+    from ai.space import shuttle
+    moving = {(int(c[0]), int(c[1])) for c in
+              (_station_cell_of(world, st) for st in shuttle.shuttle_stations(world))
+              if c is not None}
+    if moving:
+        counters = [c for c in counters if c not in moving]
     if len(counters) <= _MAX_ASSEMBLY_CELLS:
         return counters
     p2 = P.chef_by_name(world.chefs, P.P2_NAME)
     if not p2 or p2.get("x") is None or p2.get("z") is None:
         return counters[:_MAX_ASSEMBLY_CELLS]
     pc = world.to_grid(p2["x"], p2["z"])
-    return sorted(
-        counters, key=lambda c: (c[0] - pc[0]) ** 2 + (c[1] - pc[1]) ** 2
-    )[:_MAX_ASSEMBLY_CELLS]
+    from ai.space import reachability
+    field = reachability.field_for(world, bb, P.P2_NAME)
+
+    def cost(c):
+        if field is None:
+            return 0
+        best = None
+        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = field.get((c[0] + dx, c[1] + dz))
+            if v is not None and (best is None or v < best):
+                best = v
+        return best
+
+    def key(c):
+        v = cost(c)
+        return (v is None, v if v is not None else 0,
+                (c[0] - pc[0]) ** 2 + (c[1] - pc[1]) ** 2)
+    return sorted(counters, key=key)[:_MAX_ASSEMBLY_CELLS]
 
 
 def _plate_cell(world, plate):
@@ -165,6 +207,8 @@ def _compile_node(book, name):
     kind = book.node_kind(name)
     if kind in (None, "leaf"):
         return _leaf_node(book, name)
+    if kind == "cook" and book.carrier_base(name) is not None:
+        return _carrier_node(book, name)
     if kind == "cook":
         children = [n for n in
                     (_raw_production(book, r) for r in book.raws_of(name))
@@ -183,11 +227,96 @@ def _compile_node(book, name):
             "children": children,
         }
     if kind == "assemble":
-        return {
-            "type": "DeliverPlate", "item": name,
-            "children": [_compile_node(book, c) for c in book.components(name)],
-        }
+        children = [_compile_node(book, c) for c in book.components(name)]
+        # wrap 类（卷饼）：在盘装路径之外，额外给一条「卷饼直接装熟料」的路径
+        # （FillCarrier 链 → 装好料的卷饼端进盘）。盘装仍是 fallback，谁可行/
+        # 谁分高由 planner 选。wrap 节点排在**最前**：与 TakeCookedToPlate 同为
+        # 「盛熟料救锅」、同分时（L1/L2 只比 pressure），stable sort 按候选顺序
+        # 定胜负，排在前面让装馅压过装盘（trace-20261108-195728）。
+        wrap = _wrap_node(book, name)
+        if wrap is not None:
+            children.insert(0, wrap)
+        return {"type": "DeliverPlate", "item": name, "children": children}
     return None
+
+
+def _cook_node(book, name):
+    # type: (RecipeBook, str) -> Optional[Dict]
+    """熟料 name 的「下锅」节点（只到灶上煮，不含端盘盛熟）。
+
+    wrap 装馅（FillCarrier）的依赖是「这份馅已经在锅里煮」，不是「盛到盘上」
+    ——盛熟是 FillCarrier 自己（端卷饼去锅边盛）。所以这里只取 FetchToCooker
+    这一层，与 _compile_node 的 cook 分支（TakeCookedToPlate←FetchToCooker）
+    区分开。
+    """
+    if book.node_kind(name) != "cook":
+        return None
+    children = [n for n in
+                (_raw_production(book, r) for r in book.raws_of(name)) if n]
+    return {"type": "FetchToCooker", "item": name, "children": children}
+
+
+def _wrap_node(book, name):
+    # type: (RecipeBook, str) -> Optional[Dict]
+    """wrap 类载体菜（卷饼/汉堡）：卷饼直接装熟料、不进炉，装齐后端进盘。
+
+        DeliverPlate
+          └─ FetchToPlate(底料, contents=全部熟料 token)
+               └─ FillCarrier(最后一样馅) ← [煮料链] + FillCarrier(前一样馅)
+                    └─ ... 逐样往回，第一样馅只有煮料链
+    盘装路径由 _compile_node 的 assemble 分支并行给出，作为 fallback。
+    """
+    base = book.wrap_base(name)
+    if base is None:
+        return None
+    fillings = book.wrap_fillings(name)
+    tokens = []  # type: List[str]
+    for f in fillings:
+        t = book.rich_token(f)
+        if t:
+            tokens.append(t)
+    contents = CR.signature(tokens)   # 装完的卷饼内容签名（排序元组）
+
+    fill_node = None  # type: Optional[Dict]
+    # 从第一样馅往最后一样搭：FillCarrier(f) 依赖 f 的煮料链 + 前一样馅的
+    # FillCarrier，所以最后一样馅是链顶（FetchToPlate 的子节点）。
+    for i in range(len(fillings)):
+        f = fillings[i]
+        pre_sig = CR.signature(tokens[:i])   # 排在这份馅之前的馅的 token 签名
+        cook_chain = _cook_node(book, f)
+        children = [cook_chain] if cook_chain is not None else []
+        if fill_node is not None:
+            children.append(fill_node)
+        fill_node = {"type": "FillCarrier", "item": f, "base_form": base,
+                     "pre_contents": pre_sig, "children": children}
+    return {"type": "FetchToPlate", "item": base, "contents": contents,
+            "children": [fill_node]}
+
+
+def _carrier_node(book, name):
+    # type: (RecipeBook, str) -> Dict
+    """整份进炉的熟料（披萨）：底料切成载体、料放上载体、载体进炉、端盘取。
+
+        TakeCookedToPlate
+          └─ PlaceCarrierInCooker
+               ├─ Chop(底料) ← FetchToBoard        （carrier_base：切出载体）
+               └─ FetchToCarrier(配料) ← Chop ← FetchToBoard   （每样配料一条）
+    """
+    base, form, _station = book.carrier_base(name)
+    children = []  # type: List[Dict]
+    prod = _raw_production(book, base)
+    if prod is not None:
+        prod = dict(prod, carrier_base=name)
+        children.append(prod)
+    for top in book.carrier_toppings(name):
+        sub = _raw_production(book, top)
+        children.append({"type": "FetchToCarrier", "item": top, "base_form": form,
+                         "children": [sub] if sub else []})
+    return {
+        "type": "TakeCookedToPlate", "item": name,
+        "children": [{"type": "PlaceCarrierInCooker", "item": name,
+                      "base_form": form, "children": children}],
+    }
 
 
 # ---------- 落地（存在性 done） ----------
@@ -200,23 +329,98 @@ def _raw_on_board(world, raw):
     return False
 
 
-def _chopped_available(world, book, raw):
-    # type: (Any, RecipeBook, str) -> bool
-    """切好形态是否可用（板上 / 手上 / 散落）。不含盘（盘里记的是生料名）。"""
+def chopped_count(world, book, raw):
+    # type: (Any, RecipeBook, str) -> int
+    """切好形态有几份可用（板上 / 手上 / 散落）。不含盘（盘里记的是生料名）。"""
     form = book.chop_target(raw)
     if not form:
-        return False
+        return 0
     low = str(form).lower()
+    n = 0
     for _name, item in _board_items(world).items():
         if str(item or "").lower() == low:
-            return True
+            n += 1
     for c in world.chefs:
         if str(P.held_name(c)).lower() == low:
-            return True
+            n += 1
     for it in world.items:
         if str(it.get("n") or "").lower() == low:
-            return True
-    return False
+            n += 1
+    return n
+
+
+def _chopped_available(world, book, raw):
+    # type: (Any, RecipeBook, str) -> bool
+    return chopped_count(world, book, raw) > 0
+
+
+def _order_uses_raw(book, order, raw):
+    # type: (RecipeBook, Dict, str) -> List[str]
+    """order 里要用到「切好的 raw」的成分（熟料或直接装盘的切料）。"""
+    low = str(raw).lower()
+    out = []  # type: List[str]
+    for prod in book.requirements(order):
+        if book.needs_cooking(prod):
+            if any(str(r).lower() == low for r in book.raws_of(prod)):
+                out.append(prod)
+        elif str(prod).lower() == low and book.needs_chopping(prod):
+            out.append(prod)
+    return out
+
+
+def chop_waiters(world, book, raw, plate_match, cooker_match):
+    # type: (Any, RecipeBook, str, Dict[Any, Any], Dict[Any, Any]) -> List[Any]
+    """还在等「切好的 raw」的订单 id（按屏幕顺序）。
+
+    已越过切这一步的单不算：熟料单已有灶在产（cooker_match），直接装盘的切料
+    已在该单的盘里。
+    """
+    cooking = set((cooker_match or {}).values())
+    carrier_match = CR.match_carriers_to_orders(world, book, plate_match)
+    prep_match = CR.match_prep_carriers(world, book, skip=cooking)
+    low = str(raw).lower()
+    out = []  # type: List[Any]
+    for order in world.orders:
+        oid = order.get("id")
+        prods = _order_uses_raw(book, order, raw)
+        if not prods:
+            continue
+        pid = _order_plate_id(plate_match or {}, oid)
+        plate = _plate_by_n(world, pid) if pid is not None else None
+        for prod in prods:
+            if book.needs_cooking(prod):
+                if oid in cooking:
+                    continue
+                # 整份进炉的菜：底料已切成饼 / 这样配料已在饼上 → 这一单不再等它
+                base = book.carrier_base(prod)
+                if base is not None and oid in prep_match:
+                    if str(base[0]).lower() == low:
+                        continue
+                    if book.want_tokens(raw) & set(prep_match[oid]["contents"]):
+                        continue
+            elif plate is not None and book.plate_has(plate, prod):
+                continue
+            elif CR.carrier_covers(book, carrier_match.get(oid), prod):
+                continue
+            out.append(oid)
+    return out
+
+
+def _chop_done_for_order(world, book, raw, ctx):
+    # type: (Any, RecipeBook, str, Dict) -> bool
+    """这一单的「切 raw」是否已有着落：切好的份数 ≥ 排在它前面（含它）的等料单数。
+
+    旧口径是「场上有一份切好的就算全部单都切完」：两单都要薯条、只有一份
+    切好的土豆时，第二单不再发 FetchToBoard/Chop，P2 手里接住的土豆没人
+    认领，原地拿着站了 7.5 秒（trace-20261029-125348 t=434~584）。
+    """
+    waiters = chop_waiters(world, book, raw, ctx.get("plate_match"),
+                           ctx.get("cooker_match"))
+    oid = ctx.get("order_id")
+    if oid not in waiters:
+        return True
+    rank = waiters.index(oid) + 1
+    return chopped_count(world, book, raw) >= rank
 
 
 def _node_done(node, ctx):
@@ -226,19 +430,47 @@ def _node_done(node, ctx):
     world = ctx["world"]
     book = ctx["book"]
     plate_id = ctx["plate_id"]
+    if t == "PlaceCarrierInCooker":
+        return ctx["order_id"] in ctx["cooker_match"].values()
+    if node.get("carrier_base") or t == "FetchToCarrier":
+        # 载体链：这一单已上灶 → 全链完成；否则看这一单配到的载体
+        if ctx["order_id"] in ctx["cooker_match"].values():
+            return True
+        car = ctx.get("prep_carrier")
+        if car is None:
+            return False
+        if node.get("carrier_base"):
+            return True                       # 这一单已有饼
+        return bool(book.want_tokens(item) & set(car["contents"]))
+    if t == "FillCarrier":
+        # 这份馅已被该单配到的载体盖住 → 装馅视为已完成（由「载体端盘」路径
+        # 处理），不再从零切/煮一份（trace-20261031-233010：肉已在卷饼里，
+        # 旧行为仍去切肉）。否则判「底料已装好前置 + 这份熟料」。
+        if CR.carrier_covers(book, ctx.get("carrier"), item):
+            return True
+        token = book.rich_token(item)
+        toks = set(node.get("pre_contents") or ())
+        if token:
+            toks.add(token)
+        return CR.wrap_carrier_exists(world, node.get("base_form"),
+                                      CR.signature(toks))
     if t == "FetchToBoard":
         return _raw_on_board(world, item)
     if t == "Chop":
         return _chopped_available(world, book, item)
-    if t == "FetchToPlate":
+    if t in ("FetchToPlate", "TakeCookedToPlate"):
         p = _plate_by_n(world, plate_id) if plate_id is not None else None
-        return p is not None and book.plate_has(p, item)
+        contents = node.get("contents")
+        if p is not None and book.plate_has(p, item):
+            # wrap 的 FetchToPlate 节点带 contents：盘里还得有装进去的料才算齐
+            if contents is None or set(contents) <= book.plate_tokens(p):
+                return True
+        # 该单配到的已装料载体里已有这份料（包了熟肉的卷饼）：不再备料/端锅，
+        # 由「把载体放进盘」那一步（底料的 FetchToPlate）一起带进去。
+        return CR.carrier_covers(book, ctx.get("carrier"), item)
     if t == "FetchToCooker":
         # 该单已有熟料源（灶上锅/散熟锅）在产 → 下锅这条链已完成，不再发
         return ctx["order_id"] in ctx["cooker_match"].values()
-    if t == "TakeCookedToPlate":
-        p = _plate_by_n(world, plate_id) if plate_id is not None else None
-        return p is not None and book.plate_has(p, item)
     if t == "Mix":
         return _mix_done(world, book, node)
     return False
@@ -265,31 +497,7 @@ def _mix_done(world, book, node):
     return False
 
 
-# ---------- 发射（实例化：绑资源 + 认领） ----------
-
-def _in_flight_cook_claim(ctx, item=None):
-    # type: (Dict, Any) -> bool
-    """该单是否已有在途的 下锅/取熟/救熟 认领（等价 _order_needs_cooked 第 2 源）。
-
-    作用域按**熟料**而非整单（第 1 组 1.3）：原先只问「这单有没有任意烹饪
-    类认领」，于是一单要两份熟料（或多料菜）时，第一份一下锅就把第二份的
-    候选全压掉——AI 站着等、灶空着。认领的本意是「同一份熟料别重复下锅」。
-
-    认领没记 item（老认领 / 非烹饪路径）时退化回整单作用域：宁可少发一个
-    候选，也不要重复下锅。
-    """
-    want = str(item).lower() if item is not None else None
-    for (_res, action), claim in ctx["bb"].claims.items():
-        if getattr(claim, "order_id", None) != ctx["order_id"]:
-            continue
-        if action not in ("fetch_to", "take_cooked", "rescue"):
-            continue
-        claimed = getattr(claim, "item", None)
-        if want is None or claimed is None:
-            return True
-        if str(claimed).lower() == want:
-            return True
-    return False
+# ---------- 发射（实例化：绑资源） ----------
 
 
 def _takeable_cooked_source(world, book, cid):
@@ -302,6 +510,24 @@ def _takeable_cooked_source(world, book, cid):
     for src in cooked_sources(world, book):
         if src["kind"] == "loose" and src["id"] == cid:
             return True
+    return False
+
+
+def _source_has(world, book, cid, item):
+    # type: (Any, RecipeBook, Any, str) -> bool
+    """熟料源 cid（灶或散锅）装的是不是 item 这样熟料（rich token 比对）。"""
+    token = book.rich_token(item)
+    if not token:
+        return True                       # 认不出 token 的配方不拦（旧口径）
+    c = _cooker_by_id(world, cid)
+    if c is not None:
+        from ai.tasks.base import _cooker_cooked_tokens
+        toks = _cooker_cooked_tokens(c, book)
+        # 灶没报 pot_contents（旧帧/合成帧）= 内容未知，不拦；知道且不含才拦。
+        return not toks or token in toks
+    for src in cooked_sources(world, book):
+        if src["kind"] == "loose" and src["id"] == cid:
+            return token in src["tokens"]
     return False
 
 
@@ -327,15 +553,34 @@ def _cooker_by_id(world, cid):
 
 def _inst_fetch_board(node, ctx):
     # type: (Dict, Dict) -> List[Any]
+    """空板各一个候选；P2 够得着的空板一块都没有时，再给「板上东西可挪走」
+    的板发候选（FetchToBoard 先腾板再放料，判据见 T.board_clearable）。
+
+    有空板就不腾：腾板多跑一趟，只在没板可用时才值得。"""
+    from ai.space import reachability
+    world, bb = ctx["world"], ctx["bb"]
     item = node["item"]
-    tasks = []  # type: List[Any]
-    for name, board_item in _board_items(ctx["world"]).items():
-        if board_item:
+    free, occupied = [], []  # type: List[str], List[str]
+    for name, board_item in _board_items(world).items():
+        if _claimed(name, "fetch_to", bb):
             continue
-        if _claimed(name, "fetch_to", ctx["bb"]):
-            continue
-        tasks.append(T.FetchToBoard(ctx["order_id"], (name,), item))
-    return tasks
+        (occupied if board_item else free).append(name)
+    names = list(free)
+    rctx = reachability.context(world, bb)
+    if not any(_board_reachable(rctx, n) for n in free):
+        names += [n for n in occupied
+                  if T.board_clearable(world, ctx["book"], bb, n)]
+    return [T.FetchToBoard(ctx["order_id"], (n,), item) for n in names]
+
+
+def _board_reachable(rctx, name):
+    # type: (Dict, str) -> bool
+    from ai.space import reachability
+    for st in rctx["w"].stations:
+        if st.get("t") in ("board", "chopping") and \
+                P.station_name_matches(str(st.get("n") or ""), name):
+            return reachability.can_interact(rctx, st)
+    return True        # 站点表里没有（部分单测只给 workstations）：按旧口径算可用
 
 
 def _inst_chop(node, ctx):
@@ -353,28 +598,43 @@ def _inst_chop(node, ctx):
 
 def _inst_fetch_to_plate(node, ctx):
     # type: (Dict, Dict) -> List[Any]
+    """普通底料候选恒发；该单配到的载体正是这样底料时，再发一个带内容签名的
+    载体候选（包肉卷饼与空卷饼分开打分）。
+
+    普通候选不因载体而压掉：载体够不着/被 P1 拿走时它是退路；真放了空底料，
+    盘里就有了底料，载体不再匹配这只盘，被载体覆盖的备料链自动恢复。
+    """
     plate_id = ctx["plate_id"]
     if plate_id is None:
         return []
-    return [T.FetchToPlate(ctx["order_id"], (plate_id,), node["item"])]
+    item = node["item"]
+    contents = node.get("contents")
+    if contents is not None:
+        # wrap 节点：只发「装好料的底料端进盘」（带内容签名）；盘装 fallback 由
+        # 并行的普通 FetchToPlate 路径发，不在这里重复。
+        return [T.FetchToPlate(ctx["order_id"], (plate_id, tuple(contents)), item)]
+    out = [T.FetchToPlate(ctx["order_id"], (plate_id,), item)]
+    carrier = ctx.get("carrier")
+    book = ctx["book"]
+    form = book.chop_target(item) if book.needs_chopping(item) else item
+    if CR.carrier_is_base_of(carrier, item, form):
+        out.append(T.FetchToPlate(ctx["order_id"], (plate_id, carrier["sig"]), item))
+    return out
 
 
 def _inst_fetch_to_cooker(node, ctx):
     # type: (Dict, Dict) -> List[Any]
     item = node["item"]
-    if _in_flight_cook_claim(ctx, item):
-        return []
     tasks = []  # type: List[Any]
     # 去重按**熟料**分桶：`used_cookers` 原先是整单共享的一个 set，而本函数
     # 会遍历所有空灶各发一个候选——于是第一样熟料就把所有空灶"用掉"，第二样
-    # 一个候选都发不出来（第 1 组 1.3 的第二层结构限制，由
-    # tests/test_cook_claim_scope.py 暴露）。候选只是选项，真正的互斥由
-    # claims 负责，所以同一口灶出现在不同熟料的候选里没有问题。
+    # 一个候选都发不出来（第 1 组 1.3 的第二层结构限制）。候选只是选项，
+    # 同一口灶出现在不同熟料的候选里没有问题。
     used = ctx["used_cookers"].setdefault(str(item).lower(), set())
     want_cookware = (ctx["book"].cookware_of(item) or "").lower()
     for c in _cookers(ctx["world"]):
         cid = P.resource_id(c)
-        if not cid[1] or _claimed(cid, "fetch_to", ctx["bb"]):
+        if not cid[1]:
             continue
         if not P.cooker_has_pot(c):
             continue
@@ -399,8 +659,6 @@ def _inst_fetch_to_cooker(node, ctx):
         if _it != item:
             continue
         cid = P.resource_id(c)
-        if _claimed(cid, "fetch_to", ctx["bb"]):
-            continue
         if _claimed(pot_name, "recover", ctx["bb"]):
             continue
         tasks.append(T.FetchToCooker(ctx["order_id"],
@@ -420,9 +678,38 @@ def _inst_take_cooked(node, ctx):
             continue
         if not _takeable_cooked_source(ctx["world"], ctx["book"], cid):
             continue
+        # cooker_match 是「源 → 单」，一单可能配到多口锅（意面锅、鱼锅各一）：
+        # 必须是装着这一样熟料的那口，否则会去鱼锅里「取意面」
+        # （trace-20261029-130632 回放：TakeCookedToPlate(BoiledPasta, 鱼锅)）。
+        if not _source_has(ctx["world"], ctx["book"], cid, item):
+            continue
         if _claimed(cid, "take_cooked", ctx["bb"]):
             continue
         tasks.append(T.TakeCookedToPlate(ctx["order_id"], (cid, plate_id), item))
+    return tasks
+
+
+def _inst_fill_carrier(node, ctx):
+    # type: (Dict, Dict) -> List[Any]
+    """wrap 类：这份熟料还没装进卷饼、且卷饼（前置内容）可取/在手上 → 发候选。
+
+    与 _inst_take_cooked 同源：遍历配到这一单的熟料源（灶上锅/散熟锅），
+    只对装着这份熟料的那口发 FillCarrier；目标（卷饼）每拍现配，不认领。
+    """
+    item = node["item"]
+    pre = tuple(node.get("pre_contents") or ())
+    tasks = []  # type: List[Any]
+    for cid, oid in ctx["cooker_match"].items():
+        if oid != ctx["order_id"]:
+            continue
+        if not _takeable_cooked_source(ctx["world"], ctx["book"], cid):
+            continue
+        if not _source_has(ctx["world"], ctx["book"], cid, item):
+            continue
+        if _claimed(cid, "take_cooked", ctx["bb"]):
+            continue
+        tasks.append(T.FillCarrier(ctx["order_id"],
+                                   (cid, node["base_form"], pre), item))
     return tasks
 
 
@@ -433,7 +720,7 @@ def _inst_deliver(node, ctx):
         pid = p.get("n")
         if not pid:
             continue
-        if ctx["book"].missing(ctx["order"], p) != ():
+        if not ctx["book"].matches(ctx["order"], p):
             continue
         if _claimed(pid, "deliver", ctx["bb"]):
             continue
@@ -457,6 +744,36 @@ def _inst_mix(node, ctx):
     return tasks
 
 
+def _inst_fetch_to_carrier(node, ctx):
+    # type: (Dict, Dict) -> List[Any]
+    """这一单已有饼（没上灶、没在别人手里）才放料；没饼时等底料那条链切出来。"""
+    car = ctx.get("prep_carrier")
+    if car is None or car["held_by"]:
+        return []
+    return [T.FetchToCarrier(ctx["order_id"], (node["base_form"],), node["item"])]
+
+
+def _inst_place_carrier(node, ctx):
+    # type: (Dict, Dict) -> List[Any]
+    """料齐的饼 → 每口站型对得上、空着、没被认领的灶各一个候选。"""
+    from ai.tasks.carrier import cooker_accepts, cooker_free
+    car = ctx.get("prep_carrier")
+    book = ctx["book"]
+    if car is None or CR.prep_missing(book, car, node["item"]):
+        return []
+    station = book.carrier_base(node["item"])[2]
+    tasks = []  # type: List[Any]
+    for c in _cookers(ctx["world"]):
+        cid = P.resource_id(c)
+        if not cid[1]:
+            continue
+        if not cooker_accepts(c, station) or not cooker_free(c):
+            continue
+        tasks.append(T.PlaceCarrierInCooker(ctx["order_id"], (cid, node["base_form"]),
+                                            node["item"]))
+    return tasks
+
+
 def _instantiate(node, ctx):
     # type: (Dict, Dict) -> List[Any]
     t = node["type"]
@@ -474,6 +791,12 @@ def _instantiate(node, ctx):
         return _inst_deliver(node, ctx)
     if t == "Mix":
         return _inst_mix(node, ctx)
+    if t == "FetchToCarrier":
+        return _inst_fetch_to_carrier(node, ctx)
+    if t == "PlaceCarrierInCooker":
+        return _inst_place_carrier(node, ctx)
+    if t == "FillCarrier":
+        return _inst_fill_carrier(node, ctx)
     return []
 
 
@@ -497,20 +820,50 @@ def _walk(node, ctx, out):
             _walk(c, ctx, out)
     else:
         out.extend(_instantiate(node, ctx))
+    # 切好的料「有」但「不够」：上游照常放行（下锅/装盘用现成那份），同时给
+    # 这一单补发切菜链。只按存在性判，两单要薯条、只有一份切好的土豆时，
+    # 第二单不发 FetchToBoard/Chop，P2 接住的土豆没人认领、拿着干站 7.5 秒
+    # （trace-20261029-125348 t=434~584）。不能改成按份数挡住上游：唯一的板
+    # 被那份切好的料占着时，第二单就一个候选都没有了。
+    for c in node.get("children", []):
+        if c["type"] == "Chop" and c not in deps_not_done \
+                and not _chop_done_for_order(ctx["world"], ctx["book"], c["item"], ctx):
+            _walk_chop(c, ctx, out)
+
+
+def _walk_chop(node, ctx, out):
+    # type: (Dict, Dict, List[Any]) -> None
+    """按「这一单的切菜还没着落」展开 Chop 节点：板上有生料就切，否则取料上板。"""
+    deps_not_done = [c for c in node.get("children", [])
+                     if not _node_done(c, ctx)]
+    if deps_not_done:
+        for c in deps_not_done:
+            _walk(c, ctx, out)
+    else:
+        out.extend(_instantiate(node, ctx))
 
 
 def _emit_plate(world, bb, order_id):
     # type: (Any, Any, Any) -> List[Any]
     """订单没盘 → 拿干净盘摆上（第 1 号 PlaceCleanPlate）。"""
+    from ai.query.placement import counter_key_at, counter_occupied
     counters = _counter_cells(world)
     placed_ids = set(p.get("n") for p in _placed_plates(world, counters))
     tasks = []  # type: List[Any]
-    for cell in _assembly_cells(world, counters):
+    for cell in _assembly_cells(world, counters, bb):
+        # 排序/可达按当前投影格；task 身份用拼装位 id（篮子台面是站名）
+        cell = counter_key_at(world, cell)
         if _claimed(cell, "assemble", bb):
+            continue
+        # 台面上已有锅/料/盘：摆不上去（对锅摆盘会变成倒料，见 counter_occupied）
+        if counter_occupied(world, cell):
             continue
         for p in world.plates:
             pid = p.get("n")
             if not pid or P.plate_count(p) != 0 or pid in placed_ids:
+                continue
+            # 盘堆中间层拿不到：pickup 只会拿起顶层，绑定的盘 id 永远不上台面
+            if P.plate_buried_in_stack(p):
                 continue
             if _claimed(pid, "place", bb):
                 continue
@@ -518,9 +871,14 @@ def _emit_plate(world, bb, order_id):
     return tasks
 
 
-def emit(world, bb, book, order, plate_match, cooker_match):
-    # type: (Any, Any, RecipeBook, Dict, Dict[Any, Any], Dict[Any, Any]) -> List[Any]
-    """为一个订单发射 recipe 驱动的候选 task 列表（含放盘，不含 housekeeping）。"""
+def emit(world, bb, book, order, plate_match, cooker_match, carrier_match=None):
+    # type: (Any, Any, RecipeBook, Dict, Dict[Any, Any], Dict[Any, Any], Optional[Dict[Any, Dict]]) -> List[Any]
+    """为一个订单发射 recipe 驱动的候选 task 列表（含放盘，不含 housekeeping）。
+
+    carrier_match（{order_id: 载体}，见 ai.query.carriers）缺省时按 world 现算。
+    """
+    if carrier_match is None:
+        carrier_match = CR.match_carriers_to_orders(world, book, plate_match)
     order_id = order.get("id")
     plate_id = _order_plate_id(plate_match, order_id)
     dish = order.get("dish")
@@ -532,6 +890,9 @@ def emit(world, bb, book, order, plate_match, cooker_match):
     root = None
     if book.recipe(dish) is not None:
         root = _compile_node(book, dish)
+        # 整道菜是熟料节点（披萨）：编出来的根是「端盘取熟」，出餐还得包一层
+        if root is not None and root["type"] != "DeliverPlate":
+            root = {"type": "DeliverPlate", "item": dish, "children": [root]}
     if root is None:
         # 订单 dish 不在配方表（单测/异常帧）→ 退回按 composition 当拼装表
         children = [_compile_node(book, ing) for ing in book.requirements(order)]
@@ -543,6 +904,10 @@ def emit(world, bb, book, order, plate_match, cooker_match):
             "world": world, "bb": bb, "book": book, "order": order,
             "order_id": order_id, "plate_id": plate_id,
             "cooker_match": cooker_match, "used_cookers": {},
+            "plate_match": plate_match,
+            "carrier": carrier_match.get(order_id),
+            "prep_carrier": CR.match_prep_carriers(
+                world, book, skip=set((cooker_match or {}).values())).get(order_id),
         }
         _walk(root, ctx, out)
     return out

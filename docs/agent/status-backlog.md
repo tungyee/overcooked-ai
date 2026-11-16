@@ -1,5 +1,209 @@
 # 已知限制、当前状态与待办
 
+## 只备料不组装：一条永远完成不了的命令（2026-11-09，已修）
+
+- **现象**（trace-20261109-124818）：240 秒里 FetchToBoard 90 秒 + Chop 41 秒，两个灶有 225 秒是空的；`FetchToCarrier`（组装）只在少数间隙被选中。
+- **根因**：04:49:12 模型调 `execute_actions([{action:"chop"}])`（不带 target）。这条命令最后落成「给这道菜切所有料」的 dish scope、`target` 是菜名，`command_done` 对 chop 拿 `book.chop_target(菜名)` 得到 None → **永远判不出完成**。命令于是一直占着执行槽，`_scope_with_preemption` 把 planner 锁在备料 scope 里，212/240 秒都有命令挂着。
+- **修**：`command_done_undecidable()` 认出这类命令；`Command.served` 在「命中本命令 scope 的任务成功一次」时置位；`_service_commands` 对这类命令按「做过一次就收工」结算。别指望加权重能盖住它——scope 过滤发生在打分之前。
+- 顺带：组装类任务加 `W_ASSEMBLY=0.3` 固定加分，同分时压过再取一份料（原来靠候选顺序输给 FetchToBoard）。
+- **待办**：`execute_actions` 不带 target 到底该不该被接受（现在是「给这道菜备齐料」的语义），值得在对话层再收一道闸。
+
+## 换布局复核与换边（2026-11-09，3-3 / `Wizard_3_2_2P`，未实机验证）
+
+- **机制**（240 秒 7 个稳定段）：中央料箱在「竖列 (0,-3..3)」和「横排 (-3..3,0)」之间切换，把厨房切成左右或上下两半；站点全程不动。周期 34 秒，**全图只连通 2.0~3.4 秒**（实测 50.0/83.6/117.2/151.8/186.0/219.6，每次 2.0~3.4s）。错过窗口就被关在另一侧约 31 秒。
+- **复核**：`ai/space/zoning.py`。按连通块算每块有哪些功能区（砧板/灶/水槽/盘），从 `bb.division` 编出两个角色的装备（默认你=砧板、玩家=灶+水槽；有灶的一侧补水槽），先给玩家选（更受限），你再避开玩家的半边。站点没动、只是切法变了 → `layout_review`（只提醒站位）；站点真的搬家 → `division_review`。
+- **换边**：窗口打开那一拍把「见过的所有布局里都属于你」的格（实测 17 格，右上/左下象限）交给 `Reposition`，走进去后不管最后落在哪种布局都对。实测目标距离 0.2~1.2 秒行程，vs 2.0~3.4 秒窗口。
+- **话术**：`layout_review` 的 facts 只给目的半边（「请让玩家去下半边。提醒玩家时只说「去下半边」，不要提上半边」）。实测给「从A换到B」时模型会抓第一个半边反着说（6 次里 4 次说反）；只给目的半边 + 显式禁止提另一侧，6/6 方向正确。真实 prompt 模板端到端 59/62 方向正确（余下 3 条是「你先去下半边」这类表述，判据正则没覆盖，方向其实是对的）。
+- **实测回归**（trace-20261109-123544）：第一版有 95/240 秒不在自己的半场，三个原因，都已修：
+  1. **开窗发现太晚**：区域复核按 1 秒周期跑，118.0 开窗到 120.18 才 armed，只剩 1 秒。改成每拍复核（`observe` 实测 1.1ms，2% CPU）。
+  2. **命令 scope 把换边整个屏蔽**：`imperative = None if command_scope else ...` + `_scope_with_preemption` 过滤，导致 t=152/187/220 三个窗口都被一条迟迟完不成的 `plate` 命令挡掉。现在换边闸先于命令 scope，且 `Reposition` 进 `PREEMPT_COMMAND_TYPES`（命令队列不动，关窗即回）。
+  3. **到了安全区就回去干活**：t=118、t=220 都是进了安全区又被普通任务拽出来，关窗时压在分界线上。现在 `done()` = 窗口关闭，树尾加 `WaitUntil`，整个窗口占住安全区（顺手也把 L2「刚熟」从让位名单里去掉——那口锅还有十几秒，窗口只有 2~3 秒）。
+  - 修后同一段 trace 重放：6 个窗口全部当拍 armed，`Reposition` 在整个窗口里 100% 被选中。
+- **限制**：
+  - **第一次换布局无法预判**：只见过一种布局时安全格 = 当前那半边，等于不动（和现在一样，不会更差）；第二次起就有两种布局的交集。要提前，得让插件把 `ServerTriggerQueue.delay/index` 推进 NDJSON（现在探针只打 BepInEx 日志：`[PILOT-QUEUE] server ... delay=20.98 index=1`），能在窗口开前 2 秒先挪到走廊口。
+  - **分区不含「干净盘」**：盘是动态物（t=94.8 三个干净盘全在左半边），拿它当判据会把「右半边没盘」判成「你该去左半边」，和玩家抢同一半。代价是「装盘只有一侧能取盘」这种关卡看不出来。
+  - **换边不看手里拿的是什么**：端着成品盘时也可能被拉去换边，没做「送完再走」的例外。
+  - `Reposition` 只保证「跨过去」，不保证站到能干活的格；到位后由 planner 正常选活。
+
+## 双竹筏传送带（2026-11-10，Rapids_4_2_2P，未实机验证）
+
+`trace-20261110-211743`（4-1 切进 4-2 后 65 秒）暴露的问题：
+
+- **布局复核每几秒翻一次**：4-2 所有功能站都在会漂的 `Raft One` / `Raft Two` 上。旧 `zoning._kinds` 把站点局部 `gx/gz` 当主网格坐标，连通块又按投影地板每帧变化，于是 `layout_review` 在「上下两半 / 左右两半 / 不分区」之间反复触发，模型最后把 `chop/cook/plate` 全塞给玩家，AI 自己几乎没活。修：`_kinds` 按世界坐标投影、跳过 `grids[].moving` 上的站点；`observe` 只认砧板/灶/水槽两种以上才算分区（干净盘不算）。
+- **竹筏被当成渡运篮子**：`shuttle_grids` 用「台面外包盒里有没有主网格可走格」认渡运，木筏漂到半格位置时外包盒里可能暂时没有可走格，`channel_keys` 偶尔出现 `Raft One`。修：台面上有非柜台站（砧板/灶/水槽/料箱）或厨师正站在外包盒里 → 不是渡运。
+- **跨筏物流没有通道**：成品盘只能端在手里；`SendAcross` 的通道只有渡运篮子/静态共享台面，4-2 两者都没有，`plated_dish` 永远不生成。修：`ai/space/channels.py` 增加 `CONVEYOR = "@conveyor"`，段用 `(grid, 站名)`/段名认领；`free_slots`/`slot_of` 认 `on_station` 或段心 0.75m。
+- **主网格原点**：4-2 没有主网格站点，`GridMapping` 会落到 Sushi_1_4 默认的 14.4/-6.0。修：`from_grid` 增加 `fallback`，用 `grids[].main` 的 ox/oz/cell。
+- **接收侧**：切好的土豆/鸡块挂在传送带段上时，`find_ingredient` 仍按普通散落料返回；`FillCooker` 的传送带锁段/等料（1-6 那套）直接复用。fixture `tests/fixtures/rapids/rapids42-conveyor.ndjson.gz`，测试 `tests/test_conveyor.py`。
+
+`trace-20261110-221304`（第二次实机，113 秒）又暴露两个问题，已修：
+
+- **成品盘放到带子远端死胡同**：上一版按「离对面传送带最近」选段，实际选了 `gx=0,gz=-2` 的远端段；盘子停在那里，玩家够不着。修：`channels.conveyor_start_rank` 固定选带子**开头**（先大 `gz`、再大 `gx`；Raft Two 会选 `(4,0)`），不看走路距离。
+- **切好的生菜/番茄被扔给玩家**（`voice-20261111-224619`）：旧实现把切好料的「下一站」写成砧板（`CONSUMER_BOARD`），对面两块砧板恒在 → 没盘也一直扔，料堆在 P1 那边没人接。修：给切好的沙拉料新增「下一站=装盘」（`CONSUMER_PLATE`），由 `gap` 里「对面有干净盘」门控——对面有盘才投，没盘时沙拉留在 P2 这侧装盘、成品走传送带。fixture `tests/fixtures/rapids/rapids42-hold.ndjson.gz`，测试 `tests/test_conveyor.py::test_chopped_salad_thrown_only_when_far_has_clean_plate`。
+- **分工说「本关没有 Potato/Chicken」**：开局订单只刷到 ChickenOnly + Salad，`Kitchen.materials` 来自当前订单 DAG，ChipsOnly 没出现时 DAG 里没有 `Potato`；模型写的 `Chicken` 是另一关披萨叶子料，本关料箱真实名是 `NuggetChicken`。修：`_known_materials` 并入全部料箱 `ing`；`resolve_material` 对料箱名做唯一子串归一（`Chicken`→`NuggetChicken`）；仍不认识时错误信息带上「可用：…」列表。voice-20261110-221304。
+- **拿着切好的料原地打转**（`trace-20261110-222521` t=710~1048）：P2 抱着 `ChoppedLettuce` 反复 `SendAcross/FetchToBoard`，exec 停在 `confirm ['','']`。根因是 planner 在「拿着可投的料」时仍选了一个要空手的 `FetchToBoard`，树首 `EnsureHandsFree` 把料放下、下一拍再捡。修：`ThrowBatch` 新增 `held_batch` 加分（手里正拿着这一批 +1.0），保证先扔出去；`reachability.resource` 补查 `held_items`（手持资源在可达性里找得到）。fixture `tests/fixtures/rapids/rapids42-hold.ndjson.gz`。
+- **投掷落进垃圾桶**（`trace-20261110-224136` t=171）：P2 从 Raft Two 往对面 Raft One 的砧板扔 `ChoppedLettuce`，直线正好从 `Bin 1` 上方过，料被垃圾桶接住（`on_station=attach:Bin 1`），玩家拿不到。旧 `walls_of` 只把地形墙/高差地面当飞行障碍，垃圾桶是普通站点、不参与。修：`throw_supply.walls_of` 把 `stations[].t == "bin"` 的 AABB 当无高度墙加进去；当前站位直线被截断时 `aim_here` 返回 None，`launch_plan` 另找出手格，落点收到桶前/桶旁。fixture `tests/fixtures/rapids/rapids42-throw-bin.ndjson.gz`，测试 `tests/test_throw_bin.py`。
+- **传送带送来的脏盘不接、一路进桶**（`trace-20261110-230514`）：玩家把脏盘送上 Raft Two 传送带，AI 全程没洗，`DirtyPlateStack` 从 `ConveyorStation` 一路到 `attach:Bin 1`（t=1800/2502）。三个原因：① `dirty_stack_entry` 取 `items[]` 第一个脏盘，常拿到 Raft One 回盘台上 P2 够不着的那摞；② 洗碗池在竹筏边缘，主网格量化后整排交互格被台面/边缘挡住，`WashPlate` 判 sink unreachable；③ `WashPlate` 在 L7 清理层，即使可达也排不过备菜。修：`dirty_stack_entry` 有可达场时优先可达的脏盘摞；`shuttle.wash_stances` 给洗碗池合成 1.1m box、找池前约 0.9m 的格外站位，`reachability._interact_goals` 与 `Approach` 在格内交互位为空时使用它（同出餐口 hatch 兜底）；`planner_layers.dirty_on_conveyor` 把「脏盘已上传送带」的 `WashPlate` 提到 L4。fixture `tests/fixtures/rapids/rapids42-wash.ndjson.gz`，测试 `tests/test_wash_conveyor.py`。
+- **洗碗站位找不到，还是把脏盘漏进桶**（`trace-20261110-232403` t=2223~2715）：上一版的 `wash_stances` 在这个筏位返回空。根因在 `_edge_stances`：它找到最近「能站」的点就 `break`，哪怕那个点 `_link_cell` 挂不到可走格（池前 z=0.85 离可走格 >1m），于是一个方向都没有站位，WashPlate 仍 infeasible。修：`_edge_stances` 增加 `search_past_unlinked`；洗碗池传 True，能站点挂不上就继续往外找（最终在 z=0.45 挂到 cell (-3,3)）；渡运台面保持 False，旧时间表不变。fixture `tests/fixtures/rapids/rapids42-wash-edge.ndjson.gz`，测试 `tests/test_wash_conveyor.py::test_wash_stance_keeps_searching_past_unlinkable_points`。
+- **脏盘拿起后又放到旁边柜台**（`trace-20261110-234204` t=3363~3371）：WashPlate 已经走到洗碗池、手里端着 DirtyPlateStack；下一拍 `dirty_stack_entry` 只查 `items[]`，手持的脏盘在 `held_items` 里，于是拿到 Raft One 上够不着的另一摞，`WashPlate.feasible` 当场变 false；planner 改选 `Chop`，树首 `EnsureHandsFree` 把脏盘放到 countertop (6)，看起来就是“放不进洗碗池”。修：`dirty_stack_entry` 先返回 P2 手里的脏盘；`planner_layers.dirty_on_conveyor` 对 `held_items` 里的脏盘也返回 True，拿起后继续留在 L4，不被备菜抢走。fixture `tests/fixtures/rapids/rapids42-wash-hold.ndjson.gz`，测试 `tests/test_wash_conveyor.py::test_holding_dirty_plate_keeps_wash_task`。
+- **传送带上的盘进垃圾桶，没有抢救任务**（`trace-20261110-234204` t=340~421）：装生菜的 -19528 在 Raft Two 台面传送带上，末端是 Bin 1；旧逻辑只给脏盘提 WashPlate 优先级，干净盘/成品盘没有任务接，`DeliverPlate` 又被 combo_break 挡住，t=421 进桶。修：新增 `FetchConveyorPlate`（`plate.py`），非脏盘在传送带上时进 L4，树首清手后 pickup，拿起即完成；`channels.plate_on_conveyor` 按同名 item 的 `on_station` 认，避免把旁边柜台上的盘误判成传送带。fixture `tests/fixtures/rapids/rapids42-bin-rescue.ndjson.gz`，测试 `tests/test_conveyor_rescue.py`。
+- **送餐盘拿起又放下**（`trace-20261110-231906` t=512~652）：盘 -20214 只装了薯条，1:1 配给 `ChickenNuggetsAndChips_All`（order#1，还缺鸡块）；同一帧它又满足 `ChipsOnly`（order#2），于是 `SendAcross` 想把它当成品送走、`TakeCookedToPlate` 又想拿它加鸡块，两个任务每几拍交替，盘被拿起/放下。**不是脏盘**，`WashPlate` 没参与。修：`generate_candidates` 把 `plate_match` 挂到 `world._plate_match`，`cross_supply.plated_dish_sources` 对已配给某单的盘只按绑定单送；绑定单还缺料就跳过，留给 `TakeCookedToPlate` 继续装，不再生成另一张简单单的送件。fixture `tests/fixtures/rapids/rapids42-plate-conflict.ndjson.gz`，测试 `tests/test_plate_conflict.py`。
+- **自己这侧的带子被当成送件通道，放下去就被抢回来**（`trace-20261111-000723` t=227~375）：两筏漂开时 P2 只够得着 Raft Two 带子，`SendAcross` 把成品盘 -18776 放到带子开头 `(4,0)`；这条带子只通自己这侧的 Bin 1，玩家够不着，`FetchConveyorPlate` 每 10 拍把它当「快进桶」抢回来，形成「放上去 → 抢下来」循环。修：`channels.conveyor_slots` 只返回「P2 够得着、且整条带有玩家够得着的段」的带子；两筏漂开、只够得着自己这条带时不送（`@conveyor` 通道直接不存在），等漂近能碰到玩家那侧的带子再送。fixture `tests/fixtures/rapids/rapids42-own-belt.ndjson.gz`，测试 `tests/test_conveyor_rescue.py::test_own_side_belt_is_not_a_send_channel`、`tests/test_conveyor.py::test_own_side_belt_is_not_a_send_channel`。
+- **传送带上的成品盘被反复放下又拿起**（`trace-20261110-235726` t=360~536）：-20214（生菜+番茄）本该由 `SendAcross` 放到 Raft One 带子上交给玩家，下一秒 `FetchConveyorPlate` 又把它当「快进桶」抢回来，`SendAcross` 再放回去，40 多秒原地循环。根因：抢救任务只判「盘在传送带上」，没判**这是玩家那侧的带子**——Raft One 带子玩家站得到（`P1` 在下一段接），根本轮不到 P2 抢。修：`channels.belt_reached_by_player` 判整条带有没有玩家够得着的段；`plate_on_player_side_conveyor` 为真时 `FetchConveyorPlate` 不再生成/不可行，只抢救玩家够不着（自己这侧、末端是 Bin 1）的带子。fixture `tests/fixtures/rapids/rapids42-shared-belt.ndjson.gz`，测试 `tests/test_conveyor_rescue.py::test_plate_on_player_side_belt_is_not_rescued`。
+- **队首单的盘漂到对面，整局静止**（`trace-20261110-233159` t=1600~1726）：`plate_match` 把队首 All 单绑到 Raft One 的 -19556，P2 够不着；P2 这侧唯一能用的 -19560 被 ChipsOnly 单占住。`TakeCookedToPlate` 恒 unreachable，其他订单又没盘/没空灶，候选 31 个 infeasible、1 个 unreachable，P2 一直站着。修：`_match_plates_to_orders` 先排除 P2 够不着的盘（手持的除外），队首 All 单改绑 -19560，AI 恢复端盘盛薯条。fixture `tests/fixtures/rapids/rapids42-static.ndjson.gz`，测试 `tests/test_plate_conflict.py::test_unreachable_plate_is_not_matched_to_the_head_order`。
+- **端着盘盛熟料输给救锅**：`TakeCookedToPlate` 已拿着目标盘时，`RescueCooked` 的 pressure 分可能更高，锅被端离灶台、盘还空着。端盘盛饭同样能停烧糊计时、还完成订单，应优先。修：`_score_candidate` 给 `TakeCookedToPlate` 在「手持目标盘」时加 `held_plate=+2.0`（L1/L2/L6 白名单），压过同锅的救锅兜底，但压不过真正的火情/快糊更高压。测试 `tests/test_score_ordering.py::test_holding_plate_beats_rescuing_pot`。
+
+**已知限制**：插件的 `ConveyorStation` 报 `vx/vz=0`（真实方向/速度没读到，可能挂在 `ConveyenceReceiver` 子组件上），所以现在不按方向选段，只按「带子开头」的固定排序放；两筏漂开、只够得着自己这条带时**不送**（等漂近到能碰到玩家那侧的带子），不会再放到自己这侧进桶。要做准，需要插件把段的真实方向/速度或相连段报出来，或者从料在带上的跨帧位移学方向。
+
+## 半格走廊（2026-11-01，3_6_Dynamic_Lvl_02，未实机验证）
+
+- **现象**（`trace-20261101-184314`）：上层木筏 Raft One（带出餐口）停在中间平台正上方时，P2 只到得了平台下半截，鸡肉卷做好了也被判 `unreachable_destination`；Raft One 停在平台右侧（同一行横接）时正常。P1 实际走得过去。
+- **根因**：平台上两只料箱错开半格，中间 z∈(-8.4,-7.2) 全开一行；主网格格中心压在料箱边上，上下两排可走格错开不相邻，S 弯在格图上断开。
+- **修复**：`ai/space/lanes.py`。A、B 跨一排（或一列）、横向错开 1~2 格，**普通单调格路走不通**时，沿「A → 中线拐点 ×2 → B」三段直线每 0.1m 采样，按 walkable 同口径（阻挡外扩 `CHEF_CLEARANCE`、落火/KillPlane、运行时占用格）判净空，且离地板边 ≥ `SUPPORT_MARGIN`(0.1m) 才算脚下有地，通了就加跳边（代价 = 等价格路步数）。门洞格 / 传送门触发格不参与。`portals.nav_args` 统一叠上，`portals.route` 在两格间插两个拐点。fixture 全量比对：只有本关可达场变化，且都是超集。
+- **掉落机制**（反编译 `GroundCast` / `ApplyGravityForce` / `RespawnCollider`）：死亡只经 RespawnCollider；脚下检测落空才加重力，中心离开地板边就会滑下去，故走廊点要求离地板边有余量。
+- **待办**：实机验证 P2 沿拐点过 S 弯；`t=9700` P2 站在 Raft Two 边缘（x=15.8，格中心 16.0 越出地板 15.98），起点格四邻全不可走、可达场只剩自身（另一问题，未修）。
+
+## 传送门寻路（2026-11-01，插件 0.24.3 / 协议 8，未实机验证 P2 过门）
+
+- **机制**（反编译 `ServerTeleportal` / `*TeleportalPlayer*` / `*TeleportalAttachment*`）：进触发盒且位置在门正面 `arc_dir ± arc_deg` 扇区内就被强制传走，约 1.2s 不受控，落在出口门接收点、手持物随人；刚传过的人离开触发区或面朝门（±45°）前不会再传。扔进门的料从出口沿接收点 forward 重新抛出（`trace-20261101-160703`：奶酪 16.7s 入左门… 落左台 (8.4,-5.8)，出口前约 3.4m）。
+- **插件**：帧带 `portals[]`（门参数 + 动态态）与 `teleports[]`（最近 24 条传送事件，物品带 `thrown`），关卡加载打 `[PORTALS]`、每次传送打 `[TELEPORT]`。move 命令可选 `portals[]` 过门段：走到推门点一直朝门推、传送中停摇杆、落地后续走；推满 `max_wait` 没传走回 `portal busy`（回传门中心，Python 按门洞口径拉黑触发格）；没有过门段却被传走回 `teleported`。
+- **Python**：`ai/space/portals.py`。触发格对寻路不可走（防误踩，`trace-20261101-152446` t=19341/19490）；入口扇区内邻格 → 出口落地格加跳边，代价 2 + `TELEPORT_STEPS`(6)；`distance_field` 新增 `jump_cost`。`portals.nav_args` 统一给 agent / reachability 建场，`portals.route` 给 move 原语插推门/落地点。
+- **待办**：P2 过门未实机验证（推门方向、落地判定容差 1.5m、落地后转身别面朝门）；投掷规划还没用「扔进门 → 对面门前 3.4m」这种落点；P1 模型 / ETA 已经自动按跳边算。
+
+## Wizard_5_5：面包身份 / 升降楼梯 / 高度差投掷（2026-11-01，插件 0.24.2 / 协议 8，未实机验证）
+
+- **面包**：面包箱 prefab 叫 `ChoppedBun`，配方叶子是 `Bun`。反编译：面包是载体，配方身份在 `PreparationContainer.m_ingredientOrderNode`（`GetAsOrderComposite` 补在组成最后）。0.24.1 插件 `IngredientNode` 不读它、`RawNames` 只在切配索引里登记，P2 永远取不到面包（Mine_2_6 `trace-20261026-214120` 同样，面包全靠 P1）。0.24.2：`IngredientNode` 认 `PreparationContainer`；刷出器 prefab 节点名与 prefab 名不同就登记改名，帧里统一报 `Bun`。
+- **升降楼梯**：两座楼梯会整体沉到地下再升起（`trace-20261101-145921`）。`parse_terrain` 只并入两端贴着地板顶面（±0.3m）的楼梯；P2 正走在楼梯上时楼梯下沉仍会掉下去（未做下沉预测）。
+- **地板落点（插件 0.24.3）**：`trace-20261101-152446` t=535~716 P2 困在左平台（无普通台面）拿着生菜，`StashHeld` 每拍 `handle mismatch`。根因：无目标 tap 发了全 None 的 target 字典，插件当成有目标校验、必败（日志 62 次全败，地板落点自 exec 后端上线大概率一直坏）。反编译 `PlaceHeldItem_Client/Server`：拿着东西按键，面前有 placement 句柄就往上放（放不下留手里），没有才落地。修复：`handle_desc(None)` 返回 None；地板落点 = 面朝的那格（`placement.find_floor_drop`），站邻格发 `tap kind=floor` + `target_world`，插件小推杆转身、对准且无句柄才按，转不开回 `no clear floor`，`EnsureHandsFree` 换下一格。待实机：小推杆转身是否基本不挪位。另：`Prefetch` 不看切好形态是否已够，会拿多余生料（本局起因，未修）。
+- **高度差投掷**：比出手点高的地面（台阶、高台）当飞行障碍，落点地面比出手点高 >0.6m 判投不到；出手格按其地面高度分组算（`trace-20261101-142950`）。投锅路径（`plan_pot_throw`）未按出手格分高度，靠出手前真实位置复核兜住。投后落点校验未做。
+
+## 静态通道 / 披萨载体 / 站点重名（2026-11-01，插件 0.24.0 / 协议 8，未实机验证）
+
+`trace-20261101-002050`（Wizard_3_1 = 游戏内 3-1）：P2 被关在左边小区，盘子全在 P2 这边、烤箱在 P1 那边，52s 零出餐。
+
+- **站点重名**：关卡里两块砧板 GameObject 同名，`_board_items` 只认出两块、认领互撞。插件 `ObjNames`（`Oc2Executor.cs`）按名字分组，只给重名的那组加 `#<InstanceID>`；stations / workstations / cookers / `on_station` / chefs.interactions / exec 句柄同源。不重名的关 id 不变。
+- **静态通道**：`ai/space/channels.py` 把「两个可达场都能交互的普通台面」当通道，与渡运篮子并列；`SendAcross` 资源第二位改成通道 key。砧板列滑走（t≈44s）后通道自动消失。`far_plate_need` 的「要过灶」也认整道菜本身要烤。
+- **披萨**：反编译确认面团切成的饼是可烹饪载体（见 `tasks-primitives.md` carrier 一节）。插件新报 `cookers[].station_type`、`items[].cookable`、`crate.chop_cookable`；灶上是载体时 `pot_contents` 报整份组成（含底料）。`RecipeBook.requirements` 对整份进炉的菜返回菜名本身（进盘是一个熟料节点），`cooked_of_raws` 按生料集精确反查。
+- `trace-20261101-130851`（0.24.0 首局）：字段如预期（`cookable` prep/Oven/OvenTray、砧板 `#` 后缀），P2 往饼上放了番茄芝士；但 `ThrowBatch` 把饼从共享砧板拿走想投进烤箱，扔不出去、超时被放到 P2 台面，之后没有 task 能交出去，零出餐。修复：整份进炉的菜不生成「投进灶」阶段（反编译：有料的饼 `AllowThrowing` 为 false，烤箱是挂载站、只接停稳的物品）；插件 `throwable` 改按 `ServerThrowableItem.CanHandleThrow`，Python 投掷来源跳过不可投的；`SendAcross` 增加 `carrier` kind，共享空砧板作载体通道格。
+- 待实机：端盘对烤箱取披萨走 `TakeCookedToPlate` 的通用朝向句柄，未实测；阶段 B（砧板滑走后 P2 有烤箱/砧板/盘、P1 只剩面团/芝士箱）靠每拍重算自适应：P2 够不着面团/芝士就等 P1 放上共享砧板，饼一出现就放料、进炉、端盘（`tests/test_wizard31.py` 已覆盖饼在台面 / 砧板上两种）；台面上的散熟披萨不算熟料源。
+- 楼梯（插件 0.24.1）：同局 t=13767 P2 端着烤好的披萨不送，`DeliverPlate` 恒 `unreachable_destination`——出餐口在二楼，`Left Side Stairs` 在 SlopedGround(28) 层，插件没收。插件 `TERRAIN_LAYERS` 加 28；`parse_terrain` 把 28 层外扩 0.3m 并入 Ground（顶阶与二楼地板有 0.17m 接缝）。插件每场景一次在 BepInEx 日志打 `[TERRAIN-DIAG]`（非地形层碰撞体清单），新关卡走不通时先查它。待实机：P2 走楼梯送餐。
+
+## 渡运台面：隔着围栏取 / 送篮子上的东西（2026-10-31，未实机验证）
+
+2-3（Balloon_2_2）`trace-20261031-185032`：0 出餐。P1 t≈45s 把两盘成品放上下方 `Server_Balloon` 篮子台面，篮子 t≈57.7~64.1s 停在左口，P2 全程 `DeliverPlate … unreachable`，原地空站，菜又被运回右边。根因：台面在 gz=-6，正前一排格心 z=6.0 落在固定地板外 3cm（Ground minz=6.03），四邻交互位一个都没有；P1 实际站在 z≈6.44（两排格心之间）。人上不了篮子（篮子地板 0.63m），不是门洞问题，`seam_clock` z=6.0 恒 `known: False`。篮子：右停 bx≈18、左停 bx≈3.6，各停 ≈6.4s、单程 ≈11.6s、周期 ≈36.2s（`anim.len=13` 只是单程，不能当周期）。
+
+- `ai/space/shuttle.py`：渡运网格 = 会动、上面有台面、台面外包盒里没有主网格可走格（Balloon_2_3 气球、Rapids 木筏不算）。格外站位：从台面外沿往外每 0.05m 找能站的点（Ground 内、离阻挡层 ≥0.45m，≤1.25m），挂到最近可走格当寻路落脚格。`reachability._interact_goals` 并入落脚格；`Approach` 对渡运台面上的目标走到站位点（朝台面推 0.3m 作 move 终点，插件按句柄判到达）。
+- 时间表 `bb.shuttle_clock`（复用 `SeamClock`，新加 `observe_flags`）：每个台面「P2 可达区够得着」当一道门学周期；trace 顶层 `shuttle_clock`，键 `slot=网格/站名`。离线学出 T=36.2s，单格可交互窗口 10~13s（比停靠长：进出口时也够得着）。
+- `task_veto`：渡运台面上的东西够不着但时间表能预测 → 不否决；`task_wait_seconds` 给等篮子的秒数，planner 照门洞让位（>3s 先做别的）。拿着东西时门洞不让位，渡运仍让位（`task_shuttle_wait_seconds`）。
+- **取件（拿篮子上的东西）不加 task**：等篮子在 `move.Approach` 里做——目标在渡运台面上、此刻够不着但时间表能预测时原地 RUNNING，到口前 4s 先走到上一轮的落脚格（≤800 拍）。每拍 `ctx["external_wait"] += 1`，`Timeout` 不把等待算进 task 超时预算。`DeliverPlate` / `ResetPlate` / 装盘类拿篮子上的东西都一样，树结构不变。trace exec 记 `shuttle_wait`（秒）。
+- **送件（往篮子上放）**：通用 `SendAcross(item=种类, resources=(来源 id, 渡运网格))`，送什么、送几份由 `ai/revenue/cross_supply.send_deficit` 统一判（目前只有干净盘：对面要装盘的单数封顶 2，减对面现有 + 篮子上在途的空盘，再与我这边富余取小）；至少留 1 格给对面送菜；层 L_UNBLOCK，`plate_pressure` 按对面干净盘数。放哪格由 task 选（够得着的里最近，否则预测等待最短），`wait_targets` 让放置格的等篮子时间也进让位。`trace-20261031-204801` t≈132~172 右边 0 干净盘、左边积 3 块、40s 零出餐即此缺口。能投的生料仍走 `ThrowBatch`（下一步可并为同一个 task 的投掷通道）。
+- 让位：当前承诺等篮子 > `ACTIVE_SHUTTLE_DEFER_S`(8s) 也让出去（`trace-20261031-204801` t=67~99 送餐干站 30s）；3~8s 迟滞带不切。
+- 清手失败归因：失败拍 `EnsureHandsFree` 置 `ctx["hands_clear_failed"]` 且手里仍是开树时那件 → 只冷却 60 拍、不计入放弃计数（`trace-20261031-204801` t=55.4 送餐被拉黑 10s、错过停靠窗口）。
+- 拼装格排除渡运台面（`_assembly_cells`），空盘不摆到会被运走的地方。
+- fixture `balloon22-20261031-185032-shuttle` / `balloon22-20261031-204801-send-plates` / `balloon22-20261031-201659-throw-offcenter`，测试 `tests/test_shuttle.py`、`tests/test_throw_batch.py`（投掷站位离格心 0.48m 投不出：`GoToCell(precise=True)` 到格后再朝格心挪一次）。
+
+未做 / 待实机：第一圈时间表还没学会时，篮子到口那几秒照样能取（可达），但不会提前就位；站位贴墙 0.45m，句柄若够不着需调 `GOAL_PUSH`；`SendAcross` 只认干净盘、灶「全在对面」才算对面装盘（未按灶具类型细分）；地板兜底盲按 tap 发全 None target 必 handle mismatch（手里东西放不下时仍会卡）；门洞 / 投掷统一成通道、传送带与人控平台都留到下一轮。
+
+## 盘匹配优先给「能立刻装熟料」的单（2026-10-31，未实机验证）
+
+2-2（Balloon_2_3）4 局 trace（20261030-214824/224658/230700/233253）共 9 次：意面盘/空盘绑给缺肉、肉锅没开的非队首 MeatOnly（缺料数少，排序永远赢），Marinara 的熟鱼/熟虾没盘只能 `RescueCooked`。`_match_plates_to_orders` 改为两轮贪心：第一轮只配「订单要、盘还缺、且有已熟未糊源」的边，每配一条扣一份熟料供给（`cooked_sources` 计数，一口锅只让一块盘提前）；第二轮按原序（队首 → 缺料数 → 堆顶空盘 → remaining）配其余。队首能立刻用时仍是队首赢；钉住的配对先处理并占供给。fixture `balloon23-20261030-224658-plate-to-cooked`。未做：盘离锅距离 / 来不及就先救锅的 ETA 判断。
+
+## 盘堆顶层盘直接参与装配（2026-10-31，未实机验证）
+
+游戏里取盘站/沥碗架顶层盘能直接倒料、直接端去盛锅，原先因 `plates[]` 没有层信息，堆里的空盘一律不匹配，必须先 `PlaceCleanPlate` 挪到台面。插件 0.23.4 每块盘新增 `stack`（盘堆名，不在堆里为 null）/`stack_clean`/`stack_top`：遍历 `ServerCleanPlateStack`/`ServerDirtyPlateStack` 的 `m_stack`（`ServerStack.m_stackItems` + `InspectTopOfStack()`）；盘上报上限 8→32。Python：`P.plate_stack_top`/`P.plate_buried_in_stack`；`_match_plates_to_orders` 收干净堆顶盘（同等缺料时台面盘优先），中间层盘不当散落盘匹配；`_emit_plate` 不再绑中间层（pickup 只拿顶层）。配到堆顶盘的单不再发 `PlaceCleanPlate`，直接 `TakeCookedToPlate`/`FetchToPlate`。旧帧无字段时行为不变。
+
+待实机确认：`m_stackItems` 元素确为盘 GameObject、端走顶层后下一块的 `stack_top` 当帧更新；沥碗架洗好的盘也是 `ServerCleanPlateStack`。已知限制：堆顶盘装了半份料后压住下面的干净盘，别的单要等它离堆。
+
+**2026-11-08 实机（`trace-20261108-174744`）**：堆顶层盘的 `stack`/`stack_top` 上报正确，端走顶层后下一块当帧变顶层；P1 在同一站位能把海苔直接放上堆顶盘，游戏侧确实支持。但 P2 卡在 `FetchToPlate`：盘在沥水架 `DryingPart(-7,0)` 上，游戏上报的 placement 句柄被同一沥水架的洗碗池抢走（`WashingPart(-7,-1)`），插件 `HandleMatches(kind="placement")` 名字/坐标都对不上，tap 从未真正按键（trace t=2117 `exec_failure.why="handle mismatch"`，P2 耗了约 47 秒）。修：`handle_desc` 把盘堆名 `stack` 随目标发给插件；插件只对带 `stack` 的目标，在 placement 句柄失配时用朝向句柄 `m_gridLocation` 的坐标兜底（`ServerWashingStation.CanHandlePlacement` 会把非盘物品转给 `m_dryingAttachStation`，按键仍落回盘堆）。普通台面/出餐口的 placement 校验不放宽。测试 `tests/test_exec_primitives.py::test_handle_desc_carries_stack` / `test_tap_command_carries_stack_for_stack_plate`；待实机复验。
+
+## 已完成的 task 不再接着跑（2026-10-30）
+
+`trace-20261030-214824` t=1743~1795（Balloon_2_3）：P1 先把面下进 cooker_01，P2 的 `FillCooker.done()` 已为真。`agent._tick_once` ⑨.5 判「旧树后置条件已成立」把 planner 选的 DeliverPlate 压回 FillCooker，但 `Executor.tick` 不看 `done()`，树只认自己的 expect，照样走去面箱又拿一份面（52 拍），之后拿着多余的面去送餐失败。修：⑨.5 命中时设 `settle_active`，⑫ 直接 `halt_and_discard` 并按 success 走 ⑬（释放认领、清承诺），不再 tick 旧树；这一拍不开新树，下一拍 planner 重选。测试 `tests/test_agent.py::test_done_active_task_settles_instead_of_ticking`。
+
+## 落点去掉「不贴灶台」「不贴拼装台」（2026-10-30）
+
+`placement` 原先把灶台、出餐口四邻和已就位盘的格 + 四邻都禁掉。只有放**到灶台上**才会接着加热，灶旁台面不会，且落点候选只取 counter / 地板、不含灶台本身；放在盘旁边也不挡往盘里装菜。现只禁出餐口四邻，加「已占用格」（盘/锅/料/砧板自己那一格，`_occupied_station_cells`，地板兜底 `find_drop_cell` 也用它）。`trace-20261030-214824` t=1164 救锅：右篮近处台面全被这两条四邻禁区挡住，锅被搬到 FoodBasket (12)；重算后选右篮 (2)（灶旁 2 步）。
+
+## 接缝可走性诊断（2026-10-30，诊断中，未改决策）
+
+`trace-20261029-234145` t=6199~6230：篮子接缝 gx=4 列缺口 1.7m、P1 来回走得过，但两格中心离墙都 <`CHEF_CLEARANCE`(0.35)，`make_walkable_from_terrain` 判不可走，P2 候选全空、拿着盘子原地不动。反编译确认游戏没有给玩家用的可走标志（`GridNavSpace.m_nodeMap` 只在 Start 按占位算一次、只给老鼠用）。
+
+- 插件新增 `walk_probe` 帧字段（`plugin/Oc2WalkProbe.cs`，BepInEx 配置 `Diagnostics.WalkProbe` 默认开，**只在有会动附属网格的关卡出值**，其余为 null）：每个厨师 ±2 格、每格 3×3 子点，向下 Raycast 找地板 + 厨师碰撞体 OverlapCapsule；带身体尺寸、原地自检、阻挡体明细（类型/层/旋转/AABB/是否在 terrain 层）。做法参考 cortico-world-overcooked2 `Nav.Walkable/BodyBlocker`。`state_dump` 透传到 trace 的 `state.map.walk_probe`。
+- 离线对照：`python3 tools/walk_probe_report.py trace-*.jsonl`（汇总 FN_center / FN_offset / FP 与阻挡体），`--at <t>` 打印某拍格子图。
+- 实机结论（`trace-20261030-001857`）：厨师 CapsuleCollider 半径 0.4；接缝列格中心判定与物理一致（AABB 推算可信），误判全是 **FN_offset**——门洞开在两排格中心之间（t=1486 缝宽 1.26m，可站 z∈[-11.36,-11.0]，格中心 -12.0/-10.8 都在墙里）。
+
+## 平台接缝门洞（2026-10-30）
+
+- `ai/space/seams.py`：Ground 盒贴边 + 接缝上有薄墙 = 接缝；墙在墙带（接缝线 ±half）上的投影取补集、按 `GATE_RADIUS=0.45` 收窄得门洞。接缝列格是**门洞格**：只许沿穿缝方向进出，门洞与该行有交集才通。`seams.nav_predicates(world)` 给寻路用的 walkable/edge_blocked（`reachability.field_for`、agent 兜底、`tree_viz`）；**站位/交互位仍用 `world.walkable`**，门洞格不会被选成落脚点。`trace_back` 现在带上 edge_blocked（含原有薄墙判定）。
+- move 命令新增可选 `gates` 字段（`seams.path_points`）：路径中间的门洞格换成「缝口入点 + 出点」两个路点，沿缝取门洞中线。插件 `Oc2Gate.cs` 每帧在墙带上 OverlapBox 现算中线（篮子 0.55m/s，Python 5Hz 的中线到人走到时已过期），入/出点按跨缝坐标判到达；门洞没开且还没进缝时在缝口外停下等（`GATE_WAIT=4s`，超时 `why="gate closed"`），已进缝则沿用上次中线。旧插件忽略 `gates`，按静态中线走。
+- 回放 `trace-20261029-234145` t=6200~6220：x=13.2 门洞判通，P2 可达格 +20；t≥6225 缝 <1.0m 判关（P1 半径 0.4 硬挤过去，0.45 留余量）。
+- **门洞时间表**（`ai/space/seam_clock.py`，`bb.seam_clock`）：篮子随 Animator 固定周期动，门洞开关也是周期的（Balloon_2_3 一圈 27s；x=13.2 开 9s / 关 18s，x=19.2 开 24s）。Agent 每拍 `_observe_seams` 记开→关/关→开沿，周期 = 相邻开门沿间隔（两段一致取均值；一段先暂用；只见一次开门时用插件 `grids[].anim` 的循环长度），开门时长 = 最近一次完整开→关；新开门沿偏离预测 >1s 丢掉重学。防脏：开/关不足 1s 当抖动；观测断档 >2s 只重定初值、不连沿（trace-234145 t=2007~6221 断档曾被连成 210s 的开门）；周期限 5~120s。时钟用插件 `level_time`（`Time.timeSinceLevelLoad`），旧插件退回本地单调时钟，暂停中不记。离线核对 trace-001857：74s 起时间表可用，108 个预测 0 错。
+- **按到达时刻等门的寻路**：`navigation.distance_field(wait_cost=...)` 从普通格踏进门洞格时按 `now + 代价×SEC_PER_STEP(0.25s)` 查时间表，门关着就加等门步数（门开着但走到时已关也等下一圈），返回的 `Field` 带 `waits`（每格一路等门步数）；`trace_back` 自动用建场时的 `wait_cost`。时间表已知时，此刻关着、但开过的门洞格也算可走（中线取上次开门时这一格的中线）。没时间表时与之前一致（只认此刻开着的）。
+- **等门让位**（`planner._select_layer` + `_gate_waits`）：要在门口等 >`GATE_DEFER_S`(3s) 的候选先让出本拍——同层有不用等的只在它们里挑，整层都要等就往下层找不用等的先做；等待缩到 3s 内自然回来（掐开门时间出发）。不让位：L0~L2（火/快糊/刚熟）、当前承诺的 task、P2 手里有东西。整张表都要等时照旧选（去门口等）。trace 顶层 `gate_waits` 记每拍候选等门秒数。
+- **执行**：`move.gates[].max_wait` = 预测等待 + 3s（缺省 4s），move 超时同步加长；插件门关着时把找缝窗口放宽一倍（开门时缝不一定在预测中线上）。
+- **实机修正（trace-20261030-123850，P2 拿意面停在 x=13.2 缝口 ~13s）**：Python 与 walk_probe 都判门洞通（mid=-11.98，缝口一排全空），插件 `Gate.Refresh` 用碰撞体 **AABB 投影**判关——网格碰撞体 / 与地板重合的整块假墙的 AABB 盖住了实际开着的门洞。改为按厨师胶囊**真实形状逐点测**（沿缝 0.1m 一点、跨缝 5 条线，与 walk_probe 同一套过滤，20Hz 节流）。兜底：GoToCell 超时 2.5s 比插件等门 4s 短，`gate closed` 永远回不来 → move 超时一律加上插件等门上限；`gate closed` 回传门洞格，Python 记 `bad_cells`（`reason=gate_closed`，只绕格不拉黑资源），不再在缝口反复重发。日志 `move gate wait ... blocker=` / `move gate closed after Xs blocker=` 给出挡路碰撞体。
+- **实机修正（trace-20261030-125344，预测有了但没用上）**：时间表学会了（t≈1600 已有 `gate_waits` 18.8s、插件收到 `max_wait=20.25`），但 t=1665~1830 P2 空站 8s、跨缝 task 全 `unreachable`。根因：门关着时篮子已挪开，门洞格对面那格此刻悬空，可达场止于门洞格。修：时间表按格记「这一轮开门首帧两侧地板的沿缝下沿」（`Seam.anchors` / `clock.cell_anchors`），寻路给关着的预测门洞格加**跳边**到「开门时对面那格现在的位置」（篮子刚体平移），原相邻步作废（`seams.nav_jumps`，`distance_field(jumps=)` + `Field.via` 回溯）；插件路点按发令时的篮子地板锚定，开门时正好随篮子移到缝口。另：相位对不上（掉帧 / 漏看几帧）不再整表清空，离上次开门仍接近整数圈就沿用周期与开门时长、按这次重新对相位（旧实现要再等一整圈）。离线重放：P2 在固定地面时砧板不可达 25/36 帧 → 0/36。trace 顶层新增 `seam_clock`（每道门 known/T/D/open/next_open/next_close），`state.level_time`。
+- **实机修正（trace-20261030-192949，送餐到出餐口附近卡住、盘被放下）**：手持物挂在厨师刚体下、碰撞体照开（`ServerPhysicalAttachment.Attach` 只换父节点），伸在身前先顶到台面。燃烧器旁中途路点 (12,-10.8)：身体离燃烧器还有 0.5m，盘子已顶住，P2 停在 z=-11.43（开局拿意面在同处卡在 -11.31），0.8s 后 stuck → no_progress 拉黑送餐 → 备菜腾手放盘。Python 可走判定与 walk_probe 都只按身体胶囊，看不到这一点。修：插件 MoveCommand 停滞 0.3s 时用 `Rigidbody.SweepTest`（整个刚体，含手持物）试探朝下一个路点走，没挡就跳过当前中途点（门洞入/出点、终点不跳），日志 `[EXEC] move skip waypoint`。不对单个 task 豁免拉黑。
+- **实机修正（trace-20261030-213754 t=1752~1780，等门后掉头）**：参照系混用。P2 和入点前一个路点都在篮子上（相对位置一直不变，P2 还差 0.4m 没到它），等门范围却按缝口量（缝口不随篮子动）。P2 等门时被篮子带出范围，门没开就结束等待，转去够那个路点，盘子顶到篮子上的箱子 stuck，送餐失败 → 备菜放盘。修：进入缝口等待范围（离入点 ≤ GATE_HOLD+WAYPOINT_EPS）就把入点前一个路点直接算到达、以入点为目标；被带出范围会走回缝口继续等。
+- **未修（同一 trace t=708）**：开局第一圈 x=13.2 门还没见过开→关，时间表 `known=false`；端盘途中门关上，出餐口判 `unreachable_destination`，送餐被否决、备菜放盘。时间表要至少看完一圈才能预测，开局这一段无解。可选方向：按关卡缓存学到的周期/开门时长，下局开局直接用。
+- **待实机验证**：跳点是否按预期触发（`move skip waypoint`）；插件中线跟随与缝口等待（日志 `[EXEC] move gate wait` / `gate(x=13.2 ...)`）、窄缝时 0.45 是否过保守、`SEC_PER_STEP` 与实测走速、`grids[].anim` 是否 loop（不是单一循环态时只靠沿学，开局要多等一圈）、让位后能否按时回来（承诺惯性 2.0 分差可能拖住）。
+
+## 单份投掷 / 精准投进锅（2026-10-29，插件 0.23.2 / 协议 7）
+
+- **ThrowBatch 一次只投一份**（`relay.MAX_BATCH_UNITS = 1`）：缺口封顶到 1，树去掉 `RepeatUntil`、投完一份就交还 Planner，`batch_bonus` 随之为 0。分割地图（Rapids_2_1）照常投给对面；**连通地图远投关闭**（`throw_supply.ENABLE_FAR_THROW = False`）：单份没有摊销，料还落在锅旁地上要再捡。批量（锅位封顶、打分）以后再议。
+- **FillCooker / FetchToCooker 末段精准投锅**（`primitives.ThrowOntoStation`）：反编译确认锅接料靠触发器（`ServerAttachmentCatchingProxy` → `ServerIngredientCatcher.CanHandleCatch`：锅挂在灶上、能收这种料就收），飞行中穿过锅即可，不必落进锅；台面（`ServerAttachStation`）只接**非飞行**物，不会半路截走，但别的灶/锅会。命中关键是朝向：唯一成功样本 `trace-20261029-213506` t=558 出手距 4.7m、朝向偏 4°，此前落空的远投偏 ~13°（插件门槛 0.97≈14°）。现在出手距 3~5m、路径只过可走地板且无别的厨师、`aim_dot=0.996`（≈5°，5m 横偏 0.44m）、`strict`（超时没对准就不投）。投偏/没对准写 20s 冷却，期间这口灶走过去放；投偏的料先从地上捡回再放。
+- 插件 `ThrowCommand` 新增可选字段 `aim_dot` / `strict` / `face_timeout_ms`，对准要连续 2 帧满足；缺省行为不变（旧 Python 不受影响）。
+- **待实机标定**：出手距离带 3~5m（近距离料可能还在上升段越过锅）、0.996 门槛下小推杆转身能否稳定对准（`aim timeout` 多就放宽到 0.993）、冷却时长。
+
+## async_resource 改为「进灶才给」（2026-10-29）
+
+`trace-20261029-213506/220619`（Balloon_2_3）：意面相关 task 占约 1/3 拍，肉/鱼/虾排不上。`_is_async_task` 按类型名只认 FetchToCooker/Chop：意面取料即下锅第一步吃 +2，肉/鱼/虾第一步 FetchToBoard 吃不到；而切配本身并不异步（反编译 `ServerWorkstation.UpdateSynchronising`：有人切才推进），寿司鱼这类不进灶的 Chop 却照吃。改为 `planner._feeds_cooker`：FetchToCooker 恒给；FetchToBoard/Chop 看生料是否该单某道熟料的成分；无配方书退回旧判据。
+
+离线回放（每 10 帧抽一帧无状态 plan）：
+- Balloon_2_3（213506）：ThrowBatch(Pasta) 29→6、FillCooker(BoiledPasta) 29→20、ThrowBatch(BurritoMeat) 16→46、FetchToBoard(BurritoMeat) 0→5；（220619）FetchToBoard(Prawn) 28→37、FetchToBoard(UncookedFish) 8→12、ThrowBatch(Pasta) 21→15。
+- Mine_2_5（235333）无变化；Sushi_1_2（233327）仅 ±1~4 帧（Chop(SushiPrawn) 少 1）。
+- **Balloon_1_5（112633）需留意**（下面数值是 eta 删除前测的）：ThrowBatch(PastaTomato) 3→64、FillCooker(BoiledPasta) 14→0。灶空时 FillCooker（eta −1.5 + cooker_idle 3.73 = 2.23）以 0.02 输给番茄远投（eta −1.0 + async 2.0 + combo 0.25 + batch 1.0 = 2.25），14 帧是这个差距。根因是 FillCooker 与 ThrowBatch 两套加分口径（cooker_idle vs async+batch）本就不可比，此前靠 FetchToBoard 没有 async 掩盖；要不要让「灶空着」压过番茄备料，属于改权重，未动。
+- **batch_bonus 改为几何递减**（`planner._batch_bonus`）：第 k 份加 `W_BATCH × BATCH_DECAY^(k−2)`，N=2/3/4/6 → 0.5/0.75/0.875/0.97，上限 1.0（原线性 0.5×(N−1)，220619 里出现过 1.5）。理由：N 随订单数涨，后几份服务的单更从容、锅位不够要等、批次常被打断。回放后 Balloon_1_5 的 FillCooker(BoiledPasta) 回到 14 帧（ThrowBatch(PastaTomato) 64→50）；Balloon_2_3 两局基本不变。
+- ThrowBatch(BurritoMeat) 变多会放大 split 模式「拿起→放下」循环（见 220619 t=685~942）→ 已修，见下条。
+- **split 模式拿着料的保护**（`relay.ThrowBatch`）：`_carrying_this_batch` 原只认 far。split 下篮子漂移让「P1 能到砧板」逐帧翻转，t=706/905 刚拿起肉就判不可行、树按「本批结束」SUCCESS、下一拍 StashHeld 放下，再拿起（ThrowBatch+StashHeld 约 8% 拍）。现在：拿着本批料且承诺是它时按探测口径（far/split）继续；这一帧暂无出手位也算可行，由单轮里新增的 `WaitUntil(有出手位, LAUNCH_WAIT_TICKS=60)` 兜底，等满失败 → 承诺清空 → 保护解除 → StashHeld。t=706/905 两帧当场就能出手（`throw_ok_here` 为真），落点按 P1 可达格判。fixture `balloon23-20261029-220619.ndjson.gz`。需实机验证。
+
+## 食材配方节点导出（2026-10-29，插件 0.23.0 / 协议 7）
+
+`trace-20261029-213506`（Balloon_2_3）：P2 从不碰鱼，3 张海鲜单的鱼全靠 P1。反编译确认游戏下锅/装盘按物品 prefab 上 `IngredientPropertiesComponent` / `CookableIngredient` 的 `m_ingredientOrderNode` 判（`IngredientToContainerBehaviour` → `AssembledNodeTransfer.CanCombineWithContents`），不看物品名。鱼箱出 `Fish`、切成 `ChoppedFish`，下平底锅后是 `ing:UncookedFish`（`trace-20261029-130632` t=263），而配方 `PanFriedFish` 要 `UncookedFish`——Python 按物品名找不到来源，鱼相关 task 全 infeasible。肉/虾/意面的物品名恰好等于节点名，没暴露。
+
+- 插件新增：`items[].node`、`chefs[].held_node`（物品自身配方节点）；箱子 `node` / `chop_node`（出料与切好产物的节点）；`recipes[].chop_node`；切配索引同时按食材自身节点名登记。
+- 实机确认（`trace-20261029-215035`）：`ChoppedFish→UncookedFish`、`ChoppedPrawn→Prawn`、`Pasta→Pasta`；鱼/虾/肉箱 `chop_node` 分别是 `UncookedFish`/`Prawn`/`BurritoMeat`。**要切的生料（Fish/Prawn/BurritoMeat）本身没有配方节点**（`node=null`，只挂 WorkableItem），只有切好产物和免切料（Pasta）有。
+- **0.23.1 生料改名**（参考 `feat/throw-transport` 的 `BuildLeafRewrite`/`MapRawName`，该分支 0.20 在 `trace-20261027-233047` Mine_2_5 实机跑通切鱼煎鱼；只移植这一块，未合分支）：生料自身无配方节点、切好产物节点名 ≠ 生料名 ≠ 切好名时（鱼），登记 `RawNames`（`Fish → UncookedFish`），并把配方叶子 `UncookedFish` 补上 `chop=ChoppedFish`。改名作用于箱子 `ing`、`held`、砧板 `item`、`items[].n`、`interactions` 句柄名，以及 exec 侧 `ChefFrame.NameOf`（句柄/手持名），快照与句柄同源，Python 零改动。虾/肉/意面不受影响。`node`/`held_node` 保持游戏真值（生鱼为 null）。离线：改名后的 t=93 帧 `FetchToBoard(UncookedFish)` 可行（`test_renamed_fish_crate_makes_fish_choppable`）。**需实机验证**：散落生鱼的拾取、砧板上生鱼的切配。
+
+## 篮子网格原点 / 飞行料取料（2026-10-29，插件 0.22.1 / 协议 6）
+
+- **篮子台面拿不起盘**（`trace-20261029-204717` t=425~498，Balloon_2_3）：插件 `grids[]` 对非主网格报 `QuadGridManager.transform.position`，和主网格一样有父级偏移（RightBasket 报 (0,1.2)，按站点 `m_gridIndex` 反推是 (25.2,-9.6)；FoodBasket 报 z=-12.9，实为 -12.0）。盘/散料只有 x/z，Python 按错原点换算本地格 (24,-10)，句柄是 (3,-1)，`HandleMatches` 永远不过，拾取一次都没按。0.22.1 起非主网格原点按该网格下一条 Static/DynamicGridLocation 现算（`GridOrigin`），`GridIndexOn`（篮子上的洗碗池/出餐口）同源。**0.22.0 及更早的帧里非主网格 `ox/oz` 不可信。** 需实机验证。
+- **追空中的料**（`trace-20261029-202903` t=231~312）：`find_ingredient` / `loose_count` 跳过 `flying`；FillCooker 取料只锁传送带段，散落料每拍重新解析，不锁 item 快照。
+
+## 2-3 煮锅/平底锅/摆盘修复（2026-10-29，插件 0.22.0 / 协议 6）
+
+`trace-20261029-130632`（Balloon_2_3）：意面投过去不下锅、熟锅不装盘、备好的菜不送。反编译 Assembly-CSharp 后的根因：
+
+- **插件截断灶条目**：`AppendCookers` 按类型名子串同时命中 Server/ClientCookingStation，又有 `i >= 8` 上限；灶 >4 口时后几口只剩客户端条（ClientCookingHandler 无 `IsCooked()`），`cooked`/`onFire` 恒 null（Balloon_2_3 两口煮锅、Mine_2_5 后两口灶）。现按 `ServerCookingStation` 类型（含子类）筛、去掉上限。Python `cooker_has_pot` 改看 `cookware`/`cook_type`，旧帧也能判。
+- **平底锅不算锅具**：`held_is_cookware` 原样子串比配方 cook 名，`fryingpan` 匹配不上 `utensil_frying_pan_01`。插件新增 `items[].cookware` / `chefs[].held_cookware`（`ServerCookableContainer` 组件，同参考项目），Python 优先读字段，旧帧用 `cookware_matches` 归一化；新增 `P.item_is_cookware`。
+- **篮子台面不算台面**：`_counter_cells` / `_match_plates_to_orders` / `planner._placed_plates` 用站点本地 `gx/gz`，篮子上的盘永远不算就位，摆盘目标格全在 P2 够不着的厨房。改为主网格投影（`placement._station_cell`），拼装格先按 P2 可达性排。
+- **装盘取错源**：散熟锅 token 按 `cooked_of_raw` 展开到所有炊具（平底锅虾也报成煮虾）；`_inst_take_cooked` 把匹配到本单的源一律当成每道熟料的源（鱼锅被当意面源）。现在散锅只留自身炊具的 token，装盘前校验源确实装着这道熟料。
+- **连击跳单出口**：`_breaks_combo` 在队首剩余 ≤ `COMBO_SKIP_HEAD_REMAINING`(8s) 且没有料齐盘时放行。注意：这局的长时间不送，实际是队首 Marinara 等 P2 做（上面几条修了），队首 t=1996 由 P1 送出；之后 MeatOnly 盘不送是出餐口只在篮子靠岸时可达（`unreachable_destination`），属正常等待。
+- **远投连续性**：远投按料源（散料/料箱）到消费站的距离判，手上那份不算；承诺中的 ThrowBatch 拿着料走近也继续投完。消费站附近半径 2.6→3.6m。
+
+未修：P2 端着熟锅、场上没有可用盘时，RescueCooked 只把锅放台面，不会直接装盘。需要实机验证煮锅 `cooked` 字段与 `cookware` 字段（`./restart.sh` 重新部署插件）。
+
+## 投掷传递 / 批量备料（2026-10-29，分支 feat/throw-bt）
+
+按 `trace-20261028-234917`（Rapids_2_1，木筏↔厨房不连通，P2 切好料后 110 个候选全 unreachable 干等到底）：
+
+- 主网格判定改为插件 0.21 的 `grids[].main`（挂 `GridNavSpace`，同参考项目 cortico-world），旧帧按名字 `GridManager`，再退众数并排除 `grids[].moving`。旧逻辑在 Rapids_2_1、Balloon_2_3 都会把附属网格当主网格。
+- 新 task `ThrowBatch`（见 `tasks-primitives.md`）、原语 `GoToCell`、插件 `ThrowCommand` 朝向闭环、`items[].flying`。协议 4→5。
+- **只做了离线验证**（fixture 回放 + 单测，1425 passed）。实机待验：射程/落点常量、`FrierBasket` 能否接住投来的料、木筏上 `GoToCell` 到位后出手点偏差。
+- 连通关卡远距投掷默认开（`ENABLE_FAR_THROW`）：离线回放里 1-4 有拍选中「把米批量投向灶」、1-5 有拍选中投意面。`W_BATCH=0.5` 与 `THROW_MIN_DIST=9.0` 都是经验值，实机效果不好先关开关再调。
+- 已知限制：木筏格投影到主网格，偏移非整格时靠砧板那排被判不可走（`docs/map/Rapids_2_1.md`）。
+- 首次实机（`trace-20261029-122831`）两处停顿已修：① 出手格被木筏带走，`GoToCell` 追着过期格心耗到 move 超时（t=351~798）→ 先判「当下位置能否投」、段超时 2.5s 后重算格重试、分割地图落点容忍放宽到 4.5m；② 厨房/木筏同名台面（`countertop_01_standard_old (4)/(5)/(6)/(11)`），木筏上的料被解析到厨房台面，FetchToBoard 连败拉黑（t=1273~1469、1794~1990）→ `_station_for_item` 同名时按离物品最近选（插件 `item.grid` 同样按名反查，不可信）。
+- 第二次实机（`trace-20261029-125348`）：P2 接住第二个土豆后拿着干站 7.5s。`recipe_graph` 的 Chop done 是「场上有一份切好的」，两单要薯条时第二单不再发取料上板。现在上游仍按存在性放行，另按「切好份数 ≥ 排在前面的等料单数」（`chop_waiters`）给缺的那单补发切菜链；`StashHeld` 同口径。
+
 ## 本地修复补充（2026-10-19）
 
 1-4 台面盘长时间停止修复见 `../notes/sushi14-stall-2026-10-19.md`：Face 不再误跳过缺网格但实际在台面的盘/散物，借同位置容器的交互元数据且保留物品资源身份；规划读取 bad_pairs，避免唯一站位被排除后每拍重新选同盘失败。12 项新增真实帧回归，全量 1316 passed / 85 skipped；本轮未重新实控。
@@ -25,8 +229,11 @@ Windows 最新运行见 `../notes/windows-live-validation-2026-10-19.md`：已�
   这个动态性没有进入 planner（见 §2 本轮「仍未解决」）。
 - **P1 名称硬编码**：`"Player 1"` / `"Player 2"`（`predicates.P1_NAME/P2_NAME`）。真实帧 `chefs[].slot` 全为 null，只能按 name 区分（已核实 2204 条 chef 条目）。
 - **熟料 token 不透明（仅旧帧）**：`RecipeBook.want_tokens` 对需烹饪的料同时给 rich token（`cooked:{raw}:{cookware}`）和旧帧 opaque `COOKED_PLATE_TOKEN`。新帧 `detail` 已通过 `plate_tokens` 输出 rich token，`plate_has`/`plate_lacks`/`missing` 据此能区分同一盘多份不同熟料；旧帧（无 detail）仍退化为不透明 token，多熟料关卡在旧帧下无法区分。
-- **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / `W_FRESHNESS` / slack 曲线）已按真实 trace 定标，其余 `W_*` 与穿插阈值（`INTERLEAVE_THRESHOLD/PENALTY`）仍是经验初值。改之前读 §4「改权重前必读」。
+- **打分权重部分未标定**：收益相关的几项（`W_COOKER_IDLE` / `W_COMBO_*` / slack 曲线）已按真实 trace 定标，其余 `W_*` 仍是经验初值。改之前读 §4「改权重前必读」。
+- **打分项已精简（2026-11-08）**：删掉 `deliver_bonus`、`freshness`、`hands`、`move_penalty`，并进一步删掉 `eta` 与 `ingredient_reuse`；现共 12 个 term 键。后两项是有意实验：只凑到 2/3 的带料载体在 idx0 会输给 FillCooker（测试已按参数标 xfail），待实机验证后再决定是否重标定。
+- **填灶按「可上盘订单数」封顶（2026-11-08）**：`cook_supply.cooked_demand` 数所有活单，盘不够时会把灶全占满、挡住备菜。`planner._fill_plate_factor` 现在把缺口按「需要该熟料且已匹配到盘」的订单数封顶；一张盘都没有时只保留 `FILL_PLATE_DISCOUNT_FLOOR=0.25`，避免「没盘 → 不煮 → 单过期」的死锁。trace-20261108-222748 里 67% 的填灶拍缺口大于有盘寿司单数、24% 完全没有寿司单有盘。
 - 对话协作层（`Intents.assignments`、split mode 的显式分单 `order_assignment`）原为空壳预留，已连同 P1 短程意图推断一起作为死代码删除（`2026-10-18` 清理，见 `ai/state/p1model.py` 顶部说明）。
+- **分工/攻略还有三个未闭合点（2026-11-08）**：① 分工只由 LLM 的 `set_division` 写入，LLM 不可用时没有程序兜底；② 动态复核只认站点拓扑变化，转盘/梯子等纯路径变化不触发；3-3 左半场在单网格寻路之外，路径可达性不能用来判「能不能装盘」；③ DLC 关如果文档没写内部关卡名，cookbook 只能精确命中、不会回退到主线命名，3-2 的内部关卡名也仍待实机核实。
 - 「16 个 task」的说法已过时（现为 19），以代码的 `TASK_TYPES` 为准。
 
 ## 2. 当前状态
@@ -157,7 +364,7 @@ L3 兑现 / L4 解卡（无盘）/ **L5 空层** / L6 备菜（含填灶）/ L7 
   （⑨.5 接管，`infeasible_streak` 被反复清零）。现在并列记 `chosen` 与 `exec.task`。
 
 - **填灶无条件压过备菜**（`828a99f`）：见上面 L5 那段。修法是把 FillCooker 放回
-  L6、`cooker_idle` 随之进 L6 白名单（少了它填灶层内净分只剩 `eta` 的 -1.5，
+  L6、`cooker_idle` 随之进 L6 白名单（少了它填灶层内只剩 0 分，
   会从「永远赢」翻到「永远输」）。离线重放 1015 拍：缺 2 份保留填灶 100%、
   缺 1 份保留 33%、缺 0 份全让位 —— 连续单调无硬门。`W_COOKER_IDLE=5.6` 那套
   标定（按「压过备菜合计 4.97」定、饱和点缺 3 份）自动重新生效，没加新常数。
@@ -225,9 +432,9 @@ L3 兑现 / L4 解卡（无盘）/ **L5 空层** / L6 备菜（含填灶）/ L7 
 动 `W_*` 之后：① 跑 `tests/test_fill_cooker_priority.py` 与 `tests/test_plate_supply_guard.py`（两处量级卡口）；② 用 `tools/replay_urgency.py <trace>` 查 urgency 是否仍单调（倒挂须为 0%）；③ 重放一局真实 trace 比对选择分布。
 
 **打分口径**：urgency 必须读 `ETA.solo_slack_by_order`（独立 slack），**不要**读 `slack_by_order`（队列累计，判死口径）。两者对 remaining 的方向是反的，混用会让「排得越后越优先」，而单组测试查不出来——`tests/test_eta.py::test_queue_slack_is_the_one_that_inverts` 把这个差别钉住了。当前量级关系：**填灶与备菜在 L6 层内直接比**（`828a99f` 把 FillCooker 从 L5 挪回来），
-`W_COOKER_IDLE=5.6` 按缺口线性给到饱和（缺 3 份满额），实测缺 3 份时合计压过备菜的
-~4.97、缺 1 份时只有 1.9 分让位 —— 这一对是**今天唯一还靠数值定胜负的跨类关系**，
-动它必须重放（见上面第 ③ 步）。端刚熟的锅（L2）与 0 盘洗盘（L4）已由层序隔离，
-不再需要数值余量。
+`W_COOKER_IDLE=5.6` 按缺口线性给到饱和（缺 3 份满额）。原实测备菜合计 ~4.97
+（含已删除的 `ingredient_reuse` 1.0），删掉后 ~3.97；5.6 仍然压过，缺 1 份时
+只有 1.87 分让位 —— 这一对是**今天唯一还靠数值定胜负的层内关系**，动它必须重放
+（见上面第 ③ 步）。端刚熟的锅（L2）与 0 盘洗盘（L4）已由层序隔离，不再需要数值余量。
 
 **警惕"自欺的修复"**：combo 第一版按 `task.order_id == head` 加分，离线复验看着像修好了（改选了 order#3），但盘里装的菜没变、游戏照样记给同 dish 里 `remaining` 最小的单 —— 实机行为与旧版一字不差，只是 trace 上的 order_id 变好看了。验证改动时要问「实机会不会不一样」，不是「trace 看起来有没有变」。

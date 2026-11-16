@@ -51,7 +51,8 @@ def _world_hot_pot(progress=23.0):
 
 
 _PLATE_EMPTY = {"n": "p1", "name": "plate", "x": 3.0, "z": 3.0,
-                "contents": [], "detail": []}
+                "contents": [], "detail": [],
+                "stack_top": True, "stack_clean": True}
 
 
 def test_hot_pot_outranks_prep():
@@ -75,7 +76,9 @@ def test_fill_cooker_outranks_prep():
     trace-20261014-120406 的 1700~3270 窗口三口灶 59% 空转，而同期 planner
     一直在摆海苔、切鱼，order#3/4/5 三单全在这窗口过期。
     """
-    w = _world([_cooker("c1"), _cooker("c2")], plates=[_PLATE_EMPTY])
+    # 三单都要米：每单一张盘，否则盘量折扣会按可上盘订单数封顶。
+    plates = [dict(_PLATE_EMPTY, n="p%d" % i) for i in (1, 2, 3)]
+    w = _world([_cooker("c1"), _cooker("c2")], plates=plates)
     by = _score(w, [
         T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice"),
         T.FetchToPlate("1", ("p1", (3, 3)), "Seaweed"),
@@ -102,8 +105,8 @@ def test_deliver_outranks_prep():
 def test_hot_pot_outranks_deliver():
     """锅快糊 vs 料齐的盘 → 先救锅。
 
-    依据：锅会烧糊（料没了 + 要灭火），盘不会。注释里写的是
-    「W_DELIVER_BONUS 要低于快糊锅的 pressure（W_PRESSURE*2.0=10.0）」。
+    依据：锅会烧糊（料没了 + 要灭火），盘不会。分层后由 L1 > L3
+    结构性保证，不再依赖数值大小。
     """
     plate_full = {"n": "p1", "name": "plate", "x": 3.0, "z": 3.0,
                   "contents": ["Seaweed", "BoiledSushiRice", "Cucumber"],
@@ -237,3 +240,23 @@ def test_table_compares_scores_not_constants():
         checked += 1
     # 表是空的也算通过就没意义了
     assert checked >= 7, "只检查到 %d 个断言，表的规模不对" % checked
+
+
+def test_holding_plate_beats_rescuing_pot():
+    """已经端着目标盘去盛熟料时，不该输给把锅端离灶台的兜底。
+
+    trace-20261110-231906 / 用户实机：拿着盘子去盛米饭，RescueCooked
+    的 pressure 分更高，锅被端走、盘还空着。端盘盛饭同样能停烧糊计时，
+    还把这单往前推，应优先。
+    """
+    from ai.query import predicates as P
+    c = _cooker("c1", cooked=True, cooking=True, contents=["sushirice"])
+    c["cooking_time"] = 12.0
+    c["cooking_progress"] = 13.0
+    plate = dict(_PLATE_EMPTY, held_by=P.P2_NAME)
+    w = _world([c], plates=[plate], held="plate")
+    by = _score(w, [
+        T.TakeCookedToPlate("1", ("c1", "p1"), "BoiledSushiRice"),
+        T.RescueCooked(resources=("c1",)),
+    ])
+    assert by["TakeCookedToPlate"] > by["RescueCooked"], by

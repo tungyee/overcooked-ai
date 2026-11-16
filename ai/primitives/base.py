@@ -197,15 +197,21 @@ def target_grid_callbacks(world, target):
 
 
 def handle_desc(target, to_grid=None):
-    # type: (Optional[Dict], Any) -> Dict
+    # type: (Optional[Dict], Any) -> Optional[Dict]
     """目标句柄描述（exec 命令用）。核心是**网格坐标**：放置/拾取句柄按
     「网格位置」匹配（盘放在柜台上时，句柄指向柜台，但盘的 x/z 换算成网格
     跟柜台同格，所以按格匹配才对）。name 只做无网格时的兜底。
 
     网格优先用 target 自带的 gx/gz；缺失时（盘/散料只有 x/z）用 to_grid
-    从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。"""
+    从世界坐标换算——这正是旧路径 interact_ready 的 _target_cell 语义。
+
+    `stack`（盘堆名）随目标带给插件：盘堆顶层的盘，游戏上报的 placement
+    句柄可能是同一沥水架的洗碗池，插件据此改用朝向句柄兜底（见下方注释）。"""
     if not target:
-        return {"grid": None, "gx": None, "gz": None, "name": None}
+        # 无目标发 None，插件（tap/hold/move）走「不校验句柄」分支。
+        # 旧实现发全 None 的字典，插件当成有目标去校验、必然 handle mismatch
+        # （地板落点盲按 62 次全败，trace-20261101-152446 t=535~716）。
+        return None
     gx, gz = target.get("gx"), target.get("gz")
     if gx is None and to_grid is not None:
         x, z = target.get("x"), target.get("z")
@@ -214,7 +220,12 @@ def handle_desc(target, to_grid=None):
             if cell is not None:
                 gx, gz = cell
     return {"grid": target.get("grid"), "gx": gx, "gz": gz,
-            "name": target.get("name") or target.get("n")}
+            "name": target.get("name") or target.get("n"),
+            # 盘堆标记：盘在盘堆（沥水架/回盘台）上时 placement 句柄可能被
+            # 同一沥水架的洗碗池抢走（trace-20261108-174744 t=2117：
+            # 目标盘在 DryingPart(-7,0)，句柄 WashingPart(-7,-1)）。
+            # 插件据此允许用朝向句柄 m_gridLocation 兜底。
+            "stack": target.get("stack")}
 
 
 def target_world(target):
@@ -226,6 +237,20 @@ def target_world(target):
     if x is None or z is None:
         return None
     return [x, z]
+
+
+def _note_exec_failure(ctx, cmd, why, blocked_cell):
+    # type: (Dict, Optional[str], Optional[str], Any) -> None
+    """把失败命令的原因写进 ctx["exec_failure"]，trace 的 exec 记录带出。
+
+    插件回的 why（stuck / gate closed / timeout / no chef）原先只用来写
+    bad_cells，trace 里看不到：送餐 approach 连败 9 次却分不清是门洞判关、
+    卡墙还是追不上篮子（trace-20261031-004647 t=1964/2114/2152）。
+    客户端侧失败另记 not_connected / client_deadline。
+    """
+    ctx["exec_failure"] = {"cmd": cmd, "why": why,
+                           "blocked_cell": list(blocked_cell)
+                           if isinstance(blocked_cell, (list, tuple)) else None}
 
 
 class Primitive(Node):
@@ -242,6 +267,7 @@ class Primitive(Node):
         self._held_seen = _UNSET   # type: Any
         self._exec = None        # type: Any   # 委托后端的 ExecClient（首拍从 ctx 记）
         self._pending_cmd = None # type: Optional[int]  # 在途命令 id
+        self._pending_name = None  # type: Optional[str]  # 在途命令名（move/tap…），失败记 trace 用
         self._exec_deadline = 0.0  # type: float  # 在途命令的客户端截止时间
 
     def tick(self, ctx):
@@ -265,9 +291,11 @@ class Primitive(Node):
         # type: (Dict, Any, Dict) -> str
         """发一条 exec 命令并进入轮询；未连接返回 FAILURE。"""
         self._exec = ex
+        self._pending_name = cmd_dict.get("cmd")
         self._pending_cmd = ex.issue(cmd_dict)
         if self._pending_cmd < 0:
             self._pending_cmd = None
+            _note_exec_failure(ctx, self._pending_name, "not_connected", None)
             return Status.FAILURE
         # 客户端截止 = 命令 timeout + 1s 裕度（插件结果丢失时兜底 FAILURE）。
         self._exec_deadline = self._now(ctx) + (cmd_dict.get("timeout_ms", 8000) / 1000.0) + 1.0
@@ -282,7 +310,12 @@ class Primitive(Node):
             # move 命令 stuck 会把挡路的目标格（世界坐标）回传。把它翻译成
             # 主网格格写入 motion_failure，note_motion_failure 据此写 bad_cells，
             # 下一次寻路绕开这一格——否则同一个 stuck move 会被反复重发。
-            if not r.get("ok") and r.get("why") == "stuck" \
+            # 「gate closed」同理：插件在平台接缝门洞口等到上限门还没开，回传门洞格，
+            # 绕开它一阵子；否则插件判关、Python 判通时会在缝口反复重发同一条 move。
+            # 「portal busy」：推门推满 max_wait 都没被传走，回传入口门中心 → 拉黑触发格，
+            # portals.nav_args 不再连这扇门的跳边，一阵子后自然恢复（按门洞口径，不拉黑资源）。
+            if not r.get("ok") and r.get("why") in (
+                    "stuck", "ledge", "gate closed", "portal busy") \
                     and isinstance(r.get("blocked_cell"), (list, tuple)) \
                     and len(r["blocked_cell"]) >= 2:
                 w = ctx.get("w")
@@ -290,13 +323,38 @@ class Primitive(Node):
                     try:
                         cell = w.to_grid(float(r["blocked_cell"][0]),
                                          float(r["blocked_cell"][1]))
+                        reason = "gate_closed" if r.get("why") in ("gate closed", "portal busy") \
+                            else "no_progress"
                         ctx.setdefault("motion_failure", {}).update(
-                            reason="no_progress", blocked_cell=cell)
+                            reason=reason, blocked_cell=cell)
                     except (TypeError, ValueError):
                         pass
+            # 碰撞回传 blocked：插件把挡在面前的 collider AABB 回传，投影成主网格
+            # 格集合，交给 Approach 局部重绕 / note_motion_failure 拉黑（见 stuck.py）。
+            if not r.get("ok") and r.get("why") == "blocked" \
+                    and isinstance(r.get("blocked_box"), (list, tuple)) \
+                    and len(r["blocked_box"]) >= 4:
+                w = ctx.get("w")
+                if w is not None:
+                    try:
+                        from ai.space import occupancy as O
+                        box = (float(r["blocked_box"][0]), float(r["blocked_box"][1]),
+                               float(r["blocked_box"][2]), float(r["blocked_box"][3]))
+                        cells = O._box_cells(box, w.to_grid, w.to_world)
+                        ctx.setdefault("motion_failure", {}).update(
+                            reason="blocked", blocked_cells=sorted(cells),
+                            blocked_kind=r.get("blocked_kind") or "obstacle")
+                    except (TypeError, ValueError):
+                        pass
+            if not r["ok"]:
+                _note_exec_failure(ctx, getattr(self, "_pending_name", None),
+                                   r.get("why"), r.get("blocked_cell"))
             return Status.SUCCESS if r["ok"] else Status.FAILURE
         if self._now(ctx) > self._exec_deadline:
             self._exec_halt()
+            # 插件结果没在截止前回来（区别于插件自己判的 "timeout"）
+            _note_exec_failure(ctx, getattr(self, "_pending_name", None),
+                               "client_deadline", None)
             return Status.FAILURE
         return Status.RUNNING
 

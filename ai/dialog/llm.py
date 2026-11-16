@@ -1,28 +1,26 @@
-"""火山方舟 OpenAI 兼容接口的 LLM 客户端与消息构建（v2：function calling）。
+"""火山方舟 OpenAI 兼容接口的 LLM 客户端与消息构建（function calling）。
 
-一轮说话按标准两段式：
-1. 第一段带 tools：模型决定是否调用 `update_duties`；
-2. 有调用时，主循环权威校验并落地，结果以 tool 消息回填；
-3. 第二段（`tool_choice="none"`）模型看到真实结果后再说最终那句话——
-   被拒的调用会如实告诉 P1，而不是先答应再落空。
-没有调用时第一段的 content 就是回复（闲聊/提问只请求一次）。
+主路径由 `worker._run_llm` 驱动多轮工具调用：`execute_actions` /
+`cancel_action` / `speak` / `get_world_state` / `set_division` /
+`read_cookbook`。工具结果由主循环权威校验后回填，模型据此继续下一轮或收尾。
 
 消息分工：
-- 开头 system：人设、账本规则、本关配方 DAG（每关只变一次）；
-- 历史：user（P1 原话）/ assistant（含 tool_calls）/ tool（落地结果）；
+- 开头 system：人设、本关配方 DAG、攻略摘要（每关只变一次）；
+- 历史：user（玩家原话）/ assistant（含 tool_calls）/ tool（落地结果）；
 - 末尾 system：本轮世界状态 + 事件说明（不进历史）；
-- user 只放 P1 的原话，事件回合没有 user 消息。
+- user 只放玩家的原话，事件回合没有 user 消息。
 
 `requests.post` 是模块级引用，测试直接 monkeypatch 它，不会发真实请求。
 """
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from ai.dialog.duties import render_ledger
+from ai.dialog import prompts
 
 
 class LLMError(RuntimeError):
@@ -62,10 +60,39 @@ class LLMClient(object):
         self.model = model
         self.timeout = float(timeout)
 
+    def warmup(self):
+        # type: () -> None
+        """后台发一个极小请求，吸收服务端冷启动（实测首 token 可到 7–8s）。
+
+        不影响主链路；失败静默（真正请求时再报错）。
+        """
+        url = self.base_url + "/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 1,
+            "thinking": {"type": "disabled"},
+        }
+        headers = {
+            "Authorization": "Bearer " + str(self.api_key),
+            "Content-Type": "application/json",
+        }
+        timeout = max(5.0, float(self.timeout))
+
+        def run():
+            try:
+                requests.post(url, headers=headers, json=payload,
+                              timeout=timeout)
+            except Exception:                   # noqa: BLE001
+                pass
+
+        threading.Thread(target=run, name="dialog-llm-warmup",
+                         daemon=True).start()
+
     def chat(self, messages, tools=None, tool_choice="auto", on_text=None):
         # type: (List[dict], Optional[List[dict]], str, Any) -> LLMReply
-        """一次流式请求。`tool_choice="none"` 用于两段式的第二段：工具结果已
-        回填，只要最终那句话（tools 仍要带上，否则历史里的 tool_calls 无定义）。
+        """一次流式请求。`tool_choice="none"` 可强制模型只说话、不调工具。
 
         `on_text` 是可选回调：每收到一个 content delta 就调用一次，用于
         边生成边把文本交给 TTS；工具调用的 arguments 不经过它。"""
@@ -99,7 +126,8 @@ class LLMClient(object):
                 raise LLMError("LLM 请求失败 HTTP %s：%s"
                                % (resp.status_code, str(body)[:200]))
             try:
-                return _read_sse(resp, started, on_text)
+                return _read_sse(resp, started, on_text,
+                                 timeout=self.timeout)
             except LLMError:
                 raise
             except requests.RequestException as exc:
@@ -110,17 +138,20 @@ class LLMClient(object):
                 close()
 
 
-def _read_sse(resp, started=None, on_text=None):
-    # type: (Any, Optional[float], Any) -> LLMReply
+def _read_sse(resp, started=None, on_text=None, timeout=None):
+    # type: (Any, Optional[float], Any, Optional[float]) -> LLMReply
     """按 SSE 协议拼 content 与按 index 累积的 tool_calls，直到 [DONE]。"""
     if started is None:
         started = time.monotonic()
+    deadline = None if timeout is None else started + float(timeout)
     first_token_ms = None
     chunks = []  # type: List[str]
     calls = {}   # type: Dict[int, Dict[str, str]]
     # 必须自己按 UTF-8 解码：部分兼容端点的 SSE 响应头没有 charset，
     # requests 会退回 Latin-1，中文会被 splitlines 在字符中间断开。
     for raw in resp.iter_lines(decode_unicode=False):
+        if deadline is not None and time.monotonic() > deadline:
+            raise LLMError("LLM 流超时（%.1fs）" % float(timeout))
         if not raw:
             continue
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
@@ -173,138 +204,37 @@ def _read_sse(resp, started=None, on_text=None):
 
 # ---------------------------------------------------------------- prompt
 
-_SYSTEM = """\
-你是 Overcooked 2 里的 P2（AI 玩家），和真人 P1 一起做菜。你们通过语音交流：\
-P1 说的话经语音识别转成文字给你（可能有错别字，按发音理解），你的回复会被念出来。
+def system_message(kitchen_dag, guide="", division=False, cookbook=False,
+                  actions=False):
+    # type: (str, str, bool, bool, bool) -> dict
+    """静态规则 + 本关 DAG + 攻略摘要（每关只变一次，方便上下文缓存）。
 
-## 说话
-- 只用中文口语，一两句、30 字以内；菜名和食材说中文，不要念英文名。
-- 可以闲聊、开玩笑、回答问题；被吐槽时先认个错再说正事。
-- 状态问题（「你在干嘛」「饭好了没」）只按最新的【世界状态】如实回答，不知道就说不知道，不要编。
-- 你下一步具体做什么由系统决定；分工约定只是让系统偏向/避开某些活。只有 now 命令可以说「这就去」，do 说「有空就做」，其余不承诺。
-- 调用过工具后，按工具返回的结果说话：成功就确认，被拒或带提醒就如实说明。
-- 分工谈好了就用大白话确认（「那我来煮饭，你来切黄瓜」），不要念内部名词。
-
-## 分工约定（update_duties）
-P1 话里的「我」指 P1，「你」指你（P2）。这些约定每条只描述你（P2）自己，分四档：
-- now：马上去（「去X」「马上X」「先X」「现在X」「帮我X」）
-- do：有空优先做（「你负责X」「X归你」「X你来管」「X你包了」）
-- leave_to_p1：P1 优先做，你通常避开；订单收尾需要时系统仍可能让你补位（「我来X」「X交给我」「X我来」）
-- stop：先别做（「先别X」「别做X」），30 秒后自动解除
-拿不准用哪档就一律用 now。
-target 是一种**物料**（代表这种料的整条链：取料、切、下锅、盛盘、装盘都算）或一个**共享动作**。\
-「煮饭」「切黄瓜」「鱼你包了」都是指那种物料整条链；一种物料只归一个人，不要拆开。
-「我负责煮的」「切菜我来」这类按加工方式说的，就对目录里标了「要煮」「要切」的每种物料各调用一次。
-调用工具时 target 用英文枚举值，只有开口说话时才用中文。
-规则：
-1. 玩家一句话里涉及几种物料/动作就调用几次，每处都要落。
-2. 改口、对调时直接对同一 target 再 add（等于改写），不需要先删；不再需要的约定用 remove。
-3. add 不要带 id（id 由系统分配）。
-4. 闲聊、提问、抱怨不调用工具。
-5. 分工要均衡：别把活全揽给自己，也别全推给 P1；P1 已经认领的（分工里 leave_to_p1 的）或话里说「我来」的，平时优先让给 P1，订单收尾时允许系统补位。
-6. P1 把不少活交给你时，你可以回话提议让 P1 分担一部分；P1 不帮、拒绝或不回应就别反复劝，自己接着做。
-
-## 做不到的请求
-- 目录里没有的物料或动作（这关没有的食材、「本关没有对应站点」「不开放认领」里列的），不调用工具，\
-直接说做不了、为什么，可以顺带提一下本关有什么（「这关没有番茄，只有黄瓜和鱼」）。
-- 跟游戏无关的请求（捶背、点外卖），轻松接一句，不调用工具。
-"""
-
-_EVENT_TEXT = {
-    "new_order": ("事件：新菜出现了。先看这道新菜里哪些物料还没有归属，只对这些新物料调用 "
-                  "update_duties（哪些你做、哪些请 P1 做）；已经约定好的物料（世界状态「分工」栏里已有的）"
-                  "不要重复、不要改。然后直接说谁负责新物料（如「黄瓜我来切，番茄归你」），"
-                  "不要报菜名、别说「新菜来了」「新单子是」这类开场白，一句话说清分工，P1 之后可以改口。"),
-    "checkin": ("按【世界状态】用一两句大白话报当前送单局面，可轻松闲聊。"),
-    "last_seconds": ("事件：本关只剩最后几秒了。用一两句话提醒或鼓励 P1（如「最后十秒，稳住」），"
-                     "也可以说下现在该干嘛。不调用工具。"),
-    "round_summary": ("事件：本关结束了。按【世界状态】里的总分（送餐得分+小费-漏单扣分）、"
-                      "送达数、漏单扣分、连击，用一两句话总结这局，可以鼓励、也可以吐槽，"
-                      "语气自然。不调用工具。"),
-}
-
-
-def system_message(kitchen_dag):
-    # type: (str) -> dict
-    """静态规则 + 本关 DAG（每关只变一次，方便上下文缓存）。"""
-    text = _SYSTEM
-    if kitchen_dag:
-        text += "\n## 本关目录\n" + kitchen_dag + "\n"
-    return {"role": "system", "content": text}
+    `actions`：这一轮是否开放派活工具（只有玩家语音回合才为真）。
+    """
+    return {"role": "system",
+            "content": prompts.render_system(
+                kitchen_dag, guide, division=division, cookbook=cookbook,
+                actions=actions)}
 
 
 def render_state(context):
     # type: (dict) -> str
-    """主循环快照 → 给 LLM 的世界状态文本（中文分段，时间单位秒）。"""
-    ctx = context or {}
-    lines = ["【世界状态】"]
-    if ctx.get("time_left") is not None:
-        lines.append("本关剩余 %s 秒。" % (ctx.get("time_left"),))
-    total = ctx.get("total")
-    if total is not None:
-        lines.append("总分 %s。" % (total,))
-    deliveries = ctx.get("deliveries")
-    if deliveries is not None:
-        lines.append("已送 %s 单。" % (deliveries,))
-    tips = ctx.get("tips")
-    if tips is not None:
-        lines.append("小费 %s。" % (tips,))
-    deductions = ctx.get("deductions")
-    if deductions:
-        lines.append("漏单扣 %s 分。" % (abs(deductions),))
-    orders = ctx.get("orders") or []
-    if orders:
-        lines.append("订单：")
-        for o in orders:
-            eta = o.get("eta")
-            lines.append("- #%s %s 剩 %s 秒%s" % (
-                o.get("id"), o.get("dish"), o.get("remaining"),
-                "，预计 %s 秒能出" % (eta,) if eta is not None else ""))
-    else:
-        lines.append("订单：无")
-    for cooker in ctx.get("cookers") or ():
-        lines.append("%s：%s" % (cooker.get("name"), cooker.get("text")))
-    plates = ctx.get("plates")
-    if plates:
-        lines.append("盘子：%s" % (plates,))
-    boards = ctx.get("boards") or []
-    if boards:
-        lines.append("切菜板：%s" % ("；".join(boards),))
-    idle = ctx.get("idle_cookers")
-    if idle:
-        lines.append("空闲灶 %s 个" % (idle,))
-    combo = ctx.get("combo")
-    if combo:
-        lines.append("连击 %s" % (combo,))
-    expiring = ctx.get("expiring_orders") or []
-    if expiring:
-        lines.append("快过期的订单：")
-        for o in expiring:
-            lines.append("- #%s %s（剩 %s 秒）" % (
-                o.get("id"), o.get("dish"), o.get("remaining")))
-    p1 = ctx.get("p1") or {}
-    lines.append("P1：手持 %s" % (p1.get("holding") or "空",))
-    p2 = ctx.get("p2") or {}
-    doing = p2.get("doing") or "没事做"
-    lines.append("你（P2）：正在 %s" % (doing,))
-    if p2.get("stuck"):
-        lines.append("你卡住的原因：%s" % (p2.get("stuck"),))
-    nxt = ctx.get("p2_options") or []
-    if nxt:
-        lines.append("你接下来可做的（按规划器打分）：" + "；".join(nxt))
-    lines.append("分工：")
-    lines.append(render_ledger(ctx.get("duties") or []))
-    return "\n".join(lines)
+    """主循环快照 → 给模型的世界状态文本。"""
+    return prompts.render_state(context)
 
 
-def state_message(event, context, new_dishes_dag=""):
-    # type: (str, dict, str) -> dict
+def state_message(event, context, event_detail="", failed=False):
+    # type: (str, dict, str, bool) -> dict
     """本轮末尾的 system 消息：世界状态 + 事件说明（不进历史）。"""
-    parts = [render_state(context)]
-    if event == "new_order" and new_dishes_dag:
-        parts.append("【新菜】\n" + new_dishes_dag)
-    if event in _EVENT_TEXT:
-        parts.append(_EVENT_TEXT[event])
+    parts = [prompts.render_state(context)]
+    if event in ("speech", "last_seconds", "round_summary",
+                 "checkin", "batch", "division", "division_review",
+                 "layout_review"):
+        event_text = prompts.render_event(event, event_detail, failed=failed)
+        if event_text.strip():
+            parts.append(event_text)
+    elif event_detail:
+        parts.append(event_detail)
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
@@ -318,7 +248,7 @@ def speech_message(transcript):
 def event_note(event):
     # type: (str) -> dict
     """事件回合写进历史的占位（让下一轮知道上一句是主动说的）。"""
-    return {"role": "system", "content": "（%s 事件，P2 主动开口）" % (event,)}
+    return {"role": "system", "content": "（%s 事件，你主动开口）" % (event,)}
 
 
 def assistant_message(reply):

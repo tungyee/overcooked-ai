@@ -64,12 +64,125 @@ namespace Oc2AI
         }
     }
 
+    /// <summary>
+    /// 生料 prefab 名 → 配方节点名的改名表（鱼：Fish → UncookedFish）。
+    ///
+    /// 配方按 order-node 名写（PanFriedFish 要 UncookedFish），游戏里鱼箱出的生料
+    /// prefab 叫 Fish、自身没有配方节点，切好的 ChoppedFish 才挂 UncookedFish 节点。
+    /// 快照（箱子 ing / held / 砧板 item / items[].n）和 exec 句柄名都过这张表，
+    /// Python 看到的是一套与配方一致的名字：「UncookedFish 箱 → 切成 ChoppedFish
+    /// → 下锅」。参考 feat/throw-transport 的 MapRawName（Mine_2_5 实机跑通）。
+    /// 快照与句柄必须同源，否则 Python 拿 UncookedFish 去比句柄名 Fish 永远不中。
+    /// 由 Oc2AIPlugin 在建配方时填充、切关时清空；只在主线程读写。
+    /// </summary>
+    internal static class RawNames
+    {
+        private static readonly Dictionary<string, string> _map = new Dictionary<string, string>();
+
+        // Unity 会给同屏第 N 份同料 GameObject 自动加 " (n)" 后缀。食材名里这只是
+        // 自动编号、不区分实例；盘/锅的 " (n)" 有实例语义，不能用这里剥。
+        private static readonly System.Text.RegularExpressions.Regex _instanceSuffix =
+            new System.Text.RegularExpressions.Regex(@"\s*\(\d+\)\s*$");
+
+        public static void Clear() { _map.Clear(); }
+
+        public static void Add(string raw, string node)
+        {
+            if (string.IsNullOrEmpty(raw) || string.IsNullOrEmpty(node)) return;
+            _map[raw.ToLowerInvariant()] = node;
+        }
+
+        public static int Count { get { return _map.Count; } }
+
+        public static string Map(string name)
+        {
+            if (string.IsNullOrEmpty(name) || _map.Count == 0) return name;
+            string mapped;
+            return _map.TryGetValue(name.ToLowerInvariant(), out mapped) ? mapped : name;
+        }
+
+        // 食材名映射：先剥掉实例编号后缀再查改名表；没有改名项时剥掉后缀的
+        // 基名就是食材身份（Seaweed (1) → Seaweed）。
+        public static string MapIngredient(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            string baseName = _instanceSuffix.Replace(name, "");
+            string mapped;
+            if (_map.Count > 0 && _map.TryGetValue(baseName.ToLowerInvariant(), out mapped))
+                return mapped;
+            return baseName;
+        }
+    }
+
+    /// <summary>
+    /// 快照与 exec 句柄共用的对象命名：站点名全局唯一 + 生料改名（RawNames）。
+    ///
+    /// 游戏里有关卡把两个站点做成同名 GameObject（Wizard_3_1 两块砧板都叫
+    /// countertop_01_chopping_board_gold）。Python 侧所有站点资源 id 都是
+    /// (网格名, 站点名)、物品的 on_station 也是名字，同名会让两块板合成一块、
+    /// 认领互撞。这里按 GameObject 名分组，**只给重名的那组**加 "#&lt;InstanceID&gt;"
+    /// 后缀，不重名的站点名字不变（旧帧 / fixture / 测试不受影响）。
+    ///
+    /// 站点 = 挂了下列任一组件的 GameObject；每拍快照开头 Rebuild 一次（站点
+    /// 会随阶段切换出现/消失，开销只是一遍 _all）。只在主线程读写。
+    /// </summary>
+    internal static class ObjNames
+    {
+        private static readonly HashSet<string> _stationTypes = new HashSet<string>
+        {
+            "StaticGridLocation", "DynamicGridLocation", "ServerAttachStation",
+            "ServerWorkstation", "ServerCookingStation", "ServerHeatedCookingStation",
+            "ServerPlateStation", "ServerWashingStation", "ConveyorStation",
+            "ServerSwitchStation",
+        };
+
+        private static readonly Dictionary<int, string> _unique = new Dictionary<int, string>();
+
+        public static void Rebuild(MonoBehaviour[] all)
+        {
+            _unique.Clear();
+            if (all == null) return;
+            var byName = new Dictionary<string, List<GameObject>>();
+            var seen = new HashSet<int>();
+            foreach (MonoBehaviour mb in all)
+            {
+                if (mb == null || !_stationTypes.Contains(mb.GetType().Name)) continue;
+                GameObject go = mb.gameObject;
+                if (!seen.Add(go.GetInstanceID())) continue;
+                List<GameObject> list;
+                if (!byName.TryGetValue(go.name, out list))
+                    byName[go.name] = list = new List<GameObject>();
+                list.Add(go);
+            }
+            foreach (var kv in byName)
+            {
+                if (kv.Value.Count < 2) continue;
+                foreach (GameObject go in kv.Value)
+                    _unique[go.GetInstanceID()] = go.name + "#" + go.GetInstanceID();
+            }
+        }
+
+        /// <summary>对象（GameObject / Component）的对外名字；null 返回 null。</summary>
+        public static string Of(object o)
+        {
+            GameObject go = o as GameObject;
+            if (go == null && o is Component c && c != null) go = c.gameObject;
+            if (go == null)
+                return o is UnityEngine.Object uo && uo != null ? RawNames.Map(uo.name) : null;
+            string n;
+            if (_unique.TryGetValue(go.GetInstanceID(), out n)) return n;
+            return RawNames.Map(go.name);
+        }
+    }
+
     public interface IExecCommand
     {
         bool Done { get; }
         bool Ok { get; }
         string Why { get; }
         double[] BlockedCell { get; }
+        double[] BlockedBox { get; }
+        string BlockedKind { get; }
         void Tick(ChefFrame f, float now);
     }
 
@@ -211,10 +324,10 @@ namespace Oc2AI
             HeldName = ReadHeld();
         }
 
+        // 句柄名/手持名与快照同一套命名（生料改成配方节点名，见 RawNames）。
         private static string NameOf(object o)
         {
-            if (o is UnityEngine.Object uo && uo != null) return uo.name;
-            return null;
+            return ObjNames.Of(o);
         }
 
         private static int IdOf(object o)
@@ -279,8 +392,70 @@ namespace Oc2AI
         private const float STUCK_TIME = 0.8f;
         private const float BRAKE_DIST = 0.6f;
         private const float MIN_STICK = 0.35f;
+        // 卡住跳点（TrySkipWaypoint）：停滞 0.3s 起试、离当前点 1 格内才跳、试探距离 0.3m。
+        private const float SKIP_STALL = 0.3f;
+        private const float SKIP_MAX_DIST = 1.2f;
+        private const float SKIP_PROBE = 0.3f;
+        // 碰撞探测（Blocked）：移动方向前方扫这么远；同一个 obstacle collider 持续
+        // 挡这么多久才判 blocked。不依赖 relMoved——会动的 NPC 顾客把厨师顶来顶去时
+        // relMoved 恒非零、0.8s stuck 永不触发，只能靠这里的物理探测。
+        private const float BLOCK_PROBE = 0.4f;
+        private const float BLOCK_GRACE = 0.3f;
+        // 锚定射线：从厨师头顶往下打 Ground(9) + SlopedGround(28) 层，找 waypoint
+        // 脚下的地板。SlopedGround 是楼梯/坡道（Wizard_3_1「Left Side Stairs」）；
+        // 探地只认 Ground 会把上楼梯误判成悬崖（ledge），P2 端着成品盘上不了楼。
+        private static readonly int GROUND_LAYER_MASK = BuildGroundMask();
+
+        private static int BuildGroundMask()
+        {
+            int mask = 1 << 9;  // Ground
+            int sloped = LayerMask.NameToLayer("SlopedGround");
+            if (sloped >= 0) mask |= 1 << sloped;
+            return mask;
+        }
+        private const float ANCHOR_RAY_UP = 5f;
+        private const float ANCHOR_RAY_LEN = 20f;
+        // 跨地板缝隙：厨师胶囊半径/直径、Dash 按住时长、冷却。
+        // 半径实测 0.4（seams.py GATE_RADIUS 同源注释），窄于半径的缝胶囊能直接跨过去。
+        private const float CHEF_RADIUS = 0.4f;
+        private const float CHEF_DIAMETER = 0.8f;
+        private const float DASH_HOLD = 0.08f;
+        private const float DASH_COOLDOWN = 1.0f;
+        // 起跳前先看落点：沿当前方向 DASH_LAND_PROBE 处必须还有地板。
+        // 实测 dash 从头前冲约 2.2~2.4m；探针 2.0m 留 0.2m 余量。
+        // 光看「胶囊前沿没地板」就跳会把平台边缘巡逻（路径下一步拐弯）
+        // 和木筏漂走后的宽缝都当成可跳的缝。
+        private const float DASH_LAND_PROBE = 2.0f;
+        // 跳边起点前多远就允许起跳：路径在格子中心拐弯时，等走到格心才按
+        // Dash 已经太晚（trace-20261110-003648 t=286：起跳点离缝边 0.11m）。
+        private const float DASH_APPROACH = 0.9f;
+        // 对岸路点超过这个距离就不 dash：木筏可能已漂远，dash 也够不到，
+        // 交回 Python 重算比冲进水里好。2 格跳边的格心距是 2.4m，留 0.2m 余量。
+        private const float DASH_REACH = 2.6f;
+        // 长距离跑动（run）：普通地面、路径直、离终点还远时隔一段按一次 Dash 提速。
+        // 与跳边那套分开——这里不做落点格校验，但仍要求 2m 前方有地板，防止从
+        // 平台边缘冲下去；冷却沿用 DASH_COOLDOWN，避免和跳边抢按键。
+        private const float RUN_MIN_DIST = 1.8f;      // 离当前路点太近不跑（会冲过拐角）
+        private const float RUN_STOP_DIST = 1.5f;     // 离终点太近不跑（要精确停下）
+        private const float RUN_STRAIGHT_DOT = 0.85f; // 前后两段方向夹角余弦下限
+
+        // waypoint 锚点：Python 发的是发令时刻的世界坐标，但站在移动平台（气球篮/
+        // 木筏）上时，平台上的点会被平台带走。冻结的世界坐标会落进平台台面里、
+        // 永远够不到（实机 trace-20261029-234145 t=1905~1925：篮子漂 0.45m 后
+        // waypoint 落进灶台，P2 顶着台面推、stuck）。所以启动时把每个点挂到它
+        // 脚下那块地板 collider 的本地坐标系，每帧用该 transform 还原成**当前**
+        // 世界坐标——平移、旋转都跟着走；静止地板的 transform 不动，等价旧行为。
+        private struct Anchor
+        {
+            public Transform T;      // 脚下地板；null = 没打中，按冻结世界坐标
+            public Vector3 Local;
+            public Vector2 World;    // 发令时刻的世界坐标（兜底）
+        }
 
         private readonly List<Vector2> _path = new List<Vector2>();
+        private readonly List<Anchor> _anchors = new List<Anchor>();
+        private Anchor _goalAnchor;
+        private int _anchoredCount;
         private readonly Vector2 _goal;
         private readonly Dictionary<string, object> _target;
         private readonly string _kind;
@@ -292,17 +467,61 @@ namespace Oc2AI
         private float _lastRelX;
         private float _lastRelZ;
         private bool _hasRel;
+        private int _blockHitId;          // 当前持续挡在前方的 obstacle collider 实例 id
+        private float _blockHitSince = -1f;  // 该 collider 开始持续挡住的时刻
+        // Python 只在路径跨地板缝时发 dash=true；没授权时遇到踩空就停下。
+        // 新协议另发 dash_edges（落点下标列表）：只在真正的缝隙跳边段按 Dash，
+        // 不再「整条路径任意边缘都跳」。旧 Python 不发时退回 dash 标记。
+        private readonly bool _allowDash;
+        private readonly bool _allowRun;
+        private readonly List<int> _dashEdges;
+        private bool _dashDown;
+        private float _dashUntil = -1f;
+        private float _lastDashAt = -10f;
+
+        // 平台接缝门洞（Oc2Gate.cs）：gates 字段可选，旧 Python 不发则行为不变。
+        // 门洞没开时在缝口外停下等，最多 gate.MaxWait 秒（Python 按预测开门时间给，
+        // 缺省 4s）；离缝口 GATE_HOLD 内才停。
+        private const float GATE_HOLD = 0.6f;
+        private readonly List<Gate> _gates = new List<Gate>();
+        private Collider _body;
+        private float _gateWaitSince = -1f;
+
+        // 传送门过门段（Oc2Portals.cs PortalHop）：portals 字段可选，旧 Python 不发则不变。
+        // 走到推门点附近就一直朝门推，被传走后停摇杆等落地，落地后从 exit 后的路点续走。
+        // 推门推了 MaxWait 秒还没被传（门在传别人 / 冷却）→ portal busy。
+        // 没有过门段时被传走（误踩）→ teleported，交回 Python 按新位置重算。
+        private const float PORTAL_NEAR = 1.0f;     // 离推门点多近开始算「在推门」
+        private const float PORTAL_LAND_EPS = 1.5f; // 落地点与预期出口落点的容差
+        private readonly List<PortalHop> _hops = new List<PortalHop>();
+        private bool _teleportSeen;
+        private float _portalPushSince = -1f;
 
         public bool Done { get; private set; }
         public bool Ok { get; private set; }
         public string Why { get; private set; }
         public double[] BlockedCell { get; private set; }
+        public double[] BlockedBox { get; private set; }
+        public string BlockedKind { get; private set; }
 
         public MoveCommand(Dictionary<string, object> cmd)
         {
             _goal = ToVec(Req.List(cmd, "goal"));
             _target = Req.Obj(cmd, "target");
             _kind = Req.Str(cmd, "kind");
+            _allowDash = Req.Bool(cmd, "dash");
+            _allowRun = Req.Bool(cmd, "run");
+            var edges = Req.List(cmd, "dash_edges");
+            if (edges != null)
+            {
+                _dashEdges = new List<int>();
+                foreach (var e in edges)
+                {
+                    if (e is double d) _dashEdges.Add((int)d);
+                    else if (e is long l) _dashEdges.Add((int)l);
+                    else if (e is int i) _dashEdges.Add(i);
+                }
+            }
             var path = Req.List(cmd, "path");
             if (path != null)
                 foreach (var p in path)
@@ -316,13 +535,171 @@ namespace Oc2AI
             // 五入成相邻的墙格时，朝自己格心走会撞墙（实机 1-3：(-3,-5)/(-3,-6) 边界
             // 被四舍五入成底墙 (-3,-6)，朝格心向下撞墙）。跳过它，直接走 path[1]。
             _idx = 1;
-            _timeout = (float)(Req.Num(cmd, "timeout_ms") ?? 8000.0) / 1000f;
+            _goalAnchor = new Anchor { T = null, Local = Vector3.zero, World = _goal };
+            _timeout =(float)(Req.Num(cmd, "timeout_ms") ?? 8000.0) / 1000f;
+            var gates = Req.List(cmd, "gates");
+            if (gates != null)
+                foreach (var g in gates)
+                {
+                    var d = g as Dictionary<string, object>;
+                    if (d == null) continue;
+                    var gate = new Gate(d);
+                    if (gate.Valid && gate.Exit < _path.Count) _gates.Add(gate);
+                }
+            var hops = Req.List(cmd, "portals");
+            if (hops != null)
+                foreach (var h in hops)
+                {
+                    var d = h as Dictionary<string, object>;
+                    if (d == null) continue;
+                    var hop = new PortalHop(d);
+                    if (hop.Valid(_path.Count)) _hops.Add(hop);
+                }
+        }
+
+        // 下标 i 是哪段过门的推门点 / 落地点；不是返回 null。
+        private PortalHop HopAt(int i, out bool isExit)
+        {
+            isExit = false;
+            foreach (var h in _hops)
+            {
+                if (h.Enter == i) return h;
+                if (h.Exit == i) { isExit = true; return h; }
+            }
+            return null;
+        }
+
+        // 传送中 / 刚落地的处理。返回 true = 本拍已处理完（调用方直接 return）。
+        private bool TickTeleport(ChefFrame f, Vector2 pos, float now)
+        {
+            if (Oc2AIPlugin.ChefTeleporting(f.Chef))
+            {
+                if (!_teleportSeen)
+                {
+                    _teleportSeen = true;
+                    UnityEngine.Debug.Log("[EXEC] move teleporting pos=(" + f.PosX + "," + f.PosZ + ") idx=" + _idx);
+                }
+                PadEngagement.Pad.Stop();
+                ReleaseDash();
+                _lastProgress = now;          // 传送动画不算 stuck
+                _hasRel = false;
+                return true;
+            }
+            if (!_teleportSeen) return false;
+            _teleportSeen = false;
+            _portalPushSince = -1f;
+            bool isExit;
+            PortalHop hop = HopAt(_idx, out isExit);
+            if (hop != null && !isExit && Vector2.Distance(pos, hop.Land) <= PORTAL_LAND_EPS)
+            {
+                // 计划内过门：跳过落地点，朝下一个路点走
+                _idx = hop.Exit + 1;
+                _lastProgress = now;
+                UnityEngine.Debug.Log("[EXEC] move portal landed pos=(" + f.PosX + "," + f.PosZ + ") portal=" + hop.Portal);
+                return false;
+            }
+            // 计划外被传走（误踩 / 落点不对）：路点全部作废，交回 Python 重算
+            UnityEngine.Debug.Log("[EXEC] move teleported (unplanned) pos=(" + f.PosX + "," + f.PosZ + ") idx=" + _idx);
+            PadEngagement.Pad.Stop();
+            Finish(false, "teleported");
+            return true;
+        }
+
+        // 下标 i 是哪道门洞的入点/出点；不是返回 null。
+        private Gate GateAt(int i, out bool isExit)
+        {
+            isExit = false;
+            foreach (var g in _gates)
+            {
+                if (g.Enter == i) return g;
+                if (g.Exit == i) { isExit = true; return g; }
+            }
+            return null;
         }
 
         private static Vector2 ToVec(List<object> l)
         {
             if (l == null || l.Count < 2) return Vector2.zero;
             return new Vector2((float)(double)l[0], (float)(double)l[1]);
+        }
+
+        // 往 p 正下方打 Ground 层射线，打中就挂到那块地板的 transform 上。
+        // 用物理事实判「点在哪块平台上」，不靠 Python 侧按格猜网格（篮子边缘格
+        // 量化会判错：地面点误挂篮子 → 被带去悬空处）。
+        private static Anchor MakeAnchor(Vector2 p, float y)
+        {
+            Anchor a = new Anchor { T = null, Local = Vector3.zero, World = p };
+            RaycastHit hit;
+            Vector3 origin = new Vector3(p.x, y + ANCHOR_RAY_UP, p.y);
+            if (Physics.Raycast(origin, Vector3.down, out hit, ANCHOR_RAY_LEN,
+                                GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore)
+                && hit.collider != null)
+            {
+                a.T = hit.collider.transform;
+                a.Local = a.T.InverseTransformPoint(new Vector3(p.x, hit.point.y, p.y));
+            }
+            return a;
+        }
+
+        // 锚点的当前世界坐标；地板被销毁/没打中时退回发令时刻的世界坐标。
+        private static Vector2 Now(Anchor a)
+        {
+            if (a.T == null) return a.World;
+            Vector3 w = a.T.TransformPoint(a.Local);
+            return new Vector2(w.x, w.z);
+        }
+
+        // 诊断：move 日志里带上目标身份（盘 id / 站点名），复盘时能和 trace
+        // 的 exec.task / interaction.target 对上。
+        private string TargetDesc()
+        {
+            if (_target == null) return "null";
+            object n, g;
+            _target.TryGetValue("n", out n);
+            _target.TryGetValue("grid", out g);
+            return (g == null ? "" : g.ToString() + ":") + (n == null ? "?" : n.ToString());
+        }
+
+        // 诊断：dash_edges 的落点下标；旧 Python 不发时为 legacy。
+        private string DashEdgesText()
+        {
+            if (_dashEdges == null) return "legacy";
+            var parts = new string[_dashEdges.Count];
+            for (int i = 0; i < parts.Length; i++) parts[i] = _dashEdges[i].ToString();
+            return string.Join(",", parts);
+        }
+
+        private Vector2 PointAt(int i)
+        {
+            bool isExit;
+            PortalHop hop = HopAt(i, out isExit);
+            if (hop != null) return isExit ? hop.Land : hop.Push;
+            Gate g = GateAt(i, out isExit);
+            if (g != null) return isExit ? g.ExitPoint : g.EnterPoint;
+            return i < _anchors.Count ? Now(_anchors[i]) : Now(_goalAnchor);
+        }
+
+        /// <summary>
+        /// 共线路点：已经越过它的垂面就算到达，不要求回到格心。
+        ///
+        /// 路径是格子中心的序列，原判据 WAYPOINT_EPS=0.15m 要求精确到点。厨师被
+        /// 推离格心 0.4m 时，这一点会变成一次额外的「对正」移动——实机
+        /// trace-20261109-011932 t=1926~2072：在 3-3 楼梯顶朝南对正 0.4m，手持
+        /// 披萨顶住南墙，8s 后 move timeout。前后两段近似共线（直行穿过该格）时，
+        /// 只要已越过该路点的垂面就直接推进；拐角仍保持 0.15m 精确到点，避免
+        /// 切角穿墙。门洞/传送门段不参与（它们有自己的跨缝判据）。
+        /// </summary>
+        private bool PassedStraightWaypoint(Vector2 pos)
+        {
+            if (_idx < 1 || _idx + 1 >= _path.Count) return false;
+            bool isExit;
+            if (GateAt(_idx, out isExit) != null || GateAt(_idx + 1, out isExit) != null) return false;
+            if (HopAt(_idx, out isExit) != null || HopAt(_idx + 1, out isExit) != null) return false;
+            Vector2 cur = PointAt(_idx), prev = PointAt(_idx - 1), next = PointAt(_idx + 1);
+            Vector2 inDir = cur - prev, outDir = next - cur;
+            if (inDir.sqrMagnitude < 1e-6f || outDir.sqrMagnitude < 1e-6f) return false;
+            if (Vector2.Dot(inDir.normalized, outDir.normalized) < 0.98f) return false;
+            return Vector2.Dot(pos - cur, outDir.normalized) >= 0f;
         }
 
         // 靠近 goal 时用游戏交互句柄判「已就位」：句柄命中目标即算到达，
@@ -334,15 +711,115 @@ namespace Oc2AI
             return PadButtons.HandleMatches(f, _target, _kind);
         }
 
+        // 前方地面探针：先打胶囊前沿（半径处），再打一个胶囊直径处。
+        // 只有前沿没地板、且直径内也没地板才判「前面是悬崖」——窄缝（< 半径，
+        // 如 1-5 主地板与气球篮子之间 0.39m 接缝）胶囊能跨过去，单点探针会
+        // 误判 ledge（trace-20261114-205207 t=157/160：P2 空转）。
+        // 前沿中心悬空时再探垂直两侧（±半径）：楼梯顶阶↔二楼地板的纵向缝
+        // 胶囊能骑在缝上（两侧都有地板），单点探针落缝里会误判 ledge
+        // （trace-20261115-132817 t=2223：P2 端着脏盘下楼被拦）。两侧都得有
+        // 地板才算「骑在缝上」——真悬崖两侧同样悬空，仍会判 ledge。
+        private bool GroundGapAhead(ChefFrame f, Vector2 dir)
+        {
+            if (dir.sqrMagnitude < 1e-6f) return false;
+            float y = f.Chef.transform.position.y + ANCHOR_RAY_UP;
+            Vector3 lead = new Vector3(f.PosX + dir.x * CHEF_RADIUS, y,
+                                       f.PosZ + dir.y * CHEF_RADIUS);
+            if (FloorAt(lead)) return false;  // 胶囊前沿仍在板上：稳
+            float nx = -dir.y, nz = dir.x;    // 垂直方向
+            Vector3 sideA = new Vector3(lead.x + nx * CHEF_RADIUS, y, lead.z + nz * CHEF_RADIUS);
+            Vector3 sideB = new Vector3(lead.x - nx * CHEF_RADIUS, y, lead.z - nz * CHEF_RADIUS);
+            if (FloorAt(sideA) && FloorAt(sideB)) return false;  // 骑在纵向窄缝上
+            Vector3 far = new Vector3(f.PosX + dir.x * CHEF_DIAMETER, y,
+                                      f.PosZ + dir.y * CHEF_DIAMETER);
+            return !FloorAt(far);
+        }
+
+        private bool FloorAt(Vector3 origin)
+        {
+            return Physics.Raycast(origin, Vector3.down, ANCHOR_RAY_LEN,
+                                   GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore);
+        }
+
+        // 当前段是否授权 dash。新协议（dash_edges）只看真正的缝隙跳边段；
+        // 下一步就是跳边且已走到起点附近时也放行，避免等走到格心才起跳。
+        private bool DashAllowedHere(Vector2 pos, Vector2 target)
+        {
+            if (_dashEdges == null) return _allowDash;
+            if (_dashEdges.Contains(_idx)) return true;
+            if (_idx + 1 < _path.Count && _dashEdges.Contains(_idx + 1)
+                && Vector2.Distance(pos, target) <= DASH_APPROACH)
+                return true;
+            return false;
+        }
+
+        // 起跳前校验落点：当前方向 DASH_LAND_PROBE 处必须有地板；跳边落点
+        // 的锚点也必须打在真实地板上（木筏漂走后锚点会落空，此时不能跳）。
+        private bool DashLandingReady(ChefFrame f, Vector2 dir)
+        {
+            if (dir.sqrMagnitude < 1e-6f) return false;
+            Vector3 p = new Vector3(
+                f.PosX + dir.x * DASH_LAND_PROBE,
+                f.Chef.transform.position.y + ANCHOR_RAY_UP,
+                f.PosZ + dir.y * DASH_LAND_PROBE);
+            if (!Physics.Raycast(p, Vector3.down, ANCHOR_RAY_LEN,
+                                 GROUND_LAYER_MASK, QueryTriggerInteraction.Ignore))
+                return false;
+            return _idx >= _anchors.Count || _anchors[_idx].T != null;
+        }
+
+        // 跑动 dash 只在直段按：当前路点方向和下一段方向基本一致，否则一冲就
+        // 冲过拐角、插件还得折回来（格子中心路径在门/台面附近常是 90° 折）。
+        private bool RunStraight(Vector2 pos, int idx)
+        {
+            if (idx + 1 >= _path.Count) return true;
+            Vector2 here = PointAt(idx);
+            Vector2 next = PointAt(idx + 1);
+            Vector2 d1 = here - pos;
+            Vector2 d2 = next - here;
+            if (d1.sqrMagnitude < 1e-6f || d2.sqrMagnitude < 1e-6f) return true;
+            return Vector2.Dot(d1.normalized, d2.normalized) >= RUN_STRAIGHT_DOT;
+        }
+
+        private void ReleaseDash()
+        {
+            if (!_dashDown) return;
+            _dashDown = false;
+            _dashUntil = -1f;
+            try { PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.Dash, false); }
+            catch (System.Exception) { }
+        }
+
         public void Tick(ChefFrame f, float now)
         {
             if (Done) return;
+            if (_dashDown && now >= _dashUntil) ReleaseDash();
             if (!_started)
             {
                 _started = true; _startTime = now; _lastProgress = now;
+                // 锚定在首帧做（构造在 exec 线程收包时，不能碰物理/transform）。
+                float y = f.Valid ? f.Chef.transform.position.y : 0f;
+                _anchors.Clear();
+                _anchoredCount = 0;
+                foreach (Vector2 p in _path)
+                {
+                    Anchor a = MakeAnchor(p, y);
+                    if (a.T != null) _anchoredCount++;
+                    _anchors.Add(a);
+                }
+                _goalAnchor = MakeAnchor(_goal, y);
+                if (_gates.Count > 0 && f.Valid) _body = Oc2AIPlugin.ChefBody(f.Chef);
                 var sb = new System.Text.StringBuilder();
-                sb.Append("[EXEC] move start goal=(").Append(_goal.x).Append(',').Append(_goal.y)
-                  .Append(") pos=(").Append(f.PosX).Append(',').Append(f.PosZ).Append(") path=[");
+                sb.Append("[EXEC] move start t=").Append(now.ToString("0.00"))
+                  .Append(" target=").Append(TargetDesc())
+                  .Append(" kind=").Append(_kind ?? "null")
+                  .Append(" dash=").Append(_allowDash ? "1" : "0")
+                  .Append(" dashEdges=").Append(DashEdgesText())
+                  .Append(" run=").Append(_allowRun ? "1" : "0")
+                  .Append(" goal=(").Append(_goal.x).Append(',').Append(_goal.y)
+                  .Append(") goal_floor=").Append(_goalAnchor.T != null ? _goalAnchor.T.name : "none")
+                  .Append(" anchored=").Append(_anchoredCount).Append('/').Append(_path.Count)
+                  .Append(" pos=(").Append(f.PosX).Append(',').Append(f.PosZ).Append(") path=[");
                 for (int i = 0; i < _path.Count && i < 40; i++)
                 {
                     if (i > 0) sb.Append(',');
@@ -351,6 +828,10 @@ namespace Oc2AI
                 }
                 if (_path.Count > 40) sb.Append("...");
                 sb.Append(']');
+                foreach (var g in _gates)
+                    sb.Append(" gate(").Append(g.AlongX ? "x=" : "z=").Append(g.Line.ToString("0.##"))
+                      .Append(" idx=").Append(g.Enter).Append(',').Append(g.Exit)
+                      .Append(" mid=").Append(g.Mid.ToString("0.##")).Append(')');
                 UnityEngine.Debug.Log(sb.ToString());
             }
             if (now - _startTime > _timeout) { Finish(false, "timeout"); return; }
@@ -358,10 +839,15 @@ namespace Oc2AI
 
             Vector2 pos = new Vector2(f.PosX, f.PosZ);
 
+            // 传送门：传送中停摇杆等落地；落地后续走或（计划外）交回 Python
+            if (TickTeleport(f, pos, now)) return;
+
             // 到达：以游戏交互句柄为准（权威信号）——句柄命中即「到了」，
             // 不再用距离卡最后一步。goalDist 只做两件事：性能闸（离 goal 太远
             // 先不查句柄，省 FindNearbyObjects）+ 无句柄目标时的距离兜底。
-            float goalDist = Vector2.Distance(pos, _goal);
+            // goal / waypoint 都取锚点的**当前**世界坐标（随脚下平台走）。
+            Vector2 goal = Now(_goalAnchor);
+            float goalDist = Vector2.Distance(pos, goal);
             if (goalDist <= INTERACT_EPS && InteractReady(f))
             {
                 PadEngagement.Pad.Stop();
@@ -376,17 +862,106 @@ namespace Oc2AI
                 return;
             }
 
-            Vector2 target = _idx < _path.Count ? _path[_idx] : _goal;
+            // 过门段：当前路点是推门点 → 一直朝门推（不按距离推进），等门把人传走
+            bool hopIsExit;
+            PortalHop hopNow = HopAt(_idx, out hopIsExit);
+            if (hopNow != null && !hopIsExit)
+            {
+                if (Vector2.Distance(pos, hopNow.Push) <= PORTAL_NEAR)
+                {
+                    if (_portalPushSince < 0f)
+                    {
+                        _portalPushSince = now;
+                        UnityEngine.Debug.Log("[EXEC] move portal push pos=(" + f.PosX + "," + f.PosZ
+                            + ") portal=" + hopNow.Portal + " max_wait=" + hopNow.MaxWait);
+                    }
+                    _lastProgress = now;      // 顶着门等不算 stuck
+                    _hasRel = false;
+                    if (now - _portalPushSince > hopNow.MaxWait)
+                    {
+                        UnityEngine.Debug.Log("[EXEC] move portal busy after "
+                            + (now - _portalPushSince).ToString("0.0") + "s portal=" + hopNow.Portal);
+                        PadEngagement.Pad.Stop();
+                        Finish(false, "portal busy", new double[] { hopNow.Push.x, hopNow.Push.y });
+                        return;
+                    }
+                }
+                Vector2 pd = (hopNow.Push - pos).normalized;
+                PadEngagement.Pad.Move(f.Chef, pd.x, pd.y);
+                return;
+            }
+
+            // 门洞：当前或下一个路点是门洞入/出点时，按墙碰撞体现算中线
+            bool atExit;
+            Gate gate = GateAt(_idx, out atExit);
+            if (gate == null && _idx + 1 < _path.Count)
+            {
+                Gate ahead = GateAt(_idx + 1, out atExit);
+                if (ahead != null && !atExit) { gate = ahead; atExit = false; }
+            }
+            bool gateOpen = gate == null || gate.Refresh(_body, now);
+
+            // 已到缝口等待范围：入点前一个路点只是「走到缝口」的过渡，直接算到了。
+            // 等门范围按缝口（不随篮子动）量，P2 和这个路点却都在篮子上：还差 0.4m 没到
+            // 它就已停下等门，等门时被篮子带出等门范围，门没开就结束等待，接着去够这个
+            // 路点（trace-20261030-213754 t=1752~1780：P2 相对篮子一直 (-1.42,-1.12) 没动，
+            // 朝 (14.4,-12.14) 推、盘子顶到篮子上的箱子 stuck，送餐失败）。改成以入点为
+            // 目标后，被带出范围会走回缝口继续等。
+            if (gate != null && !atExit && _idx + 1 == gate.Enter
+                && Vector2.Distance(pos, gate.EnterPoint) <= GATE_HOLD + WAYPOINT_EPS)
+            {
+                _idx = gate.Enter;
+                _hasRel = false;
+            }
+
+            Vector2 target = PointAt(_idx);
+            // 接近门洞（下一路点就是入点）时，直接朝当前门洞入点走，不朝发令时
+            // 冻结的前一个路点走：前一个路点在移动篮子上，篮子一漂它就过期，P2
+            // 顶着过期点推、进不了 GATE_HOLD 等门范围（trace-20261101-223804
+            // t=4452 送餐在缝口 stuck 而非 gate closed）。入点坐标每帧由
+            // gate.Refresh 重算中线，跟得上篮子。
+            if (gate != null && !atExit && _idx + 1 == gate.Enter)
+                target = gate.EnterPoint;
             float dist = Vector2.Distance(pos, target);
 
-            // 走点推进
-            if (_idx < _path.Count && dist <= WAYPOINT_EPS)
+            // 走点推进；门洞入/出点按跨缝坐标判（沿缝坐标一直在动，按距离可能永远差一点）
+            bool reached = dist <= WAYPOINT_EPS || PassedStraightWaypoint(pos);
+            if (gate != null && _idx == gate.Enter) reached = reached || (gateOpen && gate.PastEnter(pos));
+            if (gate != null && _idx == gate.Exit) reached = reached || gate.PastExit(pos);
+            if (_idx < _path.Count && reached)
             {
                 _idx++;
-                target = _idx < _path.Count ? _path[_idx] : _goal;
+                target = PointAt(_idx);
                 dist = Vector2.Distance(pos, target);
                 _hasRel = false;
             }
+
+            // 门洞没开、还没进缝：走到缝口附近就停下等，不顶墙
+            if (gate != null && !gateOpen && _idx <= gate.Enter
+                && Vector2.Distance(pos, gate.EnterPoint) <= GATE_HOLD + WAYPOINT_EPS)
+            {
+                if (_gateWaitSince < 0f)
+                {
+                    _gateWaitSince = now;
+                    UnityEngine.Debug.Log("[EXEC] move gate wait pos=(" + f.PosX + "," + f.PosZ + ") line="
+                        + gate.Line + " mid=" + gate.Mid + " max_wait=" + gate.MaxWait + " blocker=" + gate.Blocker);
+                }
+                PadEngagement.Pad.Stop();
+                _lastProgress = now;          // 等门不算 stuck
+                _hasRel = false;
+                if (now - _gateWaitSince > gate.MaxWait)
+                {
+                    // 回传门洞格（接缝线上的中线点）：Python 记 bad_cells 绕开，防止
+                    // 插件判关、Python 判通时反复重发同一条 move 卡死在缝口。
+                    Vector2 g = gate.AlongX ? new Vector2(gate.Line, gate.Mid) : new Vector2(gate.Mid, gate.Line);
+                    UnityEngine.Debug.Log("[EXEC] move gate closed after " + (now - _gateWaitSince).ToString("0.0")
+                        + "s blocker=" + gate.Blocker);
+                    PadEngagement.Pad.Stop();
+                    Finish(false, "gate closed", new double[] { g.x, g.y });
+                }
+                return;
+            }
+            _gateWaitSince = -1f;
 
             // stuck：无进展超时 → FAILURE 交回 Python。planner 每拍用新 field 重算，
             // 会绕开障碍重新走；不在这里「跳 waypoint」——那一跳可能越过障碍、
@@ -404,12 +979,18 @@ namespace Oc2AI
                 _hasRel = true;
                 _lastProgress = now;
             }
+            else if (now - _lastProgress > SKIP_STALL && TrySkipWaypoint(f, pos, dist, now))
+            {
+                target = PointAt(_idx);
+            }
             else if (now - _lastProgress > STUCK_TIME)
             {
-                UnityEngine.Debug.Log("[EXEC] move stuck pos=(" + f.PosX + "," + f.PosZ + ")"
-                    + " goal=(" + _goal.x + "," + _goal.y + ")"
+                UnityEngine.Debug.Log("[EXEC] move stuck t=" + now.ToString("0.00")
+                    + " pos=(" + f.PosX + "," + f.PosZ + ")"
+                    + " goal=(" + goal.x + "," + goal.y + ")"
                     + " idx=" + _idx + "/" + _path.Count
-                    + " target=(" + target.x + "," + target.y + ")");
+                    + " target=(" + target.x + "," + target.y + ")"
+                    + " target_id=" + TargetDesc());
                 PadEngagement.Pad.Stop();
                 Finish(false, "stuck", new double[] { target.x, target.y });
                 return;
@@ -420,15 +1001,174 @@ namespace Oc2AI
             float mag = goalDist < BRAKE_DIST
                 ? Mathf.Clamp(goalDist / BRAKE_DIST, MIN_STICK, 1f)
                 : 1f;
+
+            bool gapAhead = GroundGapAhead(f, dir);
+            float farDist = Vector2.Distance(pos, target);
+            bool dashHere = DashAllowedHere(pos, target);
+            // 旧 Python 不发 dash_edges：保持旧行为，不额外校验落点（协议只增不改）。
+            bool landOk = true;
+            if (gapAhead && dashHere && farDist <= DASH_REACH && _dashEdges != null)
+                landOk = DashLandingReady(f, dir);
+            if (gapAhead && (!dashHere || farDist > DASH_REACH || !landOk))
+            {
+                // 不在跳边段、没有 dash 授权、对岸超出射程、或落点没地板：
+                // 宁可不走，交回 Python 重算，也不掉水。
+                PadEngagement.Pad.Stop();
+                UnityEngine.Debug.Log("[EXEC] move ledge t=" + now.ToString("0.00")
+                    + " pos=(" + f.PosX + "," + f.PosZ
+                    + ") idx=" + _idx + "/" + _path.Count
+                    + " target=(" + target.x + "," + target.y + ")"
+                    + " target_id=" + TargetDesc()
+                    + " dashHere=" + (dashHere ? "1" : "0")
+                    + " land=" + (landOk ? "1" : "0")
+                    + " far=" + farDist.ToString("0.00"));
+                Finish(false, "ledge", new double[] { target.x, target.y });
+                return;
+            }
+
+            // 碰撞探测：移动方向前方有硬障碍（obstacle）持续 BLOCK_GRACE 秒 → blocked。
+            // 不依赖 relMoved（会动的 NPC 顾客把厨师顶来顶去时 relMoved 恒非零、0.8s
+            // stuck 永不触发）。SweepTest 用厨师整个 Rigidbody（含手持物）。
+            Collider blockHit = SweepForward(f.Chef, dir, BLOCK_PROBE);
+            if (blockHit != null && BlockKind(blockHit) == "obstacle")
+            {
+                int bid = blockHit.GetInstanceID();
+                if (bid != _blockHitId)
+                {
+                    _blockHitId = bid;
+                    _blockHitSince = now;
+                }
+                else if (now - _blockHitSince > BLOCK_GRACE)
+                {
+                    UnityEngine.Debug.Log("[EXEC] move blocked t=" + now.ToString("0.00")
+                        + " pos=(" + f.PosX + "," + f.PosZ + ")"
+                        + " idx=" + _idx + "/" + _path.Count
+                        + " target=(" + target.x + "," + target.y + ")"
+                        + " blocker=" + blockHit.name + " target_id=" + TargetDesc());
+                    PadEngagement.Pad.Stop();
+                    FinishBlocked(blockHit);
+                    return;
+                }
+            }
+            else
+            {
+                _blockHitId = 0;
+                _blockHitSince = -1f;
+            }
+
             PadEngagement.Pad.Move(f.Chef, dir.x * mag, dir.y * mag);
+
+            // 长距离跑动：普通地面 + 直段 + 离终点还远 + 2m 前方有地板才按 Dash。
+            // 跳边段已有自己的授权和落点校验，两者共用冷却，避免同一拍抢按键。
+            bool runHere = _allowRun && !gapAhead
+                && farDist >= RUN_MIN_DIST && goalDist > RUN_STOP_DIST
+                && RunStraight(pos, _idx) && DashLandingReady(f, dir);
+            bool gapJump = gapAhead && dashHere && landOk;
+            if ((gapJump || runHere) && PadEngagement.Pad != null
+                && now - _lastDashAt > DASH_COOLDOWN)
+            {
+                try
+                {
+                    PadEngagement.Pad.Press(PlayerInputLookup.LogicalButtonID.Dash, true);
+                    _dashDown = true;
+                    _dashUntil = now + DASH_HOLD;
+                    _lastDashAt = now;
+                    UnityEngine.Debug.Log("[EXEC] move dash t=" + now.ToString("0.00")
+                        + " pos=(" + f.PosX + "," + f.PosZ
+                        + ") idx=" + _idx + "/" + _path.Count
+                        + " run=" + (runHere && !gapJump ? "1" : "0")
+                        + " target_id=" + TargetDesc());
+                }
+                catch (System.Exception e)
+                {
+                    UnityEngine.Debug.Log("[EXEC] move dash failed: " + e.Message);
+                }
+            }
+        }
+
+        // 中途路点够不到时提前转向下一个点。手里的东西挂在厨师刚体下面，碰撞体还开着
+        // （ServerPhysicalAttachment.Attach 只换父节点），所以伸在身前的盘子/食材
+        // 会先顶到台面。Python 和 walk_probe 只按身体胶囊判，看到的是「能走」
+        // （trace-20261030-192949 t=1804~1832：端盘朝 (12,-10.8) 推，身体离燃烧器
+        // 还有 0.5m，被盘子顶在 z=-11.43；开局 t=258 拿意面在同一处卡在 -11.31）。
+        // 卡住时用 Rigidbody.SweepTest 按整个刚体（身体 + 手持物）试探朝下一个点走
+        // 有没有挡，没挡就跳过当前点。门洞的入/出点和终点不跳。
+        private bool TrySkipWaypoint(ChefFrame f, Vector2 pos, float dist, float now)
+        {
+            if (_idx + 1 >= _path.Count || dist > SKIP_MAX_DIST) return false;
+            bool isExit;
+            if (GateAt(_idx, out isExit) != null || GateAt(_idx + 1, out isExit) != null) return false;
+            if (HopAt(_idx, out isExit) != null || HopAt(_idx + 1, out isExit) != null) return false;
+            Rigidbody rb = f.Chef.GetComponent<Rigidbody>();
+            if (rb == null) return false;
+            Vector2 next = PointAt(_idx + 1);
+            Vector2 d = next - pos;
+            if (d.sqrMagnitude < 1e-6f) return false;
+            Vector3 dir = new Vector3(d.x, 0f, d.y).normalized;
+            RaycastHit hit;
+            if (rb.SweepTest(dir, out hit, SKIP_PROBE, QueryTriggerInteraction.Ignore)) return false;
+            UnityEngine.Debug.Log("[EXEC] move skip waypoint t=" + now.ToString("0.00")
+                + " pos=(" + f.PosX + "," + f.PosZ + ")"
+                + " idx=" + _idx + " target=(" + PointAt(_idx).x + "," + PointAt(_idx).y + ")"
+                + " next=(" + next.x + "," + next.y + ")"
+                + " target_id=" + TargetDesc());
+            _idx++;
+            _lastProgress = now;
+            _hasRel = false;
+            return true;
+        }
+
+        // 前方障碍探测：移动方向 SweepTest，返回挡路的 collider（无则 null）。
+        private static Collider SweepForward(Component chef, Vector2 dir, float dist)
+        {
+            Rigidbody rb = chef != null ? chef.GetComponent<Rigidbody>() : null;
+            if (rb == null) return null;
+            RaycastHit hit;
+            Vector3 d = new Vector3(dir.x, 0f, dir.y);
+            if (rb.SweepTest(d, out hit, dist, QueryTriggerInteraction.Ignore))
+                return hit.collider;
+            return null;
+        }
+
+        // 挡路 collider 的类别：player（P1，可推）/ pushable（非 kinematic 刚体、
+        // 手持物）/ travelator（传送带）/ obstacle（其余硬障碍，如 NPC 顾客）。
+        private static string BlockKind(Collider c)
+        {
+            if (c == null) return null;
+            for (Transform t = c.transform; t != null; t = t.parent)
+                foreach (Component comp in t.GetComponents<Component>())
+                {
+                    if (comp == null) continue;
+                    string tn = comp.GetType().Name;
+                    if (tn == "PlayerControls") return "player";
+                    if (tn == "ServerPhysicalAttachment" || tn == "ClientPhysicalAttachment") return "pushable";
+                    if (tn == "Travelator") return "travelator";
+                }
+            if (c.attachedRigidbody != null && !c.attachedRigidbody.isKinematic) return "pushable";
+            return "obstacle";
+        }
+
+        // 命中硬障碍：回传其 AABB + 类别，交 Python 拉黑整块重绕。
+        private void FinishBlocked(Collider c)
+        {
+            Bounds b = c.bounds;
+            BlockedBox = new double[] { b.min.x, b.max.x, b.min.z, b.max.z };
+            BlockedKind = "obstacle";
+            Finish(false, "blocked", null);
         }
 
         private void Finish(bool ok, string why, double[] blockedCell = null)
         {
+            ReleaseDash();
             Done = true;
             Ok = ok;
             Why = why;
             BlockedCell = blockedCell;
+            UnityEngine.Debug.Log("[EXEC] move finish t=" + Time.unscaledTime.ToString("0.00")
+                + " ok=" + (ok ? "1" : "0") + " why=" + (why ?? "null")
+                + " goal=(" + _goal.x.ToString("0.00") + "," + _goal.y.ToString("0.00") + ")"
+                + " idx=" + _idx + "/" + _path.Count
+                + " target_id=" + TargetDesc());
         }
     }
 }

@@ -10,8 +10,9 @@
 熟饭——而取熟饭恰恰是最有价值的接力。
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from ai.dialog.division import DivisionState
 from ai.dialog.schema import DialogState, Preference
 
 DEFAULT_TTL = 100          # 拍。20 Hz 下约 5 秒
@@ -44,8 +45,6 @@ class Commitment:
     steps_done: int = 0
     infeasible_streak: int = 0
     retries: int = 0
-    interrupt_failure_count: int = 0  # 中断 task 连续失败计数（Arbiter 用）
-    target_resource_id: Any = None    # 当前目标资源 ID（用于失败降级拉黑）
 
 
 @dataclass
@@ -87,14 +86,6 @@ class StuckScratch:
 
 
 @dataclass
-class FireScratch:
-    """灭火模式局部状态。模式进入时构造、退出即丢弃。"""
-    ext_target: Any = None
-    bad_ext: Set[Any] = field(default_factory=set)
-    tries: int = 0
-
-
-@dataclass
 class Blackboard:
     claims: Dict[Tuple[Any, str], Claim] = field(default_factory=dict)
     waiters: Dict[Any, List[Tuple[Any, int]]] = field(default_factory=dict)
@@ -102,22 +93,56 @@ class Blackboard:
     p1_model: P1Model = field(default_factory=P1Model)
     scratch: Any = None
     tick: int = 0
-    mode: str = "Normal"  # 当前模式（Arbiter 写入）
     # 移动平台（气球篮）是否正在移动。Agent 每拍更新，planner 可行性过滤
     # 读它：篮子动时「目标在篮子上的 task」判不可行，避免选到必失败的候选。
     balloon_moving: bool = False
-    blacklisted_resources: Dict[Any, int] = field(default_factory=dict)  # 拉黑资源 → 失效拍号
-    paused_task: Optional[Dict] = None  # 暂停的任务 {"task_id": str, "steps_done": int}
+    # 投锅冷却：灶资源 id → 失效拍号。ThrowOntoStation 投偏/没对准后写，期间
+    # 这口灶只走过去放、不再投。不进 scratch：scratch 随模式整体替换会丢。
+    pot_throw_cooldown: Dict[Any, int] = field(default_factory=dict)
+    # 平台接缝门洞的开关时间表（ai/space/seam_clock.SeamClock）：跨帧学周期，
+    # 寻路按到达时刻查要等多久。Agent 每拍 observe；切关随黑板整体换新。
+    seam_clock: Any = None
+    # 传送带送件通道最近一次有可用槽位的拍号（key=通道 key，value=失效拍号）。
+    # 4-2 两筏相对位置会让 @conveyor 逐帧闪断：刚开过就允许 SendAcross 端着
+    # 成品盘等接缝重开，而不是 failure 后把盘放下（trace-20261111-001945）。
+    conveyor_open_until: Dict[Any, int] = field(default_factory=dict)
+    # 盘最近一次可交互的拍号（盘 id → 失效拍号）。移动筏的格子投影会让
+    # can_interact 逐帧翻转；宽限内仍算匹配，避免 TakeCookedToPlate 一帧
+    # 消失、planner 退回 RescueCooked 把锅端离灶台
+    # （trace-20261111-005439 t=449）。
+    plate_reachable_until: Dict[Any, int] = field(default_factory=dict)
+    # 渡运台面（ai/space/shuttle.py）的可交互窗口时间表，同为 SeamClock：每个
+    # 台面对 P2 可达区「够得着 / 够不着」当一道门。
+    shuttle_clock: Any = None
+    # 断供看门狗（planner._update_supply_watch）：灶长时间不煮、订单还要熟料
+    # 时，允许 P2 无视「cook 归玩家」的认领负分去补位下锅。
+    supply_idle_since: Optional[int] = None   # 当前短缺连续段的起始拍
+    supply_ok_since: Optional[int] = None     # 当前非短缺连续段的起始拍
+    supply_override: bool = False             # 短缺超过宽限期 → 撤销 cook 负分
+    # 4-1 过街：行人红灯亮起的起始拍（None = 非红/无过街数据）。红灯起步窗口
+    # 看它：刚亮或已经亮很久（开局长红灯）才走；由 traffic.observe 每拍维护。
+    traffic_red_since: Optional[int] = None
 
     # ---------- 对话层（spec §4.5–4.7）----------
     # 分工偏好：候选打分上的加法项，过期由 prune_expired_preferences 清理。
     preferences: List[Preference] = field(default_factory=list)
+    # 当前分工：动作/物料 → 谁负责；只由 LLM 的 set_division 工具写入。
+    division: DivisionState = field(default_factory=DivisionState)
     # 玩家「别管这单」：order id → 失效拍号（spec §4.6）。
     abandoned_orders: Dict[Any, int] = field(default_factory=dict)
     # 对话跨回合状态（最近回合、待播报事件等，spec §6.2）。
     dialog: DialogState = field(default_factory=DialogState)
     # 截止闸上一次抢单后的冷却结束拍（spec §4.6）。
     rescue_cooldown_until: int = 0
+    # 对话层临时命令：hold_until 之前 planner 不选任务（cancel_action 后停手）。
+    hold_until: int = 0
+    # 换布局时的换边目标（ai/space/zoning.RepositionGoal）；None = 不在窗口里。
+    reposition: Any = None
+    # 最近一帧的区域判定（ai/space/zoning.ZoneReport），给复核事件/trace 用。
+    zones: Any = None
+    # 当前命令的 task scope / id；planner 只在这个 scope 内选任务。
+    command_scope: Any = None
+    command_id: Optional[str] = None
 
     # ---------- 认领 ----------
     def claim(self, resource_id, action, owner, order_id, tick,

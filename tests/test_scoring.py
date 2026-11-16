@@ -1,11 +1,10 @@
 """打分权重完整集测试（Task 4）。
 
-重点验证 Plan 4 新增的 5 项权重：
+重点验证 Plan 4 新增的 4 项权重：
   1. 异步资源优先：FetchToCooker > FetchToPlate
   2. 完成度：盘里食材越接近完成优先级越高
-  3. 食材复用：一次取料满足多个订单
-  4. Combo 延续：连续送同类菜加分
-  5. 截止前瞻：会导致烧糊/超时的 task 惩罚
+  3. Combo 延续：连续送同类菜加分
+  4. 截止前瞻：会导致烧糊/超时的 task 惩罚
 """
 import pytest
 from ai.core import planner
@@ -166,102 +165,6 @@ def test_completion_bonus_beats_urgency_spread_at_two_thirds():
     assert gap > 0.5, gap
 
 
-def test_ingredient_reuse_bonus_when_multiple_orders_need_same():
-    """食材复用：取一次黄瓜同时满足两个订单，加成。"""
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Salad", "remaining": 25, "composition": ["Cucumber"]},
-            {"id": "order2", "name": "Salad", "remaining": 28, "composition": ["Cucumber"]}
-        ],
-        stations=[
-            {"t": "plate", "n": "plate1", "item": [], "gx": 3, "gz": 3},
-            {"t": "plate", "n": "plate2", "item": [], "gx": 4, "gz": 4}
-        ]
-    )
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-    bb.plate_assignments = {"order1": ("plate1",), "order2": ("plate2",)}
-
-    # 候选：取黄瓜（可复用，满足 2 个订单）
-    cand = planner.Candidate(
-        task=T.FetchToBoard("order1", ("board1",), "Cucumber"),
-        preconditions=[],
-        estimated_steps=10
-    )
-
-    score, terms = planner._score_candidate(world, bb, cand)
-
-    # 断言：有复用加成
-    assert "ingredient_reuse" in terms
-    assert terms["ingredient_reuse"] > 0, "复用食材应有加成"
-
-
-def test_ingredient_reuse_excludes_plates_already_holding_it():
-    """已经放了该料的盘不该再计入复用（实机 trace-20261014-011202）。
-
-    根因：旧实现读 `plate["item"]`——帧里的字段叫 `contents`，于是"盘已有
-    该料"永不成立，Seaweed 的 reuse 恒等于「所有要海苔的订单数」，拿满
-    2.0 分压过 FetchToCooker 的异步 2.0 分。实测后果：4 个盘挨个摆海苔，
-    锅一直空着（trace t=800/1000/1230 海苔 1.05 恒压米饭 0.90）。
-    """
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Sushi", "remaining": 25,
-             "composition": ["Seaweed"]},
-            {"id": "order2", "name": "Sushi", "remaining": 28,
-             "composition": ["Seaweed"]},
-        ],
-    )
-    # 两只盘都已经摆好海苔 → 复用计数应为 0
-    world.plates = [
-        {"n": "plate1", "x": 6.0, "z": 6.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-        {"n": "plate2", "x": 7.0, "z": 7.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-    ]
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-
-    count = planner._ingredient_reuse_count(
-        T.FetchToPlate("order1", ("plate1",), "Seaweed"), world, bb,
-        plate_match={"plate1": "order1", "plate2": "order2"})
-    assert count == 0, "两只盘都已有海苔，不该再算复用"
-
-
-def test_ingredient_reuse_counts_only_plates_still_lacking():
-    """一只盘已有、一只盘还缺 → 复用计数为 1（不足以拿加成）。"""
-    world = _make_test_world(
-        orders=[
-            {"id": "order1", "name": "Sushi", "remaining": 25,
-             "composition": ["Seaweed"]},
-            {"id": "order2", "name": "Sushi", "remaining": 28,
-             "composition": ["Seaweed"]},
-        ],
-    )
-    world.plates = [
-        {"n": "plate1", "x": 6.0, "z": 6.0, "count": 1,
-         "contents": ["Seaweed"], "detail": ["ing:Seaweed"]},
-        {"n": "plate2", "x": 7.0, "z": 7.0, "count": 0,
-         "contents": [], "detail": []},
-    ]
-    world.tick = 30
-
-    bb = Blackboard()
-    bb.tick = 30
-    bb.commitment = Commitment()
-
-    count = planner._ingredient_reuse_count(
-        T.FetchToPlate("order2", ("plate2",), "Seaweed"), world, bb,
-        plate_match={"plate1": "order1", "plate2": "order2"})
-    assert count == 1, "只剩一只盘缺海苔"
-
-
 def test_wash_plate_tree_faces_the_sink_stack():
     """洗盘的取脏盘步必须转身（face=True）、目标必须带坐标。
 
@@ -283,9 +186,11 @@ def test_wash_plate_tree_faces_the_sink_stack():
     tree = T.WashPlate(resources=("WashingPart",)).build()
     seq = tree.child
     assert isinstance(seq, Sequence)
-    sel = seq.children[0]
+    assert isinstance(seq.children[0], PR.EnsureHandsFree)
+    sel = seq.children[1]
     assert isinstance(sel, Selector)
-    pickup = sel.children[0].children[0]
+    # 第 0 支是「手里已有脏盘 → 直接放池子」；取脏盘的是第 1 支
+    pickup = sel.children[1].children[0]
     assert isinstance(pickup, PR.InteractWith)
     assert pickup._face is not None, \
         "脏盘摞是固定站点，不转身则 pickup 句柄永远为 null"
@@ -311,7 +216,7 @@ def test_wash_plate_dirty_target_prefers_station_with_grid():
     world.items = [{"n": "DirtyPlateStack", "x": 13.2, "z": -12.0}]
 
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].children[0].children[0].target
+    dirty = tree.child.children[1].children[1].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     got = dirty(ctx)
     assert got is not None
@@ -328,7 +233,7 @@ def test_wash_plate_dirty_target_none_when_no_dirty_stack():
                    "gx": -1, "gz": -5, "x": 13.2, "z": -12.0}])
     world.items = []
     tree = T.WashPlate(resources=("WashingPart",)).build()
-    dirty = tree.child.children[0].children[0].children[0].target
+    dirty = tree.child.children[1].children[1].children[0].target
     ctx = {"w": world, "book": RecipeBook(world.recipes, world.stations)}
     assert dirty(ctx) is None
 
@@ -366,10 +271,38 @@ def test_combo_bonus_goes_to_the_queue_head_order():
     assert terms["combo_break"] == 0.0
 
 
+def test_send_across_plated_dish_gets_delivery_combo_score():
+    """跨区送成品盘（SendAcross plated_dish）与 DeliverPlate 一样吃 combo 队首分。
+
+    送餐打分里 `is_deliver` 若只认 DeliverPlate，SendAcross(plated_dish) 的
+    combo_head/combo_break 恒 0——在 Rapids 这类出餐口在对岸的关卡，真正的
+    送餐永远 0 分、排不过备菜，成品盘堆在手里。
+    """
+    world = _make_test_world(
+        orders=[{"id": "1", "dish": "Chips", "remaining": 30,
+                 "composition": ["FriedChips"]}],
+        stations=[])
+    world.tick = 200
+
+    bb = Blackboard()
+    bb.tick = 200
+    bb.commitment = Commitment()
+
+    cand = planner.Candidate(
+        task=T.SendAcross("1", ("-20216", "conveyor"), "plated_dish"),
+        preconditions=[],
+        estimated_steps=5)
+
+    score, terms = planner._score_candidate(world, bb, cand)
+
+    assert terms["combo_head"] > 0, "送队首的成品盘应有 combo 加成"
+    assert terms["combo_break"] == 0.0
+
+
 def test_deadline_penalty_when_cooker_will_burn():
     """截止前瞻：启动任务后会导致锅烧糊，惩罚。
 
-    字段语义按真实帧（trace-20261014-011202 实测）：
+    字段语义按真实帧实测：
       - `cooking_time` 是**常量容量**（这关恒为 12），不是已耗时；
       - `cooking_progress` 是进度，单位≈秒（实测 1.07/秒）；
       - 熟点 = progress 达到 cooking_time，糊点 = 2×cooking_time。
@@ -414,7 +347,7 @@ def test_burn_eta_reads_progress_not_cooking_time():
 
     但真实帧里 `cooking_time` 是常量容量（这关恒 12），于是它算出的
     "距烧糊时间" 恒为常数，与锅的真实进度无关——这条前瞻实际从未按进度
-    触发过（trace-20261014-011202：锅从 progress 16.9 一路烧到 24 着火，
+    触发过（锅从 progress 16.9 一路烧到 24 着火，
     期间 planner 没给出任何烧糊惩罚）。
     """
     # 刚熟（progress≈ctime）→ 还有满额 12 秒 = 240 拍
@@ -475,32 +408,6 @@ def test_no_deadline_penalty_when_safe():
     assert "deadline_lookahead" not in terms or terms["deadline_lookahead"] == 0
 
 
-def test_deliver_plate_hand_penalty_uses_pickup_not_clear():
-    """holding_plated_dish 的"手不对"是去捡盘，不是腾手，代价应更小。
-
-    实机：DeliverPlate 被 HAND_CLEAR_STEPS(10) 惩罚压着，做好的盘送不出去，
-    反而去 FetchToBoard 取生料。
-    """
-    world = _make_test_world(
-        orders=[{"id": "order1", "name": "Sushi", "remaining": 30,
-                 "composition": ["Seaweed"]}]
-    )
-    world.chefs[1]["held"] = None   # P2 空手
-
-    bb = Blackboard()
-    bb.tick = 0
-    bb.commitment = Commitment()
-
-    cand = planner.Candidate(
-        task=T.DeliverPlate("order1", ("p1",)),
-        preconditions=["holding_plated_dish"],
-        estimated_steps=5,
-    )
-
-    score, terms = planner._score_candidate(world, bb, cand)
-    assert terms["hands"] == -(planner.W_ETA * planner.HAND_PICKUP_STEPS)
-
-
 def test_all_weights_integrated():
     """综合测试：所有权重都参与打分。"""
     world = _make_test_world(
@@ -520,18 +427,23 @@ def test_all_weights_integrated():
 
     score, terms = planner._score_candidate(world, bb, cand)
 
-    # 断言：基础 3 项存在
+    # 断言：基础 2 项存在
     assert "urgency" in terms
     assert "pressure" in terms
-    assert "eta" in terms
 
     # 断言：总分是所有项的和（验证公式完整性）
     expected_total = sum(terms.values())
     assert abs(score - expected_total) < 0.01, f"总分({score})应等于各项之和({expected_total})"
 
 
-def test_deliver_plate_gets_delivery_bonus_and_outranks_prep():
-    """送餐优先：料齐盘的 DeliverPlate 应有 deliver_bonus，压过备菜候选。"""
+def test_deliver_plate_outranks_prep_by_layer_not_bonus():
+    """送餐优先由层序保证：DeliverPlate 在 L3，备菜在 L6。
+
+    分层后不再给 DeliverPlate 加常数额外加分——L3 全是送餐，
+    给每个候选加同一个常数不改变任何排序。
+    """
+    from ai.core import planner_layers as PL
+
     world = _make_test_world(
         orders=[{"id": "order1", "name": "Sushi", "remaining": 30,
                  "composition": ["BoiledSushiRice", "SushiFish"]}],
@@ -554,12 +466,11 @@ def test_deliver_plate_gets_delivery_bonus_and_outranks_prep():
         estimated_steps=15,
     )
 
-    s_deliver, terms = planner._score_candidate(world, bb, deliver)
-    s_prep, _ = planner._score_candidate(world, bb, prep)
+    _, terms = planner._score_candidate(world, bb, deliver)
 
-    assert "deliver_bonus" in terms
-    assert terms["deliver_bonus"] > 0
-    assert s_deliver > s_prep, f"DeliverPlate({s_deliver}) 应高于备菜({s_prep})"
+    assert "deliver_bonus" not in terms
+    assert PL.layer_of_task(deliver.task, world) == PL.L_REDEEM
+    assert PL.layer_of_task(prep.task, world) == PL.L_PREP
 
 
 def test_wash_plate_gets_pressure_scaled_by_clean_plate_count():
@@ -612,3 +523,62 @@ def test_async_resource_suppressed_when_order_has_no_plate():
     # 盘↔订单匹配里没有 order1（没盘）→ 不给 async
     _, terms2 = planner._score_candidate(world, bb, cand, plate_match={})
     assert terms2["async_resource"] == 0.0
+
+
+# ---------------------------------------------------------------- 异步资源：进灶才给
+
+
+def _cook_chain_world():
+    """一张 PanFriedFish+BoiledPasta 单（鱼要切再下平底锅），一张寿司鱼单（切完直接装盘）。"""
+    world = _make_test_world(orders=[
+        {"id": "1", "dish": "FishPasta", "remaining": 120,
+         "composition": ["BoiledPasta", "PanFriedFish"]},
+        {"id": "2", "dish": "Sushi_PlainFish", "remaining": 120,
+         "composition": ["SushiFish"]},
+    ])
+    world.recipes = [
+        {"name": "BoiledPasta", "comp": ["Pasta"], "cook": "Pot"},
+        {"name": "PanFriedFish", "comp": ["UncookedFish"], "cook": "FryingPan"},
+        {"name": "UncookedFish", "comp": [], "cook": "null",
+         "chop": "ChoppedFish", "chop_stages": "8"},
+        {"name": "SushiFish", "comp": [], "cook": "null",
+         "chop": "ChoppedSushiFish", "chop_stages": "8"},
+    ]
+    return world
+
+
+def _async_term(world, task):
+    from ai.query.recipes import RecipeBook
+    bb = Blackboard()
+    bb.commitment = Commitment()
+    book = RecipeBook(world.recipes, world.stations)
+    cand = planner.Candidate(task=task, preconditions=[], estimated_steps=10)
+    _, terms = planner._score_candidate(world, bb, cand, book)
+    return terms["async_resource"]
+
+
+def test_async_resource_given_to_board_fetch_that_feeds_cooker():
+    """取鱼上砧板：鱼切完要下平底锅，整条链进灶 → 与下锅同吃异步加分。
+
+    旧判据按类型名只认 FetchToCooker/Chop，意面（取料即下锅）第一步吃 +2、
+    肉/鱼/虾第一步 FetchToBoard 吃不到，一直被意面压着（trace-20261029-213506）。
+    """
+    world = _cook_chain_world()
+    assert _async_term(world, T.FetchToBoard("1", ("board",), "UncookedFish")) > 0
+    assert _async_term(world, T.Chop("1", ("board",), "UncookedFish")) > 0
+    assert _async_term(world, T.FetchToCooker("1", ("cooker",), "BoiledPasta")) > 0
+
+
+def test_async_resource_not_given_to_chop_that_skips_cooker():
+    """寿司鱼切完直接装盘、不进灶：切配本身不是异步的（有人切才推进），不给。"""
+    world = _cook_chain_world()
+    assert _async_term(world, T.FetchToBoard("2", ("board",), "SushiFish")) == 0.0
+    assert _async_term(world, T.Chop("2", ("board",), "SushiFish")) == 0.0
+
+
+def test_feeds_cooker_without_book_keeps_legacy_types():
+    """无配方书的调用方保持旧语义：FetchToCooker / Chop 是，FetchToBoard 不是。"""
+    world = _cook_chain_world()
+    assert planner._feeds_cooker(T.FetchToCooker("1", ("c",), "BoiledPasta"), world)
+    assert planner._feeds_cooker(T.Chop("1", ("b",), "UncookedFish"), world)
+    assert not planner._feeds_cooker(T.FetchToBoard("1", ("b",), "UncookedFish"), world)

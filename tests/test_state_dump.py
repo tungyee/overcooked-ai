@@ -56,6 +56,24 @@ def test_snapshot_is_json_serializable():
     json.dumps(snap, ensure_ascii=False)
 
 
+def test_snapshot_includes_held_items():
+    w = _world()
+    w.held_items = [{"n": "Tortilla", "held_by": "Player 2",
+                     "detail": ["CookedCompositeAssembledNode(FryingPan){ ing:BurritoMeat }"]}]
+    snap = snapshot(w)
+    assert snap["held_items"] == w.held_items
+    assert snap["held_items"][0] is not w.held_items[0]
+
+
+def test_snapshot_includes_held_extinguishers():
+    w = _world()
+    w.held_extinguishers = [{"n": "ext_02", "held_by": "Player 1",
+                             "x": 3.0, "z": 4.0}]
+    snap = snapshot(w)
+    assert snap["held_extinguishers"] == w.held_extinguishers
+    assert snap["held_extinguishers"][0] is not w.held_extinguishers[0]
+
+
 def test_snapshot_preserves_held_plate_identity():
     w = _world()
     w.held_plates = [{"n": "bound-plate", "name": "equipment_plate_01",
@@ -138,6 +156,28 @@ def test_snapshot_map_includes_terrain_and_occupancy():
     ]
 
 
+def test_snapshot_map_passes_walk_probe_through():
+    """插件 walk_probe 诊断原样落进 map，旧帧缺字段时为 None。"""
+    probe = {"ms": 1.2, "ox": 0.0, "oz": 0.0, "cell": 1.2, "sub": 3,
+             "chefs": [], "blockers": []}
+    assert snapshot(World({"grid": {"nodeMap": None}, "walk_probe": probe}))["map"]["walk_probe"] == probe
+    assert snapshot(World({"grid": {"nodeMap": None}}))["map"]["walk_probe"] is None
+
+
+def test_snapshot_map_passes_portals_and_teleports_through():
+    """传送门参数与传送事件原样落进 map（Wizard_5_5 复盘「料有没有过门」），旧帧为空表。"""
+    portals = [{"id": "Portal#1", "exit": "Portal#2", "arc_deg": 90,
+                "center": [8.4, -1.9, 2.5], "item_sender": True}]
+    teleports = [{"seq": 1, "phase": "start", "kind": "item", "obj": "Meat",
+                  "pos": [8.4, -2.4, 2.6], "portal": "Portal#1", "was_flying": True}]
+    snap = snapshot(World({"grid": {"nodeMap": None},
+                           "portals": portals, "teleports": teleports}))
+    assert snap["map"]["portals"] == portals
+    assert snap["map"]["teleports"] == teleports
+    old = snapshot(World({"grid": {"nodeMap": None}}))["map"]
+    assert old["portals"] == [] and old["teleports"] == []
+
+
 def test_snapshot_keeps_recipe_chop_fields():
     """配方自带的切配信息要进 trace：回放从 trace 重建 RecipeBook 时，传送带
     供料、无箱子的食材（1-6 的鱼）才不会被当成不用切。旧帧没有就不写。"""
@@ -145,10 +185,11 @@ def test_snapshot_keeps_recipe_chop_fields():
     from ai.state.world import World
     world = World({"phase": "level", "recipes": [
         {"name": "SushiFish", "comp": [], "cook": "null",
-         "chop": "ChoppedSushiFish", "chop_stages": 8},
+         "chop": "ChoppedSushiFish", "chop_stages": 8, "chop_node": "SushiFish"},
         {"name": "Seaweed", "comp": [], "cook": "null"},
     ]})
     recipes = state_dump.snapshot(world)["recipes"]
     assert recipes[0]["chop"] == "ChoppedSushiFish"
     assert recipes[0]["chop_stages"] == 8
-    assert "chop" not in recipes[1]
+    assert recipes[0]["chop_node"] == "SushiFish"
+    assert "chop" not in recipes[1] and "chop_node" not in recipes[1]

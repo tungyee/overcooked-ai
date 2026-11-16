@@ -11,8 +11,9 @@ from ai.query import predicates as P
 from ai import primitives as PR
 from ai.exec.bt import Node, Sequence
 from ai.tasks.base import (TASK_TIMEOUT_TICKS, Task, _grid_matches, _register,
-                           _unpack_resource_id, ingredient_available,
-                           ingredient_source)
+                           _unpack_resource_id, conveyor_pickup,
+                           ingredient_available, ingredient_source,
+                           loose_on_station)
 
 
 def _mix_station(ctx, station_id):
@@ -40,7 +41,7 @@ class Mix(Task):
     """
 
     TYPE = "Mix"
-    # 给对话层 LLM 看的一句话说明（ai/dialog/duties.py 渲染 DAG 时带出）。
+    # 给对话层 LLM 看的一句话说明（ai/dialog/catalog.py 渲染 DAG 时带出）。
     DESC = "把几种料装进拌料容器里拌"
     LABEL = "拌"
     PROCESS = "拌"
@@ -108,9 +109,12 @@ class Mix(Task):
             first = comps[0]
             steps.append(PR.EnsureHandsFree(keep=lambda c: holding(c, first)))
             for comp in comps:
-                steps.append(PR.InteractWith(
-                    lambda c, comp=comp: src(c, comp), "pickup",
-                    lambda c, comp=comp: holding(c, comp)))
+                steps.append(conveyor_pickup(
+                    resolve=lambda c, comp=comp: src(c, comp),
+                    held=lambda c, comp=comp: holding(c, comp),
+                    arrived=lambda c, seg, comp=comp: loose_on_station(
+                        c["w"], c["book"].cook_input_form(comp), seg),
+                    face=True))
                 steps.append(PR.InteractWith(
                     lambda c: _mix_station(c, station_id), "placement",
                     lambda c: _mix_station(c, station_id) is not None))

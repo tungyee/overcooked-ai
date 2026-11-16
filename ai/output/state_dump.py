@@ -33,6 +33,8 @@ def snapshot(world):
     raw = getattr(world, "raw", None) or {}
     return {
         "level": getattr(world, "level", None),
+        # 主线 UI 编号（"4-1"）；trace 回放时攻略解析也按它优先。
+        "level_number": getattr(world, "level_number", None),
         "phase": getattr(world, "phase", None),
         "paused": bool(getattr(world, "paused", False)),
         "plugin_version": raw.get('plugin_version'),
@@ -41,6 +43,8 @@ def snapshot(world):
         "scene_epoch": raw.get('scene_epoch'),
         "score": raw.get("score"),
         "timer": raw.get("timer"),
+        # 插件关卡时钟（门洞时间表 seam_clock 的时基）
+        "level_time": raw.get("level_time"),
         "chefs": [_chef(world, c) for c in (getattr(world, "chefs", None) or [])],
         "orders": [_copy(o) for o in (getattr(world, "orders", None) or [])],
         "plates": [_copy(p) for p in (getattr(world, "plates", None) or [])],
@@ -48,10 +52,18 @@ def snapshot(world):
         "workstations": [_copy(s) for s in (getattr(world, "workstations", None) or [])],
         "cookers": [_copy(c) for c in (getattr(world, "cookers", None) or [])],
         "items": [_copy(i) for i in (getattr(world, "items", None) or [])],
+        # 手持物（带 held_by）：手里那件装着什么（包肉的卷饼）只有这里看得到
+        "held_items": [_copy(i) for i in (getattr(world, "held_items", None) or [])],
         "extinguishers": [_copy(e) for e in (getattr(world, "extinguishers", None) or [])],
+        # 手持灭火器单列，供离线回放重建 held_extinguishers（同 held_plates /
+        # held_items 的回放口径，见 ai/state/world.py 对应合并逻辑）。
+        "held_extinguishers": [_copy(e) for e in (getattr(world, "held_extinguishers", None) or [])],
         "stations": [_copy(s) for s in (getattr(world, "stations", None) or [])],
         "recipes": [_recipe(r) for r in (getattr(world, "recipes", None) or [])],
         "map": _map(world),
+        # 4-1 过街状态（road/lights/cars）；其它关卡为 {}。离线复盘看灯/车
+        # 与 trace.traffic.wait/hold 必须能对上，所以原样落盘。
+        "traffic": getattr(world, "traffic", None) or {},
     }
 
 
@@ -96,7 +108,8 @@ def _recipe(r):
     # 切配跟着食材走（插件 0.19+ 随配方下发）：回放从 trace 重建 RecipeBook
     # 时少了它，传送带供料、无箱子的食材会被当成不用切。旧帧没有就不写，
     # 让 RecipeBook 照旧退回箱子。
-    for key in ("chop", "chop_stages"):
+    # chop_node（插件 0.23+）：切好产物的配方节点，鱼 ChoppedFish → UncookedFish。
+    for key in ("chop", "chop_stages", "chop_node"):
         if key in r:
             out[key] = r.get(key)
     return out
@@ -120,6 +133,7 @@ def _map(world):
     """
     belt_cells = getattr(world, "belt_cells", None) or set()
     belt_dir = getattr(world, "belt_dir", None) or {}
+    belt_speed = getattr(world, "belt_speed", None) or {}
     hazards = getattr(world, "hazards", None) or []
     chefs = getattr(world, "chefs", None) or []
     p2 = P.chef_by_name(chefs, P.P2_NAME)
@@ -144,10 +158,17 @@ def _map(world):
         "terrain": raw.get("terrain") or [],
         "occupancy": raw.get("occupancy") or [],
         "level_bounds": raw.get('level_bounds'),
+        # 插件可走性物理诊断（会动网格关卡才有，其余为 None）：逐子点掩码 +
+        # 阻挡体明细，离线用 tools/walk_probe_report.py 对照 terrain 判定。
+        "walk_probe": raw.get('walk_probe'),
         "belts": raw.get('belts') or [],
         "wind_zones": raw.get('wind_zones') or [],
+        # 传送门参数/动态态 + 最近传送事件（插件 Oc2Portals.cs），原样透传
+        "portals": raw.get('portals') or [],
+        "teleports": raw.get('teleports') or [],
         "belt_cells": sorted([list(c) for c in belt_cells]),
         "belt_dir": _belt_dir(belt_dir),
+        "belt_speed": _belt_speed(belt_speed),
         "p2_cell": _chef_cell(world, p2) if p2 else None,
         "p1_cell": _chef_cell(world, p1) if p1 else None,
     }
@@ -163,4 +184,17 @@ def _belt_dir(belt_dir):
         else:
             key = str(cell)
         out[key] = list(d) if isinstance(d, (tuple, list)) else d
+    return out
+
+
+def _belt_speed(belt_speed):
+    # type: (Dict) -> Dict
+    """传送带速度表：{(gx,gz): |v|} → {"gx,gz": |v|}（复盘 4-3 快带用）。"""
+    out = {}
+    for cell, s in belt_speed.items():
+        if isinstance(cell, tuple) and len(cell) == 2:
+            key = "%d,%d" % (cell[0], cell[1])
+        else:
+            key = str(cell)
+        out[key] = s
     return out

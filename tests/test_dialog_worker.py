@@ -14,8 +14,16 @@ import pytest
 
 from ai.dialog import worker as worker_mod
 from ai.dialog.llm import LLMReply, ToolCall
+from ai.dialog.tools import tool_schemas
 from ai.dialog.schema import VoiceConfig
 from ai.dialog.worker import DialogClients, DialogWorker, DutyBatch
+
+
+def test_xml_tool_call_speak_text_is_extracted():
+    content = ("<tool_call><function=speak><parameter=text>"
+               "这关我负责左边，你管右边。</parameter></function></tool_call>")
+    assert worker_mod._xml_speak_text(content) == "这关我负责左边，你管右边。"
+    assert worker_mod._xml_speak_text("普通文本") == ""
 
 
 def make_config():
@@ -43,14 +51,10 @@ def reply(content="", *calls):
         for i, (name, args) in enumerate(calls)])
 
 
-def duty(**args):
-    return ("update_duties", args)
-
-
 class FakeLLM(object):
     """记录每次 chat 的 messages / tools / tool_choice；按顺序返回预设回复。
 
-    两段式：有工具调用的回合会请求两次，第二次 tool_choice="none"。
+    多轮：工具调用之后会继续请求，直到模型不再调用或给出最终文本。
     """
 
     def __init__(self, *replies, error=None):
@@ -275,7 +279,7 @@ def wait_until(predicate, timeout=2.0):
 
 # ------------------------------------------------------- speech pipeline
 
-TOOLS = [{"type": "function", "function": {"name": "update_duties"}}]
+TOOLS_NEW = tool_schemas()
 
 
 def ack_for(bundle, results):
@@ -284,20 +288,21 @@ def ack_for(bundle, results):
     return batch
 
 
-def test_speech_two_pass_speaks_final_reply_after_tool_results():
+def test_action_then_final_reply_after_tool_results():
     llm = FakeLLM(
         reply("我先答应一下。",
-              duty(op="add", mode="leave_to_p1", target="Cucumber")),
+              ("execute_actions", {"actions": [
+                  {"action": "chop", "target": "Cucumber"}]})),
         reply("行，切菜你来。"))
     worker, bundle = make_worker(llm=llm)
 
     thread = run_async(worker._handle_transcript, "我来切",
-                       {"tick": 100, "tools": TOOLS})
+                       {"tick": 100, "tools": TOOLS_NEW})
     batch = bundle.cmd_q.get(timeout=2)
 
     assert isinstance(batch, DutyBatch)
-    assert batch.calls == [("update_duties", {
-        "op": "add", "mode": "leave_to_p1", "target": "Cucumber"})]
+    assert batch.calls == [("execute_actions", {"actions": [
+        {"action": "chop", "target": "Cucumber"}]})]
     assert batch.source == "我来切"
 
     bundle.ack_q.put({"batch_id": batch.batch_id,
@@ -305,11 +310,11 @@ def test_speech_two_pass_speaks_final_reply_after_tool_results():
     thread.join(2)
 
     assert not thread.is_alive()
-    # 第一段 text 现在也流式播，第二段紧随其后
-    assert bundle.tts.spoken == ["我先答应一下。", "行，切菜你来。"]
-    assert llm.choices == ["auto", "none"]
-    assert llm.calls[0][1] == TOOLS and llm.calls[1][1] == TOOLS
-    # 第二段看得到工具结果
+    # 有动作时只播最终那句，第一段"先答应"不播（避免先出口后改口）
+    assert bundle.tts.spoken == ["行，切菜你来。"]
+    assert llm.choices == ["auto", "auto"]
+    assert llm.calls[0][1] == TOOLS_NEW and llm.calls[1][1] == TOOLS_NEW
+    # 下一轮看得到工具结果
     second = llm.calls[1][0]
     assert second[-1]["role"] == "tool"
     assert json.loads(second[-1]["content"]) == {"ok": True, "id": "a1"}
@@ -317,23 +322,22 @@ def test_speech_two_pass_speaks_final_reply_after_tool_results():
     assert bundle.vad.paused is False
 
 
-def test_rejection_reaches_second_pass_and_history():
-    llm = FakeLLM(reply("", duty(op="add", mode="do", target="WashPlate")),
-                  reply("这关没洗碗池，我洗不了。"))
+def test_rejection_is_fed_back_and_final_reply_is_spoken():
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [
+            {"action": "wash", "target": "Plate"}]})),
+        reply("这关没洗碗池，我洗不了。"))
     worker, bundle = make_worker(llm=llm)
 
-    thread = run_async(worker._handle_transcript, "你去洗盘", {"tick": 100})
+    thread = run_async(worker._handle_transcript, "你去洗盘",
+                       {"tick": 100, "tools": TOOLS_NEW})
     ack_for(bundle, [{"ok": False, "reason": "本关没有洗碗池"}])
     thread.join(2)
 
     assert "本关没有洗碗池" in llm.calls[1][0][-1]["content"]
-    roles = [m["role"] for m in worker.state.history]
-    assert roles == ["user", "assistant", "tool", "assistant"]
-    assert worker.state.history[0]["content"] == "你去洗盘"
-    assert worker.state.history[1]["content"] == ""
-    assert worker.state.history[1]["tool_calls"][0]["id"] == "call_0"
-    assert worker.state.history[3] == {"role": "assistant",
-                                       "content": "这关没洗碗池，我洗不了。"}
+    assert worker.state.history[0] == {"role": "user", "content": "你去洗盘"}
+    assert any(m.get("content") == "这关没洗碗池，我洗不了。"
+               for m in worker.state.history)
     assert bundle.tts.spoken == ["这关没洗碗池，我洗不了。"]
 
 
@@ -360,11 +364,14 @@ def test_world_state_is_system_message_not_in_history():
 
 def test_ack_timeout_reported_to_second_pass(monkeypatch):
     monkeypatch.setattr(worker_mod, "ACK_TIMEOUT_S", 0.05)
-    llm = FakeLLM(reply("", duty(op="add", mode="do", target="Cucumber")),
-                  reply("刚才没记上，再说一次？"))
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})),
+        reply("刚才没记上，再说一次？"))
     worker, bundle = make_worker(llm=llm)
 
-    thread = run_async(worker._handle_transcript, "你去切", {"tick": 100})
+    thread = run_async(worker._handle_transcript, "你去切",
+                       {"tick": 100, "tools": TOOLS_NEW})
     bundle.cmd_q.get(timeout=2)
     thread.join(2)
 
@@ -373,28 +380,11 @@ def test_ack_timeout_reported_to_second_pass(monkeypatch):
     assert bundle.tts.spoken == ["刚才没记上，再说一次？"]
 
 
-def test_second_pass_failure_falls_back_to_result_template():
-    class FlakyLLM(FakeLLM):
-        def chat(self, messages, tools=None, tool_choice="auto", on_text=None):
-            if tool_choice == "none":
-                raise RuntimeError("timeout")
-            return FakeLLM.chat(self, messages, tools, tool_choice, on_text)
-
-    llm = FlakyLLM(reply("", duty(op="add", mode="do", target="Cucumber")))
-    worker, bundle = make_worker(llm=llm)
-
-    thread = run_async(worker._handle_transcript, "你去切", {"tick": 100})
-    ack_for(bundle, [{"ok": True, "id": "a1"}])
-    thread.join(2)
-
-    assert bundle.tts.spoken == ["好，记下了。"]
-
-
 def test_chat_without_tools_is_single_request():
     llm = FakeLLM(reply("你好呀。"))
     worker, bundle = make_worker(llm=llm)
 
-    worker._handle_transcript("你好", {"tick": 100, "tools": TOOLS})
+    worker._handle_transcript("你好", {"tick": 100})
 
     assert bundle.cmd_q.empty()
     assert len(llm.calls) == 1
@@ -414,13 +404,12 @@ def test_empty_reply_stays_silent():
 
 def test_history_is_capped_and_never_starts_with_tool(monkeypatch):
     monkeypatch.setattr(worker_mod, "HISTORY_MAX", 5)
-    llm = FakeLLM(reply("", duty(op="add", mode="do", target="Cucumber")))
+    llm = FakeLLM(reply("", ("speak", {"text": "好"})))
     worker, bundle = make_worker(llm=llm)
 
     for index in range(3):
         thread = run_async(worker._handle_transcript, "第%d句" % index,
-                           {"tick": 100 * (index + 1)})
-        ack_for(bundle, [{"ok": True}])
+                           {"tick": 100 * (index + 1), "tools": TOOLS_NEW})
         thread.join(2)
 
     assert len(worker.state.history) <= 5
@@ -533,60 +522,6 @@ def test_speak_is_noop_after_stop():
 
 # --------------------------------------------------------------- events
 
-def test_new_order_event_waits_for_batch_window():
-    llm = FakeLLM(reply("新菜黄瓜寿司，我煮饭你切黄瓜？"))
-    worker, bundle = make_worker(llm=llm)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Cucumber"}],
-               "dish_dags": {"Sushi_Cucumber": "Sushi_Cucumber\n  └ Chop:Cucumber"},
-               "tools": TOOLS}
-
-    worker._handle_event(("new_order", [1]), context)
-    assert llm.calls == []
-
-    worker._handle_event(("new_order", []), dict(context, tick=1020))
-    assert len(llm.calls) == 1
-    messages, tools = llm.calls[0]
-    # 新菜的 DAG 进本轮 system 消息；new_order 可直接调 update_duties
-    state = messages[-2]
-    assert state["role"] == "system"
-    assert "Chop:Cucumber" in state["content"] and "新菜" in state["content"]
-    # 事件回合没有 user 消息，只有一条事件占位
-    assert messages[-1]["role"] == "system" and "new_order" in messages[-1]["content"]
-    assert all(m["role"] != "user" for m in messages)
-    # new_order 与 speech 一样 tool_choice=auto：可以直接落账本
-    assert tools == TOOLS and llm.choices == ["auto"]
-    assert bundle.tts.spoken == ["新菜黄瓜寿司，我煮饭你切黄瓜？"]
-
-
-def test_new_order_can_write_duties_directly():
-    llm = FakeLLM(
-        reply("", duty(op="add", mode="do", target="BoiledSushiRice")),
-        reply("新菜鱼寿司，米饭我煮，海苔和鱼你来切。"))
-    worker, bundle = make_worker(llm=llm)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Fish"}],
-               "dish_dags": {"Sushi_Fish": "Sushi_Fish\n  └ Chop:SushiFish"},
-               "tools": TOOLS}
-
-    worker._handle_event(("new_order", [1]), context)
-    thread = run_async(worker._handle_event, ("new_order", []),
-                       dict(context, tick=1020))
-
-    batch = bundle.cmd_q.get(timeout=2)
-    assert isinstance(batch, DutyBatch)
-    assert batch.calls == [("update_duties", {
-        "op": "add", "mode": "do", "target": "BoiledSushiRice"})]
-    assert batch.origin == "new_order"
-    assert bundle.tts.spoken == []
-
-    bundle.ack_q.put({"batch_id": batch.batch_id,
-                      "results": [{"ok": True, "id": "a1"}]})
-    thread.join(2)
-
-    assert not thread.is_alive()
-    assert llm.choices == ["auto", "none"]
-    assert bundle.tts.spoken == ["新菜鱼寿司，米饭我煮，海苔和鱼你来切。"]
-
-
 def test_help_event_is_gone():
     worker, _ = make_worker(llm=FakeLLM(reply("好。")))
 
@@ -638,13 +573,11 @@ def test_start_after_stop_raises():
 def test_reset_state_clears_dialog_state():
     worker, _ = make_worker()
     worker.state.last_speech_tick = 9
-    worker.state.pending_orders = [1, 2]
     worker.last_proactive_tick = 50
 
     worker.reset_state()
 
     assert worker.state.last_speech_tick == 0
-    assert worker.state.pending_orders == []
     assert worker.last_proactive_tick == 0
 
 
@@ -661,7 +594,7 @@ def test_run_llm_schedules_next_checkin_after_normal_turn():
     worker, _ = make_worker(llm=FakeLLM(reply("你好呀。")))
     before = time.monotonic()
 
-    worker._handle_transcript("你好", {"tick": 100, "tools": TOOLS})
+    worker._handle_transcript("你好", {"tick": 100, "tools": TOOLS_NEW})
 
     assert worker._next_checkin_at is not None
     assert worker._next_checkin_at - before >= worker_mod.CHECKIN_MIN_S
@@ -714,64 +647,26 @@ def test_put_event_drops_oldest_when_full():
     assert bundle.event_q.empty()
 
 
-def test_thread_drains_event_queue():
-    worker, bundle = make_worker(llm=FakeLLM(reply("我来帮你。")))
-    worker.publish_context({"tick": 1000})
-    worker.start()
-
-    worker.put_event(("new_order", [1]))
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-    assert wait_until(lambda: worker.state.pending_orders == [1])
-
-    worker.publish_context({"tick": 1021})
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-
-    assert wait_until(lambda: bundle.tts.spoken == ["我来帮你。"])
-    worker.stop()
-
-
-def test_run_flushes_single_new_order_batch_after_window():
-    llm = FakeLLM(reply("新单来了。"))
-    worker, bundle = make_worker(llm=llm)
-    worker.publish_context({"tick": 100})
-    worker.start()
-
-    # 单张新单只投一次 [id]：批窗内不触发
-    worker.put_event(("new_order", [1]))
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-    assert wait_until(lambda: worker.state.pending_orders == [1])
-    assert llm.prompts == []
-
-    # 窗口过后由 worker 的周期 flush 以空 id 推进；批次 [1] 触发一次
-    worker.publish_context({"tick": 121})
-    bundle.capture.push(np.zeros(160, dtype=np.float32))
-
-    assert wait_until(lambda: len(llm.prompts) == 1)
-    assert worker.state.pending_orders == []
-    assert "新菜" in llm.prompts[0]
-    assert bundle.tts.spoken == ["新单来了。"]
-    worker.stop()
-
-
-def test_thread_transcribes_utterance_as_int16_pcm():
-    asr = FakeASR(["我来切"])
-    worker, bundle = make_worker(
-        llm=FakeLLM(reply("行，你切。")), asr=asr)
-    bundle.vad.events = ["start", "end"]
-    worker.publish_context({"tick": 1000})
-    worker.start()
-
-    loud = np.full(160, 0.5, dtype=np.float32)
-    bundle.capture.push(loud)
-    assert wait_until(lambda: bundle.vad.fed >= 1)
-    bundle.capture.push(loud)
-
-    assert wait_until(lambda: bundle.tts.spoken == ["行，你切。"])
-    assert len(asr.calls) == 1
-    # 两帧 × 160 个 float32 样本 → 320 个 int16 样本 = 640 字节
-    assert len(asr.calls[0]) == 640
-    assert np.frombuffer(asr.calls[0], dtype="<i2")[0] == 16383
-    worker.stop()
+# VAD 自动切句已停用，此用例依赖 VAD 检测循环，暂时注释。
+# def test_thread_transcribes_utterance_as_int16_pcm():
+#     asr = FakeASR(["我来切"])
+#     worker, bundle = make_worker(
+#         llm=FakeLLM(reply("行，你切。")), asr=asr)
+#     bundle.vad.events = ["start", "end"]
+#     worker.publish_context({"tick": 1000})
+#     worker.start()
+#
+#     loud = np.full(160, 0.5, dtype=np.float32)
+#     bundle.capture.push(loud)
+#     assert wait_until(lambda: bundle.vad.fed >= 1)
+#     bundle.capture.push(loud)
+#
+#     assert wait_until(lambda: bundle.tts.spoken == ["行，你切。"])
+#     assert len(asr.calls) == 1
+#     # 两帧 × 160 个 float32 样本 → 320 个 int16 样本 = 640 字节
+#     assert len(asr.calls[0]) == 640
+#     assert np.frombuffer(asr.calls[0], dtype="<i2")[0] == 16383
+#     worker.stop()
 
 
 def test_ptt_records_while_held_and_sends_on_release():
@@ -975,17 +870,20 @@ def test_debug_sets_ai_dialog_logger_debug_and_adds_handler_once():
 
 def test_debug_logging_emits_pipeline_content(caplog):
     caplog.set_level(logging.DEBUG, logger="ai.dialog")
-    llm = FakeLLM(reply("", duty(op="add", mode="leave_to_p1", target="Cucumber")),
-                  reply("行，你切。"))
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})),
+        reply("行，你切。"))
     worker, bundle = make_worker(llm=llm)
 
-    thread = run_async(worker._handle_transcript, "我来切", {"tick": 100})
+    thread = run_async(worker._handle_transcript, "我来切",
+                       {"tick": 100, "tools": TOOLS_NEW})
     ack_for(bundle, [{"ok": True, "id": "a1"}])
     thread.join(2)
 
     text = caplog.text
     assert "ASR" in text and "我来切" in text
-    assert "LLM 回复" in text and "update_duties" in text
+    assert "LLM 回复" in text and "execute_actions" in text
     assert "播报" in text and "行，你切。" in text
 
 
@@ -1041,49 +939,20 @@ def test_turn_latency_logs_asr_llm_tts_and_audio(tmp_path):
     assert latency["outcome"] == "ok"
 
 
-def test_new_order_latency_includes_level_and_merge_window(tmp_path):
-    log_path = tmp_path / "voice-new-order.jsonl"
-    config = make_config()
-    config.log_path = str(log_path)
-    worker, _bundle = make_worker(
-        llm=TimedLLM(reply("新单来了，我煮饭。")), config=config)
-    context = {"tick": 1000, "orders": [{"id": 1, "dish": "Sushi_Cucumber"}],
-               "tools": TOOLS}
-
-    worker.start()
-    try:
-        worker.log_event("level_start", level="Sushi_1_4_2P")
-        time.sleep(0.01)
-        worker._handle_event(("new_order", [1]), context)
-        worker._handle_event(("new_order", []), dict(context, tick=1020))
-    finally:
-        worker.stop()
-
-    latency = next(r for r in _log_records(log_path)
-                   if r["kind"] == "turn_latency")
-    assert latency["event"] == "new_order"
-    assert latency["source"] == "event"
-    assert latency["since_level_ms"] >= 10
-    # 事件回合没有 ASR/音频时长，但 LLM/TTS/出声都要有。
-    assert latency["asr_ms"] is None
-    assert latency["llm_first_token_ms"] is not None
-    assert latency["tts_first_chunk_ms"] is not None
-    assert latency["first_audio_ms"] is not None
-
-
 def test_tool_ack_duration_is_logged(tmp_path):
     log_path = tmp_path / "voice-tools.jsonl"
     config = make_config()
     config.log_path = str(log_path)
     llm = TimedLLM(
-        reply("", duty(op="add", mode="do", target="Cucumber")),
+        reply("", ("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})),
         reply("行，我来切。"))
     worker, bundle = make_worker(llm=llm, config=config)
 
     worker.start()
     try:
         thread = run_async(worker._handle_transcript, "你去切",
-                           {"tick": 100, "tools": TOOLS})
+                           {"tick": 100, "tools": TOOLS_NEW})
         ack_for(bundle, [{"ok": True, "id": "a1"}])
         thread.join(2)
     finally:
@@ -1094,7 +963,7 @@ def test_tool_ack_duration_is_logged(tmp_path):
     latency = next(r for r in records if r["kind"] == "turn_latency")
     assert ack["ack_ms"] is not None and ack["ack_ms"] >= 0
     assert latency["tool_ack_ms"] is not None
-    # 两段式：第一段首 token + 工具落地 + 第二段，最终话必须已就绪。
+    # 首 token + 工具落地 + 收尾轮，最终话必须已就绪。
     assert latency["llm_first_token_ms"] is not None
     assert latency["llm_done_ms"] is not None
     assert latency["outcome"] == "ok"
@@ -1125,40 +994,6 @@ def test_speak_flushes_only_the_playback_window():
     assert capture.flushed == 0
 
 
-def test_first_checkin_defers_until_after_first_new_order():
-    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
-    worker.publish_context({"level": "Sushi_1_4_2P",
-                            "orders": [{"id": 1, "dish": "X"}],
-                            "tick": 100,
-                            "live": True})
-    worker._first_new_order_at = time.monotonic()
-    worker._next_checkin_at = time.monotonic() - 1.0
-    worker._checkins_fired = 0
-
-    worker._maybe_checkin(None, False, False)
-
-    assert worker._checkins_fired == 0
-    assert worker._next_checkin_at >= (
-        worker._first_new_order_at + worker_mod.CHECKIN_MIN_S - 0.01)
-    assert bundle.tts.spoken == []
-
-
-def test_second_checkin_is_not_deferred_by_first_new_order():
-    worker, bundle = make_worker(llm=FakeLLM(reply("局面不错。")))
-    worker.publish_context({"level": "Sushi_1_4_2P",
-                            "orders": [{"id": 1, "dish": "X"}],
-                            "tick": 100,
-                            "live": True})
-    worker._first_new_order_at = time.monotonic() - 100.0
-    worker._next_checkin_at = time.monotonic() - 1.0
-    worker._checkins_fired = 1
-
-    worker._maybe_checkin(None, False, False)
-
-    assert worker._checkins_fired == 2
-    assert bundle.tts.spoken == ["局面不错。"]
-
-
 def test_checkin_clears_schedule_when_round_finished():
     worker, bundle = make_worker(llm=FakeLLM())
     worker.publish_context({"level": "Sushi_1_4_2P",
@@ -1179,3 +1014,349 @@ def test_round_summary_does_not_schedule_next_checkin():
     worker._handle_event(("round_summary", None),
                          {"tick": 1000, "live": False, "round_finished": True})
     assert worker._next_checkin_at is None
+
+
+# ------------------------------------------------------- 新工具协议
+
+
+def test_new_protocol_execute_and_speak_in_one_turn():
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]}),
+              ("speak", {"text": "好，这就去切黄瓜"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    assert [c[0] for c in batch.calls] == ["execute_actions"]
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": True, "status": "running"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，这就去切黄瓜"]
+    assert llm.choices == ["auto"]
+
+
+def test_new_protocol_rejection_suppresses_optimistic_speak():
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]}),
+              ("speak", {"text": "好，这就去切黄瓜"})),
+        reply("", ("speak", {"text": "砧板被占了，切不了"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch1 = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch1.batch_id,
+                      "results": [{"ok": False, "reason": "砧板被占了"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["砧板被占了，切不了"]
+
+
+def test_ptt_down_stops_active_tts():
+    """最小 barge-in：PTT 按下时停掉正在播的 TTS。"""
+    worker, _bundle = make_worker()
+
+    class FakeStream(object):
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    stream = FakeStream()
+    worker._active_stream = stream
+    worker._on_ptt_event("down")
+    assert stream.stopped is True
+    worker._on_ptt_event("up")
+    assert stream.stopped is True
+
+
+def test_watchdog_logs_turn_stall(tmp_path):
+    log_path = tmp_path / "voice-stall.jsonl"
+    config = make_config()
+    config.log_path = str(log_path)
+    worker, _bundle = make_worker(config=config)
+    worker.start()
+    try:
+        worker._turn_started_at = time.monotonic() - 10
+        worker._turn_stage = "tts"
+        worker._turn_event = "speech"
+        assert wait_until(
+            lambda: any(r["kind"] == "turn_stall"
+                        for r in _log_records(log_path)),
+            timeout=4.0)
+    finally:
+        worker.stop()
+    rec = next(r for r in _log_records(log_path)
+               if r["kind"] == "turn_stall")
+    assert rec["stage"] == "tts"
+    assert rec["elapsed_ms"] >= 5000
+
+
+def test_barge_in_is_logged(tmp_path):
+    log_path = tmp_path / "voice-barge.jsonl"
+    config = make_config()
+    config.log_path = str(log_path)
+    worker, _bundle = make_worker(config=config)
+    worker._open_log()
+
+    class FakeStream(object):
+        def stop(self):
+            pass
+
+    worker._active_stream = FakeStream()
+    worker._turn_stage = "tts"
+    worker._on_ptt_event("down")
+    rec = next(r for r in _log_records(log_path)
+               if r["kind"] == "barge_in")
+    assert rec["ptt"] == "down" and rec["stage"] == "tts"
+
+
+def test_tts_wait_total_timeout_resumes_vad():
+    """TTS 生成卡住时 wait 不能拖 3×timeout，且必须恢复 VAD。"""
+    worker, bundle = make_worker()
+
+    class BlockingTTS(object):
+        def synthesize(self, text):
+            def gen():
+                yield b"\x00\x00"
+                time.sleep(5.0)          # 模拟卡住的网络流
+            return gen()
+
+    bundle.tts = BlockingTTS()
+    bundle.player.hold()
+    timing = worker_mod.TurnTiming(source="direct", event="speech",
+                                   started=time.monotonic())
+    stream = worker_mod.StreamingTTS(worker, timing)
+    stream.feed("测试")
+    stream.finish()
+
+    started = time.monotonic()
+    stream.wait(timeout=0.2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert bundle.vad.paused is False
+
+
+def test_failed_execute_continues_without_forcing_speak():
+    """execute 失败后继续一轮让模型解释，但不再强制 tool_choice=speak。"""
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "BurritoMeat"}]})),
+        reply("", ("speak", {"text": "我现在够不着砧板，切不了肉。"})))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "你去切肉",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": False, "reason": "够不着砧板"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["我现在够不着砧板，切不了肉。"]
+    assert llm.choices == ["auto", "auto"]
+
+
+def test_content_only_speech_turn_is_spoken(caplog):
+    """模型只回 content 的闲聊也要出声，不能静默；不强制补轮。"""
+    caplog.set_level(logging.WARNING, logger="ai.dialog")
+    llm = FakeLLM(reply("现在没有装好的盘能送。"))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "去送餐吧",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert llm.choices == ["auto"]
+    assert bundle.tts.spoken == ["现在没有装好的盘能送。"]
+    assert "没有调用任何工具" not in caplog.text
+
+
+def test_xml_tool_call_content_is_not_spoken():
+    llm = FakeLLM(reply(
+        "<tool_call><function=execute_actions><parameter=actions>"
+        "[]</parameter></function></tool_call>"))
+    worker, bundle = make_worker(llm=llm)
+
+    worker._handle_transcript("你好", {"tick": 100, "tools": TOOLS_NEW})
+
+    assert bundle.tts.spoken == []
+
+
+def test_speak_tag_content_is_spoken_for_proactive_event(caplog):
+    """主动播报事件里模型把台词写成 <speak> 标签：仍按标签内容播出。"""
+    caplog.set_level(logging.WARNING, logger="ai.dialog")
+    llm = FakeLLM(reply("<speak>只剩最后几秒啦，冲一把！</speak>"))
+    worker, bundle = make_worker(llm=llm)
+
+    worker._handle_event(("last_seconds", None),
+                         {"tick": 1000, "live": True, "tools": TOOLS_NEW})
+
+    assert bundle.tts.spoken == ["只剩最后几秒啦，冲一把！"]
+    assert "<speak>" in caplog.text
+
+
+def test_speak_tag_content_is_not_spoken_for_player_command():
+    """玩家命令回合不能靠 <speak> 标签绕过 execute_actions。"""
+    llm = FakeLLM(reply("<speak>好，我去洗碗。</speak>"))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "你去洗碗吧",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == []
+    assert llm.choices == ["auto"]
+
+
+def test_execute_without_speak_does_not_force_ack():
+    """直接 execute 后模型没 speak：不再强制补 speak，下一轮用 content 收尾。"""
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [{"action": "chop", "target": "Cucumber"}]})),
+        reply("好，这就去切黄瓜"))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": True, "status": "running"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，这就去切黄瓜"]
+    assert llm.choices == ["auto", "auto"]
+
+
+def test_tool_result_does_not_append_nudge_system_message():
+    """工具结果后不再往对话里塞催 speak 的 system 提示。"""
+    llm = FakeLLM(
+        reply("", ("execute_actions", {"actions": [
+            {"action": "chop", "target": "Cucumber"}]})),
+        reply("好，这就去切黄瓜"))
+    worker, bundle = make_worker(llm=llm)
+
+    thread = run_async(worker._handle_transcript, "把黄瓜切了",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    bundle.ack_q.put({"batch_id": batch.batch_id,
+                      "results": [{"ok": True, "status": "running"}]})
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert llm.choices == ["auto", "auto"]
+    assert not any("必须调用 speak" in str(m.get("content"))
+                   for m in llm.calls[1][0])
+
+
+def test_execute_actions_batch_sent_to_main_loop():
+    """execute_actions 的 actions 数组原样交给主循环，逐条结果回填。"""
+    calls = {"actions": [
+        {"action": "chop", "target": "Cucumber"},
+        {"action": "wash"},
+    ]}
+    llm = FakeLLM(
+        reply("", ("execute_actions", calls), ("speak", {"text": "好，先切再洗"})),
+    )
+    worker, bundle = make_worker(llm=llm)
+    thread = run_async(worker._handle_transcript, "切黄瓜，然后洗碗",
+                       {"tick": 100, "tools": TOOLS_NEW})
+    batch = bundle.cmd_q.get(timeout=2)
+    assert batch.calls == [("execute_actions", calls)]
+    bundle.ack_q.put({
+        "batch_id": batch.batch_id,
+        "results": [{"ok": True, "results": [
+            {"ok": True, "status": "running", "action": "chop"},
+            {"ok": True, "status": "queued", "action": "wash"},
+        ]}],
+    })
+    thread.join(2)
+    assert not thread.is_alive()
+    assert bundle.tts.spoken == ["好，先切再洗"]
+
+
+def test_speech_content_without_tools_is_spoken():
+    """闲聊/拒绝类回复没调 speak 时，content 兜底播报，不能静默。"""
+    llm = FakeLLM(reply("抱歉，递东西我做不了，得你自己去拿。"))
+    worker, bundle = make_worker(llm=llm)
+
+    worker._handle_transcript("把盘子拿过来。", {"tick": 100,
+                                                "tools": TOOLS_NEW})
+
+    assert bundle.tts.spoken == ["抱歉，递东西我做不了，得你自己去拿。"]
+    assert bundle.cmd_q.empty()
+
+
+def test_tool_ack_timeout_covers_level_load_gap():
+    """等 ack 的上限必须盖住关卡加载时的空档。
+
+    voice-20261109-122611：开局 division 事件刚发出去，主循环连吃 4.1 秒
+    `phase=None` 的帧（`_tick_once` 的生命周期守卫直接跳过对话服务），
+    `set_division` 的 ack 超时，模型只好说「刚才没说上话，重来一遍」。
+    2 秒不够，抬到 5 秒。正常一拍内 ack 仍是几十毫秒。
+    """
+    from ai.dialog import worker as W
+    assert W.ACK_TIMEOUT_S >= 5.0
+
+
+def test_division_turn_does_not_offer_action_tools():
+    """分工回合不开放派活工具。
+
+    实机 trace-20261109-124818：division 回合 turn0 定了分工并说了「好，我负责
+    送烤箱…」，turn1 又调 execute_actions（被拒），turn2 补一句「好，我这就去
+    送烤箱」——玩家听到两句。根因是分工回合还摆着 execute_actions。
+    """
+    llm = FakeLLM(reply("好。"))
+    worker, _ = make_worker(llm=llm)
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "mix"])
+    worker._run_llm({"tools": tools_with_division}, "division", "")
+
+    tools = llm.calls[0][1]
+    names = {t["function"]["name"] for t in tools}
+    assert "execute_actions" not in names
+    assert "cancel_action" not in names
+    assert "speak" in names and "set_division" in names
+
+
+def test_speech_turn_keeps_action_tools():
+    llm = FakeLLM(reply("好。"))
+    worker, bundle = make_worker(llm=llm)
+    worker._run_llm({"tools": TOOLS_NEW}, "speech", "帮我切个番茄")
+    names = {t["function"]["name"] for t in llm.calls[0][1]}
+    assert "execute_actions" in names
+
+
+def test_division_turn_ends_naturally_when_model_stops_calling_tools():
+    """分工回合按「模型不再调工具」自然收尾，不做事件特判。
+
+    回合是一段连续对话：每次把 assistant(tool_calls) 和 tool(result) 追加进
+    messages 再问一次；模型这一轮不调任何工具，回合就结束。分工定完它多要
+    一轮本来也是合理的（可能想读世界状态或补一句），只有多出来的派活被工具
+    表裁掉了。
+    """
+    llm = FakeLLM(
+        reply("",
+              ("set_division", {"assignments": [
+                  {"action": "cook", "owner": "you"}]}),
+              ("speak", {"text": "好，我负责烤箱和洗碗，你切菜装盘。"})),
+        reply(""),                      # 第二轮不调工具 → 自然结束
+    )
+    worker, bundle = make_worker(llm=llm)
+
+    tools_with_division = tool_schemas(division_actions=["chop", "cook", "mix"])
+    thread = run_async(worker._run_llm, {"tools": tools_with_division},
+                       "division", "")
+    ack_for(bundle, [{"tool": "set_division", "ok": True,
+                      "division_changed": True}])
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert len(llm.calls) == 2, "模型没调工具才该收尾"
+    assert bundle.tts.spoken == ["好，我负责烤箱和洗碗，你切菜装盘。"]

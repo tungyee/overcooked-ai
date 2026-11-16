@@ -47,7 +47,6 @@ def test_exclude_carves_out_of_scope():
 def test_dialog_state_defaults():
     state = DialogState()
     assert state.history == []
-    assert state.pending_orders == []
     assert state.last_transcript == ""
     assert state.pending_event is None
     assert state.rescue_task_key is None
@@ -61,8 +60,7 @@ def test_rescue_and_relay_types_have_no_branch():
     from ai.query.recipes import RecipeBook
 
     book = RecipeBook([{"name": "pot", "comp": []}], [])
-    for task in (T.RecoverLoosePot(resources=("cooker_1",), item="pot"),
-                 T.PlaceToRelay(item="pot")):
+    for task in (T.RecoverLoosePot(resources=("cooker_1",), item="pot"),):
         assert task.TYPE in NO_BRANCH_TYPES
         assert planner.branch_of_task(task, book) is None
     # 对照：普通取料动作仍按生料归一。

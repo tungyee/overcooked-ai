@@ -69,8 +69,20 @@ def _parse_detail_item(s):
         return {s[len(ING_PREFIX):].lower()}
     if s.startswith(ITEM_PREFIX):
         return {s[len(ITEM_PREFIX):].lower()}
+    lb0 = s.find("{")
+    lp0 = s.find("(")
+    # 无锅具的组合节点：CompositeAssembledNode{ 子节点, 子节点, ... }。
+    # 墨西哥卷等「包一层」的菜放上最后一料后，游戏把整盘折叠成这一个节点，
+    # 子节点里还套着熟料节点。必须按花括号深度递归展开，否则只认出第一个
+    # 熟料、其余全丢 → 盘永远「缺料」、不出 DeliverPlate（实机
+    # trace-20261031-230344，Mine_2_4_2P 蘑菇卷）。
+    if lb0 != -1 and (lp0 == -1 or lb0 < lp0) and s.endswith("}"):
+        out = set()  # type: Set[str]
+        for part in _split_top(s[lb0 + 1:-1]):
+            out.update(_parse_detail_item(part))
+        return out
     # 复合/熟料节点：TypeName(Cookware){ ing:A, ing:B, ... }
-    lp = s.find("(")
+    lp = lp0
     rp = s.find(")", lp + 1)
     lb = s.find("{", rp + 1)
     rb = s.find("}", lb + 1)
@@ -83,6 +95,22 @@ def _parse_detail_item(s):
             return {"cooked:%s:%s" % ("+".join(sorted(raw_names)), cookware)}
         return {"cooked:%s" % cookware}
     return {s.lower()}
+
+
+def _split_top(inner):
+    # type: (str) -> List[str]
+    """按顶层逗号切分（花括号/圆括号内的逗号不切）。"""
+    parts, depth, start = [], 0, 0  # type: List[str], int, int
+    for i, ch in enumerate(inner):
+        if ch in "{(":
+            depth += 1
+        elif ch in "})":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(inner[start:i])
+            start = i + 1
+    parts.append(inner[start:])
+    return [p for p in (x.strip() for x in parts) if p]
 
 
 def _raw_names(inner):

@@ -2,7 +2,7 @@
 """熟料供需计数回归（第 1 组 1.2）。
 
 根因不是权重而是结构：`FetchToCooker` 只能由 recipe_graph 按单发射，
-`_in_flight_cook_claim` 压掉同单第二个下锅候选，`_match_cookers_to_orders`
+`FetchToCooker` 按单发射，`_match_cookers_to_orders`
 又是严格 1:1 —— 于是「5 单要米」永远不等于「3 口灶在烧」。实测
 trace-20261014-120406 的 1700~3270 窗口（正是 order#3/4/5 三单过期的窗口）
 **59% 的拍里三口灶一个都没在煮**，峰值也只有 2 口。
@@ -50,12 +50,13 @@ class W(object):
     """只读世界替身：供需计数是纯谓词，不该依赖真 World。"""
 
     def __init__(self, orders=(), cookers=(), plates=(), chefs=(), items=(),
-                 recipes=None):
+                 recipes=None, held_plates=()):
         self.orders = list(orders)
         self.cookers = list(cookers)
         self.plates = list(plates)
         self.chefs = list(chefs)
         self.items = list(items)
+        self.held_plates = list(held_plates)
         self.recipes = recipes if recipes is not None else RECIPES
 
 
@@ -118,6 +119,17 @@ def test_supply_counts_plated_portions():
     """已装盘未送的也算供给：那份米已经不需要再煮一次。"""
     w = W(orders=[order("1", "Sushi_Fish")],
           plates=[plate("p1", ["cooked:sushirice:pot"])])
+    assert CS.cooked_supply(w, book(), "BoiledSushiRice") == 1
+
+
+def test_supply_counts_held_plates():
+    """手里端着、正在送的那盘也是供给。
+
+    World.plates 不含手持盘，只看它会在端盘/送餐途中把供给判成 0，planner
+    重复下锅；4-1 断供看门狗也会被这种瞬时 0 抖动误触发。
+    """
+    w = W(orders=[order("1", "Sushi_Fish")],
+          held_plates=[plate("p1", ["cooked:sushirice:pot"])])
     assert CS.cooked_supply(w, book(), "BoiledSushiRice") == 1
 
 

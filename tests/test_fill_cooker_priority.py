@@ -5,6 +5,8 @@
 不会）。这四条分别对应 trace-20261014-120406 的 t=1800 / t=2760 / t=3226
 / t=2279，离线复验的分数写在断言旁。
 """
+import pytest
+
 from ai.core import planner
 from ai import tasks as T
 from ai.state.blackboard import Blackboard
@@ -115,6 +117,59 @@ def test_fill_is_not_gated_on_having_a_plate():
         w, bb, planner.Candidate(t, [], 15), book, plate_match={})
     assert terms["cooker_idle"] > 0
     assert score > 0
+
+
+def _fill_task():
+    return T.FillCooker(None, ("c1", ("SushiRice",)), "BoiledSushiRice")
+
+
+def _plate(n):
+    # stack_top/clean 让空盘被算作「已就位」：盘匹配只认台面盘、手持盘、
+    # 带料散盘和干净盘堆顶层（见 planner._match_plates_to_orders）。
+    return {"n": n, "x": 1.0, "z": 1.0, "contents": [], "detail": [],
+            "stack_top": True, "stack_clean": True}
+
+
+def test_fill_damped_when_no_order_has_a_plate():
+    """没有可上盘的订单时，填灶只保留地板优先级。
+
+    2~3 单要米但全都没有盘 → 煮了也上不了桌；不能按满额 5.6 压过备菜/盘链。
+    仍保留 `FILL_PLATE_DISCOUNT_FLOOR`，避免「没盘 → 不煮 → 单过期」死锁。
+    """
+    w = _world([_cooker("c1"), _cooker("c2")], plates=[])
+    bb = Blackboard()
+    book = RecipeBook(w.recipes, w.stations)
+    _, terms = planner._score_candidate(
+        w, bb, planner.Candidate(_fill_task(), [], 15), book, plate_match={})
+    full = planner._cooker_idle_bonus(3)
+    assert 0 < terms["cooker_idle"] < full
+    assert terms["cooker_idle"] == pytest.approx(
+        full * planner.FILL_PLATE_DISCOUNT_FLOOR)
+
+
+def test_fill_damped_proportional_to_plated_orders():
+    """3 单要米、只有 1 单有盘 → 填灶按 1/3 打折。"""
+    w = _world([_cooker("c1"), _cooker("c2")], plates=[_plate("p1")])
+    bb = Blackboard()
+    book = RecipeBook(w.recipes, w.stations)
+    _, terms = planner._score_candidate(
+        w, bb, planner.Candidate(_fill_task(), [], 15), book,
+        plate_match={"p1": "1"})
+    assert terms["cooker_idle"] == pytest.approx(
+        planner._cooker_idle_bonus(3) / 3.0)
+
+
+def test_fill_full_when_all_orders_have_plates():
+    """3 单都有盘 → 不打折，仍是满额填灶。"""
+    plates = [_plate("p1"), _plate("p2"), _plate("p3")]
+    w = _world([_cooker("c1"), _cooker("c2")], plates=plates)
+    bb = Blackboard()
+    book = RecipeBook(w.recipes, w.stations)
+    _, terms = planner._score_candidate(
+        w, bb, planner.Candidate(_fill_task(), [], 15), book,
+        plate_match={"p1": "1", "p2": "2", "p3": "3"})
+    assert terms["cooker_idle"] == pytest.approx(
+        planner._cooker_idle_bonus(3))
 
 
 def test_fill_not_generated_when_supply_covers_demand():

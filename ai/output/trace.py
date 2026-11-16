@@ -4,7 +4,7 @@
 职责：
   每拍输出一条 JSONL，记录模式 / 候选 / 打分 / 选中 task / 执行状态 / 按键。
 
-落盘位置：仓库根目录 `trace-<时间戳>.jsonl`，每次启动一个新文件。
+落盘位置：仓库根 `runs/trace-<时间戳>.jsonl`，每次启动一个新文件。
   - 不写 /tmp：系统会清理（实机复盘时文件凭空消失过），且每次跑都覆盖上
     一局的日志，事后无法回看；
   - 文件名与 .gitignore 里的 `trace-*.jsonl` 对应，不会误提交。
@@ -24,13 +24,19 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 
 def default_path(root=None, now=None):
     # type: (Optional[str], Optional[time.struct_time]) -> str
-    """默认落盘路径：<root>/trace-<YYYYmmdd-HHMMSS>.jsonl。"""
+    """默认落盘路径：<root>/runs/trace-<YYYYmmdd-HHMMSS>.jsonl。"""
     root = root or REPO_ROOT
-    stamp = time.strftime("%Y%m%d-%H%M%S", now or time.localtime())
-    return os.path.join(root, "trace-%s.jsonl" % stamp)
+    if now is not None:
+        stamp = time.strftime("%Y%m%d-%H%M%S", now)
+    else:
+        # 同一次启动的 trace / voice 日志共用一个 stamp（restart.sh 导出）。
+        stamp = os.environ.get("OC2_RUN_STAMP") or time.strftime(
+            "%Y%m%d-%H%M%S", time.localtime())
+    return os.path.join(root, "runs", "trace-%s.jsonl" % stamp)
 
 
 TRACE_PATH = default_path()
+os.makedirs(os.path.dirname(TRACE_PATH), exist_ok=True)
 
 
 def _score_of(state):
@@ -149,7 +155,8 @@ def execution_record(status, task, ctx, frame_seq=None, received_at=None):
         result["task"] = repr(task)
     if "motion" in ctx:
         result["motion"] = ctx["motion"]
-    for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment'):
+    for name in ('interaction', 'interaction_failure', 'interaction_recovery', 'alignment',
+                 'exec_failure', 'throw', 'shuttle_wait'):
         if name in ctx:
             result[name] = ctx[name]
     if frame_seq is not None and received_at is not None:
@@ -182,6 +189,10 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
         "bindings": record.get("bindings", {}),
         # 这一拍选在哪层。复盘先看它，再看候选明细（spec §6）。
         "top_layer": record.get("top_layer"),
+        # 断供补位看门狗：override=True 表示本拍 cook 负分被撤销。
+        "supply": record.get("supply") or {},
+        # 4-1 过街：wait=路沿等灯/车，hold=过街承诺保住旧 task。
+        "traffic": record.get("traffic") or {},
         # planner 这一拍**原始**选的 task（字符串）。与 exec.task 可能不同：
         # agent ⑨.5 会把「后置条件已成立的旧树」接回去让它报完 SUCCESS。
         # 实机 trace-20261015-165358 t=2582~2718 的 WashPlate/FillCooker 2:1
@@ -207,6 +218,15 @@ def emit(record, mode, commit, exec_state, keys, tick, state=None):
     if state:
         log_entry["revenue"] = _revenue(state)
 
+    # 等门让位：要在平台接缝门洞口等门的候选 {task key: 秒}（只在有等门时写）。
+    if record.get("gate_waits"):
+        log_entry["gate_waits"] = record["gate_waits"]
+    # 门洞时间表快照（只在有接缝的关卡写）。
+    if record.get("seam_clock"):
+        log_entry["seam_clock"] = record["seam_clock"]
+    if record.get("shuttle_clock"):
+        log_entry["shuttle_clock"] = record["shuttle_clock"]
+
     # 卡住事件只在判据成立时写（grep 友好：没卡住的拍不带这个 key）。
     stuck = record.get("stuck")
     if stuck:
@@ -231,7 +251,7 @@ def _format_candidates(candidates):
     for cand in candidates:
         layer, in_top_layer = None, False
         # 解构候选元组。分层后尾部多两项（spec §6）；旧的 6 元组与 3 元组
-        # 仍要能格式化——测试与 plan_firefighting 都还在用短元组。
+        # 仍要能格式化——测试场景会造短元组，这里兼容保留。
         if len(cand) >= 8:
             task, score, terms, ok, veto, chosen, layer, in_top_layer = cand[:8]
         elif len(cand) >= 6:

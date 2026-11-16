@@ -69,7 +69,7 @@ def test_llm_chat_returns_content_and_sends_tools(monkeypatch):
     monkeypatch.setattr(llm.requests, "post", fake_post)
     client = LLMClient("key", "https://ark.cn-beijing.volces.com/api/v3",
                        "doubao-seed-2-1-pro-260915")
-    tools = [{"type": "function", "function": {"name": "update_duties"}}]
+    tools = [{"type": "function", "function": {"name": "assign_action"}}]
     messages = [{"role": "user", "content": "我来切"}]
     reply = client.chat(messages, tools)
 
@@ -133,10 +133,10 @@ def test_llm_chat_without_tools_omits_tool_fields(monkeypatch):
 def test_llm_chat_accumulates_streamed_tool_calls(monkeypatch):
     resp = FakeSSE([
         _chunk("好"),
-        _tool_chunk(0, name="update_duties", arguments='{"op": "add", ',
+        _tool_chunk(0, name="assign_action", arguments='{"op": "add", ',
                     call_id="call_a"),
         _tool_chunk(0, arguments='"mode": "do", "target": "WashPlate"}'),
-        _tool_chunk(1, name="update_duties",
+        _tool_chunk(1, name="assign_action",
                     arguments='{"op": "remove", "id": "a1"}', call_id="call_b"),
         "data: [DONE]\n\n",
     ])
@@ -151,7 +151,7 @@ def test_llm_chat_accumulates_streamed_tool_calls(monkeypatch):
 
 
 def test_tool_call_bad_json_args_is_none(monkeypatch):
-    resp = FakeSSE([_tool_chunk(0, name="update_duties", arguments="{oops"),
+    resp = FakeSSE([_tool_chunk(0, name="assign_action", arguments="{oops"),
                     "data: [DONE]\n\n"])
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: resp)
     reply = LLMClient("key", "https://x.example/v3", "m").chat([], [{}])
@@ -238,15 +238,32 @@ def test_system_message_carries_rules_and_dag():
     msg = system_message("本关菜：\n  Sushi_Cucumber = Cucumber")
     assert msg["role"] == "system"
     text = msg["content"]
-    assert "你是 Overcooked 2 里的 P2" in text
-    assert "leave_to_p1" in text and "do" in text
-    assert "target" in text and "整条" in text
+    assert "AI 队友" in text
+    assert "execute_actions" in text
+    assert "execute_action(" not in text
+    assert "cancel_action" in text and "speak" in text
+    assert "get_world_state" in text
+    assert "check_action" not in text
     assert "Sushi_Cucumber = Cucumber" in text
     # 回复用中文，不念英文节点名
     assert "中文" in text
-    # 步骤语义来自目录渲染（task 的 DESC），prompt 里不手写类型清单、不写关卡物料
-    assert "DAG 节点类型" not in text
-    assert "BoiledSushiRice" not in text.split("本关目录")[0]
+    # 模型可见文本里不能出现内部代号，否则会被念出来
+    assert "P1" not in text and "P2" not in text
+
+
+def test_system_prompt_allows_retry_after_state_change():
+    """ok=false 后世界状态变了（例如现在有脏盘）要允许重试同一个动作。
+
+    旧规则“不要重复同一个 target”会让模型在 wash 刚失败两次后，即使
+    玩家说“切完洗碗”、场上已经有脏盘，也不敢再调 execute_actions。
+    """
+    text = system_message("本关菜：\n  Sushi_Cucumber = Cucumber",
+                          actions=True)["content"]
+    assert "不要重复同一个 target" not in text
+    assert "可以重新放进 execute_actions" in text
+    # 没有派活工具的回合（division / 播报）不该出现执行规则
+    no_actions = system_message("")["content"]
+    assert "可以重新放进 execute_actions" not in no_actions
 
 
 def test_render_state_is_readable_and_in_seconds():
@@ -259,17 +276,17 @@ def test_render_state_is_readable_and_in_seconds():
         "p1": {"holding": "cucumber"},
         "p2": {"doing": "Chop:SushiFish（订单 #1）", "held": None},
         "p2_options": ["FetchToBoard:SushiFish（订单 #1）"],
-        "duties": [{"id": "a1", "mode": "leave_to_p1", "target": "Cucumber",
-                    "source": "我来切黄瓜",
-                    "impact": "挡住了你 2 个可做的活（Chop:Cucumber），已 12.0 秒；P1 手上：空手"}],
+        "duties": [{"id": "a1", "mode": "assign", "action": "下锅",
+                    "direction": "P1", "source": "下锅我来",
+                    "impact": "挡住了你 2 个可做的活，已 12.0 秒；P1 手上：空手"}],
     })
     assert "剩余 99.0 秒" in text
-    assert "#1 Sushi_Fish 剩 18.1 秒" in text
-    assert "在煮，40%" in text
-    assert "P1：手持 cucumber" in text
+    # 订单明细 / 灶 / 盘都容易滞后，不再进快照；用 get_world_state 查。
+    assert "订单：1 个" in text
+    assert "Sushi_Fish" not in text
+    assert "灶：" not in text and "砧板：" not in text and "盘子：" not in text
     assert "Chop:SushiFish" in text
-    assert "[a1] 交给 P1 Cucumber  来源「我来切黄瓜」" in text
-    assert "此刻：挡住了你 2 个可做的活" in text
+    assert "get_world_state" in text
 
 
 def test_speech_message_is_plain_transcript_on_one_line():
@@ -283,15 +300,8 @@ def test_state_message_is_system_with_world_state():
     assert "事件" not in msg["content"]
 
 
-def test_state_message_new_order_includes_new_dish_dag():
-    msg = state_message("new_order", {}, "Pasta\n  └ Chop:Tomato")
-    assert "【新菜】" in msg["content"]
-    assert "Chop:Tomato" in msg["content"]
-    assert "系统：" not in msg["content"]
-
-
 def test_event_note_is_system():
-    assert event_note("new_order")["role"] == "system"
+    assert event_note("division")["role"] == "system"
 
 
 def test_chat_passes_tool_choice_none(monkeypatch):
@@ -304,11 +314,128 @@ def test_chat_passes_tool_choice_none(monkeypatch):
 
 
 def test_assistant_and_tool_messages_round_trip():
-    reply = llm.LLMReply("好", [llm.ToolCall("c1", "update_duties", '{"op":"add"}')])
+    reply = llm.LLMReply("好", [llm.ToolCall("c1", "assign_action", '{"op":"add"}')])
     msg = assistant_message(reply)
     assert msg["tool_calls"][0] == {
         "id": "c1", "type": "function",
-        "function": {"name": "update_duties", "arguments": '{"op":"add"}'}}
+        "function": {"name": "assign_action", "arguments": '{"op":"add"}'}}
     tool = tool_message("c1", {"ok": True, "id": "a1"})
     assert tool["role"] == "tool" and tool["tool_call_id"] == "c1"
     assert json.loads(tool["content"]) == {"ok": True, "id": "a1"}
+
+
+def test_render_state_includes_reachable_division():
+    """世界状态里要有「你能做的动作」和「玩家能做的动作」。"""
+    text = render_state({
+        "reachable_actions": {"p2_actions": ["切"],
+                              "p1_actions": ["下锅", "装盘", "送餐"]},
+    })
+    assert "你能做的动作：切" in text
+    assert "玩家能做的动作：下锅、装盘、送餐" in text
+
+
+def test_render_state_prefers_reachable_actions_over_division():
+    """够得着的动作不再受分工排除限制：送餐 / 洗盘也要列出来。"""
+    text = render_state({
+        "p2_reachable_actions": ["切", "装盘", "送餐", "洗盘"],
+        "reachable_actions": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
+    })
+    assert "你能做的动作：" in text and "切、装盘、送餐、洗盘" in text
+    assert "玩家能做的动作：" in text
+
+
+def test_render_state_does_not_fall_back_when_reachable_is_empty():
+    """空列表是「一个都够不着」，不能回落到分工建议。"""
+    text = render_state({
+        "p2_reachable_actions": [],
+        "division": {"p2_actions": ["装盘"], "p1_actions": ["切"]},
+    })
+    assert "你能做的动作" not in text
+
+
+def test_render_state_omits_division_when_none():
+    text = render_state({})
+    assert "你能做的动作" not in text
+
+
+def test_state_renders_success_last_result_without_reason():
+    """成功结果没有 reason；模板不能因 StrictUndefined 抛异常。"""
+    msg = state_message("speech", {
+        "last_result": {"label": "切", "target": "BurritoMeat",
+                        "status": "succeeded"},
+    })
+    assert "上一条命令结果" in msg["content"]
+
+
+@pytest.mark.parametrize("event", ["last_seconds", "round_summary",
+                                   "division", "division_review",
+                                   "checkin", "batch"])
+def test_proactive_event_prompts_require_speak(event):
+    """新协议 content 不播：主动开口的事件必须明确要求调用 speak。"""
+    msg = state_message(event, {})
+    assert "调用 speak 工具" in msg["content"]
+    assert "不调用工具" not in msg["content"]
+
+
+def test_system_prompt_says_speak_is_a_tool_call():
+    """模型会把 speak 当成文本标签；system 里要明确是工具调用。"""
+    text = system_message("")["content"]
+    assert "这是工具调用，不是文本格式" in text
+
+
+def test_system_prompt_lists_division_tools_when_available():
+    text = system_message("", guide="本关攻略", division=True,
+                          cookbook=True)["content"]
+    # 工具签名已移到 tools schema（见 test_agent_dialog / test_dialog_worker）
+    assert "先看【本关地图】" in text
+    assert "送餐和洗盘不在分工里" in text
+
+
+def test_system_prompt_respects_no_fixed_division_guide():
+    """攻略明确说不设固定分工时，模型不应再调用 set_division。"""
+    text = system_message("", guide="本关不设固定分工", division=True,
+                          cookbook=True)["content"]
+    assert "不要调用 set_division" in text
+
+
+def test_system_prompt_omits_division_tools_when_absent():
+    text = system_message("")["content"]
+    assert "set_division" not in text
+    assert "read_cookbook" not in text
+
+
+def test_stream_total_timeout_raises(monkeypatch):
+    """服务端持续发 keepalive/慢帧时，requests 的单次 read timeout 不会
+    结束整个流；必须用总时长硬上限。"""
+    import time
+
+    class SlowSSE(FakeSSE):
+        def iter_lines(self, decode_unicode=False):
+            yield _chunk("a")
+            time.sleep(0.2)
+            yield _chunk("b")
+
+    monkeypatch.setattr(llm.requests, "post",
+                        lambda *a, **k: SlowSSE([]))
+    client = LLMClient("key", "http://127.0.0.1:9", "model", timeout=0.05)
+    with pytest.raises(llm.LLMError, match="流超时"):
+        client.chat([{"role": "user", "content": "hi"}])
+
+
+def test_state_warns_when_game_paused():
+    msg = state_message("speech", {"live": False})
+    assert "游戏当前已暂停" in msg["content"]
+
+
+def test_state_does_not_warn_when_live():
+    msg = state_message("speech", {"live": True})
+    assert "游戏当前已暂停" not in msg["content"]
+
+def test_state_does_not_render_plate_contents():
+    """盘子明细容易滞后，不再进快照；需要时用 get_world_state。"""
+    msg = state_message("speech", {
+        "plates": "空盘 1 个；装了料的盘 1 个；脏盘 0 个",
+    })
+    assert "空盘" not in msg["content"]
+    assert "装了料的盘" not in msg["content"]
+    assert "pasta(熟)" not in msg["content"]

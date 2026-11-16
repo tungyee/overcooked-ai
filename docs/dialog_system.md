@@ -8,17 +8,47 @@
 
 ```text
 麦克风 → PTT 按住录音 / RMS VAD 切句 → 火山流式 ASR
-      → 方舟 LLM 第一段（function calling：update_duties）
-      → 主循环落分工账本、回填工具结果
-      → 方舟 LLM 第二段（按真实结果说最终那句话）
+      → 方舟 LLM（多轮 function calling：execute_actions / cancel_action /
+        speak / set_division / get_world_state / read_cookbook）
+      → 主循环落地动作与分工、回填 tool 结果
+      → 模型继续下一轮，或给出最终 speak / content
       → LLM text 按句流式 → 火山流式 TTS → 扬声器播放
 ```
 
-第一段 / 第二段的 text 都按句喂给 TTS 流式播放；第一段带工具调用时也不丢弃、直接播（换更快体感，接受「先出口、随后第二段再确认」的少量重复）。
+只有 `speak` 出声；动作与 speak 同轮时先落地动作，成功才播；动作成功但没有 speak 就安静结束。没有单独的「第一段/第二段」路径，旧 trace/回放也走同一套多轮工具调用。
 
 - 代码在 `ai/dialog/`：`audio.py`（采集/播放/VAD）· `ptt.py`（全局按键 PTT）· `asr.py` · `tts.py` · `llm.py` · `policy.py`（主动开口/限频/新单合并）· `worker.py`（后台线程）· `duties.py`（分工账本/物料目录/工具 schema）· `schema.py`（偏好/作用域匹配/`VoiceConfig`）· `env.py`（`.env` 加载）。
 - 主循环仍是 **20 Hz** 的唯一决策者；`DialogWorker` 是独立 daemon 线程，只通过上下文快照（2 Hz）、事件、工具批次、ack 四个队列与主循环通信，**不读 World、不写 Blackboard**。
 - 语音是可选能力：没装依赖或没配 key 时，加上 `--no-voice`（或什么都不加）就退回纯行为树模式，仍由插件虚拟手柄执行，决策行为不变。
+
+## 1.1 新工具协议（2026-11）
+
+对话层已切到「临时命令」模型；旧的 `assign_action` / 持久分工不再暴露给模型，也没有单独的两段式回合路径。旧 trace/回放同样走下面的多轮工具调用。
+
+模型看到的工具（`set_division` 恒常驻，`read_cookbook` 按是否有攻略出现）：
+
+```text
+execute_actions(actions=[{action, target?}, ...])
+                                    一次提交一个或多个动作，按数组顺序排队；
+                                    逐条返回 ok/status/reason
+cancel_action(action=None)          撤销当前命令和队列，停手约 5 秒
+speak(text)                         主要发言通道；模型不调用时，语音/播报类
+                                    事件允许用 content 兜底（见下）
+get_world_state()                   按需读取最新世界状态
+set_division(assignments=[...])     设置长期分工（动作级 + 可选 item）
+read_cookbook(section)              读取本关攻略某一节（有攻略时）
+```
+
+- 工具结果只以 `role=tool` 回填，不追加催 `speak` 的 system 提示；每轮都用 `tool_choice=auto`，是否发言由模型决定。`division` / `division_review` 的 content 不播（只认 `speak`），`speech` / `checkin` / `last_seconds` / `round_summary` / `batch` / `layout_review` 在没有工具调用的回合用 content 兜底播报。
+- `action` 用英文标识：`chop / cook / mix / plate / deliver / wash / fetch`（`prepare` 为后续目标级动作）。
+- `target` 用本关目录里的英文名（`Cucumber`、`BoiledSushiRice`、`Sushi_Cucumber`）；中文别名在 `ai/dialog/command_queue.py` 里做一次归一化。
+- 动作是**目标状态**：`cook(Tomato)` 会自动补取料、切；`plate(dish)` 会自动补上游。命令带 `scope` 和 `done`，不会因为第一个子任务成功就被消费。
+- 命令队列最多 3 条待执行；满了丢最后一条待执行项，新指令照收。当前命令 waiting（煎/煮/资源被占）时，下一条有可行任务的命令可以跑；依赖由 scope 可行性天然表达。
+- 命令 scope 是硬过滤，但会随时间恶化的动作允许越过 scope 抢占当前命令：`TakeCookedToPlate`（锅已熟/快熟）、`RescueCooked`（快糊/烧焦）、`Extinguish`（灭火）。端完/救完自动回到命令 scope，不取消命令。
+- 永久不可行（订单过期/目标不再需要）、连续任务失败、waiting 超时 → 命令 failed，队列暂停；失败事件让模型解释/重试/跳过。成功默认不打扰，失败必须说。
+- 模型可见文本（system prompt、工具 description、状态/事件模板、工具结果 reason）统一用「你 / 队友 / 玩家」，不出现 P1/P2，避免被念出来。
+- prompt 用 Jinja2 模板管理：`ai/dialog/prompts/system.j2`、`state.j2`、`event.j2`，渲染入口 `ai/dialog/prompts.py`。`requirements-voice.txt` 已加 `jinja2>=3.1,<4`。
+- LLM provider：`run_agent.py` 优先读 `LLM_PROVIDER`，未设置时有 `MIMO_API_KEY` 就用 MIMO，否则用 ARK。MIMO 相关变量见 `.env.example`；`thinking.type=disabled` 对两家都发送。
 
 ## 2. 先决条件
 
@@ -50,10 +80,10 @@
 
 - **历史 trace 回放 LLM**：`python3 tools/replay_dialog_llm.py --trace trace-<时间戳>.jsonl` 从 trace 的 `state` 快照重建 World，按局面选帧，走线上同一条路径（worker 两段式 LLM → 主循环落账本 → planner 重选），逐轮打印回复、工具调用、账本和 P2 的实际选择，并按期望检查（闲聊不调工具、一句两处分工都落、改口用 edit、叫停/恢复、截止抢回的话术与节点一致等）。`--dry-run` 只选帧打印 prompt；`--show-prompt` 每轮打印完整消息；`--scenario NAME` 只跑指定场景。
 
-- **PTT（推荐）**：设置 `OC2_VOICE_PTT_KEY=f8` 后，按住 F8 录音、松开发送，完全绕过 VAD 的起止判断。一次按住 = 一轮对话：录音会带约 300 ms pre-roll 和 200 ms 尾音，ASR 返回的多个 definite 片段会先合并再送 LLM，避免一句话被拆成多次回复。
+- **PTT（推荐）**：按住 `OC2_VOICE_PTT_KEY`（未设置时默认 `f8`）录音、松开发送。一次按住 = 一轮对话：录音会带约 300 ms pre-roll 和 200 ms 尾音，ASR 返回的多个 definite 片段会先合并再送 LLM，避免一句话被拆成多次回复。
   - macOS 默认把 F8 当媒体键：需要 **Fn+F8**，或在「系统设置 → 键盘 → 键盘快捷键 → 功能键」里启用「使用 F1、F2 等键作为标准功能键」。
   - 当前只监听键盘事件。手柄需要通过 Steam Input 映射成 F8；如果游戏不是由 Steam 启动（本项目用 `run_game.sh` 直接启动），Steam 的**游戏布局**可能不生效，需要试 **Desktop Layout**，或另行实现原生手柄监听。
-  - 监听建立失败（缺「辅助功能/输入监控」权限）时，worker 会记录 `worker_error where=ptt` 并自动退回 VAD。
+  - 监听建立失败（缺「辅助功能/输入监控」权限）时，worker 会记录 `worker_error where=ptt`，语音输入不可用。
 - **半双工限制**：TTS 播放期间 VAD 暂停、PTT 按键事件被忽略，播完只 flush 播放窗口内的采集块（TTS 前已排队的语音保留），避免把自己的声音送进 ASR。因此 AI 说话时你插话会被忽略，等它说完再说。主动回合（新单/截止抢回）在 worker 里是串行的：LLM 请求在飞时新的人声要等这一回合结束才处理；v1 不做抢占（第二版再支持 barge-in）。游戏音效和扬声器外放也会干扰识别，建议戴耳机或把游戏音量调低。
 - **默认值验证状态**：TTS 2.0（`seed-tts-2.0` + `zh_female_vv_uranus_bigtts`）、ASR 2.0（`volc.seedasr.sauc.duration`）、方舟 plan 端点（`/api/plan/v3`）与键盘 PTT（Fn+F8）均已用真实 key/设备验证；手柄经 Steam Input 直接触发 F8 尚未验证。普通方舟 key 仍用 `/api/v3`；首次换账号请按 §6 排障确认。`tests/test_live_voice.py` 在 `OC2_LIVE_VOICE=1` 时做真实冒烟，CI/常规测试不会执行。
 - 还需要游戏侧正常：插件把状态推到 `127.0.0.1:27411`（见 `AGENTS.md`）。语音不改这条链路。
@@ -77,22 +107,28 @@ python3 run_agent.py --voice --voice-debug
 | `VOLC_TTS_API_KEY` | 是 | — |
 | `VOLC_TTS_VOICE` | 否 | `zh_female_vv_uranus_bigtts`（Vivi，2.0 音色；1.0 音色与 `seed-tts-2.0` 不匹配） |
 | `VOLC_TTS_RESOURCE_ID` | 否 | `seed-tts-2.0` |
-| `ARK_API_KEY` | 是 | — |
-| `ARK_MODEL` | 是 | —（方舟推理接入点 ID 或模型名；推荐 `doubao-seed-2-1-pro-260915`（lite 理解分工指令不稳；plan 端点上 pro 整轮 1.5–5 s，turbo `doubao-seed-2-1-turbo-260628` 介于两者之间）。客户端固定传 `thinking.type=disabled`，带「深度思考」标签的模型也不会思考） |
+| `LLM_PROVIDER` | 否 | 不填时有 `MIMO_API_KEY` 用 `mimo`，否则用 `ark` |
+| `MIMO_API_KEY` | 二选一 | — |
+| `MIMO_MODEL` | 二选一 | —（如 `mimo-v2.6-pro-ultraspeed`） |
+| `MIMO_BASE_URL` | 否 | `https://api.xiaomimimo.com/v1` |
+| `ARK_API_KEY` | 二选一 | — |
+| `ARK_MODEL` | 二选一 | —（方舟推理接入点 ID 或模型名；推荐 `doubao-seed-2-1-pro-260915`（lite 理解分工指令不稳；plan 端点上 pro 整轮 1.5–5 s，turbo `doubao-seed-2-1-turbo-260628` 介于两者之间）。客户端固定传 `thinking.type=disabled`，带「深度思考」标签的模型也不会思考） |
 | `ARK_BASE_URL` | 否 | `https://ark.cn-beijing.volces.com/api/v3`；方舟「兼容 OpenAI 接口协议工具」/ plan 套餐 key 用 `https://ark.cn-beijing.volces.com/api/plan/v3` |
 | `OC2_VOICE` | 否 | 不设；`0` 强制关，其他值表示希望开（缺 key 时仍告警退回） |
 | `OC2_VOICE_RATE` | 否 | `1.05`（允许 0.5–2.0，超出收敛；**当前仅保留、未接到 TTS 参数**） |
 | `OC2_VOICE_VOLUME` | 否 | `0.7`（允许 0.3–1.2，超出收敛） |
-| `OC2_VOICE_VAD_DB` | 否 | `9.0`（VAD 开口阈值，底噪之上的 dB，范围 2–20；越小越敏感） |
-| `OC2_VOICE_PTT_KEY` | 否 | 不设（VAD 自动切句）；设为 `f8` 等则按住录音、松开发送。macOS 直接按 F8 可能是媒体键，用 Fn+F8 或启用标准功能键；手柄可用 Steam Input 映射到该键 |
+| `OC2_VOICE_VAD_DB` | 否 | `9.0`（已弃用：VAD 自动切句停用后无实际作用） |
+| `OC2_VOICE_PTT_KEY` | 否 | 默认 `f8`（未设置时兜底为 `f8`）；按住该键录音、松开发送。macOS 直接按 F8 可能是媒体键，用 Fn+F8 或启用标准功能键；手柄可用 Steam Input 映射到该键 |
 | `OC2_LLM_TIMEOUT` | 否 | `10.0`（方舟请求超时秒数，范围 1–60；plan 端点容易超过 3s） |
-| `OC2_VOICE_LOG` | 否 | 不落盘（没有时间戳默认文件名；建议 `voice*.jsonl`，已被 gitignore） |
+| `OC2_VOICE_LOG` | 否 | 不设时自动用 `runs/voice-<trace 时间戳>.jsonl`；显式路径优先，`.gitignore` 已排除 `voice*.jsonl` |
 
 控制台入口：ASR <https://console.volcengine.com/speech/service/16>，TTS <https://console.volcengine.com/speech/service/8>，方舟 <https://console.volcengine.com/ark>。
 
 `OC2_VOICE_RATE` / `OC2_VOICE_VOLUME` 的非法或非有限值（`nan`/`inf`）会告警并回退默认值；有限但超范围的值会收敛到边界。
 
-## 4. 对话与分工账本
+## 4. 对话与分工账本（legacy，已移除）
+
+> 本节描述旧的 `assign_action` / 物料级分工与两段式回合；2026-11 起已移除，新协议见 §1.1。以下内容仅作历史参考。
 
 - **一轮对话**：P1 的话作为 user 消息；世界状态（订单、灶、盘、P1/P2 在做什么、规划器接下来可做的、账本）作为本轮的 system 消息，不进历史。有工具调用时走两段式：第一段调用工具 → 主循环落地 → 第二段按真实结果说话（被拒的会如实说明）；闲聊/提问只请求一次。
 - **历史**：本关完整对话（user / assistant / tool 结果）留在 `DialogState.history`，最多 60 条；换关卡清空，暂停不清。
@@ -103,7 +139,7 @@ python3 run_agent.py --voice --voice-debug
 - **覆盖**：同一 target 只有一条约定，再 add 就是改写；`edit` 保留 id。不同物料共用中间产物时新条目优先（旧条目 `exclude` 掉重叠的 item）。
 - **账本影响**：世界状态里每条约定后面带「此刻」：它挡住了 P2 哪些可做的活、挡了多久、P1 手上拿着什么。挡住超过 10 秒时提示 LLM 在回话时顺带问一句要不要调整（只提议，P1 同意后才改账本）。
 - **兑现不了的认领会如实回报**：认领带救锅步骤的物料（饭链里的 `TakeCookedToPlate`，planner L1/L2 免疫认领负分）时，工具结果带 `warning`，第二段回复据此转告玩家。不绑订单的认领（洗盘、填灶、预取）在截止闸里按最紧的活单计算 cushion。
-- **事件**：新菜出现（`new_order`）由 LLM 按新菜的物料组成直接落账本并告诉 P1 分工，P1 之后可以改口；截止闸抢回（`rescue`）由 LLM 按被抢的具体步骤说明接手了哪一步。没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声。
+- **事件**：截止闸抢回（`rescue`）由 LLM 按被抢的具体步骤说明接手了哪一步。没有固定模板播报：火情 / 快糊由 planner 直接处理、不出声。
 
 ## 5. 启动与 CLI
 
@@ -119,8 +155,8 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 |---|---|
 | `--voice` | 显式启用；优先于 `OC2_VOICE=0`。任一必需 key 缺失时打印缺失项并 **退出码 2**（不会去连游戏） |
 | `--no-voice` | 恒关闭，优先于 `--voice` 和 `OC2_VOICE` |
-| `--voice-debug` | 把 `ai.dialog` logger 开到 DEBUG 并输出到 stderr（ASR 文本、两段 LLM 回复与工具调用、工具批次/ack、播报、worker 错误；不含分段计时） |
-| `--voice-log PATH` | 写逐行 JSON 对话日志；优先于 `OC2_VOICE_LOG`。**没有时间戳默认文件名**：不传且环境变量为空时不落盘 |
+| `--voice-debug` | 把 `ai.dialog` logger 开到 DEBUG 并输出到 stderr（ASR 文本、LLM 回合与工具调用、命令批次/ack、播报、worker 错误；不含分段计时）。`restart.sh` 在有语音时默认开启 |
+| `--voice-log PATH` | 写逐行 JSON 对话日志；优先于 `OC2_VOICE_LOG`。不传且环境变量为空时默认 `runs/voice-<trace 时间戳>.jsonl`，与本次 `runs/trace-<时间戳>.jsonl` 一一对应 |
 
 注意 `--dry-run` 只关闭按键注入，**不关闭语音**。离线只想跑决策时用 `--dry-run --no-voice`。
 
@@ -139,7 +175,12 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 | `kind` | 字段 |
 |---|---|
 | `start` / `stop` | `debug`、`log_path` |
-| `level_start` | `level`（Agent 第一次看到关卡 / 换关时写；`since_level_ms` 的分母） |
+| `turn_start` | `event`、`stage`、`source`、`text`（截断的 ASR 原文） |
+| `turn_stall` | `stage`（asr/llm/tools/tts）、`event`、`elapsed_ms`、`vad_paused`、`player_playing`、`producer_done`、`stream_cancelled` |
+| `worker_dead` | `stage`、`event`（worker 线程已退出；看前面的 `worker_error`） |
+| `ptt` / `ptt_cb` | `event`（down/up）、`vad_paused`、`recording`、`utterance`、`stage`、`active_stream` |
+| `barge_in` | `ptt`、`stage`（PTT 按下打断 TTS 时写） |
+| `level_start` | `level`（Agent 第一次看到关卡 / 换关时写；`since_level_ms` 的分母。值为 UI 关卡编号如 `4-4`，DLC/Kevin/教学关无编号时回退内部关卡名） |
 | `asr` | `text`、`tick`、`source`（`ptt` / `vad` / `direct`）、`audio_ms`、`asr_ms`、`end_to_asr_ms` |
 | `llm_reply` | `event`、`stage`（`first` / `final`）、`content`、`tool_calls`、`request_ms`、`first_token_ms`、`elapsed_ms`、`end_to_first_token_ms`、`end_to_done_ms` |
 | `duty_batch` | `event`、`batch_id`、`calls`（工具名 + 参数） |
@@ -154,11 +195,11 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 
 计时口径：
 
-- 一轮的起点是 `turn_latency.started`：PTT 是**按键松开**（之后还有 200 ms 尾音才送 ASR）；VAD 是**判定句尾**（已含约 400 ms 静音）；主动事件是 worker 收到事件（`new_order` 从第一张单到达算起，含 1 秒合并窗口）。
+- 一轮的起点是 `turn_latency.started`：PTT 是**按键松开**（之后还有 200 ms 尾音才送 ASR）；VAD 是**判定句尾**（已含约 400 ms 静音）；主动事件是 worker 收到事件。
 - `*_ms` 不带前缀的字段都相对这一起点；`request_ms` / `first_token_ms` / `elapsed_ms` / `tts_first_chunk_ms` / `tts_to_audio_ms` 是相对各段自己的起点。
 - `llm_first_token_ms` 是起点到**第一次看到 content/tool_calls delta**；`llm_done_ms` 是到最终那段文字就绪（两段式包含工具落地和第二段）。
 - `tts_first_chunk_ms` 是起点到第一块 PCM；`first_audio_ms` 是起点到输出回调第一次真正写入采样，更接近耳朵听到的时间。
-- `since_level_ms` 只对主动事件（尤其开局 `new_order`）有意义，表示从 Agent 首次看到关卡到本轮开始隔了多久。
+- `since_level_ms` 只对主动事件（尤其开局分工）有意义，表示从 Agent 首次看到关卡到本轮开始隔了多久。
 
 不记录密钥、完整 prompt 或原始音频。日志写入失败只降级为 debug，不影响对话链路；日志只由 worker / 生命周期线程写。`--voice-debug` 仍只打印文本级事件，分段计时看 `turn_latency`。
 
@@ -171,16 +212,16 @@ python3 run_agent.py --dry-run --no-voice         # 只看决策、不注入按�
 - 如果说话太轻：靠近麦克风、提高系统输入音量；如果回声/键盘声频繁触发：降低输入增益或换指向性麦克风。
 - 阈值可用 `OC2_VOICE_VAD_DB` 调（默认 9）：不触发时先试 4–6；误触发/游戏声频繁打断时调回 8–12。
 - 更底层的阈值改动在 `VAD(threshold_db=...)`，改完跑 `python3 -m pytest tests/test_audio_vad.py -q`。
-- 环境噪声大、说话偏轻时优先用 PTT（见下），不要继续硬调 VAD。
+- 环境噪声大、说话偏轻时用 PTT 会更稳（见下）。
 
 ### PTT 没反应 / 重复回复
 
-- 日志先看 `PTT 已启用：按键 ...`；没有这行说明 `OC2_VOICE_PTT_KEY` 没生效或 `PushToTalk.start()` 失败（会同时出现 `worker_error where=ptt`，并退回 VAD）。
+- 日志先看 `PTT 已启用：按键 ...`；没有这行说明 `PushToTalk.start()` 失败（会同时出现 `worker_error where=ptt`，语音输入不可用）。
 - 按下时应有 `PTT 事件: down`，松开有 `up`，随后是 `处理一段人声`。只有 `up` 没有 `down`，或完全没有事件，说明按键事件没到进程：
   - macOS 笔记本默认 F8 是媒体键，直接按不会产生标准 F8 的 keycode；用 **Fn+F8**，或在系统设置里启用「使用 F1、F2 等键作为标准功能键」。
   - 手柄通过 Steam Input 映射时，游戏若不是由 Steam 启动（本项目用 `run_game.sh`），Steam 的游戏布局可能不生效；试 `Steam → 设置 → 控制器 → 桌面布局`，或改用键盘/原生手柄监听。
   - 全局监听需要「辅助功能」权限；listen-only event tap 在部分系统上还需要「输入监控」权限，授权后重启进程。
-- 一次按住只应回复一次。若同一句话被拆成多次回复，看 `ASR 合并文本`：PTT 模式已把多个 definite 片段合并；VAD 模式仍按片段处理，建议切 PTT。
+- 一次按住只应回复一次。若同一句话被拆成多次回复，看 `ASR 合并文本`：PTT 已把多个 definite 片段合并。
 
 ### 自己的 TTS 被当成用户说话（回声）
 

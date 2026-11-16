@@ -2,10 +2,9 @@
 """端到端冒烟测试（Plan 3 Task 9）。
 
 验证目标（spec §11.2.1）：
-  1. 完整决策循环（Arbiter → Planner → Executor → Trace）
-  2. 模式切换（Normal → Firefighting）
-  3. 任务完成与认领释放
-  4. Trace 日志正确记录
+  1. 完整决策循环（Planner → Executor → Trace）
+  2. 任务完成与认领释放
+  3. Trace 日志正确记录
 
 测试方法：
   - 使用 Mock StateClient 提供固定游戏状态序列
@@ -104,67 +103,6 @@ def _make_simple_order_scenario():
     return states
 
 
-def _make_firefighting_scenario():
-    """构造灭火场景：锅着火。
-
-    状态序列：
-      1-2. Normal 模式（无火灾）
-      3-4. 锅着火（应切换到 Firefighting 模式）
-      5. 火被扑灭（应切回 Normal 模式）
-    """
-    states = []
-
-    # 状态 1-2: Normal 模式
-    for i in range(2):
-        state = _make_minimal_state(
-            tick=i,
-            orders=[{"id": "order1", "recipe": "TomatoSoup", "remaining": 30}],
-            cookers=[]
-        )
-        # 添加灭火器到 extinguishers 列表
-        state["extinguishers"] = [
-            {"n": "ext_01", "held": None, "x": 1.0, "z": 2.0}
-        ]
-        states.append(state)
-
-    # 状态 3-4: 着火，P1 不在附近
-    for i in range(2, 4):
-        state = _make_minimal_state(
-            tick=i,
-            orders=[{"id": "order1", "recipe": "TomatoSoup", "remaining": 30}],
-            cookers=[
-                {"n": "cooker_01", "onFire": True, "isCooking": False, "x": 5.0, "z": 5.0}
-            ],
-            chefs=[
-                {"name": "Player 1", "x": 10.0, "z": 10.0, "held": None},  # P1 远离火源
-                {"name": "Player 2", "x": 1.0, "z": 1.0, "held": None}
-            ],
-            stations=[
-                {"n": "ext_01", "t": "fire_extinguisher", "x": 1.0, "z": 2.0}
-            ]
-        )
-        # 添加灭火器到 extinguishers 列表
-        state["extinguishers"] = [
-            {"n": "ext_01", "held": None, "x": 1.0, "z": 2.0}
-        ]
-        states.append(state)
-
-    # 状态 5: 火灭
-    state = _make_minimal_state(
-        tick=4,
-        orders=[{"id": "order1", "recipe": "TomatoSoup", "remaining": 30}],
-        cookers=[
-            {"n": "cooker_01", "onFire": False, "isCooking": False, "x": 5.0, "z": 5.0}
-        ]
-    )
-    state["extinguishers"] = [
-        {"n": "ext_01", "held": None, "x": 1.0, "z": 2.0}
-    ]
-    states.append(state)
-
-    return states
-
-
 @pytest.fixture
 def clean_trace():
     """清空 trace 日志。"""
@@ -216,47 +154,6 @@ def test_e2e_basic_decision_loop(clean_trace):
 
     # 验证模式为 Normal
     assert logs[0]["mode"] == "Normal", "初始模式应为 Normal"
-
-
-def test_e2e_mode_transition(clean_trace):
-    """端到端：模式切换（Normal → Firefighting → Normal）。
-
-    验证：
-      - Arbiter 检测到火灾并切换到 Firefighting
-      - 火灭后切回 Normal
-      - 模式切换时 Executor halt 并丢弃树
-      - Trace 记录模式变化
-    """
-    states = _make_firefighting_scenario()
-    mock_client = MockStateClient(states)
-
-    with patch("ai.agent.StateClient", return_value=mock_client):
-        agent = Agent()
-        agent.client = mock_client
-
-        modes_seen = []
-
-        # 执行 5 拍
-        for _ in range(5):
-            try:
-                snapshot = agent.client.read()
-                agent._tick_once(World(snapshot))
-                modes_seen.append(agent.bb.mode)
-                agent.tick += 1
-            except EOFError:
-                break
-
-    # 验证模式转换序列
-    assert "Normal" in modes_seen, "应该经历 Normal 模式"
-    assert "Firefighting" in modes_seen, "应该切换到 Firefighting 模式"
-
-    # 验证 trace 日志记录模式
-    logs = trace.read_log()
-    assert len(logs) > 0, "应该有决策日志"
-
-    log_modes = [log["mode"] for log in logs]
-    assert "Normal" in log_modes, "日志应记录 Normal 模式"
-    assert "Firefighting" in log_modes, "日志应记录 Firefighting 模式"
 
 
 def test_e2e_task_commitment(clean_trace):

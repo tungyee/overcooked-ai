@@ -1,4 +1,4 @@
-"""对话层 schema：账本偏好、作用域匹配与对话状态（spec §4.3–4.5）。
+"""对话层 schema：分工偏好、作用域匹配与对话状态（spec §4.3–4.5）。
 
 本模块**只允许导入标准库**：`ai/state/blackboard.py` 要引用这里的
 `Preference` / `DialogState`，若这里反向导入 `ai.*` 会形成
@@ -18,19 +18,19 @@ RESCUE_TYPES = {"RescueCooked", "ReturnPot", "RecoverLoosePot"}
 NO_BRANCH_TYPES = {
     "WashPlate", "PlaceCleanPlate", "DeliverPlate",
     "Discard", "ResetPlate", "StashHeld", "Extinguish",
-    "PlaceToRelay", "RecoverLoosePot",
+    "RecoverLoosePot", "Reposition",
 }
 
 
 @dataclass
 class Preference(object):
-    """一条分工偏好：候选打分上的加法项，由账本编译（ai/dialog/duties.py）。
+    """一条分工偏好：候选打分上的加法项，由分工表编译（ai/dialog/division.py）。
 
     - `kind`：direct（P2 优先做，正分）/ now（马上去，正分，权重 WEIGHT_NOW）
       / claim（P1 优先做，负分；P2 仍可按订单价值补位）
       / stop（硬压制，权重 0，`planner._is_stopped` 读）；
     - `scope`：`{(task 类型或 None, item 小写或 None)}`，见 `scope_matches`；
-    - `exclude`：从 scope 里扣掉的部分（被更新的账本条目接管）；
+    - `exclude`：从 scope 里扣掉的部分（被更新的分工条目接管）；
     - `expires_tick`：0 = 长期；非零时 `tick >= expires_tick` 即失效。
     空 scope 不匹配任何候选（不会退化成「影响全部」）。
     """
@@ -40,7 +40,7 @@ class Preference(object):
     owner: str = "P1"
     weight: float = 0.0
     expires_tick: int = 0
-    # 编译出该偏好的账本条目 id（trace / rescue 事件里报给 LLM）。
+    # 编译出该偏好的分工条目 id（trace / rescue 事件里报给 LLM）。
     duty_id: Optional[str] = None
 
 
@@ -48,11 +48,8 @@ class Preference(object):
 class DialogState(object):
     """对话层的跨回合状态；由主循环持有（spec §6.2）。"""
     last_speech_tick: int = 0
-    last_order_tick: int = 0
+    last_speech_at: float = 0.0
     last_rescue_tick: int = 0
-    # 新单合并窗口（spec §5.1）：1 秒内到达的订单攒成一批，由
-    # `ai.dialog.policy.merge_new_orders` 维护；清批前一个都不丢。
-    pending_orders: List = field(default_factory=list)
     # 上一条已触发的 speech（规范化后），供 4 秒内同句去重用。
     last_transcript: str = ""
     # 本关对话历史：OpenAI 多轮消息 dict（user / assistant / tool / 事件占位
@@ -101,7 +98,7 @@ def scope_matches(scope, task):
     """作用域是否覆盖该候选。
 
     作用域元素是 `(task 类型或 None, item 小写或 None)`：
-    - `(None, item)`：物料——任意 task 类型、这个 item（账本按物料认领）；
+    - `(None, item)`：物料——任意 task 类型、这个 item（分工按物料限定）；
     - `(类型, None)`：共享动作——这个类型、任意 item；
     - `(类型, item)`：精确到一个节点（测试/诊断用）。
     """

@@ -77,40 +77,14 @@ def test_reconcile_claims_called(agent, mock_state_client):
         assert mock_reconcile.called
 
 
-def test_mode_transition_halts_executor(agent, mock_state_client):
-    """步骤 ⑦ 模式变化时 halt 并丢弃树。"""
-    agent.bb.mode = "Normal"
-
-    # Mock arbiter 返回新模式
-    with patch("ai.core.arbiter.select_mode") as mock_select:
-        mock_select.return_value = ("Firefighting", "fire detected")
-
-        # Mock executor
-        agent.executor_inst = MagicMock()
-
-        snapshot = mock_state_client.receive.return_value
-        agent._tick_once(World(snapshot))
-
-        # 验证 halt_and_discard 被调用。模式切换（⑦）会 halt 一次；
-        # Firefighting 下 chosen_task 为 None，⑫ 也会再 halt 一次（幂等）。
-        agent.executor_inst.halt_and_discard.assert_called()
-
-        # 验证模式更新
-        assert agent.bb.mode == "Firefighting"
-
-
 def test_no_task_halts_executor(agent, mock_state_client):
     """步骤 ⑫ 无任务可选时也要 halt 旧树松键。
 
     实机复现：RecoverLoosePot 因锅被 P1 端走变不可行，planner 选不到任务，
     但上一次 Approach 的移动键还按着，角色一直按 right 顶墙。
     """
-    agent.bb.mode = "Normal"
-
-    with patch("ai.core.arbiter.select_mode") as mock_mode, \
-         patch("ai.core.planner.select_task") as mock_plan:
-        mock_mode.return_value = ("Normal", "default")
-        mock_plan.return_value = None  # 无可行任务
+    with patch("ai.core.planner.plan") as mock_plan:
+        mock_plan.return_value = (None, {"candidates": []})  # 无可行任务
 
         agent.executor_inst = MagicMock()
 
@@ -122,7 +96,6 @@ def test_no_task_halts_executor(agent, mock_state_client):
 
 def test_claims_written_back_to_blackboard(agent, mock_state_client):
     """步骤 ⑨ 写回 claims 到黑板。"""
-    agent.bb.mode = "Normal"
 
     # Mock planner：plan 返回 (task, record)
     with patch("ai.core.planner.plan") as mock_plan:
@@ -148,7 +121,6 @@ def test_claims_written_back_to_blackboard(agent, mock_state_client):
 
 def test_commitment_registered(agent, mock_state_client):
     """步骤 ⑩ 登记 commitment。"""
-    agent.bb.mode = "Normal"
 
     # Mock planner：plan 返回 (task, record)
     with patch("ai.core.planner.plan") as mock_plan:
@@ -175,7 +147,6 @@ def test_commitment_registered(agent, mock_state_client):
 
 def test_task_success_releases_claims(agent, mock_state_client):
     """task SUCCESS → 释放该 task 的认领。"""
-    agent.bb.mode = "Normal"
 
     # 预先设置认领
     agent.bb.claims[("board_01", "chop")] = Claim("P2", "order1", 0)
@@ -201,6 +172,87 @@ def test_task_success_releases_claims(agent, mock_state_client):
             # 验证认领被释放
             assert ("board_01", "chop") not in agent.bb.claims
             assert agent.bb.commitment is None
+
+
+class _FakeTask(object):
+    """done() 由外部开关控制；树每拍 RUNNING 并计数，用来看它是否还在被 tick。"""
+
+    TYPE = "FillCooker"
+    order_id = None
+    item = "BoiledPasta"
+
+    def __init__(self, name):
+        self.key = (self.TYPE, None, (name,), "BoiledPasta")
+        self.resources = (name,)
+        self.is_done = False
+        self.ticks = 0
+        self.halted = 0
+
+    def claims(self):
+        return [((self.key[2][0],), "fill")]
+
+    def done(self, ctx):
+        return self.is_done
+
+    def build(self):
+        task = self
+
+        class _Tree(object):
+            def tick(self, ctx):
+                task.ticks += 1
+                return "running"
+
+            def halt(self):
+                task.halted += 1
+        return _Tree()
+
+    def __eq__(self, other):
+        return getattr(other, "key", None) == self.key
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __str__(self):
+        return "FillCooker(%s)" % self.key[2][0]
+
+
+def test_done_active_task_settles_instead_of_ticking(agent, mock_state_client):
+    """⑨.5：正在跑的 task 后置条件已成立 → 当拍收尾成功，不再 tick 旧树。
+
+    实机 trace-20261030-214824 t=1743~1795：P1 先把面下进了 cooker_01，P2 的
+    FillCooker.done() 已为真，⑨.5 把 planner 选的 DeliverPlate 压回 FillCooker，
+    但树只认自己的 expect，照样走去面箱又拿了一份面，白跑 52 拍。
+    """
+    from ai.core.executor import Executor
+
+    agent.executor_inst = Executor()
+    fill = _FakeTask("cooker_01")
+    other = _FakeTask("cooker_02")
+    snapshot = mock_state_client.receive.return_value
+
+    with patch("ai.core.planner.plan") as mock_plan, \
+            patch("ai.output.trace.emit"):
+        # 第 1 拍：planner 选 fill，建树并 tick 一次
+        mock_plan.return_value = (fill, {"candidates": []})
+        agent._tick_once(World(snapshot))
+        assert fill.ticks == 1
+        assert agent.executor_inst.active_task == fill
+        agent.bb.claims[((("cooker_01",), "fill"))] = Claim("P2", None, 0)
+
+        # 第 2 拍：P1 替我们完成了 → fill.done 为真；planner 改选别的
+        fill.is_done = True
+        mock_plan.return_value = (other, {"candidates": []})
+        agent._tick_once(World(snapshot))
+
+    assert fill.ticks == 1, "后置条件已成立，不该再 tick 旧树"
+    assert fill.halted == 1, "旧树要 halt（松键/停移动）"
+    assert agent.executor_inst.active_task is None
+    assert agent.bb.commitment is None, "按成功收尾：承诺清空"
+    assert (("cooker_01",), "fill") not in agent.bb.claims, "成功收尾释放认领"
+    assert other.ticks == 0, "收尾这一拍不顺带开新树，下一拍由 planner 重选"
 
 
 def test_order_selection_by_remaining(agent, mock_state_client):
@@ -240,7 +292,6 @@ def test_order_switch_when_current_gone(agent, mock_state_client):
 
 def test_trace_emit_called(agent, mock_state_client):
     """步骤 ⑭ 决策日志被调用。"""
-    agent.bb.mode = "Normal"
 
     with patch("ai.agent.trace") as mock_trace:
         with patch("ai.agent.planner") as mock_planner:
@@ -320,3 +371,110 @@ def test_balloon_stationary_after_motion():
     agent._update_balloon_motion(World(_balloon_frame(-8.2, -1.0)))
     agent._frame_seq = 3
     assert agent._update_balloon_motion(World(_balloon_frame(-8.2, -1.0))) is False
+
+
+def test_hands_clear_failure_only_short_cooldown(agent):
+    """开头清手没清掉（手里还是开树时那件）：不计入放弃计数，只短冷却。
+
+    trace-20261031-204801 t=55.4：送餐被选中那拍手里刚多出一块肉，清手两次放不下
+    → 整个送餐拉黑 10s，篮子停靠窗口里再也没选它。
+    """
+    from ai import agent as A
+    from ai import tasks as T
+    task = T.DeliverPlate("1", ("p1",))
+    agent.executor_inst.held_at_start = "dicedmeat"   # 同 P.held_name 口径
+    ctx = {"chef": {"name": "Player 2", "held": "DicedMeat"}, "hands_clear_failed": True}
+    for _ in range(A.ABANDON_FAIL_STREAK + 2):
+        agent._note_failure(task, ctx)
+    until = agent.bb.scratch.abandoned_actions[task.claims()[0]]
+    assert until == agent.tick + A.HANDS_CLEAR_COOLDOWN_TICKS
+    assert A.HANDS_CLEAR_COOLDOWN_TICKS < A.ABANDON_TTL_TICKS
+
+
+def test_task_own_failure_still_abandons(agent):
+    """失败在 task 自己的动作上（没有 hands_clear_failed）：照旧连败 3 次整体放弃。"""
+    from ai import agent as A
+    from ai import tasks as T
+    task = T.DeliverPlate("1", ("p1",))
+    agent.executor_inst.held_at_start = None
+    ctx = {"chef": {"name": "Player 2", "held": None}}
+    for _ in range(A.ABANDON_FAIL_STREAK):
+        agent._note_failure(task, ctx)
+    assert agent.bb.scratch.abandoned_actions[task.claims()[0]] == agent.tick + A.ABANDON_TTL_TICKS
+
+
+def test_abandon_cooldown_is_five_seconds():
+    """整体放弃冷却 = 100 拍（5 秒）。
+
+    10 秒（200 拍）会让移动木筏关卡里的送餐被锁过久：接缝/篮子停靠窗口只有
+    约 10~16 秒，10 秒冷却一出，窗口就错过、成品盘干放到终局
+    （trace-20261111-220835 的 SendAcross -87392 三次捡盘失败后 10s 冷却，
+    冷却没结束接缝又断开）。但仍要长于清手短冷却（HANDS_CLEAR_COOLDOWN_TICKS）。
+    """
+    from ai import agent as A
+    assert A.ABANDON_TTL_TICKS == 100
+    assert A.HANDS_CLEAR_COOLDOWN_TICKS < A.ABANDON_TTL_TICKS
+
+
+# ---- Task 4: _validate_action（用 2-1 真实帧） ----
+
+import gzip
+import json
+import os
+
+from ai.dialog.catalog import Kitchen
+from ai.query.recipe_graph import _compile_node
+from ai.query.recipes import RecipeBook
+
+RAPIDS21 = os.path.join(os.path.dirname(__file__), "fixtures",
+                        "rapids", "rapids21-20261028.ndjson.gz")
+
+
+@pytest.fixture
+def rapids_world():
+    with gzip.open(RAPIDS21, "rt") as fh:
+        frame = [json.loads(line) for line in fh][-1]
+    return World(frame)
+
+
+@pytest.fixture
+def rapids_kitchen(rapids_world):
+    from ai.agent import _TASK_META
+    book = RecipeBook(rapids_world.recipes, rapids_world.stations)
+    stations = {st.get("t") for st in rapids_world.stations if st.get("t")}
+    return Kitchen.from_orders(book, rapids_world.orders, _compile_node,
+                               _TASK_META, stations)
+
+
+def test_validate_rejects_cross_side_assign(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, reason = _validate_action(rapids_kitchen, "下锅", "P2", rapids_world, bb)
+    assert ok is False and "够不着" in reason
+
+
+def test_validate_accepts_p2_reachable_action(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, _ = _validate_action(rapids_kitchen, "切", "P2", rapids_world, bb)
+    assert ok is True
+
+
+def test_validate_rejects_missing_action_station(rapids_world, rapids_kitchen):
+    from ai.agent import _validate_action
+    bb = Blackboard()
+    ok, reason = _validate_action(rapids_kitchen, "洗盘", "P2", rapids_world, bb)
+    assert ok is False and "没有" in reason
+
+
+# ---- Task 8: 开局分工事件 ----
+
+DIALOG_FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
+                              "dialog_scenarios.ndjson.gz")
+
+
+@pytest.fixture
+def sushi_world():
+    with gzip.open(DIALOG_FIXTURE, "rt") as fh:
+        frame = [json.loads(line) for line in fh][-1]
+    return World(frame)

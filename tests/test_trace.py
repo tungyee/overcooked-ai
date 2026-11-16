@@ -28,10 +28,10 @@ def clean_log():
 
 
 def test_default_path_is_repo_local_trace_jsonl():
-    """默认落盘在仓库根目录的 trace-<时间戳>.jsonl，与 .gitignore 对应。"""
+    """默认落盘在仓库根 runs/trace-<时间戳>.jsonl，与 .gitignore 对应。"""
     path = trace.default_path()
-    assert os.path.dirname(path) == trace.REPO_ROOT
-    assert os.path.dirname(trace.REPO_ROOT) != trace.REPO_ROOT
+    assert os.path.dirname(path) == os.path.join(trace.REPO_ROOT, "runs")
+    assert os.path.dirname(os.path.dirname(path)) == trace.REPO_ROOT
     assert os.path.isfile(os.path.join(trace.REPO_ROOT, "run_agent.py"))
     assert fnmatch(os.path.basename(path), "trace-*.jsonl")
 
@@ -44,7 +44,7 @@ def test_default_path_uses_given_root_and_time():
     """落盘目录/时间戳可注入（测试与工具用）。"""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(0))
     path = trace.default_path(root="/somewhere/var", now=time.localtime(0))
-    assert path == os.path.join("/somewhere/var", "trace-%s.jsonl" % stamp)
+    assert path == os.path.join("/somewhere/var", "runs", "trace-%s.jsonl" % stamp)
 
 
 def test_trace_format_valid_jsonl():

@@ -148,6 +148,88 @@ def station_blocked_cells(stations, mapping):
     return blocked
 
 
+def _box_of(entry):
+    # type: (Dict) -> Optional[Tuple[float, float, float, float]]
+    vals = [entry.get(k) for k in ("minx", "maxx", "minz", "maxz")]
+    if any(v is None for v in vals):
+        return None
+    try:
+        return tuple(float(v) for v in vals)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _box_cells(box, to_grid, to_world):
+    # type: (Tuple[float, float, float, float], Callable, Callable) -> Set[Tuple[int, int]]
+    """AABB 让哪些主网格格不可走：判据与 make_walkable_from_terrain 第 4 步
+    相同（格中心落在 AABB 外扩 CHEF_CLEARANCE 内）。
+
+    必须与可走性同口径：阈值不一致时，溢进邻格的量落在两套阈值之间，那一格
+    被判不可走、却又不算占地 → 交互位仍为空（实测 t=947 溢出 0.26）。
+    只依赖 to_grid / to_world，单测的轻量 World 也能用。
+    """
+    minx, maxx, minz, maxz = box
+    gx0, gz0 = to_grid(minx, minz)
+    gx1, gz1 = to_grid(maxx, maxz)
+    out = set()  # type: Set[Tuple[int, int]]
+    for gx in range(min(gx0, gx1) - 1, max(gx0, gx1) + 2):
+        for gz in range(min(gz0, gz1) - 1, max(gz0, gz1) + 2):
+            cx, cz = to_world(gx, gz)
+            if _point_in_any_box(cx, cz, [box], margin=CHEF_CLEARANCE):
+                out.add((gx, gz))
+    return out
+
+
+def _support_station(entry, stations):
+    # type: (Dict, Optional[List[Dict]]) -> Optional[Dict]
+    """承载 entry（盘/散锅/散料）的站点：x/z 落在其 AABB 内，取中心最近的。"""
+    x, z = entry.get("x"), entry.get("z")
+    if x is None or z is None:
+        return None
+    best, best_d = None, None
+    for st in stations or ():
+        if not isinstance(st, dict) or st is entry or st.get("t") == "floor":
+            continue
+        box = _box_of(st)
+        if box is None or not (box[0] - _POINT_EPS <= x <= box[1] + _POINT_EPS
+                               and box[2] - _POINT_EPS <= z <= box[3] + _POINT_EPS):
+            continue
+        d = ((box[0] + box[1]) / 2.0 - x) ** 2 + ((box[2] + box[3]) / 2.0 - z) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = st, d
+    return best
+
+
+def interaction_footprint(entry, cell, stations, to_grid, to_world, is_walkable):
+    # type: (Dict, Tuple[int, int], Optional[List[Dict]], Callable, Callable, Callable[[int, int], bool]) -> Set[Tuple[int, int]]
+    """交互目标的占地格：单格四邻有可走格时就是 {cell}；四邻全不可走时，
+    扩成 目标格 ∪ 自身（或承载站点）collider 让其不可走的格。
+
+    为什么不能只用目标中心投影的单格：移动篮上的台面相对静态主网格有亚格
+    偏移时，一张 1.2 m 的台面会跨两格。盘心越过格界被量化到后一格，前一格
+    又被台面 collider（外扩 CHEF_CLEARANCE）判成不可走 → 单格四邻全不可走、
+    判 unreachable；物理上站在台面前照样拿得到（Balloon_2_3_2P
+    trace-20261030-002104 t=853：盘 -16202 量化到 (13,6)，台面压着 (13,5)，
+    能站的 (13,4) 只是 (13,5) 的邻格）。按完整占地取四邻并集即可。
+
+    只在单格无路时才扩：静态厨房站点与格对齐，单格四邻总有交互位，行为
+    逐字不变，也不会多出离站点更远的备选站位。盘/散锅没有自己的 AABB，
+    借用承载它的站点；都没有时退回单格。
+    """
+    cells = {cell}
+    gx, gz = cell
+    if any(is_walkable(gx + dx, gz + dz)
+           for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+        return cells
+    box = _box_of(entry)
+    if box is None:
+        support = _support_station(entry, stations)
+        box = _box_of(support) if support is not None else None
+    if box is not None:
+        cells |= _box_cells(box, to_grid, to_world)
+    return cells
+
+
 def make_walkable(node_map, rows, cols, bounds, blocked, belt_cells,
                   off_x, off_z):
     # type: (Optional[List[List[bool]]], int, int, Optional[Tuple[int,int,int,int]], Set[Tuple[int,int]], Set[Tuple[int,int]], int, int) -> Callable[[int, int], bool]
@@ -285,17 +367,20 @@ LAYER_WALLS = 10
 LAYER_PLATEBLOCK = 20
 LAYER_COOKINGBLOCK = 22
 LAYER_TABLEBLOCK = 26
+LAYER_SLOPED_GROUND = 28
+SLOPE_JOIN_MARGIN = 0.3   # 楼梯并入 Ground 时的外扩（米），补台阶与地板间接缝
 LAYER_KILLPLANE = 30
 BLOCKING_LAYERS = (LAYER_WALLS, LAYER_TABLEBLOCK, LAYER_COOKINGBLOCK, LAYER_PLATEBLOCK)
+# 地板顶面高度取这两层（SlopedGround 楼梯并入 Ground 的可走面）。
+GROUND_TOP_LAYERS = (LAYER_GROUND, LAYER_SLOPED_GROUND)
 
 
-def parse_terrain(terrain_list):
-    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[float, float, float, float]]]
-    """按层号归类 AABB 列表（spec §4.4/§6）：{layer: [(minx,maxx,minz,maxz), ...]}。
+def _iter_terrain(terrain_list):
+    """逐个产出 (layer, (minx,maxx,minz,maxz), (miny,maxy) 或 None)。
 
-    层号跨关稳定（Unity 工程配置，不是场景实例名），取代 Col_* 名字前缀。
+    盒子 4 元素 = 旧格式（只有平面范围）；6 元素 = 插件 0.23.5+ 追加
+    miny/maxy。其它长度、非数值一律丢弃。
     """
-    out = {}  # type: Dict[int, List[Tuple[float, float, float, float]]]
     for entry in terrain_list or ():
         if not isinstance(entry, dict):
             continue
@@ -306,16 +391,107 @@ def parse_terrain(terrain_list):
             layer_i = int(layer)
         except (TypeError, ValueError):
             continue
-        boxes = []  # type: List[Tuple[float, float, float, float]]
         for b in entry.get("boxes") or ():
-            if not isinstance(b, (list, tuple)) or len(b) != 4:
+            if not isinstance(b, (list, tuple)) or len(b) not in (4, 6):
                 continue
             try:
-                boxes.append(tuple(float(v) for v in b))
+                vals = tuple(float(v) for v in b)
             except (TypeError, ValueError):
                 continue
-        if boxes:
-            out.setdefault(layer_i, []).extend(boxes)
+            yield layer_i, vals[:4], (vals[4:6] if len(vals) == 6 else None)
+
+
+def parse_terrain(terrain_list):
+    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[float, float, float, float]]]
+    """按层号归类 AABB 列表（spec §4.4/§6）：{layer: [(minx,maxx,minz,maxz), ...]}。
+
+    层号跨关稳定（Unity 工程配置，不是场景实例名），取代 Col_* 名字前缀。
+    6 元素盒（带高度）也只取平面 4 元素，高度见 parse_terrain_y。
+
+    SlopedGround(28)（楼梯/坡道）并入 Ground(9)：角色能走上去，可走性与
+    Ground 同一口径。Wizard_3_1 一楼↔二楼只靠 Left Side Stairs 连通，漏收
+    时出餐口判不可达（trace-20261101-130851）。原层号也保留一份。
+
+    只并入「在位」的楼梯（stairs_in_place）：Wizard_5_5 两座楼梯会沉到地下
+    再升起来（y 到 -7.5），沉下去的台阶盒平面位置不变，不看高度就当成能走，
+    P2 走上去掉进虚空反复重生（trace-20261101-145921 t=460~622）。
+    """
+    out = {}  # type: Dict[int, List[Tuple[float, float, float, float]]]
+    slopes = []  # type: List[Tuple[Tuple[float, float, float, float], Optional[Tuple[float, float]]]]
+    ground_tops = []  # type: List[float]
+    for layer, box, y in _iter_terrain(terrain_list):
+        out.setdefault(layer, []).append(box)
+        if layer == LAYER_SLOPED_GROUND:
+            slopes.append((box, y))
+        elif layer == LAYER_GROUND and y is not None:
+            ground_tops.append(y[1])
+    m = SLOPE_JOIN_MARGIN
+    for group in _slope_groups(slopes):
+        if not stairs_in_place([y for _b, y in group], ground_tops):
+            continue
+        for box, _y in group:
+            # 楼梯盒只包台阶本身，与上下层地板之间留有接缝（3-1 顶阶 maxz=-1.22、
+            # 二楼地板 minz=-1.05），格中心 z=-1.2 正落在缝里。并入时外扩补缝；
+            # 楼梯两侧有墙（阻挡层），外扩不会放出悬空格。
+            out.setdefault(LAYER_GROUND, []).append(
+                (box[0] - m, box[1] + m, box[2] - m, box[3] + m))
+    return out
+
+
+# 楼梯两端离地板顶面这么近（m）算接上：一级台阶高 ≈0.5，升降中的楼梯差得更多。
+STAIRS_JOIN_TOL = 0.3
+
+
+def _slope_groups(slopes):
+    """SlopedGround 盒按平面相邻（外扩 SLOPE_JOIN_MARGIN 后相交）分组，一组 = 一座楼梯。"""
+    m = SLOPE_JOIN_MARGIN
+    n = len(slopes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        a = slopes[i][0]
+        for j in range(i + 1, n):
+            b = slopes[j][0]
+            if a[0] - m <= b[1] and b[0] - m <= a[1] and a[2] - m <= b[3] and b[2] - m <= a[3]:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(slopes[i])
+    return list(groups.values())
+
+
+def stairs_in_place(heights, ground_tops):
+    # type: (List[Optional[Tuple[float, float]]], List[float]) -> bool
+    """一座楼梯（各台阶盒 (miny,maxy)）是否在位：最低台阶顶、最高台阶顶都贴着
+    某块地板顶面（±STAIRS_JOIN_TOL）。没有高度（旧帧）或没有地板高度时视为在位。"""
+    tops = [y[1] for y in heights if y is not None]
+    if not tops or not ground_tops:
+        return True
+
+    def near(v):
+        return any(abs(v - g) <= STAIRS_JOIN_TOL for g in ground_tops)
+
+    # 最低台阶顶比它接的下层地板高半级台阶：按下沿判
+    lows = [y[0] for y in heights if y is not None]
+    return near(min(lows)) and near(max(tops))
+
+
+def parse_terrain_y(terrain_list):
+    # type: (Optional[List[Dict]]) -> Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]
+    """带高度的盒子：{layer: [((minx,maxx,minz,maxz), miny, maxy), ...]}。
+
+    只收 6 元素盒；旧插件帧返回空 dict，调用方据此退回「不知道墙高」。
+    """
+    out = {}  # type: Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]
+    for layer, box, y in _iter_terrain(terrain_list):
+        if y is not None:
+            out.setdefault(layer, []).append((box, y[0], y[1]))
     return out
 
 
@@ -352,9 +528,66 @@ def _point_in_any_box(x, z, boxes, margin=0.0):
     return False
 
 
+def _ground_top_at(terrain_y, x, z):
+    # type: (Optional[Dict[int, List[Tuple[Tuple[float, float, float, float], float, float]]]], float, float) -> Optional[float]
+    """(x,z) 处地板顶面高度（Ground/SlopedGround 盒顶取最高）。
+
+    只读带高度的 terrain_y（parse_terrain_y）；旧帧/无高度地面盒返回 None。
+    调用方对 None 的解释是「不知道地板高度」——保守按阻挡处理，保持旧行为。
+    """
+    best = None  # type: Optional[float]
+    for layer in GROUND_TOP_LAYERS:
+        for box, _miny, maxy in (terrain_y or {}).get(layer) or ():
+            if box[0] <= x <= box[1] and box[2] <= z <= box[3] \
+                    and (best is None or maxy > best):
+                best = maxy
+    return best
+
+
+def _blocking_boxes(terrain_by_layer, terrain_y):
+    # type: (Dict[int, List[Tuple[float, float, float, float]]], Optional[Dict]) -> List[Tuple[float, ...]]
+    """阻挡层盒，带高度时是 6 元素 (minx,maxx,minz,maxz,miny,maxy)。
+
+    高度从 terrain_y 反查（按 (layer, 2D box) 精确匹配）。旧 4 元素盒（无
+    高度）原样返回——调用方对无高度盒一律按阻挡处理，保持旧行为。
+    """
+    heights = {}  # type: Dict[Tuple[int, Tuple[float, float, float, float]], Tuple[float, float]]
+    for layer, entries in (terrain_y or {}).items():
+        for box, miny, maxy in entries:
+            heights[(layer, box)] = (miny, maxy)
+    out = []  # type: List[Tuple[float, ...]]
+    for layer in BLOCKING_LAYERS:
+        for box in terrain_by_layer.get(layer) or ():
+            h = heights.get((layer, box))
+            out.append(box + h if h is not None else box)
+    return out
+
+
+def _point_in_blocking(x, z, boxes, gtop, margin=0.0):
+    # type: (float, float, List[Tuple[float, ...]], Optional[float], float) -> bool
+    """点 (x,z) 是否落在阻挡盒内（带外扩）。
+
+    6 元素盒先按高度过滤：整段顶面（maxy）不超过地板顶面 gtop 的盒在脚下
+    之下（矿洞/平台底座之类），不挡路。gtop 为 None（不知道地板高度）时不
+    过滤，保持旧行为。
+    """
+    for box in boxes:
+        if len(box) == 6:
+            minx, maxx, minz, maxz, _miny, maxy = box
+            if gtop is not None and maxy <= gtop:
+                continue
+        else:
+            minx, maxx, minz, maxz = box
+        if (minx - margin - _POINT_EPS <= x <= maxx + margin + _POINT_EPS
+                and minz - margin - _POINT_EPS <= z <= maxz + margin + _POINT_EPS):
+            return True
+    return False
+
+
 def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
-                               mapping, belt_cells=None, level_bounds=None):
-    # type: (Dict[int, List[Tuple]], List[Tuple[float,float,float,float]], Set[Tuple[int,int]], GridMapping, Optional[Set[Tuple[int,int]]], Optional[List[Tuple[float,float,float,float]]]) -> Callable[[int, int], bool]
+                               mapping, belt_cells=None, level_bounds=None,
+                               terrain_y=None):
+    # type: (Dict[int, List[Tuple]], List[Tuple[float,float,float,float]], Set[Tuple[int,int]], GridMapping, Optional[Set[Tuple[int,int]]], Optional[List[Tuple[float,float,float,float]]], Optional[Dict]) -> Callable[[int, int], bool]
     """按 §5.3 判定顺序构造 is_walkable(gx,gz)。替代 `make_walkable`。
 
     判定顺序：
@@ -380,9 +613,7 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
     """
     ground = terrain_by_layer.get(LAYER_GROUND) or []
     killplane = terrain_by_layer.get(LAYER_KILLPLANE) or []
-    blocking = []  # type: List[Tuple[float, float, float, float]]
-    for layer in BLOCKING_LAYERS:
-        blocking.extend(terrain_by_layer.get(layer) or ())
+    blocking = _blocking_boxes(terrain_by_layer, terrain_y)
     hazard_boxes = list(hazard_boxes or ())
     belts = set(belt_cells or ())
     level_bounds = list(level_bounds or ())
@@ -407,7 +638,9 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
         # AABB 会朝邻格溢出一点点，若按格子区域相交判，会把贴着墙站立的
         # 可走地板整排误判成不可走（Balloon_1_5 上层地板、上左走廊被封死，
         # trace-20261017-193620）。点判只拦「格中心真的被占」的格子。
-        if _point_in_any_box(x, z, blocking, margin=CHEF_CLEARANCE):
+        # 带高度的盒先滤掉「整段在地板之下」的假墙（矿洞地板下空腔之类）。
+        if _point_in_blocking(x, z, blocking, _ground_top_at(terrain_y, x, z),
+                              margin=CHEF_CLEARANCE):
             return False
         if (gx, gz) in occupancy_cells and (gx, gz) not in belts:
             return False
@@ -416,8 +649,8 @@ def make_walkable_from_terrain(terrain_by_layer, hazard_boxes, occupancy_cells,
     return is_walkable
 
 
-def make_edge_blocker(terrain_by_layer, mapping):
-    # type: (Dict[int, List[Tuple[float, float, float, float]]], GridMapping) -> Callable[[Tuple[int, int], Tuple[int, int]], bool]
+def make_edge_blocker(terrain_by_layer, mapping, terrain_y=None):
+    # type: (Dict[int, List[Tuple[float, float, float, float]]], GridMapping, Optional[Dict]) -> Callable[[Tuple[int, int], Tuple[int, int]], bool]
     """返回 edge_blocked(cur, nxt) -> bool：两格之间是否被薄墙挡住。
 
     薄墙 = collider AABB **严格夹在两格中心之间**（比一格窄、盖不住任何格
@@ -433,24 +666,29 @@ def make_edge_blocker(terrain_by_layer, mapping):
     站点 collider 会朝邻格溢出一点点，按区域判会把贴墙站立的可走地板整排
     误杀（同 is_walkable 点判的教训）。
     """
-    blocking = []  # type: List[Tuple[float, float, float, float]]
-    for layer in BLOCKING_LAYERS:
-        blocking.extend(terrain_by_layer.get(layer) or ())
+    blocking = _blocking_boxes(terrain_by_layer, terrain_y)
 
     def edge_blocked(cur, nxt):
         # type: (Tuple[int, int], Tuple[int, int]) -> bool
         x0, z0 = mapping.to_world(cur[0], cur[1])
         x1, z1 = mapping.to_world(nxt[0], nxt[1])
+        gtop = _ground_top_at(terrain_y, x0, z0)
         if cur[0] != nxt[0]:
             # 水平移动：墙夹在左右两格中心之间，且高度盖住本行中心 z
             lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
-            for minx, maxx, minz, maxz in blocking:
+            for box in blocking:
+                minx, maxx, minz, maxz = box[:4]
+                if len(box) == 6 and gtop is not None and box[5] <= gtop:
+                    continue          # 整段在地板之下：不拦这条边
                 if lo < minx and maxx < hi and minz <= z0 <= maxz:
                     return True
         else:
             # 垂直移动：墙夹在上下两格中心之间，且横向盖住本列中心 x
             lo, hi = (z0, z1) if z0 < z1 else (z1, z0)
-            for minx, maxx, minz, maxz in blocking:
+            for box in blocking:
+                minx, maxx, minz, maxz = box[:4]
+                if len(box) == 6 and gtop is not None and box[5] <= gtop:
+                    continue          # 整段在地板之下：不拦这条边
                 if lo < minz and maxz < hi and minx <= x0 <= maxx:
                     return True
         return False
@@ -514,15 +752,19 @@ def parse_wind_zones(wind_list):
 
 
 def parse_belts(belts_list):
-    # type: (Optional[List[Dict]]) -> Tuple[Set[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]]]
-    """传送带格集合与方向（spec §5.4）：方向来自 GetSurfaceVelocity() 归一化。
+    # type: (Optional[List[Dict]]) -> Tuple[Set[Tuple[int, int]], Dict[Tuple[int, int], Tuple[int, int]], Dict[Tuple[int, int], float]]
+    """传送带格集合、方向与速度（spec §5.4）：方向来自 GetSurfaceVelocity() 归一化。
 
     取代 occupancy.BELTS 关卡硬编码表。vx/vz 都是 0（速度为零，异常数据）
     时该格仍算传送带（belt_cells 决定"是不是传送带"，不决定推力方向），
-    但不记方向——navigation 的逆向代价判定对无方向格天然不生效。
+    但不记方向/速度——navigation 的逆向代价判定对无方向格天然不生效。
+
+    速度（|v|）单独保留：4-3 的快带（5 m/s）逆行走不动，navigation 据此
+    硬挡；1-4 的慢带（2.5 m/s）仍允许逆行 + dash 顶住。
     """
-    cells = set()  # type: Set[Tuple[int, int]]
-    dirs = {}      # type: Dict[Tuple[int, int], Tuple[int, int]]
+    cells = set()   # type: Set[Tuple[int, int]]
+    dirs = {}       # type: Dict[Tuple[int, int], Tuple[int, int]]
+    speeds = {}     # type: Dict[Tuple[int, int], float]
     for b in belts_list or ():
         if not isinstance(b, dict):
             continue
@@ -546,7 +788,40 @@ def parse_belts(belts_list):
             (1 if vx_f > 0 else -1) if vx_f != 0 else 0,
             (1 if vz_f > 0 else -1) if vz_f != 0 else 0,
         )
-    return cells, dirs
+        speeds[cell] = (vx_f * vx_f + vz_f * vz_f) ** 0.5
+    return cells, dirs, speeds
+
+
+def wind_flow(wind_zones, to_grid, to_world):
+    # type: (Optional[List[Dict]], Callable, Callable) -> Tuple[Dict[Tuple[int, int], Tuple[int, int]], Dict[Tuple[int, int], float]]
+    """风区 → 每格方向/速度流场（把风当传送带处理，供寻路避开逆风）。
+
+    与 parse_belts 对齐：方向按 vx/vz 符号归一化到 (±1,0)/(0,±1)，速度 =
+    |v|。风区是 AABB（不是逐格上报），用 _box_cells 按「格心落 AABB 外扩
+    CHEF_CLEARANCE」落格（与可走性同口径）。返回 (wind_dir, wind_speed)，
+    由 World 与 belt_dir/belt_speed 合并成 flow，navigation 统一消费。
+    """
+    dirs = {}    # type: Dict[Tuple[int, int], Tuple[int, int]]
+    speeds = {}  # type: Dict[Tuple[int, int], float]
+    for wz in wind_zones or ():
+        if not isinstance(wz, dict):
+            continue
+        box = _box_of(wz)
+        if box is None:
+            continue
+        try:
+            vx, vz = float(wz.get("vx") or 0), float(wz.get("vz") or 0)
+        except (TypeError, ValueError):
+            continue
+        if vx == 0.0 and vz == 0.0:
+            continue
+        d = ((1 if vx > 0 else -1) if vx != 0 else 0,
+             (1 if vz > 0 else -1) if vz != 0 else 0)
+        speed = (vx * vx + vz * vz) ** 0.5
+        for cell in _box_cells(box, to_grid, to_world):
+            dirs[cell] = d
+            speeds[cell] = speed
+    return dirs, speeds
 
 
 def station_block_cells(station, terrain_by_layer, mapping):

@@ -17,11 +17,21 @@ class _T(object):
         self.TYPE = type_name
 
 
-def _rules(pressure=0.0, plate_pressure=0.0, placed=False):
-    # type: (float, float, bool) -> tuple
+class _ItemTask(object):
+    """带 item 的 task 替身：L_REDEEM 的 SendAcross 判据要读 item。"""
+
+    def __init__(self, type_name, item=None):
+        # type: (str, Any) -> None
+        self.TYPE = type_name
+        self.item = item
+
+
+def _rules(pressure=0.0, plate_pressure=0.0, placed=False, plate_total=99):
+    # type: (float, float, bool, int) -> tuple
     """固定返回值的规则表，让层判定与三条曲线的实现解耦。"""
     return PL.build_rules(lambda t, w: pressure, lambda w: plate_pressure,
-                          lambda w: placed)
+                          lambda w: placed,
+                          plate_total_fn=lambda w: plate_total)
 
 
 def test_layer_constants_are_ordered_high_to_low():
@@ -57,6 +67,19 @@ def test_pressure_thresholds_are_inclusive():
 
 def test_deliver_is_redeem_layer():
     assert PL.layer_of(_T("DeliverPlate"), None, rules=_rules()) == PL.L_REDEEM
+
+
+def test_send_across_plated_dish_is_redeem_layer():
+    """成品盘跨区送 = 送餐兑现，归 L_REDEEM；其它 kind 仍是解拼装卡。
+
+    出餐口在河对岸时 DeliverPlate 不可行，真正送餐的是 SendAcross(plated_dish)。
+    它若不进 L_REDEEM 就吃不到 combo/urgency 送餐分，恒 0 分、永远输给备菜。
+    """
+    assert PL.layer_of(_ItemTask("SendAcross", "plated_dish"),
+                       None, rules=_rules()) == PL.L_REDEEM
+    for item in ("clean_plate", "dirty_plate", "carrier", None):
+        assert PL.layer_of(_ItemTask("SendAcross", item),
+                           None, rules=_rules()) == PL.L_UNBLOCK
 
 
 def test_plate_tasks_move_between_unblock_and_cleanup():
@@ -157,13 +180,19 @@ def _cooker(n="cooker1", progress=None, ctime=12.0, cooked=False,
 
 
 class _W(object):
-    """最小 world 替身：层判定只读 cookers / plates / stations。"""
+    """最小 world 替身：层判定只读 cookers / plates / held_plates / stations。"""
 
-    def __init__(self, cookers=(), plates=(), stations=()):
-        # type: (Any, Any, Any) -> None
+    def __init__(self, cookers=(), plates=(), held_plates=(), stations=()):
+        # type: (Any, Any, Any, Any) -> None
         self.cookers = list(cookers)
         self.plates = list(plates)
+        self.held_plates = list(held_plates)
         self.stations = list(stations)
+
+    @property
+    def all_plates(self):
+        # type: () -> List
+        return self.plates + self.held_plates
 
     def to_grid(self, x, z):
         # type: (float, float) -> tuple
@@ -226,14 +255,52 @@ def test_task_without_cooker_id_never_enters_cook_layers():
 
 
 def test_plate_pressure_three_tiers():
-    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。L4 层谓词收紧为
-    clean==0 且无装配盘，所以只有 0 盘档进 L4，1 盘与 >=2 盘都掉 L7。"""
+    """_plate_pressure：0 块=2.0、1 块=1.0、>=2 块=0.0。
+
+    这里的 `_W` 只有 1~2 块盘且没有脏盘，`_plate_total` 不等于 2（或压力为 0），
+    所以仍按旧的「clean==0 且无装配盘」规则落层：
+    1 块干净盘、2 块干净盘都掉 L7。
+    """
     clean = {"n": "plate1", "contents": []}
     t = _T("WashPlate")
     assert PL.layer_of_task(t, _W(plates=[])) == PL.L_UNBLOCK
     assert PL.layer_of_task(t, _W(plates=[clean])) == PL.L_CLEANUP
     assert PL.layer_of_task(
         t, _W(plates=[clean, dict(clean, n="plate2")])) == PL.L_CLEANUP
+
+
+def test_plate_pressure_counts_held_plates():
+    """_plate_pressure 数全量（含手持）干净盘：P2 端着唯一一块干净盘去盛料时，
+    PlaceCleanPlate 不能因为「盘离开盘堆」被抬进 L4——否则盛料 task 被抢走、
+    盘一放下压力又归零，形成拿放死循环（trace-20261101-223804 尾部）。"""
+    held = {"n": "plate2", "contents": []}
+    t = _T("PlaceCleanPlate")
+    # 非手持 1 块 + 手持 1 块 = 2 块干净盘 → 压力 0 → PlaceCleanPlate 掉 L7
+    assert PL.layer_of_task(
+        t, _W(plates=[{"n": "plate1", "contents": []}],
+              held_plates=[held])) == PL.L_CLEANUP
+    # 非手持 0 块 + 手持 1 块 = 1 块 → 压力 1.0 → 仍升 L4（真的只剩一块可用）
+    assert PL.layer_of_task(
+        t, _W(plates=[], held_plates=[held])) == PL.L_UNBLOCK
+    # 全空 → 压力 2.0 → L4
+    assert PL.layer_of_task(t, _W(plates=[], held_plates=[])) == PL.L_UNBLOCK
+
+
+def test_place_clean_plate_yields_to_usable_stack_top():
+    """干净盘堆顶层已经能直接接料时，PlaceCleanPlate 不该再以 L4 抢先。
+
+    实机确认：盘堆顶可以放料（trace-20261108-225713 t=612 的
+    FetchToPlate 对 stack_top 盘 ok=True）。旧规则只看 plate_pressure>0，
+    会在只剩这一块干净盘时把 L6 的 FetchToPlate 结构性压掉，逼 P2 先搬盘。
+    """
+    t = _T("PlaceCleanPlate")
+    stack_top = {"n": "p1", "contents": [],
+                 "stack_top": True, "stack_clean": True}
+    # 唯一一块干净盘在盘堆顶、可直接接料 → 不进 L4
+    assert PL.layer_of_task(t, _W(plates=[stack_top])) == PL.L_CLEANUP
+    # 同一块盘但旧帧/脏标记缺失 → 仍按「只剩一块干净盘」升 L4
+    assert PL.layer_of_task(
+        t, _W(plates=[{"n": "p1", "contents": []}])) == PL.L_UNBLOCK
 
 
 def test_missing_cooking_progress_falls_back_to_binary():
@@ -426,21 +493,21 @@ def test_duplicate_key_takes_the_higher_layer():
 
 def test_filter_terms_keeps_only_whitelisted():
     """层内只算该层相关的项。这是「W_* 之间不再需要跨类可比」的实现——
-    W_COOKER_IDLE 只跟 W_ETA 比（同在 L5），结构上碰不到备菜的项。"""
-    terms = {"cooker_idle": 4.8, "eta": -1.5, "urgency": 3.0,
-             "completion_ratio": 1.33}
-    score, kept = PL.filter_terms(terms, PL.L_CAPACITY)
-    assert set(kept) == {"cooker_idle", "eta"}
-    assert score == pytest.approx(4.8 - 1.5)
+    备菜层只和白名单内的项比较，结构上碰不到别的层的项。"""
+    terms = {"cooker_idle": 4.8, "pressure": 2.0, "urgency": 3.0,
+             "plate_pressure": 7.0}
+    score, kept = PL.filter_terms(terms, PL.L_PREP)
+    assert set(kept) == {"cooker_idle", "pressure", "urgency"}
+    assert score == pytest.approx(4.8 + 2.0 + 3.0)
 
 
 # planner 当前产出的全部 term 键（与 ai/planner.py 的 terms[...] 对齐）。
 _ALL_TERMS = (
-    "urgency", "pressure", "eta", "async_resource",
-    "completion_ratio", "ingredient_reuse", "combo_head",
-    "combo_break", "freshness", "deadline_lookahead", "hands", "move_penalty",
-    "deliver_bonus", "plate_pressure", "relay_1_3_bonus", "cooker_idle",
-    "no_plate_placed", "pref",
+    "urgency", "pressure", "async_resource",
+    "completion_ratio", "combo_head",
+    "combo_break", "deadline_lookahead", "plate_pressure", "cooker_idle",
+    "no_plate_placed", "pref", "batch_bonus", "held_batch", "held_plate",
+    "hands",
 )
 
 
@@ -467,19 +534,6 @@ def test_whitelists_only_reference_real_terms():
         assert not unknown, "层 %s 的白名单含未知 term: %s" % (layer, unknown)
 
 
-def test_deliver_bonus_is_in_no_whitelist():
-    """W_DELIVER_BONUS 是恒等加常数的类别标记：L3 全部候选都是
-    DeliverPlate，给每个人加同一个 3.0 不改变任何排序。它原本在调两件事
-    （类别优先级 + 改选频率，见 4.0→3.0 那段注释），现在类别优先级归层序、
-    改选频率归 COMMITMENT_MARGIN。
-
-    常量本身保留（三个测试文件引用它，删会连带改测试，而「零测试改动」
-    是分层正确性的核心证据）；这里只钉住它不再参与打分。
-    """
-    for allowed in PL.TERM_WHITELIST.values():
-        assert "deliver_bonus" not in allowed
-
-
 def test_rescue_layers_ignore_completion_ratio():
     """L1/L2 只看锅。盘满不满不影响该不该去盛这锅饭。"""
     terms = {"pressure": 1.8, "completion_ratio": 2.5, "urgency": 4.0}
@@ -490,31 +544,31 @@ def test_rescue_layers_ignore_completion_ratio():
 
 
 def test_fire_layer_scores_zero():
-    """L0 不打分（plan_firefighting 只发一个全局候选）。"""
-    score, kept = PL.filter_terms({"pressure": 2.0, "eta": -1.0}, PL.L_FIRE)
+    """L0 不打分（L_FIRE 层只有一个全局 Extinguish 候选）。"""
+    score, kept = PL.filter_terms({"pressure": 2.0, "urgency": 3.0}, PL.L_FIRE)
     assert score == 0.0
     assert kept == {}
 
 
 def test_filter_terms_sums_negative_contributions():
     """惩罚项存负数，求和即可。"""
-    terms = {"eta": -1.5, "hands": -1.0, "move_penalty": -5.0,
+    terms = {"deadline_lookahead": -5.0, "combo_break": -0.5,
              "urgency": 3.0, "completion_ratio": 1.33}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
-    assert score == pytest.approx(-1.5 - 1.0 - 5.0 + 3.0 + 1.33)
+    assert score == pytest.approx(-5.0 - 0.5 + 3.0 + 1.33)
 
 
 def test_prep_layer_scores_take_cooked_pressure():
     """快熟阶段的 TakeCookedToPlate 在 L6 要能吃到 pressure 项，否则
     「提前端盘等熟」的压力梯度又会被白名单架空（实机烧糊的根因之一）。"""
-    terms = {"pressure": 2.5, "eta": -1.5, "hands": -1.0, "urgency": 3.0}
+    terms = {"pressure": 2.5, "urgency": 3.0}
     score, kept = PL.filter_terms(terms, PL.L_PREP)
     assert "pressure" in kept
-    assert score == pytest.approx(2.5 - 1.5 - 1.0 + 3.0)
+    assert score == pytest.approx(2.5 + 3.0)
 
 
 def test_filter_terms_with_none_layer():
-    assert PL.filter_terms({"eta": -1.0}, None) == (0.0, {})
+    assert PL.filter_terms({"pressure": 1.0}, None) == (0.0, {})
 
 
 def test_identical_scores_keep_input_order_after_sort():
@@ -529,7 +583,7 @@ def test_identical_scores_keep_input_order_after_sort():
         == ["a", "b", "c"]
 
     # 且 filter_terms 对相同输入给出相同输出（无随机性、无字典序依赖）
-    terms = {"cooker_idle": 4.8, "eta": -1.2}
+    terms = {"cooker_idle": 4.8, "pressure": -1.2}
     first = PL.filter_terms(terms, PL.L_CAPACITY)
     for _ in range(5):
         assert PL.filter_terms(terms, PL.L_CAPACITY) == first
@@ -541,17 +595,31 @@ def test_unregistered_layer_raises():
     静默不隔离比静默丢分危险：隔离是本模块存在的全部理由。
     """
     with pytest.raises(KeyError):
-        PL.filter_terms({"urgency": 5.0, "eta": -1.0}, 999)
+        PL.filter_terms({"urgency": 5.0, "pressure": 1.0}, 999)
 
 
 def test_unblock_layer_scores_plate_terms_only():
     """L4 解卡只看盘：plate_pressure（洗盘）与 no_plate_placed（摆盘）。
 
-    评审把这层白名单换成语义错误但名字合法的 {hands, move_penalty}，39 个测试
-    全绿——L4 此前只有 spec 的文字定义，没有行为断言。
+    评审把这层白名单换成语义错误但名字合法的 {combo_break, async_resource}，
+    39 个测试全绿——L4 此前只有 spec 的文字定义，没有行为断言。
     """
     terms = {"plate_pressure": 7.0, "no_plate_placed": 3.0,
-             "urgency": 4.0, "eta": -1.5, "hands": -1.0}
+             "urgency": 4.0, "pressure": -1.5, "combo_break": -0.5}
     score, kept = PL.filter_terms(terms, PL.L_UNBLOCK)
     assert set(kept) == {"plate_pressure", "no_plate_placed"}
     assert score == pytest.approx(10.0)
+
+
+def test_wash_two_plate_level_with_one_dirty_is_unblock():
+    """2 盘关：只要不是两块都干净，wash 就进 L4。"""
+    t = _T("WashPlate")
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=1.0, plate_total=2)) == PL.L_UNBLOCK
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=2.0, plate_total=2,
+                              placed=True)) == PL.L_UNBLOCK
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=1.0, plate_total=3)) == PL.L_CLEANUP
+    assert PL.layer_of(
+        t, None, rules=_rules(plate_pressure=0.0, plate_total=2)) == PL.L_CLEANUP

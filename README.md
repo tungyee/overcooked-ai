@@ -1,8 +1,9 @@
 # CoChef
 
-> 厨房可以胡闹，搭子必须靠谱 —— 一个实时陪你切菜、下锅、出餐，还能听懂你说话的 “胡闹厨房 2” (Overcooked! 2) AI 队友。
+> 厨房可以胡闹，搭子必须靠谱！一个实时陪你切菜、下锅、出餐，还能听懂你说话的 “胡闹厨房 2” (Overcooked! 2) AI 队友。
 
-<!-- TODO: 顶部放一条 15–30s 高光 GIF，录好后替换为：![](media/demo.gif) -->
+<p align="center"><img src="media/demo.webp" alt="CoChef 在厨房里实时协作" width="480"></p>
+<p align="center"><sub>蓝色为人类玩家，红色为 AI，完整演示视频可见<a href="media/Level-1-6-demo.mp4">这里</a></sub></p>
 
 ## 它是什么
 
@@ -49,12 +50,6 @@ flowchart LR
 
 截至 **2026-11**，主线已推进到 **4-6 关**（第 4 世界第 6 关）。进展持续更新，见 [进展记录](docs/progress.md)。
 
-## 演示
-
-[Level 1–6 完整演示视频（约 4 分半）](media/Level-1-6-demo.mp4)
-
-<!-- 截图占位：主菜单 / 关卡内 -->
-
 ## 快速开始
 
 ### 1. 环境准备
@@ -86,10 +81,21 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start_windows.ps1 -Gam
 ### 3. 开始协作
 
 - AI 自动接管分屏 2P，与人类玩家 P1 一起切菜、下锅、送餐、灭火。
-- **语音协作**：装好依赖、在 `.env` 配好 key 后（见 [语音配置](docs/dialog_system.md)），按住说话键（PTT，默认 F8）说话，松开发送。例如：
-  - 「你洗盘子，我来炒菜」
-  - 「我不太会这一关的操作，带带我」
+- **语音协作**：装好依赖、在 `.env` 配好 key 后（见 [语音配置](docs/dialog_system.md)），按住说话键（PTT，默认 F8）说话，松开发送。
 - AI 会结合你的发言与战局自主分工，遇到新订单还会主动开口跟你商量怎么配合。
+
+> 玩家：你先去煮饭吧，煮完饭之后洗碗。
+> CoChef：好，我先煮饭，煮完就去洗碗。
+>
+> 玩家：去送餐吧。
+> CoChef：好，这就去送餐。
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="media/join-p2-virtual-gamepad.jpg" alt="出现红色虚拟手柄，即表示 AI 玩家加入" width="100%"><br><sub>出现红色虚拟手柄，即表示 AI 玩家加入</sub></td>
+    <td align="center" width="50%"><img src="media/select-level.jpg" alt="选择任意关卡，即可开黑" width="100%"><br><sub>选择任意关卡，即可开黑</sub></td>
+  </tr>
+</table>
 
 ## 常见问题
 

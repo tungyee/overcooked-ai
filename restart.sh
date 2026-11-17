@@ -49,6 +49,20 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+G="$(cd "$G" && pwd -P)" || exit 1
+APP="$G/Overcooked2.app"
+GAME_EXE="$APP/Contents/MacOS/Overcooked2"
+PRELOADER="$G/BepInEx/core/BepInEx.Preloader.dll"
+DOORSTOP="$G/libdoorstop.dylib"
+if [ ! -x "$GAME_EXE" ]; then
+    echo "[restart] 找不到可执行的游戏程序：$GAME_EXE；请检查 GAME_DIR" >&2
+    exit 1
+fi
+if [ ! -f "$PRELOADER" ] || [ ! -f "$DOORSTOP" ]; then
+    echo "[restart] 游戏目录缺少 BepInEx 或 doorstop；安装步骤见 docs/setup.md" >&2
+    exit 1
+fi
+
 # 用进程命令行精确匹配，避免误杀 Steam/脚本自身。
 GAME_PATTERN="Overcooked2\.app/Contents/MacOS/Overcooked2"
 AGENT_PATTERN="run_agent\.py"
@@ -146,8 +160,10 @@ stop_if_running "$GAME_PATTERN" "游戏"
 # 3. 编译 + 部署。
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "[restart] 编译插件 ..."
-    "$ROOT/plugin/build.sh" || { echo "[restart] 编译失败，中止" >&2; exit 1; }
-    cp "$ROOT/plugin/build/Oc2AIPlugin.dll" "$G/BepInEx/plugins/Oc2AIPlugin.dll"
+    GAME_DIR="$G" "$ROOT/plugin/build.sh" || { echo "[restart] 编译失败，中止" >&2; exit 1; }
+    mkdir -p "$G/BepInEx/plugins" &&
+        cp "$ROOT/plugin/build/Oc2AIPlugin.dll" "$G/BepInEx/plugins/Oc2AIPlugin.dll" ||
+        { echo "[restart] 部署失败，中止" >&2; exit 1; }
     echo "[restart] 已部署 dll"
 fi
 
@@ -155,7 +171,15 @@ fi
 check_ports_free
 PRE_GAME_PIDS="$(pgrep -f "$GAME_PATTERN" 2>/dev/null | tr '\n' ' ' || true)"
 echo "[restart] 启动游戏 ..."
-"$G/run_game.sh" &
+(
+    cd "$G" || exit 1
+    DOORSTOP_ENABLED=1 \
+    DOORSTOP_TARGET_ASSEMBLY="$PRELOADER" \
+    DOORSTOP_MONO_DLL_SEARCH_PATH_OVERRIDE="$APP/Contents/Resources/Data/Managed" \
+    DYLD_INSERT_LIBRARIES="$DOORSTOP" \
+    DYLD_LIBRARY_PATH="$G" \
+    exec "$GAME_EXE"
+) &
 
 # 5. 等插件两个端口就绪（最多 120s）：27411 快照 + 27412 exec。
 #    必须核对监听者属于本次启动的游戏，并让 exec 真回一次 ping——残留的

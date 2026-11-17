@@ -18,7 +18,7 @@
     python3 run_agent.py --no-voice  # 关闭语音对话
     python3 run_agent.py --voice --voice-debug  # 显式开语音并打印对话调试信息
 
-语音配置全部走环境变量（spec §6.5），见 `.env.example` / `docs/dialog_system.md`。
+语音配置全部走环境变量（spec §6.5），见 `.env.example` / `docs/agent/dialog_system.md`。
 启动时默认自动读取仓库根 `.env`（已有环境变量优先）；可用 `--env-file PATH`
 指定其它文件，或 `--no-env-file` 关闭。
 

@@ -1,4 +1,4 @@
-# CoChef
+# CoChef — An AI Teammate for Overcooked! 2
 
 [中文](README_CN.md)
 
@@ -55,8 +55,8 @@ As of November 2026, we’ve reached **World 4, Level 6** in Story mode. [Progre
 You’ll need the Steam version of *Overcooked! 2* and Python 3.9 or later. Clone the repository and open it in your terminal.
 
 ```sh
-git clone https://github.com/tungyee/overcooked-ai
-cd overcooked-ai
+git clone https://github.com/tungyee/overcooked-ai-teammate
+cd overcooked-ai-teammate
 ```
 
 Complete the one-time setup for your platform. It covers the game plugin, Python environment, voice API credentials, and audio permissions. [macOS setup](docs/setup-en.md#first-time-setup) · [Windows setup](docs/setup-windows-en.md#first-time-setup)

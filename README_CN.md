@@ -1,8 +1,9 @@
-# CoChef
+# CoChef — 胡闹厨房 2 AI 搭子
 
 [English](README.md)
 
 > 厨房可以胡闹，搭子必须靠谱！
+>
 > 一个实时陪你切菜、下锅、出餐，还能听懂你说话的 “胡闹厨房 2” (Overcooked! 2) AI 队友。
 
 <p align="center"><img src="media/demo.webp" alt="CoChef 在厨房里实时协作" width="480"></p>
@@ -60,8 +61,8 @@ flowchart LR
 安装 Steam 版《胡闹厨房 2》和 Python 3.9 或更高版本。克隆仓库后，在仓库根目录执行后续命令。
 
 ```sh
-git clone https://github.com/tungyee/overcooked-ai
-cd overcooked-ai
+git clone https://github.com/tungyee/overcooked-ai-teammate
+cd overcooked-ai-teammate
 ```
 
 按平台完成首次配置，包括游戏插件、Python 环境、语音凭据和音频权限。 [macOS 搭建文档](docs/setup.md#首次配置) · [Windows 搭建文档](docs/setup-windows.md#首次配置)
